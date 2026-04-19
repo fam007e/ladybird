@@ -325,7 +325,7 @@ BrowserWindow::BrowserWindow(Vector<URL::URL> const& initial_urls, IsPopupWindow
         tab.focus_location_editor();
     });
     QObject::connect(m_new_window_action, &QAction::triggered, this, [] {
-        (void)Application::the().new_window({});
+        (void)Application::the().new_window({ WebView::Application::settings().new_tab_page_url() });
     });
     QObject::connect(open_file_action, &QAction::triggered, this, &BrowserWindow::open_file);
 
@@ -340,6 +340,12 @@ BrowserWindow::BrowserWindow(Vector<URL::URL> const& initial_urls, IsPopupWindow
             setWindowTitle(QString("%1 - Ladybird").arg(tab->title()));
 
         set_current_tab(tab);
+        if (tab) {
+            if (auto* focus_widget = tab->focusWidget(); focus_widget && tab->isAncestorOf(focus_widget))
+                focus_widget->setFocus();
+            else
+                tab->view().setFocus();
+        }
         fullscreen_mode().exit(FullscreenMode::ExitInitiatedBy::UI);
     });
     QObject::connect(m_tabs_container, &TabWidget::tab_close_requested, this, &BrowserWindow::request_to_close_tab);

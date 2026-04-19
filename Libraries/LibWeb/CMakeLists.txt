@@ -166,6 +166,7 @@ set(SOURCES
     CSS/CSSUnitValue.cpp
     CSS/CSSUnparsedValue.cpp
     CSS/CSSVariableReferenceValue.cpp
+    CSS/ColorInterpolation.cpp
     CSS/CustomPropertyData.cpp
     CSS/Descriptor.cpp
     CSS/Display.cpp
@@ -176,6 +177,7 @@ set(SOURCES
     CSS/Flex.cpp
     CSS/FontComputer.cpp
     CSS/FontFace.cpp
+    CSS/FontLoading.cpp
     CSS/FontFaceSet.cpp
     CSS/FontFaceSetLoadEvent.cpp
     CSS/FontFeatureData.cpp

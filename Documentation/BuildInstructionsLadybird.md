@@ -252,14 +252,35 @@ If you want to run other applications, such as the JS REPL or the WebAssembly RE
 Ladybird will be built with one of the following browser frontends, depending on the platform:
 * [AppKit](https://developer.apple.com/documentation/appkit?language=objc) - The native UI on macOS.
 * [Qt](https://doc.qt.io/qt-6/) - The UI used on all other platforms.
+* [GTK 4](https://docs.gtk.org/gtk4/) - An alternative UI on Linux (experimental).
 * [Android UI](https://developer.android.com/develop/ui) - The native UI on Android.
 
-The Qt UI is available on platforms where it is not the default as well (except on Android).
-You can pick the UI using the `LADYBIRD_GUI_FRAMEWORK` option, for example to enable the Qt UI:
+The Qt and GTK UIs are available on Linux. You can pick the UI using the `LADYBIRD_GUI_FRAMEWORK` option:
 
 ```bash
 # From /path/to/ladybird
 cmake --preset Release -DLADYBIRD_GUI_FRAMEWORK=Qt
+cmake --preset Release -DLADYBIRD_GUI_FRAMEWORK=Gtk
+```
+
+#### Additional prerequisites for the GTK UI
+
+Building with `LADYBIRD_GUI_FRAMEWORK=Gtk` requires additional system packages, as some vcpkg
+dependencies (e.g. gettext) need to be rebuilt from source:
+
+**Debian/Ubuntu:**
+```bash
+sudo apt install bison libxkbcommon-dev
+```
+
+**Arch Linux/Manjaro:**
+```bash
+sudo pacman -S bison
+```
+
+**Fedora:**
+```bash
+sudo dnf install bison
 ```
 
 ### Build error messages you may encounter
@@ -353,15 +374,6 @@ open -W --stdout $(tty) --stderr $(tty) ./Build/release/bin/Ladybird.app
 # Or to launch with arguments:
 open -W --stdout $(tty) --stderr $(tty) ./Build/release/bin/Ladybird.app --args https://ladybird.dev
 ```
-
-### Experimental GN build
-
-There is an experimental GN build for Ladybird. It is not officially supported, but it is kept up to date on a best-effort
-basis by interested contributors. See the [GN build instructions](../Meta/gn/README.md) for more information.
-
-In general, the GN build organizes ninja rules in a more compact way than the CMake build, and it may be faster on some systems.
-GN also allows building host and cross-targets in the same build directory, which is useful for managing dependencies on host tools when
-cross-compiling to other platforms.
 
 ### Debugging with CLion
 

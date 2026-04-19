@@ -362,15 +362,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b5b646652bf6661599e1da8901b3b9522896f01e736bad5f723fe7a3a27f899d"
 
 [[package]]
+name = "libgfx_rust"
+version = "0.1.0"
+dependencies = [
+ "cbindgen",
+ "yuv",
+]
+
+[[package]]
 name = "libjs_rust"
 version = "0.1.0"
 dependencies = [
  "bytecode_def",
  "cbindgen",
+ "libunicode_rust",
  "num-bigint",
  "num-integer",
  "num-traits",
- "unicode-ident",
 ]
 
 [[package]]
@@ -384,6 +392,7 @@ name = "libregex_rust"
 version = "0.1.0"
 dependencies = [
  "cbindgen",
+ "libunicode_rust",
 ]
 
 [[package]]
@@ -890,6 +899,15 @@ dependencies = [
  "quote",
  "syn",
  "synstructure",
+]
+
+[[package]]
+name = "yuv"
+version = "0.8.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "47d3a7e2cda3061858987ee2fb028f61695f5ee13f9490d75be6c3900df9a4ea"
+dependencies = [
+ "num-traits",
 ]
 
 [[package]]
