@@ -836,6 +836,20 @@ public:
 
     void set_needs_invalidation_of_elements_affected_by_has() { m_needs_invalidation_of_elements_affected_by_has = true; }
 
+    // Test-only counters for observing :has() invalidation work. See Internals.idl.
+    struct StyleInvalidationCounters {
+        u64 has_ancestor_walk_invocations { 0 };
+        u64 has_ancestor_walk_visits { 0 };
+        u64 has_ancestor_sibling_element_checks { 0 };
+        u64 has_invalidation_metadata_candidates { 0 };
+        u64 has_match_invocations { 0 };
+        u64 has_result_cache_hits { 0 };
+        u64 has_result_cache_misses { 0 };
+        u64 style_invalidations { 0 };
+    };
+    StyleInvalidationCounters& style_invalidation_counters() const { return m_style_invalidation_counters; }
+    void reset_style_invalidation_counters() const { m_style_invalidation_counters = {}; }
+
     void set_needs_accumulated_visual_contexts_update(bool value) { m_needs_accumulated_visual_contexts_update = value; }
     bool needs_accumulated_visual_contexts_update() const { return m_needs_accumulated_visual_contexts_update; }
 
@@ -1049,8 +1063,7 @@ public:
 
     void exit_pointer_lock();
 
-    Optional<CSS::SelectorList> const* cached_query_selector_result(String const& selector_text) const;
-    void cache_query_selector_result(String selector_text, Optional<CSS::SelectorList>);
+    Optional<CSS::SelectorList> const& parse_or_cache_selector_list(StringView) const;
 
     GC::Ptr<HTML::CustomElementRegistry> custom_element_registry() const;
     void set_custom_element_registry(GC::Ptr<HTML::CustomElementRegistry> custom_element_registry) { m_custom_element_registry = custom_element_registry; }
@@ -1387,6 +1400,8 @@ private:
     bool m_needs_accumulated_visual_contexts_update { false };
     bool m_needs_invalidation_of_elements_affected_by_has { false };
 
+    mutable StyleInvalidationCounters m_style_invalidation_counters;
+
     mutable GC::Ptr<WebIDL::ObservableArray> m_adopted_style_sheets;
 
     // Document should not visit ShadowRoot list to avoid leaks.
@@ -1491,9 +1506,8 @@ private:
     // https://drafts.csswg.org/css-values-5/#random-caching
     HashMap<CSS::RandomCachingKey, double> m_element_shared_css_random_base_value_cache;
 
-    // Cache of parsed selector lists for querySelectorAll/querySelector.
-    static constexpr size_t max_selector_query_cache_size = 256;
-    HashMap<String, Optional<CSS::SelectorList>> m_selector_query_cache;
+    // Cache of parsed selector lists for querySelectorAll/querySelector/matches/closest.
+    mutable HashMap<String, Optional<CSS::SelectorList>> m_selector_query_cache;
 
     // https://fullscreen.spec.whatwg.org/#list-of-pending-fullscreen-events
     Vector<PendingFullscreenEvent> m_pending_fullscreen_events;

@@ -10,7 +10,7 @@
 #include <LibJS/Runtime/VM.h>
 #include <LibWasm/Types.h>
 #include <LibWeb/Bindings/Intrinsics.h>
-#include <LibWeb/Bindings/MemoryPrototype.h>
+#include <LibWeb/Bindings/Memory.h>
 #include <LibWeb/WebAssembly/Memory.h>
 #include <LibWeb/WebAssembly/WebAssembly.h>
 
@@ -216,6 +216,8 @@ void Memory::refresh_the_memory_buffer(JS::VM& vm, JS::Realm& realm, Wasm::Memor
         if (!buffer->is_shared_array_buffer()) {
             // 1. Perform ! DetachArrayBuffer(buffer, "WebAssembly.Memory").
             MUST(JS::detach_array_buffer(vm, *buffer, JS::PrimitiveString::create(vm, "WebAssembly.Memory"_string)));
+        } else {
+            buffer->refresh_cached_typed_array_view_data_pointers();
         }
 
         // 2. Let newBuffer be the result of creating a fixed length memory buffer from memaddr.
