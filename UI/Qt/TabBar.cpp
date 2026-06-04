@@ -16,7 +16,6 @@
 #    include <UI/Qt/MacWindow.h>
 #endif
 #include <UI/Qt/Menu.h>
-#include <UI/Qt/Settings.h>
 #include <UI/Qt/Tab.h>
 #include <UI/Qt/TabBar.h>
 #include <UI/Qt/WindowControlButton.h>
@@ -1116,7 +1115,7 @@ TabWidget::TabWidget(QWidget* parent)
     if (auto* top_level_window = window(); top_level_window != this)
         top_level_window->installEventFilter(this);
 
-    m_vertical_tabs_expanded_width = Settings::the()->vertical_tabs_expanded_width().value_or(VERTICAL_TABS_DEFAULT_EXPANDED_WIDTH);
+    m_vertical_tabs_expanded_width = Application::settings().tab_settings().vertical_tabs_expanded_width.value_or(VERTICAL_TABS_DEFAULT_EXPANDED_WIDTH);
     m_vertical_tabs_expanded_width = clamp_vertical_tabs_expanded_width(m_vertical_tabs_expanded_width);
 
     m_tab_bar = new TabBar(this);
@@ -1319,6 +1318,7 @@ void TabWidget::set_tab_bar_visible(bool visible)
 
     m_tab_bar_visible = visible;
     update_tab_chrome_visibility();
+    update_tab_layout();
 }
 
 void TabWidget::set_window_controls_visible(bool visible)
@@ -1579,6 +1579,8 @@ bool TabWidget::cursor_is_over_vertical_tabs() const
 
 int TabWidget::vertical_tabs_layout_width() const
 {
+    if (!m_tab_bar_visible)
+        return 0;
     return m_vertical_tabs_expanded ? m_vertical_tabs_expanded_width : VERTICAL_TABS_COLLAPSED_WIDTH;
 }
 
@@ -1714,7 +1716,12 @@ void TabWidget::apply_vertical_tabs_expanded_width(int width)
 
 void TabWidget::persist_vertical_tabs_expanded_width()
 {
-    Settings::the()->set_vertical_tabs_expanded_width(m_vertical_tabs_expanded_width);
+    auto tab_settings = Application::settings().tab_settings();
+
+    using ValueType = decltype(tab_settings.vertical_tabs_expanded_width)::ValueType;
+    tab_settings.vertical_tabs_expanded_width = clamp(m_vertical_tabs_expanded_width, 0, NumericLimits<ValueType>::max());
+
+    Application::settings().set_tab_settings(tab_settings);
 }
 
 void TabWidget::set_resize_handle_property(char const* property, bool enabled)
@@ -1725,7 +1732,7 @@ void TabWidget::set_resize_handle_property(char const* property, bool enabled)
 void TabWidget::update_vertical_tabs_resize_handle()
 {
     auto is_vertical = m_tab_bar->tab_layout() != TabLayout::Horizontal;
-    auto show_resize_handle = is_vertical && m_vertical_tabs_expanded;
+    auto show_resize_handle = m_tab_bar_visible && is_vertical && m_vertical_tabs_expanded;
     m_vertical_tabs_resize_handle->setVisible(show_resize_handle);
     if (!show_resize_handle) {
         m_vertical_tabs_resize_handle->releaseMouse();
@@ -1873,6 +1880,7 @@ void TabWidget::update_tab_chrome_visibility()
     auto is_horizontal = tab_layout == TabLayout::Horizontal;
     auto show_top_row = m_tab_bar_visible && is_horizontal;
     m_tab_bar_row->setVisible(show_top_row);
+    m_toolbar_container->setVisible(m_tab_bar_visible);
     m_vertical_tab_bar_column->setVisible(m_tab_bar_visible && !is_horizontal);
     update_vertical_tabs_content_separator();
 
@@ -1906,7 +1914,7 @@ void TabWidget::update_chrome_style()
 
 void TabWidget::update_vertical_tabs_overlay_geometry()
 {
-    if (m_tab_bar->tab_layout() == TabLayout::Horizontal) {
+    if (!m_tab_bar_visible || m_tab_bar->tab_layout() == TabLayout::Horizontal) {
         m_vertical_tab_bar_column->hide();
         return;
     }

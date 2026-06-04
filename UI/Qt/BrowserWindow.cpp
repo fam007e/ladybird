@@ -180,7 +180,7 @@ bool FullscreenMode::eventFilter(QObject* obj, QEvent* event)
     ASSERT(is_api_fullscreen());
     if (event->type() == QEvent::MouseMove) {
         QMouseEvent* mouse_event = static_cast<QMouseEvent*>(event);
-        maybe_animate_show_exit_button(mouse_event->pos());
+        maybe_animate_show_exit_button(m_window->mapFromGlobal(mouse_event->globalPosition().toPoint()));
     }
 
     return QObject::eventFilter(obj, event);
@@ -189,10 +189,14 @@ bool FullscreenMode::eventFilter(QObject* obj, QEvent* event)
 ExitFullscreenButton::ExitFullscreenButton(QWidget* parent)
     : QPushButton("Exit fullscreen", parent)
 {
+#if defined(AK_OS_MACOS)
+    // The web content view is a native QRhiWidget on macOS, so this overlay must also be native to remain above it.
+    setAttribute(Qt::WA_NativeWindow);
+#endif
     setStyleSheet("background-color:rgb(55, 99, 129); color: white; padding: 10px; border-radius: 5px;");
     adjustSize();
     hide();
-    m_widget_animation = new QPropertyAnimation(this, "pos");
+    m_widget_animation = new QPropertyAnimation(this, "pos", this);
 }
 
 void ExitFullscreenButton::animate_show()
@@ -201,12 +205,13 @@ void ExitFullscreenButton::animate_show()
         return;
 
     show();
-    QScreen* current_screen = screen();
-    QRect screen_geometry = current_screen->geometry();
+    raise();
 
-    int const destination_x = (screen_geometry.width() - width()) / 2;
-    int const destination_y = static_cast<int>(static_cast<float>(screen_geometry.height()) * 0.05);
+    auto const container_size = screen() ? screen()->geometry().size() : (parentWidget() ? parentWidget()->size() : QSize {});
+    int const destination_x = (container_size.width() - width()) / 2;
+    int const destination_y = static_cast<int>(static_cast<float>(container_size.height()) * 0.05);
 
+    m_widget_animation->stop();
     m_widget_animation->setDuration(FullscreenMode::button_animation_time());
     m_widget_animation->setStartValue(QPoint(destination_x, -height()));
     m_widget_animation->setEndValue(QPoint(destination_x, destination_y));
@@ -229,6 +234,7 @@ BrowserWindow::BrowserWindow(Vector<URL::URL> const& initial_urls, IsPopupWindow
     : m_tabs_container(new TabWidget(this))
     , m_is_popup_window(is_popup_window)
 {
+    auto& application = WebView::Application::the();
     auto const& browser_options = WebView::Application::browser_options();
 
     setWindowFlag(Qt::FramelessWindowHint, uses_client_side_decorations());
@@ -258,11 +264,7 @@ BrowserWindow::BrowserWindow(Vector<URL::URL> const& initial_urls, IsPopupWindow
     menuBar()->setObjectName("LadybirdMenuBar");
     create_menu_bar_window_controls();
     update_menu_bar_style();
-    update_menu_bar_visibility(Settings::the()->show_menubar());
-
-    QObject::connect(Settings::the(), &Settings::show_menubar_changed, this, [this](bool show_menubar) {
-        update_menu_bar_visibility(show_menubar);
-    });
+    update_menu_bar_visibility();
 
     auto* file_menu = menuBar()->addMenu("&File");
 
@@ -297,10 +299,10 @@ BrowserWindow::BrowserWindow(Vector<URL::URL> const& initial_urls, IsPopupWindow
     auto* edit_menu = m_hamburger_menu->addMenu("&Edit");
     menuBar()->addMenu(edit_menu);
 
-    edit_menu->addAction(create_application_action(*this, Application::the().cut_selection_action(), IncludeActionIcon::No));
-    edit_menu->addAction(create_application_action(*this, Application::the().copy_selection_action(), IncludeActionIcon::No));
-    edit_menu->addAction(create_application_action(*this, Application::the().paste_action(), IncludeActionIcon::No));
-    edit_menu->addAction(create_application_action(*this, Application::the().select_all_action(), IncludeActionIcon::No));
+    edit_menu->addAction(create_application_action(*this, application.cut_selection_action(), IncludeActionIcon::No));
+    edit_menu->addAction(create_application_action(*this, application.copy_selection_action(), IncludeActionIcon::No));
+    edit_menu->addAction(create_application_action(*this, application.paste_action(), IncludeActionIcon::No));
+    edit_menu->addAction(create_application_action(*this, application.select_all_action(), IncludeActionIcon::No));
     edit_menu->addSeparator();
 
     m_find_in_page_action = new QAction("&Find in Page...", this);
@@ -324,7 +326,7 @@ BrowserWindow::BrowserWindow(Vector<URL::URL> const& initial_urls, IsPopupWindow
     QObject::connect(m_find_in_page_action, &QAction::triggered, this, &BrowserWindow::show_find_in_page);
 
     edit_menu->addSeparator();
-    edit_menu->addAction(create_application_action(*edit_menu, Application::the().open_settings_page_action(), IncludeActionIcon::No));
+    edit_menu->addAction(create_application_action(*edit_menu, application.open_settings_page_action(), IncludeActionIcon::No));
 
     auto* view_menu = m_hamburger_menu->addMenu("&View");
     menuBar()->addMenu(view_menu);
@@ -355,40 +357,33 @@ BrowserWindow::BrowserWindow(Vector<URL::URL> const& initial_urls, IsPopupWindow
 
     view_menu->addSeparator();
 
-    view_menu->addMenu(create_application_menu(*view_menu, Application::the().zoom_menu()));
+    view_menu->addMenu(create_application_menu(*view_menu, application.zoom_menu()));
     view_menu->addSeparator();
 
-    view_menu->addMenu(create_application_menu(*view_menu, Application::the().color_scheme_menu()));
-    view_menu->addMenu(create_application_menu(*view_menu, Application::the().contrast_menu()));
-    view_menu->addMenu(create_application_menu(*view_menu, Application::the().motion_menu()));
+    view_menu->addMenu(create_application_menu(*view_menu, application.color_scheme_menu()));
+    view_menu->addMenu(create_application_menu(*view_menu, application.contrast_menu()));
+    view_menu->addMenu(create_application_menu(*view_menu, application.motion_menu()));
     view_menu->addSeparator();
 
-    if (show_menubar_option_available()) {
-        auto* show_menubar = new QAction("Show &Menubar", this);
-        show_menubar->setCheckable(true);
-        show_menubar->setChecked(Settings::the()->show_menubar());
-        view_menu->addAction(show_menubar);
-        QObject::connect(show_menubar, &QAction::triggered, this, [](bool checked) {
-            Settings::the()->set_show_menubar(checked);
-        });
-    }
+    if (show_menubar_option_available())
+        view_menu->addAction(create_application_action(*view_menu, application.toggle_menu_bar_action(), IncludeActionIcon::No));
 
-    m_bookmarks_menu = create_application_menu(*this, Application::the().bookmarks_menu());
+    m_bookmarks_menu = create_application_menu(*this, application.bookmarks_menu());
     m_hamburger_menu->addMenu(m_bookmarks_menu);
     menuBar()->addMenu(m_bookmarks_menu);
 
-    auto* inspect_menu = create_application_menu(*m_hamburger_menu, Application::the().inspect_menu());
+    auto* inspect_menu = create_application_menu(*m_hamburger_menu, application.inspect_menu());
     m_hamburger_menu->addMenu(inspect_menu);
     menuBar()->addMenu(inspect_menu);
 
-    auto* debug_menu = create_application_menu(*m_hamburger_menu, Application::the().debug_menu());
+    auto* debug_menu = create_application_menu(*m_hamburger_menu, application.debug_menu());
     m_hamburger_menu->addMenu(debug_menu);
     menuBar()->addMenu(debug_menu);
 
     auto* help_menu = m_hamburger_menu->addMenu("&Help");
     menuBar()->addMenu(help_menu);
 
-    help_menu->addAction(create_application_action(*help_menu, Application::the().open_about_page_action(), IncludeActionIcon::No));
+    help_menu->addAction(create_application_action(*help_menu, application.open_about_page_action(), IncludeActionIcon::No));
 
     m_hamburger_menu->addSeparator();
     file_menu->addSeparator();
@@ -517,11 +512,12 @@ void BrowserWindow::rebuild_bookmarks_menu()
     });
 }
 
-void BrowserWindow::update_bookmarks_bar_display(bool show_bookmarks_bar)
+void BrowserWindow::show_bookmarks_bar_changed()
 {
+    auto show_bookmarks_bar = WebView::Application::settings().show_bookmarks_bar();
+
     for_each_tab([&](Tab& tab) {
-        if (tab.view().is_fullscreen() == Web::ViewportIsFullscreen::No)
-            tab.bookmarks_bar().setVisible(show_bookmarks_bar);
+        tab.bookmarks_bar().setVisible(show_bookmarks_bar);
     });
 }
 
@@ -932,12 +928,14 @@ void BrowserWindow::update_menu_bar_style()
     menuBar()->setStyleSheet(ChromeStyle::menu_bar_style_sheet(palette()));
 }
 
-void BrowserWindow::update_menu_bar_visibility(bool show_menubar)
+void BrowserWindow::update_menu_bar_visibility()
 {
-    menuBar()->setVisible(show_menubar);
+    auto show_menu_bar = show_menubar_option_available() && WebView::Application::settings().show_menu_bar();
+    menuBar()->setVisible(show_menu_bar);
+
     if (m_menu_bar_window_controls)
-        m_menu_bar_window_controls->setVisible(show_menubar && uses_client_side_decorations());
-    m_tabs_container->set_window_controls_visible(!show_menubar && uses_client_side_decorations());
+        m_menu_bar_window_controls->setVisible(show_menu_bar && uses_client_side_decorations());
+    m_tabs_container->set_window_controls_visible(!show_menu_bar && uses_client_side_decorations());
 }
 
 void BrowserWindow::update_menu_bar_window_control_icons()
@@ -976,7 +974,7 @@ void BrowserWindow::update_window_decoration_state()
         }
     }
 
-    update_menu_bar_visibility(Settings::the()->show_menubar());
+    update_menu_bar_visibility();
 }
 
 void BrowserWindow::toggle_window_maximized()
@@ -1329,6 +1327,11 @@ void BrowserWindow::changeEvent(QEvent* event)
         }
     }
     QWidget::changeEvent(event);
+}
+
+void BrowserWindow::show_menu_bar_changed()
+{
+    update_menu_bar_visibility();
 }
 
 void BrowserWindow::config_variable_changed(WebView::ConfigVariableID variable)
