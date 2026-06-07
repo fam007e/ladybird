@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/NeverDestroyed.h>
 #include <LibGC/Heap.h>
 #include <LibGfx/Bitmap.h>
 #include <LibJS/Runtime/ExternalMemory.h>
@@ -19,8 +20,8 @@ GC_DEFINE_ALLOCATOR(AnimatedDecodedImageData);
 
 HashMap<i64, GC::RawPtr<AnimatedDecodedImageData>>& AnimatedDecodedImageData::session_registry()
 {
-    static HashMap<i64, GC::RawPtr<AnimatedDecodedImageData>> s_registry;
-    return s_registry;
+    static NeverDestroyed<HashMap<i64, GC::RawPtr<AnimatedDecodedImageData>>> registry;
+    return *registry;
 }
 
 void AnimatedDecodedImageData::install_frame_delivery_callback()
@@ -178,12 +179,12 @@ Optional<Gfx::IntRect> AnimatedDecodedImageData::frame_rect(size_t) const
     return Gfx::IntRect { {}, m_size };
 }
 
-void AnimatedDecodedImageData::paint(DisplayListRecordingContext& context, size_t frame_index, Gfx::IntRect dst_rect, Gfx::IntRect clip_rect, Gfx::ScalingMode scaling_mode) const
+void AnimatedDecodedImageData::paint(DisplayListRecordingContext& context, size_t frame_index, Gfx::IntRect dst_rect, Gfx::ScalingMode scaling_mode) const
 {
     auto decoded_frame = frame(frame_index);
     if (!decoded_frame.has_value())
         return;
-    context.display_list_recorder().draw_scaled_decoded_image_frame(dst_rect, clip_rect, *decoded_frame, scaling_mode);
+    context.display_list_recorder().draw_scaled_decoded_image_frame(dst_rect, *decoded_frame, scaling_mode);
 }
 
 void AnimatedDecodedImageData::receive_frames(Vector<NonnullRefPtr<Gfx::Bitmap>> bitmaps, u32 start_frame_index)

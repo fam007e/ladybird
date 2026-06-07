@@ -122,6 +122,11 @@ static ErrorOr<void> add_config_paths(StringView test_root_path, Vector<ByteStri
     return {};
 }
 
+static ByteString unique_localhost_hostname(StringView prefix)
+{
+    return ByteString::formatted("{}-{}.localhost", prefix, generate_random_uuid().to_byte_string());
+}
+
 static ErrorOr<void> load_test_config(StringView test_root_path)
 {
     auto config_path = LexicalPath::join(test_root_path, "TestConfig.ini"sv);
@@ -803,15 +808,23 @@ static void run_ref_test(TestWebView& view, TestRunContext& context, Test& test,
 
     auto handle_completed_test = [&view, &context, test_index, url]() -> ErrorOr<TestResult> {
         auto& test = context.tests[test_index];
-        VERIFY(test.ref_test_expectation_type.has_value());
-        auto should_match = test.ref_test_expectation_type == RefTestExpectationType::Match;
-        auto screenshot_matches = fuzzy_screenshot_match(url, view.url(), *test.actual_screenshot,
-            *test.expectation_screenshot, test.fuzzy_matches, should_match);
-        if (should_match == screenshot_matches)
-            return TestResult::Pass;
+        switch (test.ref_test_expectation_type) {
+        case RefTestExpectationType::None:
+            return TestResult::Fail;
+        case RefTestExpectationType::Match:
+        case RefTestExpectationType::Mismatch: {
+            auto should_match = test.ref_test_expectation_type == RefTestExpectationType::Match;
+            auto screenshot_matches = fuzzy_screenshot_match(url, view.url(), *test.actual_screenshot,
+                *test.expectation_screenshot, test.fuzzy_matches, should_match);
+            if (should_match == screenshot_matches)
+                return TestResult::Pass;
 
-        TRY(write_screenshot_failure_results(test, *test.actual_screenshot, *test.expectation_screenshot));
-        return TestResult::Fail;
+            TRY(write_screenshot_failure_results(test, *test.actual_screenshot, *test.expectation_screenshot));
+            return TestResult::Fail;
+        }
+        }
+
+        VERIFY_NOT_REACHED();
     };
 
     auto on_test_complete = [&view, test_index, handle_completed_test]() {
@@ -860,16 +873,12 @@ static void run_ref_test(TestWebView& view, TestRunContext& context, Test& test,
         }
     };
 
-    view.on_reference_test_metadata = [&view, &context, test_index](JsonValue const& metadata) {
+    view.on_reference_test_metadata = [&view, &context, test_index, on_test_complete = move(on_test_complete)](JsonValue const& metadata) {
         auto& test = context.tests[test_index];
         auto metadata_object = metadata.as_object();
 
         auto match_references = metadata_object.get_array("match_references"sv);
         auto mismatch_references = metadata_object.get_array("mismatch_references"sv);
-        if (match_references->is_empty() && mismatch_references->is_empty()) {
-            dbgln("No match or mismatch references in `{}`! Metadata: {}", view.url(), metadata_object.serialized());
-            VERIFY_NOT_REACHED();
-        }
 
         // Read fuzzy configurations.
         test.fuzzy_matches.clear_with_capacity();
@@ -901,17 +910,24 @@ static void run_ref_test(TestWebView& view, TestRunContext& context, Test& test,
 
             test.ref_test_expectation_type = RefTestExpectationType::Match;
             reference_to_load = match_references->at(0).as_string();
-        } else {
+        } else if (!mismatch_references->is_empty()) {
             if (mismatch_references->size() > 1)
                 dbgln("FIXME: Only a single ref test mismatch reference is supported");
 
             test.ref_test_expectation_type = RefTestExpectationType::Mismatch;
             reference_to_load = mismatch_references->at(0).as_string();
         }
-        // Clear flag so we can inject the JS into the reference page.
-        test.ref_test_expectation_url = URL::Parser::basic_parse(reference_to_load).release_value();
-        test.did_inject_js = false;
-        view.load(test.ref_test_expectation_url.value());
+
+        if (test.ref_test_expectation_type == RefTestExpectationType::None) {
+            // Skip loading the expectation page entirely since none was specified
+            warnln("Test '{}' does not specify an expectation file (e.g. '<link rel=\"match\" href=\"...\" />' tag), test will fail.", test.input_path);
+            on_test_complete();
+        } else {
+            // Clear flag so we can inject the JS into the reference page.
+            test.ref_test_expectation_url = URL::Parser::basic_parse(reference_to_load).release_value();
+            test.did_inject_js = false;
+            view.load(test.ref_test_expectation_url.value());
+        }
     };
 
     view.load(url);
@@ -1079,7 +1095,7 @@ static void run_test(TestWebView& view, TestRunContext& context, size_t test_ind
             VERIFY(echo_server_port.has_value());
             auto relative_path = LexicalPath::relative_path(real_path, app.test_root_path);
             VERIFY(relative_path.has_value());
-            url = URL::Parser::basic_parse(ByteString::formatted("http://localhost:{}/static/{}", echo_server_port.value(), relative_path.value())).release_value();
+            url = URL::Parser::basic_parse(ByteString::formatted("http://{}:{}/static/{}", unique_localhost_hostname("test-web"sv), echo_server_port.value(), relative_path.value())).release_value();
         } else {
             url = URL::create_with_file_scheme(real_path).release_value();
         }
@@ -1530,6 +1546,12 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
         warnln("Run once with --rebaseline, or drop --rebaseline when repeating.");
         return 1;
     }
+
+    if (app->test_root_path.is_empty()) {
+        warnln("Error: --test-path must be passed to specify the location of the tests.");
+        return 1;
+    }
+
     Core::EventLoop::register_signal(SIGINT, TestWeb::handle_signal);
     Core::EventLoop::register_signal(SIGTERM, TestWeb::handle_signal);
 
@@ -1538,8 +1560,6 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
 
     auto const& browser_options = TestWeb::Application::browser_options();
     Web::DevicePixelSize window_size { browser_options.window_width, browser_options.window_height };
-
-    VERIFY(!app->test_root_path.is_empty());
 
     app->test_root_path = LexicalPath::absolute_path(TRY(FileSystem::current_working_directory()), app->test_root_path);
 

@@ -70,6 +70,7 @@
 #include <LibWeb/CSS/StyleSheetList.h>
 #include <LibWeb/CSS/StyleValues/ColorSchemeStyleValue.h>
 #include <LibWeb/CSS/StyleValues/GuaranteedInvalidStyleValue.h>
+#include <LibWeb/CSS/StyleValues/ImageStyleValue.h>
 #include <LibWeb/CSS/StyleValues/RandomValueSharingStyleValue.h>
 #include <LibWeb/CSS/SystemColor.h>
 #include <LibWeb/CSS/TransitionEvent.h>
@@ -728,6 +729,8 @@ void Document::visit_edges(Cell::Visitor& visitor)
     visitor.visit(m_query_containers_needing_container_query_evaluation_after_layout);
 
     visitor.visit(m_shared_resource_requests);
+    for (auto& resource : m_css_image_resources)
+        resource.value->visit_edges(visitor);
 
     visitor.visit(m_associated_animation_timelines);
     visitor.visit(m_list_of_available_images);
@@ -2290,7 +2293,7 @@ static CSS::RequiredInvalidationAfterStyleChange recompute_style_for_targeted_st
     return {};
 }
 
-GC::Ptr<CSS::ComputedProperties const> Document::update_style_for_element(AbstractElement const& abstract_element, StyleUpdateMode mode)
+CSS::ComputedProperties const* Document::update_style_for_element(AbstractElement const& abstract_element, StyleUpdateMode mode)
 {
     // Refresh computed properties for an abstract element without requiring every unrelated dirty element in the
     // document to be resolved. This walks the flat-tree inheritance chain and re-cascades from the rootmost stale
@@ -2349,7 +2352,7 @@ GC::Ptr<CSS::ComputedProperties const> Document::update_style_for_element(Abstra
             ancestor_needs_descendant_style_recompute = true;
         }
 
-        if (auto const* properties = ancestor->computed_properties().ptr(); properties && properties->display().is_none()) {
+        if (auto const properties = ancestor->computed_properties(); properties && properties->display().is_none()) {
             topmost_display_none_index = i - 1;
             if (mode == StyleUpdateMode::StopAtDisplayNone && !topmost_element_requiring_style.has_value())
                 return nullptr;
@@ -3547,8 +3550,8 @@ DocumentType const* Document::doctype() const
 
 String const& Document::compat_mode() const
 {
-    static String const back_compat = "BackCompat"_string;
-    static String const css1_compat = "CSS1Compat"_string;
+    static String const& back_compat = *new String("BackCompat"_string);
+    static String const& css1_compat = *new String("CSS1Compat"_string);
 
     if (m_quirks_mode == QuirksMode::Yes)
         return back_compat;
@@ -6706,6 +6709,64 @@ HashMap<URL::URL, GC::Ptr<HTML::SharedResourceRequest>>& Document::shared_resour
     return m_shared_resource_requests;
 }
 
+HashMap<URL::URL, GC::Ptr<HTML::SharedResourceRequest>> const& Document::shared_resource_requests() const
+{
+    return m_shared_resource_requests;
+}
+
+CSS::ImageStyleValueResource* Document::css_image_resource(URL::URL const& url)
+{
+    auto it = m_css_image_resources.find(url);
+    if (it == m_css_image_resources.end())
+        return nullptr;
+    return it->value.ptr();
+}
+
+CSS::ImageStyleValueResource const* Document::css_image_resource(URL::URL const& url) const
+{
+    auto it = m_css_image_resources.find(url);
+    if (it == m_css_image_resources.end())
+        return nullptr;
+    return it->value.ptr();
+}
+
+CSS::ImageStyleValueResource& Document::ensure_css_image_resource(URL::URL const& url)
+{
+    if (auto* resource = css_image_resource(url))
+        return *resource;
+
+    auto resource = make<CSS::ImageStyleValueResource>(url);
+    auto& resource_ref = *resource;
+    m_css_image_resources.set(url, move(resource));
+    return resource_ref;
+}
+
+void Document::remove_css_image_resource_if_unused(URL::URL const& url)
+{
+    auto it = m_css_image_resources.find(url);
+    if (it == m_css_image_resources.end())
+        return;
+    if (!it->value->can_be_removed())
+        return;
+    m_css_image_resources.remove(it);
+}
+
+void Document::animate_css_image_resource(URL::URL const& url)
+{
+    if (auto* resource = css_image_resource(url))
+        resource->animate(*this);
+}
+
+u64 Document::active_css_image_animation_timer_count() const
+{
+    u64 count = 0;
+    for (auto const& it : m_css_image_resources) {
+        if (it.value->has_active_animation_timer())
+            ++count;
+    }
+    return count;
+}
+
 void Document::prune_image_resource_caches()
 {
     static constexpr size_t decoded_image_resource_cache_limit = 8 * MiB;
@@ -7664,11 +7725,11 @@ Optional<String> Document::get_style_sheet_source(CSS::StyleSheetIdentifier cons
             if (auto* node = Node::from_unique_id(*identifier.dom_element_unique_id)) {
                 if (node->is_html_style_element()) {
                     if (auto* sheet = as<HTML::HTMLStyleElement>(*node).sheet())
-                        return sheet->source_text({});
+                        return sheet->source_text();
                 }
                 if (node->is_svg_style_element()) {
                     if (auto* sheet = as<SVG::SVGStyleElement>(*node).sheet())
-                        return sheet->source_text({});
+                        return sheet->source_text();
                 }
             }
         }
@@ -7683,7 +7744,7 @@ Optional<String> Document::get_style_sheet_source(CSS::StyleSheetIdentifier cons
         if (m_style_sheets) {
             for (auto& style_sheet : m_style_sheets->sheets()) {
                 if (auto match = find_style_sheet_with_url(identifier.url.value(), style_sheet); match.has_value())
-                    return match->source_text({});
+                    return match->source_text();
             }
         }
 
@@ -7694,7 +7755,7 @@ Optional<String> Document::get_style_sheet_source(CSS::StyleSheetIdentifier cons
                     return;
 
                 if (auto match = find_style_sheet_with_url(identifier.url.value(), style_sheet); match.has_value())
-                    result = match->source_text({});
+                    result = match->source_text();
             });
             return result;
         }

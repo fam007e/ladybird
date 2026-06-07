@@ -136,8 +136,13 @@ public:
         Tag
     };
 
+    enum class NavigationAPIAbortBehavior {
+        Abort,
+        Preserve
+    };
+
     Variant<Empty, Traversal, String> ongoing_navigation() const { return m_ongoing_navigation; }
-    void set_ongoing_navigation(Variant<Empty, Traversal, String> ongoing_navigation);
+    void set_ongoing_navigation(Variant<Empty, Traversal, String> ongoing_navigation, NavigationAPIAbortBehavior = NavigationAPIAbortBehavior::Abort);
 
     void populate_session_history_entry_document(
         URL::URL url,
@@ -299,6 +304,7 @@ private:
     void resolve_all_pending_async_scroll_operations();
     void schedule_hover_update_after_async_scroll();
     void update_hover_after_async_scroll_stops();
+    void cancel_hover_update_after_async_scroll();
 
     // https://html.spec.whatwg.org/multipage/document-sequences.html#nav-id
     String m_id;

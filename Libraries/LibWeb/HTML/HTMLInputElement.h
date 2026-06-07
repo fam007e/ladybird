@@ -64,7 +64,7 @@ class WEB_API HTMLInputElement final
 public:
     virtual ~HTMLInputElement() override;
 
-    virtual GC::Ptr<Layout::Node> create_layout_node(GC::Ref<CSS::ComputedProperties>) override;
+    virtual GC::Ptr<Layout::Node> create_layout_node(CSS::ComputedProperties const&) override;
     virtual void adjust_computed_style(CSS::ComputedProperties&) override;
     virtual void set_being_activated(bool) override;
 
@@ -86,8 +86,8 @@ public:
     WebIDL::ExceptionOr<void> set_value(Utf16String const&);
 
     // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#concept-textarea/input-relevant-value
-    virtual Utf16String relevant_value() const override { return value(); }
-    WebIDL::ExceptionOr<void> set_relevant_value(Utf16String const& value) override { return set_value(value); }
+    virtual Utf16String relevant_value() const override;
+    WebIDL::ExceptionOr<void> set_relevant_value(Utf16String const& value) override;
     virtual Optional<Utf16String> selected_text_for_stringifier() const override;
 
     virtual void set_dirty_value_flag(bool flag) override { m_dirty_value = flag; }

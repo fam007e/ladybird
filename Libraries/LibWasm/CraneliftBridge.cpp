@@ -6,10 +6,13 @@
 
 #include <AK/ByteString.h>
 #include <AK/Checked.h>
+#include <AK/LexicalPath.h>
+#include <AK/NeverDestroyed.h>
 #include <AK/Platform.h>
 #include <AK/ScopeGuard.h>
 #include <CraneliftFFI.h>
 #include <LibCore/Process.h>
+#include <LibCore/System.h>
 #include <LibWasm/AbstractMachine/BytecodeInterpreter.h>
 #include <LibWasm/AbstractMachine/Configuration.h>
 #include <LibWasm/Printer/Printer.h>
@@ -141,8 +144,13 @@ struct CacheState {
     Vector<BatchInput> pending_batch;
 };
 
-static thread_local CacheState s_cranelift_cache_state;
 static thread_local u32 s_active_function_index = NumericLimits<u32>::max();
+
+static CacheState& cranelift_cache_state()
+{
+    static thread_local auto* state = new CacheState;
+    return *state;
+}
 
 static u64 compute_layout_hash(RuntimeHelpers const& h)
 {
@@ -251,12 +259,12 @@ static bool install_compiled_function(CompiledInstructions& target, ReadonlyByte
     for (auto const& trap : traps)
         handle->traps.unchecked_append(trap);
 
-    target.dispatches[0].handler_ptr = bit_cast<FlatPtr>(func_ptr);
     target.cranelift_code_handle = handle;
     target.cranelift_code_size = code_size;
     target.cranelift_traps = handle->traps.data();
     target.cranelift_trap_count = handle->traps.size();
     target.cranelift_compiled = true;
+    publish_cranelift_entry(target, bit_cast<FlatPtr>(func_ptr));
     return true;
 }
 
@@ -273,7 +281,7 @@ static ALWAYS_INLINE i32 wasm_cl_finish_call(BytecodeInterpreter& interpreter, C
 
     if (auto* wasm_function = instance->get_pointer<WasmFunction>(); wasm_function
         && !config.should_limit_instruction_count()
-        && wasm_function->code().func().body().compiled_instructions.cranelift_compiled) {
+        && cranelift_entry_acquire(wasm_function->code().func().body().compiled_instructions) != 0) {
 
         // Fast compiled-to-compiled call: stack-allocate locals + non-owning frame.
         auto& func = wasm_function->code().func();
@@ -305,7 +313,7 @@ static ALWAYS_INLINE i32 wasm_cl_finish_call(BytecodeInterpreter& interpreter, C
             auto const* cc = ci.dispatches.data();
             auto const* addrs = ci.src_dst_mappings.data();
             using HandlerFn = Outcome (*)(BytecodeInterpreter&, Configuration&, Instruction const*, u32, Dispatch const*, SourcesAndDestination const*);
-            auto const handler = bit_cast<HandlerFn>(cc[0].handler_ptr);
+            auto const handler = bit_cast<HandlerFn>(cranelift_entry_acquire(ci));
             auto outcome = handler(interpreter, config, cc[0].instruction, 0, cc, addrs);
 
             if (outcome != Outcome::Return) {
@@ -1098,6 +1106,33 @@ static CraneliftInsn serialize_insn(Dispatch const& dispatch, SourcesAndDestinat
     return out;
 }
 
+static StringView resolve_cranelift_compiler_path()
+{
+    // Lookup order: LADYBIRD_CRANELIFT_COMPILER, compile-time path, sibling-of-self.
+    static NeverDestroyed<ByteString> s_path = []() -> ByteString {
+        auto file_exists = [](ByteString const& path) {
+            return !Core::System::stat(path).is_error();
+        };
+
+        if (auto const* env = getenv("LADYBIRD_CRANELIFT_COMPILER"); env && *env) {
+            if (file_exists(env))
+                return ByteString { env };
+        }
+
+        if (file_exists(WASM_CRANELIFT_COMPILER_PATH))
+            return WASM_CRANELIFT_COMPILER_PATH;
+
+        if (auto self_path = Core::System::current_executable_path(); !self_path.is_error()) {
+            auto sibling = LexicalPath::join(LexicalPath::dirname(self_path.value()), "cranelift-compiler"sv).string();
+            if (file_exists(sibling))
+                return sibling;
+        }
+
+        return WASM_CRANELIFT_COMPILER_PATH;
+    }();
+    return s_path->view();
+}
+
 static void try_cranelift_compile_batch(Vector<BatchInput>& batch)
 {
     if (batch.is_empty())
@@ -1209,7 +1244,7 @@ static void try_cranelift_compile_batch(Vector<BatchInput>& batch)
 
     auto process_result = Core::Process::spawn({
         .name = "cranelift-compiler"sv,
-        .executable = WASM_CRANELIFT_COMPILER_PATH,
+        .executable = resolve_cranelift_compiler_path(),
         .arguments = arguments,
     });
     if (process_result.is_error())
@@ -1262,7 +1297,7 @@ static void try_cranelift_compile_batch(Vector<BatchInput>& batch)
             ? ReadonlySpan<CraneliftTrap> {}
             : ReadonlySpan<CraneliftTrap> { reinterpret_cast<CraneliftTrap const*>(base + reloc_region_start + trap_offset), trap_count };
 
-        auto& capture = s_cranelift_cache_state.cache_capture;
+        auto& capture = cranelift_cache_state().cache_capture;
         if (capture.capturing && batch[i].function_index != NumericLimits<u32>::max()) {
             if (auto copy = ByteBuffer::copy(code_bytes.data(), code_bytes.size()); !copy.is_error()) {
                 CacheRecord rec;
@@ -1305,8 +1340,8 @@ bool try_cranelift_compile(CompiledInstructions& compiled, u32 result_arity)
 
     // Cache hit: install from the parsed blob instead of going through cranelift.
     //            dispatches[] has just been populated by try_compile_instructions, so handler_ptr is ready to be set.
-    if (s_cranelift_cache_state.pending_install.active && s_active_function_index != NumericLimits<u32>::max()) {
-        auto record = s_cranelift_cache_state.pending_install.records.take(s_active_function_index);
+    if (cranelift_cache_state().pending_install.active && s_active_function_index != NumericLimits<u32>::max()) {
+        auto record = cranelift_cache_state().pending_install.records.take(s_active_function_index);
         if (record.has_value()) {
             static auto cache_install_helpers = make_runtime_helpers();
             if (install_compiled_function(
@@ -1319,7 +1354,7 @@ bool try_cranelift_compile(CompiledInstructions& compiled, u32 result_arity)
                 return true;
             }
             // Put it back so we can try later.
-            s_cranelift_cache_state.pending_install.records.set(s_active_function_index, record.release_value());
+            cranelift_cache_state().pending_install.records.set(s_active_function_index, record.release_value());
         }
     }
 
@@ -1352,9 +1387,9 @@ bool try_cranelift_compile(CompiledInstructions& compiled, u32 result_arity)
         static size_t s_min_insns = read_size_env("CRANELIFT_MIN_INSNS", 0);
         static size_t s_min_fn = read_size_env("CRANELIFT_MIN_FN", 0);
         static size_t s_max_fn = read_size_env("CRANELIFT_MAX_FN", NumericLimits<size_t>::max());
-        static auto s_skip_fn = read_set_env("CRANELIFT_SKIP_FN");
-        static auto s_only_fn = read_set_env("CRANELIFT_ONLY_FN");
-        static auto s_dump_fn = read_set_env("CRANELIFT_DUMP_FN");
+        static auto& s_skip_fn = *new HashTable<size_t>(read_set_env("CRANELIFT_SKIP_FN"));
+        static auto& s_only_fn = *new HashTable<size_t>(read_set_env("CRANELIFT_ONLY_FN"));
+        static auto& s_dump_fn = *new HashTable<size_t>(read_set_env("CRANELIFT_DUMP_FN"));
         static bool s_trace = getenv("CRANELIFT_TRACE") != nullptr;
 
         static size_t s_func_counter = 0;
@@ -1415,6 +1450,9 @@ bool try_cranelift_compile(CompiledInstructions& compiled, u32 result_arity)
     for (size_t i = 0; i < dispatches.size(); ++i) {
         flat.append(serialize_insn(dispatches[i], addresses[i]));
 
+        if (dispatches[i].instruction->opcode().value() == Instructions::synthetic_tier_up.value())
+            flat.last().imm1 = static_cast<i64>(i);
+
         if (dispatches[i].instruction->opcode().value() == Instructions::br_table.value()) {
             auto const& table_args = dispatches[i].instruction->arguments().get<Instruction::TableBranchArgs>();
             auto const total = table_args.labels.size();
@@ -1435,22 +1473,22 @@ bool try_cranelift_compile(CompiledInstructions& compiled, u32 result_arity)
         }
     }
 
-    s_cranelift_cache_state.pending_batch.append({ move(flat), result_arity, s_active_function_index, &compiled });
+    cranelift_cache_state().pending_batch.append({ move(flat), result_arity, s_active_function_index, &compiled });
     return false; // Not compiled yet, will be compiled in flush.
 #endif
 }
 
 void flush_cranelift_batch()
 {
-    if (s_cranelift_cache_state.pending_batch.is_empty())
+    if (cranelift_cache_state().pending_batch.is_empty())
         return;
-    try_cranelift_compile_batch(s_cranelift_cache_state.pending_batch);
-    s_cranelift_cache_state.pending_batch.clear();
+    try_cranelift_compile_batch(cranelift_cache_state().pending_batch);
+    cranelift_cache_state().pending_batch.clear();
 }
 
 void discard_cranelift_batch()
 {
-    s_cranelift_cache_state.pending_batch.clear();
+    cranelift_cache_state().pending_batch.clear();
 }
 
 void free_cranelift_code(void* handle)
@@ -1473,30 +1511,30 @@ void set_cranelift_active_function_index(u32 function_index)
 
 void begin_cranelift_cache_capture()
 {
-    s_cranelift_cache_state.cache_capture.capturing = true;
-    s_cranelift_cache_state.cache_capture.records.clear();
+    cranelift_cache_state().cache_capture.capturing = true;
+    cranelift_cache_state().cache_capture.records.clear();
 }
 
 void abort_cranelift_cache_capture()
 {
-    s_cranelift_cache_state.cache_capture.capturing = false;
-    s_cranelift_cache_state.cache_capture.records.clear();
+    cranelift_cache_state().cache_capture.capturing = false;
+    cranelift_cache_state().cache_capture.records.clear();
 }
 
 void abort_cranelift_cache_install()
 {
-    s_cranelift_cache_state.pending_install.active = false;
-    s_cranelift_cache_state.pending_install.records.clear();
+    cranelift_cache_state().pending_install.active = false;
+    cranelift_cache_state().pending_install.records.clear();
 }
 
 Optional<ByteBuffer> serialize_cranelift_cache_blob(ReadonlyBytes wasm_hash)
 {
     ScopeGuard reset = [] {
-        s_cranelift_cache_state.cache_capture.capturing = false;
-        s_cranelift_cache_state.cache_capture.records.clear();
+        cranelift_cache_state().cache_capture.capturing = false;
+        cranelift_cache_state().cache_capture.records.clear();
     };
 
-    auto const& capture = s_cranelift_cache_state.cache_capture;
+    auto const& capture = cranelift_cache_state().cache_capture;
 
     if (!capture.capturing || capture.records.is_empty())
         return {};
@@ -1618,10 +1656,10 @@ bool try_install_cranelift_cache_blob(ReadonlyBytes expected_wasm_hash, Readonly
             __builtin_memcpy(&trap, blob.data() + trap_off + j * sizeof(CraneliftTrap), sizeof(CraneliftTrap));
             rec.traps.unchecked_append(trap);
         }
-        s_cranelift_cache_state.pending_install.records.set(entry->function_index, move(rec));
+        cranelift_cache_state().pending_install.records.set(entry->function_index, move(rec));
     }
 
-    s_cranelift_cache_state.pending_install.active = true;
+    cranelift_cache_state().pending_install.active = true;
     return true;
 }
 

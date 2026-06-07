@@ -10,6 +10,7 @@
 #include <LibMedia/GenericTimeProvider.h>
 #include <LibMedia/PlaybackStates/StartingStateHandler.h>
 #include <LibMedia/Processors/AudioMixer.h>
+#include <LibMedia/Processors/AudioTimeStretchProcessor.h>
 #include <LibMedia/Producers/DecodedAudioProducer.h>
 #include <LibMedia/Producers/DecodedVideoProducer.h>
 #include <LibMedia/Sinks/AudioPlaybackSink.h>
@@ -29,7 +30,7 @@ DecoderErrorOr<NonnullRefPtr<Demuxer>> PlaybackManager::create_demuxer_for_strea
     return FFmpeg::FFmpegDemuxer::from_stream(stream);
 }
 
-DecoderErrorOr<void> PlaybackManager::prepare_playback_from_demuxer(WeakPlaybackManager const& self, NonnullRefPtr<Demuxer> const& demuxer, NonnullRefPtr<Core::WeakEventLoopReference> const& main_thread_event_loop_reference)
+DecoderErrorOr<void> PlaybackManager::prepare_playback_from_demuxer(WeakPlaybackManager const& self, NonnullRefPtr<Demuxer> const& demuxer, Core::EventLoop& main_thread_event_loop)
 {
     // Create the video tracks and their producers.
     auto all_video_tracks = TRY(demuxer->get_tracks_for_type(TrackType::Video));
@@ -39,7 +40,7 @@ DecoderErrorOr<void> PlaybackManager::prepare_playback_from_demuxer(WeakPlayback
     supported_video_tracks.ensure_capacity(all_video_tracks.size());
     supported_video_track_datas.ensure_capacity(all_video_tracks.size());
     for (auto const& track : all_video_tracks) {
-        auto video_producer_result = DecodedVideoProducer::try_create(main_thread_event_loop_reference, demuxer, track);
+        auto video_producer_result = DecodedVideoProducer::try_create(main_thread_event_loop, demuxer, track);
         if (video_producer_result.is_error())
             continue;
         supported_video_tracks.append(track);
@@ -56,7 +57,7 @@ DecoderErrorOr<void> PlaybackManager::prepare_playback_from_demuxer(WeakPlayback
     supported_audio_tracks.ensure_capacity(all_audio_tracks.size());
     supported_audio_track_datas.ensure_capacity(all_audio_tracks.size());
     for (auto const& track : all_audio_tracks) {
-        auto audio_producer_result = DecodedAudioProducer::try_create(main_thread_event_loop_reference, demuxer, track);
+        auto audio_producer_result = DecodedAudioProducer::try_create(main_thread_event_loop, demuxer, track);
         if (audio_producer_result.is_error())
             continue;
         auto audio_producer = audio_producer_result.release_value();
@@ -79,8 +80,7 @@ DecoderErrorOr<void> PlaybackManager::prepare_playback_from_demuxer(WeakPlayback
     auto duration = demuxer->total_duration().value_or(AK::Duration::zero());
     auto start_time_realtime = demuxer->start_time_realtime();
 
-    auto main_thread_event_loop = main_thread_event_loop_reference->take();
-    main_thread_event_loop->deferred_invoke([self, video_tracks = move(supported_video_tracks), video_track_datas = move(supported_video_track_datas), preferred_video_track, audio_tracks = move(supported_audio_tracks), audio_track_datas = move(supported_audio_track_datas), preferred_audio_track, duration, start_time_realtime] mutable {
+    main_thread_event_loop.deferred_invoke([self, video_tracks = move(supported_video_tracks), video_track_datas = move(supported_video_track_datas), preferred_video_track, audio_tracks = move(supported_audio_tracks), audio_track_datas = move(supported_audio_track_datas), preferred_audio_track, duration, start_time_realtime] mutable {
         if (!self)
             return;
 
@@ -117,13 +117,15 @@ DecoderErrorOr<void> PlaybackManager::prepare_playback_from_demuxer(WeakPlayback
 
         if (!self->m_audio_output_disabled && !self->m_audio_sink && !self->m_audio_tracks.is_empty()) {
             self->m_audio_mixer = MUST(AudioMixer::try_create());
+            self->m_audio_time_stretch_processor = MUST(AudioTimeStretchProcessor::try_create());
             self->m_audio_sink = MUST(AudioPlaybackSink::try_create(
                 [self](PipelineStatus status) {
                     if (!self)
                         return;
                     self->on_audio_sink_state_changed(status);
                 }));
-            MUST(self->m_audio_sink->connect_input(*self->m_audio_mixer));
+            MUST(self->m_audio_time_stretch_processor->connect_input(*self->m_audio_mixer));
+            MUST(self->m_audio_sink->connect_input(*self->m_audio_time_stretch_processor));
             self->set_time_provider(*self->m_audio_sink);
             self->m_audio_sink->on_audio_output_error = [self](Error&& error) {
                 if (!self)
@@ -167,12 +169,9 @@ PlaybackManager::~PlaybackManager()
     m_weak_link->revoke({});
 }
 
-static void handle_media_init_error(WeakPlaybackManager self, NonnullRefPtr<Core::WeakEventLoopReference> const& main_thread_event_loop_reference, DecoderError error)
+static void handle_media_init_error(WeakPlaybackManager self, Core::EventLoop& main_thread_event_loop, DecoderError error)
 {
-    auto main_thread_event_loop = main_thread_event_loop_reference->take();
-    if (!main_thread_event_loop)
-        return;
-    main_thread_event_loop->deferred_invoke([self = move(self), error = move(error)] mutable {
+    main_thread_event_loop.deferred_invoke([self = move(self), error = move(error)] mutable {
         if (!self)
             return;
         if (self->on_unsupported_format_error)
@@ -183,30 +182,30 @@ static void handle_media_init_error(WeakPlaybackManager self, NonnullRefPtr<Core
 void PlaybackManager::add_media_source(NonnullRefPtr<MediaStream> const& stream)
 {
     auto self = weak();
-    auto main_thread_event_loop_reference = Core::EventLoop::current_weak();
+    auto& main_thread_event_loop = Core::EventLoop::current();
 
-    Threading::ThreadPool::the().submit([self = move(self), stream, main_thread_event_loop_reference = move(main_thread_event_loop_reference)] mutable {
+    Threading::ThreadPool::the().submit([self = move(self), stream, &main_thread_event_loop] mutable {
         auto demuxer_or_error = create_demuxer_for_stream(stream);
         if (demuxer_or_error.is_error()) {
-            handle_media_init_error(move(self), move(main_thread_event_loop_reference), demuxer_or_error.release_error());
+            handle_media_init_error(move(self), main_thread_event_loop, demuxer_or_error.release_error());
             return;
         }
 
-        auto maybe_error = prepare_playback_from_demuxer(self, demuxer_or_error.release_value(), main_thread_event_loop_reference);
+        auto maybe_error = prepare_playback_from_demuxer(self, demuxer_or_error.release_value(), main_thread_event_loop);
         if (maybe_error.is_error())
-            handle_media_init_error(move(self), move(main_thread_event_loop_reference), maybe_error.release_error());
+            handle_media_init_error(move(self), main_thread_event_loop, maybe_error.release_error());
     });
 }
 
 void PlaybackManager::add_media_source(NonnullRefPtr<Demuxer> const& demuxer)
 {
     auto self = weak();
-    auto main_thread_event_loop_reference = Core::EventLoop::current_weak();
+    auto& main_thread_event_loop = Core::EventLoop::current();
 
-    Threading::ThreadPool::the().submit([self = move(self), demuxer, main_thread_event_loop_reference = move(main_thread_event_loop_reference)] mutable {
-        auto maybe_error = prepare_playback_from_demuxer(self, demuxer, main_thread_event_loop_reference);
+    Threading::ThreadPool::the().submit([self = move(self), demuxer, &main_thread_event_loop] mutable {
+        auto maybe_error = prepare_playback_from_demuxer(self, demuxer, main_thread_event_loop);
         if (maybe_error.is_error())
-            handle_media_init_error(move(self), move(main_thread_event_loop_reference), maybe_error.release_error());
+            handle_media_init_error(move(self), main_thread_event_loop, maybe_error.release_error());
     });
 }
 
@@ -305,6 +304,7 @@ void PlaybackManager::set_time_provider(NonnullRefPtr<MediaTimeProvider> const& 
             continue;
         track_data.display->set_time_provider(provider);
     }
+    provider->set_playback_rate(m_playback_rate);
     if (is_playing())
         provider->resume();
 }
@@ -313,6 +313,7 @@ void PlaybackManager::disable_audio()
 {
     m_audio_buffering = false;
     m_audio_mixer = nullptr;
+    m_audio_time_stretch_processor = nullptr;
     m_audio_sink = nullptr;
     set_time_provider(make_ref_counted<GenericTimeProvider>());
     on_audio_sink_state_changed(PipelineStatus::EndOfStream);
@@ -347,8 +348,10 @@ void PlaybackManager::enable_an_audio_track(Track const& track)
 {
     auto& track_data = get_audio_data_for_track(track);
     VERIFY(!track_data.enabled);
-    if (m_audio_mixer)
+    if (m_audio_mixer) {
+        m_audio_mixer->seek(current_time());
         MUST(m_audio_mixer->connect_input(track_data.producer));
+    }
     track_data.enabled = true;
 }
 
@@ -356,8 +359,10 @@ void PlaybackManager::disable_an_audio_track(Track const& track)
 {
     auto& track_data = get_audio_data_for_track(track);
     VERIFY(track_data.enabled);
-    if (m_audio_mixer)
+    if (m_audio_mixer) {
+        m_audio_mixer->seek(current_time());
         m_audio_mixer->disconnect_input(track_data.producer);
+    }
     track_data.enabled = false;
 }
 
@@ -434,6 +439,12 @@ void PlaybackManager::set_volume(double volume)
 {
     if (m_audio_sink)
         m_audio_sink->set_volume(volume);
+}
+
+void PlaybackManager::set_playback_rate(float rate)
+{
+    m_playback_rate = rate;
+    m_time_provider->set_playback_rate(rate);
 }
 
 }

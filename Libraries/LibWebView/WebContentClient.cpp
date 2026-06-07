@@ -28,7 +28,11 @@
 
 namespace WebView {
 
-HashTable<WebContentClient*> WebContentClient::s_clients;
+HashTable<WebContentClient*>& WebContentClient::clients()
+{
+    static NeverDestroyed<HashTable<WebContentClient*>> clients;
+    return *clients;
+}
 
 static constexpr auto detached_page_close_timeout_ms = 1000;
 static constexpr auto close_server_exit_timeout_ms = 5000;
@@ -51,13 +55,13 @@ WebContentClient::WebContentClient(NonnullOwnPtr<IPC::Transport> transport, u64 
     , m_initial_page_id(initial_page_id)
 {
     VERIFY(m_initial_page_id > 0);
-    s_clients.set(this);
+    clients().set(this);
 }
 
 WebContentClient::~WebContentClient()
 {
     WorkerProcessManager::the().remove_web_content_owner(*this);
-    s_clients.remove(this);
+    clients().remove(this);
 }
 
 Optional<WebContentClient&> WebContentClient::client_for_compositor_context_id(Web::Compositor::CompositorContextId context_id)
@@ -620,7 +624,7 @@ void WebContentClient::did_request_media_context_menu(u64 page_id, Gfx::IntPoint
 void WebContentClient::did_get_source(u64, URL::URL url, URL::URL base_url, String source)
 {
     if (auto view = Application::the().open_blank_new_tab(Web::HTML::ActivateTab::Yes); view.has_value()) {
-        auto html = highlight_source(url, base_url, source, Syntax::Language::HTML, WebView::HighlightOutputMode::FullDocument);
+        auto html = highlight_source(url, base_url, source, Syntax::Language::HTML);
         view->load_html(html);
     }
 }

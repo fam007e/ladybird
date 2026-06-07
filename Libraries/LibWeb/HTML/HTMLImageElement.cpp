@@ -5,6 +5,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/NeverDestroyed.h>
 #include <LibCore/Timer.h>
 #include <LibGC/Weak.h>
 #include <LibGfx/Bitmap.h>
@@ -83,8 +84,8 @@ private:
 
 static BatchingDispatcher& batching_dispatcher()
 {
-    static BatchingDispatcher dispatcher;
-    return dispatcher;
+    static NeverDestroyed<BatchingDispatcher> dispatcher;
+    return *dispatcher;
 }
 
 static bool image_element_dimensions_may_depend_on_intrinsic_size(Layout::ImageBox const& image_box)
@@ -295,9 +296,9 @@ void HTMLImageElement::form_associated_element_attribute_changed(FlyString const
     }
 }
 
-GC::Ptr<Layout::Node> HTMLImageElement::create_layout_node(GC::Ref<CSS::ComputedProperties> style)
+GC::Ptr<Layout::Node> HTMLImageElement::create_layout_node(CSS::ComputedProperties const& style)
 {
-    return heap().allocate<Layout::ImageBox>(document(), *this, move(style), *this);
+    return heap().allocate<Layout::ImageBox>(document(), *this, style, *this);
 }
 
 void HTMLImageElement::adjust_computed_style(CSS::ComputedProperties& style)

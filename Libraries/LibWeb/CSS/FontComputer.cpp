@@ -684,7 +684,7 @@ NonnullRefPtr<Gfx::FontCascadeList const> FontComputer::compute_font_for_style_v
 Gfx::Font const& FontComputer::initial_font() const
 {
     // FIXME: This is not correct.
-    static auto font = ComputedProperties::font_fallback(false, false, 12);
+    static auto const& font = ComputedProperties::font_fallback(false, false, 12).leak_ref();
     return font;
 }
 
@@ -829,7 +829,9 @@ GC::Ptr<FontLoader> FontComputer::load_font_face(ParsedFontFace const& font_face
         .environment_settings_object = document().relevant_settings_object(),
         .value = RuleOrDeclaration::Rule {
             .parent_style_sheet = font_face.parent_rule()->parent_style_sheet(),
-        }
+        },
+        .style_resource_base_url = {},
+        .parent_style_sheet_origin_clean = {},
     };
 
     auto key = urls.first().to_string();

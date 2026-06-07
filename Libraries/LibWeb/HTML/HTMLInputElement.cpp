@@ -13,6 +13,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/NeverDestroyed.h>
 #include <LibGfx/DecodedImageFrame.h>
 #include <LibJS/Runtime/Date.h>
 #include <LibJS/Runtime/NativeFunction.h>
@@ -131,7 +132,7 @@ void HTMLInputElement::set_being_activated(bool activated)
         set_needs_repaint();
 }
 
-GC::Ptr<Layout::Node> HTMLInputElement::create_layout_node(GC::Ref<CSS::ComputedProperties> style)
+GC::Ptr<Layout::Node> HTMLInputElement::create_layout_node(CSS::ComputedProperties const& style)
 {
     if (type_state() == TypeAttributeState::Hidden)
         return nullptr;
@@ -139,15 +140,15 @@ GC::Ptr<Layout::Node> HTMLInputElement::create_layout_node(GC::Ref<CSS::Computed
     // NOTE: Image inputs are `appearance: none` per the default UA style,
     //       but we still need to create an ImageBox for them, or no image will get loaded.
     if (type_state() == TypeAttributeState::ImageButton) {
-        return heap().allocate<Layout::ImageBox>(document(), *this, move(style), *this);
+        return heap().allocate<Layout::ImageBox>(document(), *this, style, *this);
     }
 
     // https://drafts.csswg.org/css-ui/#appearance-switching
     // This specification introduces the appearance property to provide some control over this behavior.
     // In particular, using appearance: none allows authors to suppress the native appearance of widgets,
     // giving them a primitive appearance where CSS can be used to restyle them.
-    if (style->appearance() == CSS::Appearance::None) {
-        return Element::create_layout_node_for_display_type(document(), style->display(), style, this);
+    if (style.appearance() == CSS::Appearance::None) {
+        return Element::create_layout_node_for_display_type(document(), style.display(), style, this);
     }
 
     switch (type_state()) {
@@ -155,24 +156,18 @@ GC::Ptr<Layout::Node> HTMLInputElement::create_layout_node(GC::Ref<CSS::Computed
     case TypeAttributeState::SubmitButton:
     case TypeAttributeState::Button:
     case TypeAttributeState::ResetButton:
-        return heap().allocate<Layout::BlockContainer>(document(), this, move(style));
+        return heap().allocate<Layout::BlockContainer>(document(), this, style);
     case TypeAttributeState::Checkbox:
-        return heap().allocate<Layout::CheckBox>(document(), *this, move(style));
+        return heap().allocate<Layout::CheckBox>(document(), *this, style);
     case TypeAttributeState::RadioButton:
-        return heap().allocate<Layout::RadioButton>(document(), *this, move(style));
-    case TypeAttributeState::Text:
-    case TypeAttributeState::Search:
-    case TypeAttributeState::URL:
-    case TypeAttributeState::Telephone:
-    case TypeAttributeState::Email:
-    case TypeAttributeState::Password:
-    case TypeAttributeState::Number:
-        // FIXME: text padding issues
-        return heap().allocate<Layout::TextInputBox>(document(), *this, move(style));
+        return heap().allocate<Layout::RadioButton>(document(), *this, style);
     case TypeAttributeState::Range:
-        return heap().allocate<Layout::RangeInputBox>(document(), *this, move(style));
+        return heap().allocate<Layout::RangeInputBox>(document(), *this, style);
+    case TypeAttributeState::Color:
+    case TypeAttributeState::FileUpload:
+        return Element::create_layout_node_for_display_type(document(), style.display(), style, this);
     default:
-        return Element::create_layout_node_for_display_type(document(), style->display(), style, this);
+        return heap().allocate<Layout::TextInputBox>(document(), *this, style);
     }
 }
 
@@ -570,18 +565,8 @@ WebIDL::ExceptionOr<void> HTMLInputElement::run_input_activation_behavior(DOM::E
 
 void HTMLInputElement::did_edit_text_node(FlyString const& input_type, Optional<Utf16String> const& data)
 {
-    // An input element's dirty value flag must be set to true whenever the user interacts with the control in a way that changes the value.
-    auto old_value = move(m_value);
-    m_value = value_sanitization_algorithm(m_text_node->data());
     m_dirty_value = true;
-
     m_has_uncommitted_changes = true;
-
-    if (m_value != old_value)
-        relevant_value_was_changed();
-
-    update_placeholder_visibility();
-
     user_interaction_did_change_input_value(input_type, data);
 }
 
@@ -718,6 +703,36 @@ Optional<String> HTMLInputElement::optional_value() const
     }
 }
 
+// https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#concept-textarea/input-relevant-value
+Utf16String HTMLInputElement::relevant_value() const
+{
+    // AD-HOC: If a text node is present, use that as the raw text buffer, so that it can differ from the sanitized
+    //         or canonicalized value.
+    if (m_text_node)
+        return m_text_node->data();
+    return value();
+}
+
+WebIDL::ExceptionOr<void> HTMLInputElement::set_relevant_value(Utf16String const& value)
+{
+    if (m_text_node)
+        m_text_node->set_data(value);
+
+    // https://html.spec.whatwg.org/multipage/input.html#number-state-(type=number)
+    // If the user agent provides a user interface for selecting a number, then the value must be set to the best
+    // representation of the number representing the user's selection as a floating-point number.
+    if (type_state() == TypeAttributeState::Number) {
+        m_value = {};
+        if (auto parsed = parse_floating_point_number(value); parsed.has_value() && isfinite(*parsed))
+            m_value = convert_number_to_string(*parsed);
+    } else {
+        m_value = value_sanitization_algorithm(value);
+    }
+
+    update_placeholder_visibility();
+    return {};
+}
+
 WebIDL::ExceptionOr<void> HTMLInputElement::set_value(Utf16String const& value)
 {
     auto& realm = this->realm();
@@ -807,7 +822,7 @@ void HTMLInputElement::commit_pending_changes()
 // https://www.w3.org/TR/css-ui-4/#input-rules
 static GC::Ref<CSS::CSSStyleProperties> inner_text_style_when_visible()
 {
-    static GC::Root<CSS::CSSStyleProperties> style;
+    static auto& style = *new GC::Root<CSS::CSSStyleProperties>;
     if (!style) {
         style = CSS::CSSStyleProperties::create(internal_css_realm(), {}, {});
         style->set_declarations_from_text(R"~~~(
@@ -825,7 +840,7 @@ static GC::Ref<CSS::CSSStyleProperties> inner_text_style_when_visible()
 
 static GC::Ref<CSS::CSSStyleProperties> inner_text_style_when_hidden()
 {
-    static GC::Root<CSS::CSSStyleProperties> style;
+    static auto& style = *new GC::Root<CSS::CSSStyleProperties>;
     if (!style) {
         style = CSS::CSSStyleProperties::create(internal_css_realm(), {}, {});
         style->set_declarations_from_text(R"~~~(
@@ -838,7 +853,7 @@ static GC::Ref<CSS::CSSStyleProperties> inner_text_style_when_hidden()
 
 static GC::Ref<CSS::CSSStyleProperties> stepper_button_style_when_visible()
 {
-    static GC::Root<CSS::CSSStyleProperties> style;
+    static auto& style = *new GC::Root<CSS::CSSStyleProperties>;
     if (!style) {
         style = CSS::CSSStyleProperties::create(internal_css_realm(), {}, {});
         style->set_declarations_from_text(R"~~~(
@@ -851,7 +866,7 @@ static GC::Ref<CSS::CSSStyleProperties> stepper_button_style_when_visible()
 
 static GC::Ref<CSS::CSSStyleProperties> stepper_button_style_when_hidden()
 {
-    static GC::Root<CSS::CSSStyleProperties> style;
+    static auto& style = *new GC::Root<CSS::CSSStyleProperties>;
     if (!style) {
         style = CSS::CSSStyleProperties::create(internal_css_realm(), {}, {});
         style->set_declarations_from_text(R"~~~(
@@ -863,7 +878,7 @@ static GC::Ref<CSS::CSSStyleProperties> stepper_button_style_when_hidden()
 
 static GC::Ref<CSS::CSSStyleProperties> placeholder_style_when_visible()
 {
-    static GC::Root<CSS::CSSStyleProperties> style;
+    static auto& style = *new GC::Root<CSS::CSSStyleProperties>;
     if (!style) {
         style = CSS::CSSStyleProperties::create(internal_css_realm(), {}, {});
         style->set_declarations_from_text(R"~~~(
@@ -881,7 +896,7 @@ static GC::Ref<CSS::CSSStyleProperties> placeholder_style_when_visible()
 
 static GC::Ref<CSS::CSSStyleProperties> placeholder_style_when_hidden()
 {
-    static GC::Root<CSS::CSSStyleProperties> style;
+    static auto& style = *new GC::Root<CSS::CSSStyleProperties>;
     if (!style) {
         style = CSS::CSSStyleProperties::create(internal_css_realm(), {}, {});
         style->set_declarations_from_text("display: none;"sv);
@@ -938,10 +953,7 @@ void HTMLInputElement::update_button_input_shadow_tree()
 
 void HTMLInputElement::update_text_input_shadow_tree()
 {
-    if (m_text_node) {
-        m_text_node->set_data(m_value);
-        update_placeholder_visibility();
-    }
+    update_placeholder_visibility();
 
     if (m_type == TypeAttributeState::Number) {
         // The `textfield` appearance is used to hide the stepper buttons.
@@ -1130,7 +1142,7 @@ void HTMLInputElement::create_text_input_shadow_tree()
 
     auto element = MUST(DOM::create_element(document(), HTML::TagNames::div, Namespace::HTML));
     {
-        static GC::Root<CSS::CSSStyleProperties> style;
+        static auto& style = *new GC::Root<CSS::CSSStyleProperties>;
         if (!style) {
             style = CSS::CSSStyleProperties::create(internal_css_realm(), {}, {});
             style->set_declarations_from_text(R"~~~(
@@ -1149,7 +1161,7 @@ void HTMLInputElement::create_text_input_shadow_tree()
     // https://www.w3.org/TR/css-ui-4/#input-rules
     m_inner_text_element = MUST(DOM::create_element(document(), HTML::TagNames::div, Namespace::HTML));
     {
-        static GC::Root<CSS::CSSStyleProperties> style;
+        static auto& style = *new GC::Root<CSS::CSSStyleProperties>;
         if (!style) {
             style = CSS::CSSStyleProperties::create(internal_css_realm(), {}, {});
             style->set_declarations_from_text(R"~~~(
@@ -1256,6 +1268,7 @@ void HTMLInputElement::create_color_input_shadow_tree()
 {
     auto shadow_root = realm().create<DOM::ShadowRoot>(document(), *this, Bindings::ShadowRootMode::Closed);
     shadow_root->set_user_agent_internal(true);
+    set_shadow_root(shadow_root);
 
     auto color = value_sanitization_algorithm(m_value);
 
@@ -1279,7 +1292,6 @@ void HTMLInputElement::create_color_input_shadow_tree()
 
     MUST(border->append_child(*m_color_well_element));
     MUST(shadow_root->append_child(border));
-    set_shadow_root(shadow_root);
 }
 
 void HTMLInputElement::update_color_well_element()
@@ -1296,6 +1308,7 @@ void HTMLInputElement::create_file_input_shadow_tree()
 
     auto shadow_root = realm.create<DOM::ShadowRoot>(document(), *this, Bindings::ShadowRootMode::Closed);
     shadow_root->set_user_agent_internal(true);
+    set_shadow_root(shadow_root);
 
     m_file_button = DOM::create_element(document(), HTML::TagNames::button, Namespace::HTML).release_value_but_fixme_should_propagate_errors();
     MUST(shadow_root->append_child(*m_file_button));
@@ -1316,8 +1329,6 @@ void HTMLInputElement::create_file_input_shadow_tree()
     update_file_input_shadow_tree();
 
     MUST(shadow_root->append_child(*m_file_label));
-
-    set_shadow_root(shadow_root);
 }
 
 void HTMLInputElement::update_file_input_shadow_tree()
@@ -1562,6 +1573,9 @@ void HTMLInputElement::form_associated_element_attribute_changed(FlyString const
 
             if (m_value != old_value)
                 relevant_value_was_changed();
+
+            if (m_text_node)
+                m_text_node->set_data(m_value);
 
             update_shadow_tree();
         }
@@ -3603,10 +3617,10 @@ bool HTMLInputElement::suffering_from_being_missing() const
 // https://html.spec.whatwg.org/multipage/input.html#valid-e-mail-address
 static regex::ECMAScriptRegex& valid_email_address_regex()
 {
-    static auto regex = MUST(regex::ECMAScriptRegex::compile(
+    static NeverDestroyed<regex::ECMAScriptRegex> regex { MUST(regex::ECMAScriptRegex::compile(
         "^[a-zA-Z0-9.!#$%&'*+\\/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$"sv,
-        regex::ECMAScriptCompileFlags {}));
-    return regex;
+        regex::ECMAScriptCompileFlags {})) };
+    return *regex;
 }
 
 // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#suffering-from-a-type-mismatch

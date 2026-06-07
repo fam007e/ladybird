@@ -161,6 +161,21 @@ public:
     bool is_grid_item() const { return m_is_grid_item; }
     void set_grid_item(bool b) { m_is_grid_item = b; }
 
+    bool vertical_align_applies() const
+    {
+        // https://drafts.csswg.org/css-flexbox/#flex-containers
+        // "vertical-align has no effect on a flex item"
+        if (is_flex_item())
+            return false;
+        // https://drafts.csswg.org/css-grid-1/#grid-container
+        // "vertical-align has no effect on a grid item"
+        if (is_grid_item())
+            return false;
+        // FIXME: Per-spec, vertical-align only applies to inline-level boxes and table cells; this should be narrowed
+        //        to that — rather than only excluding flex and grid items.
+        return true;
+    }
+
     [[nodiscard]] GC::Ptr<Box const> containing_block() const { return m_containing_block; }
     [[nodiscard]] GC::Ptr<Box> containing_block() { return m_containing_block; }
 
@@ -328,7 +343,7 @@ public:
     void set_layout_index(u32 index) { m_layout_index = index; }
 
 protected:
-    NodeWithStyle(DOM::Document&, DOM::Node*, GC::Ref<CSS::ComputedProperties>);
+    NodeWithStyle(DOM::Document&, DOM::Node*, CSS::ComputedProperties const&);
     NodeWithStyle(DOM::Document&, DOM::Node*, NonnullOwnPtr<CSS::ComputedValues>);
 
 private:
@@ -364,10 +379,7 @@ public:
     virtual void visit_edges(Cell::Visitor& visitor) override;
 
 protected:
-    NodeWithStyleAndBoxModelMetrics(DOM::Document& document, DOM::Node* node, GC::Ref<CSS::ComputedProperties> style)
-        : NodeWithStyle(document, node, style)
-    {
-    }
+    NodeWithStyleAndBoxModelMetrics(DOM::Document&, DOM::Node*, CSS::ComputedProperties const&);
 
     NodeWithStyleAndBoxModelMetrics(DOM::Document& document, DOM::Node* node, NonnullOwnPtr<CSS::ComputedValues> computed_values)
         : NodeWithStyle(document, node, move(computed_values))

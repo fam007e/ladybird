@@ -20,7 +20,7 @@ namespace Media {
 
 static constexpr int AUTO_SUSPEND_IDLE_TIMEOUT_MS = 10000;
 
-DecoderErrorOr<NonnullRefPtr<DecodedAudioProducer>> DecodedAudioProducer::try_create(NonnullRefPtr<Core::WeakEventLoopReference> const& main_thread_event_loop, NonnullRefPtr<Demuxer> const& demuxer, Track const& track)
+DecoderErrorOr<NonnullRefPtr<DecodedAudioProducer>> DecodedAudioProducer::try_create(Core::EventLoop& main_thread_event_loop, NonnullRefPtr<Demuxer> const& demuxer, Track const& track)
 {
     auto converter = DECODER_TRY_ALLOC(FFmpeg::FFmpegAudioConverter::try_create());
 
@@ -96,7 +96,7 @@ TimeRanges DecodedAudioProducer::buffered_time_ranges() const
     return m_thread_data->buffered_time_ranges();
 }
 
-DecodedAudioProducer::ThreadData::ThreadData(NonnullRefPtr<Core::WeakEventLoopReference> const& main_thread_event_loop, NonnullRefPtr<Demuxer> const& demuxer, Track const& track, AK::Duration duration, NonnullOwnPtr<Audio::AudioConverter>&& converter)
+DecodedAudioProducer::ThreadData::ThreadData(Core::EventLoop& main_thread_event_loop, NonnullRefPtr<Demuxer> const& demuxer, Track const& track, AK::Duration duration, NonnullOwnPtr<Audio::AudioConverter>&& converter)
     : m_main_thread_event_loop(main_thread_event_loop)
     , m_demuxer(demuxer)
     , m_track(track)
@@ -239,7 +239,7 @@ void DecodedAudioProducer::ThreadData::pull(AudioBlock& into)
     }
     if (!m_queue.is_empty()) {
         into = m_queue.dequeue();
-        m_earliest_available_timestamp = into.end_timestamp();
+        m_earliest_available_timestamp = into.media_time_end();
         wake();
         return;
     }
@@ -336,10 +336,7 @@ void DecodedAudioProducer::ThreadData::invoke_on_main_thread_while_locked(Invoke
 {
     if (m_requested_state == RequestedState::Exit)
         return;
-    auto event_loop = m_main_thread_event_loop->take();
-    if (!event_loop.is_alive())
-        return;
-    event_loop->deferred_invoke([self = NonnullRefPtr(*this), invokee = move(invokee)] mutable {
+    m_main_thread_event_loop.deferred_invoke([self = NonnullRefPtr(*this), invokee = move(invokee)] mutable {
         invokee(self);
     });
 }
@@ -353,7 +350,7 @@ void DecodedAudioProducer::ThreadData::invoke_on_main_thread(Invokee invokee)
 
 void DecodedAudioProducer::ThreadData::dispatch_block_end_time(AudioBlock const& block)
 {
-    auto end_time = block.end_timestamp();
+    auto end_time = block.media_time_end();
     if (end_time < m_duration)
         return;
     m_duration = end_time;
@@ -371,7 +368,7 @@ void DecodedAudioProducer::ThreadData::queue_block(AudioBlock&& block)
     if (m_seek_id.load() != m_last_processed_seek_id)
         return;
     dispatch_block_end_time(block);
-    m_latest_available_timestamp = block.end_timestamp();
+    m_latest_available_timestamp = block.media_time_end();
     m_queue.enqueue(move(block));
     VERIFY(!m_queue.tail().is_empty());
     dispatch_wake_if_needed_while_locked();
@@ -399,9 +396,9 @@ DecoderErrorOr<void> DecodedAudioProducer::ThreadData::retrieve_next_block(Audio
     if (convert_result.is_error())
         return DecoderError::format(DecoderErrorCategory::NotImplemented, "Sample specification conversion failed: {}", convert_result.error().string_literal());
 
-    if (block.timestamp_in_frames() < m_last_output_frame)
-        block.set_timestamp_in_frames(m_last_output_frame);
-    m_last_output_frame = block.end_timestamp_in_frames();
+    if (block.first_frame_index() < m_last_output_frame)
+        block.set_first_frame_index(m_last_output_frame);
+    m_last_output_frame = block.end_frame_index();
     return {};
 }
 
@@ -496,7 +493,7 @@ bool DecodedAudioProducer::ThreadData::handle_seek()
                     return true;
                 }
 
-                if (current_block.timestamp() > timestamp) {
+                if (current_block.media_time_start() > timestamp) {
                     auto locker = take_lock();
                     resolve_seek(seek_id, moved_position);
 
