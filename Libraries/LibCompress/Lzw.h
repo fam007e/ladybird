@@ -59,7 +59,7 @@ protected:
     void init_code_table()
     {
         m_code_table.ensure_capacity(m_table_capacity);
-        for (u16 i = 0; i < m_table_capacity; ++i) {
+        for (u32 i = 0; i < m_table_capacity; ++i) {
             m_code_table.unchecked_append({ (u8)i });
         }
         m_original_code_table = m_code_table;
