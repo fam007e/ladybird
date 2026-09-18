@@ -22,6 +22,10 @@
 #include <sys/ucontext.h>
 #include <unistd.h>
 
+#ifndef SYS_SECCOMP
+#    define SYS_SECCOMP 1
+#endif
+
 namespace Sandbox {
 
 namespace {
@@ -36,6 +40,8 @@ static constexpr u32 audit_architecture = AUDIT_ARCH_RISCV64;
 #    error "Add 64-bit seccomp audit architecture for this Linux architecture"
 #endif
 
+static constexpr u16 emulate_fstatat_trap = 1;
+
 static constexpr u32 thread_clone_required_flags = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD;
 static constexpr u32 thread_clone_allowed_flags = thread_clone_required_flags
     | CLONE_SYSVSEM
@@ -44,7 +50,7 @@ static constexpr u32 thread_clone_allowed_flags = thread_clone_required_flags
     | CLONE_CHILD_CLEARTID
     | CLONE_DETACHED
     | CLONE_CHILD_SETTID;
-static constexpr u32 vfork_clone_flags = CLONE_VM | CLONE_VFORK | SIGCHLD;
+static constexpr u32 fork_clone_flags = CLONE_CHILD_CLEARTID | CLONE_CHILD_SETTID | SIGCHLD;
 
 #ifdef O_LARGEFILE
 static constexpr unsigned read_only_open_flags = O_CLOEXEC | O_LARGEFILE;
@@ -93,6 +99,7 @@ static constexpr unsigned read_only_open_flags = O_CLOEXEC;
 #define IF_DEFINED_exit(if_defined, if_not_defined) if_defined
 #define IF_DEFINED_exit_group(if_defined, if_not_defined) if_defined
 #define IF_DEFINED_fallocate(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_fchmod(if_defined, if_not_defined) if_defined
 #define IF_DEFINED_fcntl(if_defined, if_not_defined) if_defined
 #define IF_DEFINED_fcntl64(if_defined, if_not_defined) if_defined
 #define IF_DEFINED_fdatasync(if_defined, if_not_defined) if_defined
@@ -150,6 +157,7 @@ static constexpr unsigned read_only_open_flags = O_CLOEXEC;
 #define IF_DEFINED_read(if_defined, if_not_defined) if_defined
 #define IF_DEFINED_readlink(if_defined, if_not_defined) if_defined
 #define IF_DEFINED_readlinkat(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_readv(if_defined, if_not_defined) if_defined
 #define IF_DEFINED_rename(if_defined, if_not_defined) if_defined
 #define IF_DEFINED_renameat(if_defined, if_not_defined) if_defined
 #define IF_DEFINED_renameat2(if_defined, if_not_defined) if_defined
@@ -184,9 +192,11 @@ static constexpr unsigned read_only_open_flags = O_CLOEXEC;
 #define IF_DEFINED_unlinkat(if_defined, if_not_defined) if_defined
 #define IF_DEFINED_umask(if_defined, if_not_defined) if_defined
 #define IF_DEFINED_uname(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_utimensat(if_defined, if_not_defined) if_defined
 #define IF_DEFINED_wait4(if_defined, if_not_defined) if_defined
 #define IF_DEFINED_waitid(if_defined, if_not_defined) if_defined
 #define IF_DEFINED_write(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_writev(if_defined, if_not_defined) if_defined
 
 #ifndef __NR_accept
 #    undef IF_DEFINED_accept
@@ -472,6 +482,10 @@ static constexpr unsigned read_only_open_flags = O_CLOEXEC;
 #    undef IF_DEFINED_umask
 #    define IF_DEFINED_umask(if_defined, if_not_defined) if_not_defined
 #endif
+#ifndef __NR_utimensat
+#    undef IF_DEFINED_utimensat
+#    define IF_DEFINED_utimensat(if_defined, if_not_defined) if_not_defined
+#endif
 #ifndef __NR_wait4
 #    undef IF_DEFINED_wait4
 #    define IF_DEFINED_wait4(if_defined, if_not_defined) if_not_defined
@@ -686,6 +700,9 @@ static char const* syscall_name(long syscall_number)
 #ifdef __NR_unlinkat
         CASE_SYSCALL_NAME(unlinkat);
 #endif
+#ifdef __NR_utimensat
+        CASE_SYSCALL_NAME(utimensat);
+#endif
     default:
         return "unknown";
     }
@@ -693,9 +710,60 @@ static char const* syscall_name(long syscall_number)
 
 #undef CASE_SYSCALL_NAME
 
+static char s_process_name[16] = "unknown";
+
+#if defined(__NR_newfstatat) && defined(__NR_fstat)
+static void emulate_fstatat(void* context)
+{
+    auto& machine_context = static_cast<ucontext_t*>(context)->uc_mcontext;
+#    if defined(__x86_64__)
+    auto fd = static_cast<int>(machine_context.gregs[REG_RDI]);
+    auto* path = reinterpret_cast<char const*>(machine_context.gregs[REG_RSI]);
+    auto* buffer = reinterpret_cast<void*>(machine_context.gregs[REG_RDX]);
+    auto flags = static_cast<int>(machine_context.gregs[REG_R10]);
+    auto& result = machine_context.gregs[REG_RAX];
+#    elif defined(__aarch64__)
+    auto fd = static_cast<int>(machine_context.regs[0]);
+    auto* path = reinterpret_cast<char const*>(machine_context.regs[1]);
+    auto* buffer = reinterpret_cast<void*>(machine_context.regs[2]);
+    auto flags = static_cast<int>(machine_context.regs[3]);
+    auto& result = machine_context.regs[0];
+#    elif defined(__riscv) && __riscv_xlen == 64
+    auto fd = static_cast<int>(machine_context.__gregs[REG_A0]);
+    auto* path = reinterpret_cast<char const*>(machine_context.__gregs[REG_A0 + 1]);
+    auto* buffer = reinterpret_cast<void*>(machine_context.__gregs[REG_A0 + 2]);
+    auto flags = static_cast<int>(machine_context.__gregs[REG_A0 + 3]);
+    auto& result = machine_context.__gregs[REG_A0];
+#    endif
+
+    // NB: glibc can implement fstat() using newfstatat(). Follow Chromium's SIGSYSFstatatHandler
+    //     and Firefox's StatAtTrap by translating empty-path descriptor queries back to fstat().
+    //     Seccomp cannot inspect pathname strings, and AT_EMPTY_PATH also permits nonempty paths.
+    //     https://chromium.googlesource.com/chromium/src/+/main/sandbox/linux/seccomp-bpf-helpers/sigsys_handlers.cc
+    //     https://searchfox.org/firefox-main/source/security/sandbox/linux/SandboxFilter.cpp
+    result = -EACCES;
+    if (flags != AT_EMPTY_PATH || (path && path[0] != '\0'))
+        return;
+
+    auto saved_errno = errno;
+    auto syscall_result = syscall(__NR_fstat, fd, buffer);
+    result = syscall_result < 0 ? -errno : syscall_result;
+    errno = saved_errno;
+}
+#endif
+
 static void handle_sigsys(int, siginfo_t* info, void* context)
 {
-    write_string("Sandbox violation: disallowed syscall ");
+#if defined(__NR_newfstatat) && defined(__NR_fstat)
+    if (info->si_code == SYS_SECCOMP && info->si_arch == audit_architecture && info->si_syscall == __NR_newfstatat && info->si_errno == emulate_fstatat_trap) {
+        emulate_fstatat(context);
+        return;
+    }
+#endif
+
+    write_string("Sandbox violation in ");
+    write_string(s_process_name);
+    write_string(": disallowed syscall ");
     write_string(syscall_name(info->si_syscall));
     write_string(" (");
     write_unsigned(static_cast<u64>(info->si_syscall));
@@ -749,6 +817,8 @@ static ErrorOr<void> install_sigsys_handler()
         return Error::from_syscall("sigemptyset"sv, errno);
     if (sigaction(SIGSYS, &action, nullptr) < 0)
         return Error::from_syscall("sigaction(SIGSYS)"sv, errno);
+
+    (void)prctl(PR_GET_NAME, s_process_name, 0ul, 0ul, 0ul);
     return {};
 }
 
@@ -799,6 +869,18 @@ void SeccompPolicy::deny_readonly_filesystem_probes()
     append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0, 0, 1));
     append(SECCOMP_ERRNO(EACCES));
     append(SECCOMP_LOAD_SYSCALL_NR);
+#endif
+#ifdef __NR_access
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_access, 0, 1));
+    append(SECCOMP_ERRNO(EACCES));
+#endif
+#ifdef __NR_faccessat
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_faccessat, 0, 1));
+    append(SECCOMP_ERRNO(EACCES));
+#endif
+#ifdef __NR_faccessat2
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_faccessat2, 0, 1));
+    append(SECCOMP_ERRNO(EACCES));
 #endif
 }
 
@@ -854,7 +936,11 @@ void SeccompPolicy::allow_filesystem_writes()
     SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, fsync);
     SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, fdatasync);
     SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, fallocate);
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, fchmod);
     SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, flock);
+    // NB: Mesa's shader disk cache updates entry mtimes for LRU eviction, and glibc routes the
+    //     whole utime() family through utimensat() on modern kernels.
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, utimensat);
 
     append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_fcntl, 0, 5));
     append(SECCOMP_LOAD_ARGUMENT(1));
@@ -881,10 +967,19 @@ void SeccompPolicy::allow_filesystem_writes()
 void SeccompPolicy::allow_file_descriptor_operations()
 {
     SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, read);
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, readv);
     SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, write);
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, writev);
     SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, close);
     SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, fstat);
+#if defined(__NR_newfstatat) && defined(__NR_fstat)
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_newfstatat, 0, 1));
+    append(BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRAP | emulate_fstatat_trap));
+#endif
     SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, dup);
+#ifdef __NR_dup2
+    SECCOMP_APPEND_ALLOW_SYSCALL(*this, dup2);
+#endif
     SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, dup3);
     SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, pipe2);
     SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, ftruncate);
@@ -989,13 +1084,31 @@ void SeccompPolicy::allow_file_descriptor_operations()
 
 void SeccompPolicy::allow_process_creation()
 {
+#ifdef __NR_arch_prctl
+    SECCOMP_APPEND_ALLOW_SYSCALL(*this, arch_prctl);
+#endif
+#ifdef __NR_getppid
+    SECCOMP_APPEND_ALLOW_SYSCALL(*this, getppid);
+#endif
+#ifdef __NR_fork
+    SECCOMP_APPEND_ALLOW_SYSCALL(*this, fork);
+#endif
+
 #ifdef __NR_clone
     append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_clone, 0, 5));
     append(SECCOMP_LOAD_ARGUMENT(0));
-    append(BPF_STMT(BPF_ALU | BPF_AND | BPF_K, ~vfork_clone_flags));
-    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0, 0, 1));
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, fork_clone_flags, 0, 1));
     append(SECCOMP_ALLOW);
     append(SECCOMP_LOAD_SYSCALL_NR);
+    append(BPF_STMT(BPF_ALU | BPF_ADD | BPF_K, 0));
+
+    // musl implements fork() as clone(SIGCHLD, ...).
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_clone, 0, 5));
+    append(SECCOMP_LOAD_ARGUMENT(0));
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SIGCHLD, 0, 1));
+    append(SECCOMP_ALLOW);
+    append(SECCOMP_LOAD_SYSCALL_NR);
+    append(BPF_STMT(BPF_ALU | BPF_ADD | BPF_K, 0));
 #endif
 
     SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, execve);

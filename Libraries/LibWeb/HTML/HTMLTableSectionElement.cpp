@@ -5,9 +5,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibWeb/Bindings/HTMLTableSectionElement.h>
-#include <LibWeb/Bindings/Intrinsics.h>
-#include <LibWeb/CSS/ComputedProperties.h>
+#include <LibWeb/CSS/PropertyID.h>
 #include <LibWeb/CSS/StyleValues/ColorStyleValue.h>
 #include <LibWeb/CSS/StyleValues/ImageStyleValue.h>
 #include <LibWeb/CSS/StyleValues/StyleValueList.h>
@@ -30,12 +28,6 @@ HTMLTableSectionElement::HTMLTableSectionElement(DOM::Document& document, DOM::Q
 
 HTMLTableSectionElement::~HTMLTableSectionElement() = default;
 
-void HTMLTableSectionElement::initialize(JS::Realm& realm)
-{
-    WEB_SET_PROTOTYPE_FOR_INTERFACE(HTMLTableSectionElement);
-    Base::initialize(realm);
-}
-
 void HTMLTableSectionElement::visit_edges(Cell::Visitor& visitor)
 {
     Base::visit_edges(visitor);
@@ -48,9 +40,7 @@ GC::Ref<DOM::HTMLCollection> HTMLTableSectionElement::rows() const
     // The rows attribute must return an HTMLCollection rooted at this element,
     // whose filter matches only tr elements that are children of this element.
     if (!m_rows) {
-        m_rows = DOM::HTMLCollection::create(const_cast<HTMLTableSectionElement&>(*this), DOM::HTMLCollection::Scope::Children, [](Element const& element) {
-            return is<HTMLTableRowElement>(element);
-        });
+        m_rows = DOM::HTMLCollection::create(const_cast<HTMLTableSectionElement&>(*this), DOM::HTMLCollection::Scope::Children, [](Element const& element) { return is<HTMLTableRowElement>(element); }, DOM::HTMLCollection::AttributeInvalidationType::None);
     }
     return *m_rows;
 }
@@ -63,7 +53,7 @@ WebIDL::ExceptionOr<GC::Ref<HTMLTableRowElement>> HTMLTableSectionElement::inser
 
     // 1. If index is less than −1 or greater than the number of elements in the rows collection, throw an "IndexSizeError" DOMException.
     if (index < -1 || index > rows_collection_size)
-        return WebIDL::IndexSizeError::create(realm(), "Index is negative or greater than the number of rows"_utf16);
+        return WebIDL::IndexSizeError::create("Index is negative or greater than the number of rows"_utf16);
 
     // 2. Let table row be the result of creating an element given this element's node document, "tr", and the HTML namespace.
     auto& table_row = static_cast<HTMLTableRowElement&>(*TRY(DOM::create_element(document(), TagNames::tr, Namespace::HTML)));
@@ -87,7 +77,7 @@ WebIDL::ExceptionOr<void> HTMLTableSectionElement::delete_row(WebIDL::Long index
 
     // 1. If index is less than −1 or greater than or equal to the number of elements in the rows collection, then throw an "IndexSizeError" DOMException.
     if (index < -1 || index >= rows_collection_size)
-        return WebIDL::IndexSizeError::create(realm(), "Index is negative or greater than or equal to the number of rows"_utf16);
+        return WebIDL::IndexSizeError::create("Index is negative or greater than or equal to the number of rows"_utf16);
 
     // 2. If index is −1, then remove the last element in the rows collection from this element, or do nothing if the rows collection is empty.
     if (index == -1) {
@@ -101,7 +91,7 @@ WebIDL::ExceptionOr<void> HTMLTableSectionElement::delete_row(WebIDL::Long index
     return {};
 }
 
-bool HTMLTableSectionElement::is_presentational_hint(FlyString const& name) const
+bool HTMLTableSectionElement::is_presentational_hint(Utf16FlyString const& name) const
 {
     if (Base::is_presentational_hint(name))
         return true;
@@ -116,7 +106,7 @@ bool HTMLTableSectionElement::is_presentational_hint(FlyString const& name) cons
 void HTMLTableSectionElement::apply_presentational_hints(Vector<CSS::StyleProperty>& properties) const
 {
     Base::apply_presentational_hints(properties);
-    for_each_attribute([&](auto& name, auto& value) {
+    for_each_attribute([&](Utf16FlyString const& name, Utf16View value) {
         if (name == HTML::AttributeNames::align) {
             if (auto parsed_value = parse_table_child_element_align_value(value))
                 properties.append({ .property_id = CSS::PropertyID::TextAlign, .value = parsed_value.release_nonnull() });

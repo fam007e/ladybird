@@ -92,7 +92,6 @@ struct PhaseTimings {
     i64 sweep_dead_cells_us { 0 };
 
     // gather_roots() subphases.
-    i64 gather_must_survive_roots_us { 0 };
     i64 gather_embedder_roots_us { 0 };
     i64 gather_conservative_roots_us { 0 };
     i64 gather_explicit_roots_us { 0 };
@@ -176,7 +175,6 @@ void print_gc_report(i64 total_us, size_t live_block_count)
     dbgln("");
     dbgln("Phase breakdown (us, % of total):");
     dbgln("  gather_roots                  {:>10} us ({:>5.1f}%)", t.gather_roots_us, pct(t.gather_roots_us));
-    dbgln("    must-survive scan           {:>10} us ({:>5.1f}%)", t.gather_must_survive_roots_us, pct(t.gather_must_survive_roots_us));
     dbgln("    embedder roots              {:>10} us ({:>5.1f}%)", t.gather_embedder_roots_us, pct(t.gather_embedder_roots_us));
     dbgln("    conservative roots          {:>10} us ({:>5.1f}%)", t.gather_conservative_roots_us, pct(t.gather_conservative_roots_us));
     dbgln("      register scan             {:>10} us ({:>5.1f}%)", t.conservative_register_scan_us, pct(t.conservative_register_scan_us));
@@ -288,7 +286,7 @@ void Heap::set_default_heap_for_testing(Heap& heap)
 CellAllocator& Heap::cell_allocator_for(Badge<CellAllocatorDescriptorBase>, CellAllocatorDescriptorBase& descriptor)
 {
     return *m_cell_allocators_by_type.ensure(&descriptor, [&] {
-        return make<CellAllocator>(descriptor.cell_size(), descriptor.class_name(), descriptor.overrides_must_survive_garbage_collection(), descriptor.overrides_finalize());
+        return make<CellAllocator>(descriptor.cell_size(), descriptor.class_name(), descriptor.overrides_finalize());
     });
 }
 
@@ -376,38 +374,19 @@ void Heap::update_gc_bytes_threshold(size_t live_cell_bytes, size_t live_externa
     m_gc_bytes_threshold = max(next_gc_bytes_threshold.value(), GC_MIN_BYTES_THRESHOLD);
 }
 
-static void add_possible_value(HashMap<FlatPtr, HeapRoot>& possible_pointers, FlatPtr data, HeapRoot origin, FlatPtr min_block_address, FlatPtr max_block_address)
+static void add_possible_value(HashMap<FlatPtr, HeapRoot>& possible_pointers, FlatPtr data, HeapRoot origin, FlatPtr heap_region_start, FlatPtr heap_region_end)
 {
-    if constexpr (sizeof(FlatPtr*) == sizeof(NanBoxedValue)) {
-        // Because NanBoxedValue stores pointers in non-canonical form we have to check if the top bytes
-        // match any pointer-backed tag, in that case we have to extract the pointer to its
-        // canonical form and add that as a possible pointer.
-        FlatPtr possible_pointer;
-        if ((data & SHIFTED_IS_CELL_PATTERN) == SHIFTED_IS_CELL_PATTERN)
-            possible_pointer = NanBoxedValue::extract_pointer_bits(data);
-        else
-            possible_pointer = data;
-        if (possible_pointer < min_block_address || possible_pointer > max_block_address)
-            return;
-        possible_pointers.set(possible_pointer, move(origin));
-    } else {
-        static_assert((sizeof(NanBoxedValue) % sizeof(FlatPtr*)) == 0);
-        if (data < min_block_address || data > max_block_address)
-            return;
-        // In the 32-bit case we will look at the top and bottom part of NanBoxedValue separately we just
-        // add both the upper and lower bytes as possible pointers.
-        possible_pointers.set(data, move(origin));
-    }
-}
-
-void Heap::find_min_and_max_block_addresses(FlatPtr& min_address, FlatPtr& max_address)
-{
-    min_address = explode_byte(0xff);
-    max_address = 0;
-    for (auto& allocator : m_all_cell_allocators) {
-        min_address = min(min_address, allocator.min_block_address());
-        max_address = max(max_address, allocator.max_block_address() + HeapBlock::BLOCK_SIZE);
-    }
+    // Because NanBoxedValue stores heap offsets in the payload, decode
+    // pointer-backed values relative to the heap region before checking the
+    // resulting address.
+    FlatPtr possible_pointer;
+    if ((data & SHIFTED_IS_CELL_PATTERN) == SHIFTED_IS_CELL_PATTERN)
+        possible_pointer = heap_region_start + (data & HEAP_REGION_OFFSET_MASK);
+    else
+        possible_pointer = data;
+    if (possible_pointer < heap_region_start || possible_pointer >= heap_region_end)
+        return;
+    possible_pointers.set(possible_pointer, move(origin));
 }
 
 template<typename Callback>
@@ -430,7 +409,8 @@ public:
     explicit GraphConstructorVisitor(Heap& heap, HashMap<Cell*, HeapRoot> const& roots)
         : m_heap(heap)
     {
-        m_heap.find_min_and_max_block_addresses(m_min_block_address, m_max_block_address);
+        m_heap_region_start = BlockAllocator::heap_region_start();
+        m_heap_region_end = BlockAllocator::heap_region_end();
         m_work_queue.ensure_capacity(roots.size());
 
         for (auto& [root, root_origin] : roots) {
@@ -465,7 +445,7 @@ public:
 
         auto* raw_pointer_sized_values = reinterpret_cast<FlatPtr const*>(bytes.data());
         for (size_t i = 0; i < (bytes.size() / sizeof(FlatPtr)); ++i)
-            add_possible_value(possible_pointers, raw_pointer_sized_values[i], HeapRoot { .type = HeapRoot::Type::HeapFunctionCapturedPointer }, m_min_block_address, m_max_block_address);
+            add_possible_value(possible_pointers, raw_pointer_sized_values[i], HeapRoot { .type = HeapRoot::Type::HeapFunctionCapturedPointer }, m_heap_region_start, m_heap_region_end);
 
         for_each_cell_among_possible_pointers(m_heap.m_live_heap_blocks, possible_pointers, [&](Cell* cell, FlatPtr) {
             if (cell->state() != Cell::State::Live)
@@ -520,9 +500,6 @@ public:
                 case HeapRoot::Type::HeapFunctionCapturedPointer:
                     node.set("root"sv, "HeapFunctionCapturedPointer"sv);
                     break;
-                case HeapRoot::Type::MustSurviveGC:
-                    node.set("root"sv, "MustSurviveGC"sv);
-                    break;
                 case HeapRoot::Type::Root:
                     node.set("root"sv, MUST(String::formatted("Root {} {}:{}", location->function_name(), location->filename(), location->line_number())));
                     break;
@@ -571,12 +548,25 @@ private:
     HashMap<FlatPtr, GraphNode> m_graph;
 
     Heap& m_heap;
-    FlatPtr m_min_block_address;
-    FlatPtr m_max_block_address;
+    FlatPtr m_heap_region_start;
+    FlatPtr m_heap_region_end;
 };
 
-AK::JsonObject Heap::dump_graph()
+NO_SANITIZE_ADDRESS AK::JsonObject Heap::dump_graph()
 {
+    jmp_buf registers;
+    setjmp(registers);
+    ReadonlySpan<FlatPtr> captured_registers { reinterpret_cast<FlatPtr const*>(registers), sizeof(jmp_buf) / (sizeof(FlatPtr)) };
+    return build_graph(captured_registers);
+}
+
+AK::JsonObject Heap::build_graph(ReadonlySpan<FlatPtr> callee_saved_registers)
+{
+    ConservativeScanOrigin origin {
+        .stack_floor = bit_cast<FlatPtr>(__builtin_frame_address(0)),
+        .callee_saved_registers = callee_saved_registers,
+    };
+
     // An in-progress incremental sweep would leave parts of the heap as freelist
     // entries while the conservative scan in gather_roots() can still pick up
     // not-yet-swept (but unreachable) cells whose internal pointers lead to
@@ -585,7 +575,7 @@ AK::JsonObject Heap::dump_graph()
 
     HashMap<Cell*, HeapRoot> roots;
     Vector<StackFrameInfo> stack_frames;
-    gather_roots(roots, &stack_frames);
+    gather_roots(origin, roots, &stack_frames);
     GraphConstructorVisitor visitor(*this, roots);
     visitor.visit_all_cells();
     auto graph = visitor.dump();
@@ -638,8 +628,21 @@ void Heap::run_post_mark_phases(bool report)
     }
 }
 
-void Heap::collect_garbage(CollectionType collection_type, bool print_report)
+NO_SANITIZE_ADDRESS void Heap::collect_garbage(CollectionType collection_type, bool print_report)
 {
+    jmp_buf registers;
+    setjmp(registers);
+    ReadonlySpan<FlatPtr> captured_registers { reinterpret_cast<FlatPtr const*>(registers), sizeof(jmp_buf) / (sizeof(FlatPtr)) };
+    run_collection(captured_registers, collection_type, print_report);
+}
+
+void Heap::run_collection(ReadonlySpan<FlatPtr> callee_saved_registers, CollectionType collection_type, bool print_report)
+{
+    ConservativeScanOrigin origin {
+        .stack_floor = bit_cast<FlatPtr>(__builtin_frame_address(0)),
+        .callee_saved_registers = callee_saved_registers,
+    };
+
     VERIFY(!m_collecting_garbage);
 
     finish_pending_incremental_sweep();
@@ -647,6 +650,7 @@ void Heap::collect_garbage(CollectionType collection_type, bool print_report)
 
     {
         TemporaryChange change(m_collecting_garbage, true);
+        TemporaryChange collection_type_change(m_current_collection_type, collection_type);
 
         // The caller can force level 1 by passing print_report=true; LIBGC_LOG_LEVEL=N
         // raises the floor for every collection.
@@ -670,7 +674,7 @@ void Heap::collect_garbage(CollectionType collection_type, bool print_report)
             HashMap<Cell*, HeapRoot> roots;
             {
                 ScopedPhaseTimer timer { report, g_phase_timings.gather_roots_us };
-                gather_roots(roots);
+                gather_roots(origin, roots);
             }
             {
                 ScopedPhaseTimer timer { report, g_phase_timings.mark_live_cells_us };
@@ -802,7 +806,7 @@ void Heap::register_sweep_callback(AK::Function<void()> callback)
     m_sweep_callbacks.append(move(callback));
 }
 
-void Heap::gather_roots(HashMap<Cell*, HeapRoot>& roots, Vector<StackFrameInfo>* out_stack_frames, IncludeIncomingCrossHeapMembers include_incoming_cross_heap_members)
+void Heap::gather_roots(ConservativeScanOrigin const& origin, HashMap<Cell*, HeapRoot>& roots, Vector<StackFrameInfo>* out_stack_frames, IncludeIncomingCrossHeapMembers include_incoming_cross_heap_members)
 {
     // Cross-heap members targeting this heap act as roots for local collections (as the foreign holder is invisible to a local mark).
     if (include_incoming_cross_heap_members == IncludeIncomingCrossHeapMembers::Yes) {
@@ -813,27 +817,12 @@ void Heap::gather_roots(HashMap<Cell*, HeapRoot>& roots, Vector<StackFrameInfo>*
     }
 
     {
-        ScopedPhaseTimer timer { g_recording_phase_timings, g_phase_timings.gather_must_survive_roots_us };
-        for_each_block([&](auto& block) {
-            if (block.overrides_must_survive_garbage_collection()) {
-                block.template for_each_cell_in_state<Cell::State::Live>([&](Cell* cell) {
-                    if (cell->must_survive_garbage_collection()) {
-                        roots.set(cell, HeapRoot { .type = HeapRoot::Type::MustSurviveGC });
-                    }
-                });
-            }
-
-            return IterationDecision::Continue;
-        });
-    }
-
-    {
         ScopedPhaseTimer timer { g_recording_phase_timings, g_phase_timings.gather_embedder_roots_us };
         m_gather_embedder_roots(roots);
     }
     {
         ScopedPhaseTimer timer { g_recording_phase_timings, g_phase_timings.gather_conservative_roots_us };
-        gather_conservative_roots(roots, out_stack_frames);
+        gather_conservative_roots(origin, roots, out_stack_frames);
     }
 
     {
@@ -859,7 +848,7 @@ void Heap::gather_roots(HashMap<Cell*, HeapRoot>& roots, Vector<StackFrameInfo>*
 }
 
 #ifdef HAS_ADDRESS_SANITIZER
-NO_SANITIZE_ADDRESS void Heap::gather_asan_fake_stack_roots(HashMap<FlatPtr, HeapRoot>& possible_pointers, FlatPtr addr, FlatPtr min_block_address, FlatPtr max_block_address, FlatPtr stack_reference, FlatPtr stack_top)
+NO_SANITIZE_ADDRESS void Heap::gather_asan_fake_stack_roots(HashMap<FlatPtr, HeapRoot>& possible_pointers, FlatPtr addr, FlatPtr heap_region_start, FlatPtr heap_region_end, FlatPtr stack_reference, FlatPtr stack_top)
 {
     void* begin = nullptr;
     void* end = nullptr;
@@ -878,7 +867,7 @@ NO_SANITIZE_ADDRESS void Heap::gather_asan_fake_stack_roots(HashMap<FlatPtr, Hea
         void const* real_address = *real_stack_addr;
         if (real_address == nullptr)
             continue;
-        add_possible_value(possible_pointers, reinterpret_cast<FlatPtr>(real_address), HeapRoot { .type = HeapRoot::Type::StackPointer }, min_block_address, max_block_address);
+        add_possible_value(possible_pointers, reinterpret_cast<FlatPtr>(real_address), HeapRoot { .type = HeapRoot::Type::StackPointer }, heap_region_start, heap_region_end);
     }
 }
 #else
@@ -887,30 +876,34 @@ void Heap::gather_asan_fake_stack_roots(HashMap<FlatPtr, HeapRoot>&, FlatPtr, Fl
 }
 #endif
 
-NO_SANITIZE_ADDRESS void Heap::gather_conservative_roots(HashMap<Cell*, HeapRoot>& roots, Vector<StackFrameInfo>* out_stack_frames)
+NO_SANITIZE_ADDRESS void Heap::gather_conservative_roots(ConservativeScanOrigin const& origin, HashMap<Cell*, HeapRoot>& roots, Vector<StackFrameInfo>* out_stack_frames)
 {
-    FlatPtr dummy;
-
     dbgln_if(HEAP_DEBUG, "gather_conservative_roots:");
-
-    jmp_buf buf;
-    setjmp(buf);
 
     HashMap<FlatPtr, HeapRoot> possible_pointers;
 
-    auto* raw_jmp_buf = reinterpret_cast<FlatPtr const*>(buf);
+    auto heap_region_start = BlockAllocator::heap_region_start();
+    auto heap_region_end = BlockAllocator::heap_region_end();
 
-    FlatPtr min_block_address, max_block_address;
-    find_min_and_max_block_addresses(min_block_address, max_block_address);
+    // The scan covers the entry point's frame and its callers; the collection's own frames below the floor are left out.
+    FlatPtr own_frame;
+    auto stack_reference = origin.stack_floor;
+    auto stack_top = m_stack_info.top();
+    VERIFY(stack_reference > bit_cast<FlatPtr>(&own_frame) && stack_reference < stack_top);
+
+    // The captured registers are a buffer in the entry point's frame, so they fall inside the range scanned below.
+    auto captured_registers_start = bit_cast<FlatPtr>(origin.callee_saved_registers.data());
+    auto captured_registers_end = captured_registers_start + origin.callee_saved_registers.size() * sizeof(FlatPtr);
+    VERIFY(captured_registers_start % sizeof(FlatPtr) == 0);
+    VERIFY(captured_registers_start >= stack_reference && captured_registers_end <= stack_top);
 
     {
         ScopedPhaseTimer timer { g_recording_phase_timings, g_phase_timings.conservative_register_scan_us };
-        for (size_t i = 0; i < ((size_t)sizeof(buf)) / sizeof(FlatPtr); ++i)
-            add_possible_value(possible_pointers, raw_jmp_buf[i], HeapRoot { .type = HeapRoot::Type::RegisterPointer }, min_block_address, max_block_address);
+        for (auto register_value : origin.callee_saved_registers) {
+            add_possible_value(possible_pointers, register_value, HeapRoot { .type = HeapRoot::Type::RegisterPointer }, heap_region_start, heap_region_end);
+            gather_asan_fake_stack_roots(possible_pointers, register_value, heap_region_start, heap_region_end, stack_reference, stack_top);
+        }
     }
-
-    auto stack_reference = bit_cast<FlatPtr>(&dummy);
-    auto stack_top = m_stack_info.top();
 
     // Build frame boundary map for annotation if requested.
     // Each entry maps a frame pointer address to the stack frame index in out_stack_frames.
@@ -1005,9 +998,14 @@ NO_SANITIZE_ADDRESS void Heap::gather_conservative_roots(HashMap<Cell*, HeapRoot
     {
         ScopedPhaseTimer timer { g_recording_phase_timings, g_phase_timings.conservative_stack_scan_us };
         for (FlatPtr stack_address = stack_reference; stack_address < stack_top; stack_address += sizeof(FlatPtr)) {
+            // Stepping over the captured registers keeps roots that live only in a register attributed as RegisterPointer.
+            if (stack_address == captured_registers_start) {
+                stack_address = captured_registers_end - sizeof(FlatPtr);
+                continue;
+            }
             auto data = *reinterpret_cast<FlatPtr*>(stack_address);
-            add_possible_value(possible_pointers, data, HeapRoot { .type = HeapRoot::Type::StackPointer, .stack_frame_index = frame_index_for_stack_address(stack_address) }, min_block_address, max_block_address);
-            gather_asan_fake_stack_roots(possible_pointers, data, min_block_address, max_block_address, stack_reference, stack_top);
+            add_possible_value(possible_pointers, data, HeapRoot { .type = HeapRoot::Type::StackPointer, .stack_frame_index = frame_index_for_stack_address(stack_address) }, heap_region_start, heap_region_end);
+            gather_asan_fake_stack_roots(possible_pointers, data, heap_region_start, heap_region_end, stack_reference, stack_top);
         }
     }
 
@@ -1015,27 +1013,27 @@ NO_SANITIZE_ADDRESS void Heap::gather_conservative_roots(HashMap<Cell*, HeapRoot
         ScopedPhaseTimer timer { g_recording_phase_timings, g_phase_timings.conservative_vector_scan_us };
         for (auto& vector : m_conservative_vectors) {
             for (auto possible_value : vector.possible_values()) {
-                add_possible_value(possible_pointers, possible_value, HeapRoot { .type = HeapRoot::Type::ConservativeVector }, min_block_address, max_block_address);
+                add_possible_value(possible_pointers, possible_value, HeapRoot { .type = HeapRoot::Type::ConservativeVector }, heap_region_start, heap_region_end);
             }
         }
 
         for (auto& provider : m_conservative_range_providers) {
             provider.for_each_conservative_range([&](ReadonlySpan<FlatPtr> range) {
                 for (auto possible_value : range)
-                    add_possible_value(possible_pointers, possible_value, HeapRoot { .type = HeapRoot::Type::ConservativeVector }, min_block_address, max_block_address);
+                    add_possible_value(possible_pointers, possible_value, HeapRoot { .type = HeapRoot::Type::ConservativeVector }, heap_region_start, heap_region_end);
             });
         }
     }
 
     for (auto& hash_map : m_conservative_hash_maps) {
         hash_map.for_each_possible_value([&](FlatPtr possible_value) {
-            add_possible_value(possible_pointers, possible_value, HeapRoot { .type = HeapRoot::Type::ConservativeHashMap }, min_block_address, max_block_address);
+            add_possible_value(possible_pointers, possible_value, HeapRoot { .type = HeapRoot::Type::ConservativeHashMap }, heap_region_start, heap_region_end);
         });
     }
 
     for (auto& hash_table : m_conservative_hash_tables) {
         hash_table.for_each_possible_value([&](FlatPtr possible_value) {
-            add_possible_value(possible_pointers, possible_value, HeapRoot { .type = HeapRoot::Type::ConservativeHashTable }, min_block_address, max_block_address);
+            add_possible_value(possible_pointers, possible_value, HeapRoot { .type = HeapRoot::Type::ConservativeHashTable }, heap_region_start, heap_region_end);
         });
     }
 
@@ -1058,14 +1056,8 @@ public:
     explicit MarkingVisitor(ReadonlySpan<Heap* const> domain, HashMap<Cell*, HeapRoot> const& roots)
         : m_domain(domain)
     {
-        m_min_block_address = explode_byte(0xff);
-        m_max_block_address = 0;
-        for (auto* heap : m_domain) {
-            FlatPtr min_block_address, max_block_address;
-            heap->find_min_and_max_block_addresses(min_block_address, max_block_address);
-            m_min_block_address = min(m_min_block_address, min_block_address);
-            m_max_block_address = max(m_max_block_address, max_block_address);
-        }
+        m_heap_region_start = BlockAllocator::heap_region_start();
+        m_heap_region_end = BlockAllocator::heap_region_end();
         for (auto* root : roots.keys()) {
             visit(root);
         }
@@ -1120,7 +1112,7 @@ public:
 
         auto* raw_pointer_sized_values = reinterpret_cast<FlatPtr const*>(bytes.data());
         for (size_t i = 0; i < (bytes.size() / sizeof(FlatPtr)); ++i)
-            add_possible_value(possible_pointers, raw_pointer_sized_values[i], HeapRoot { .type = HeapRoot::Type::HeapFunctionCapturedPointer }, m_min_block_address, m_max_block_address);
+            add_possible_value(possible_pointers, raw_pointer_sized_values[i], HeapRoot { .type = HeapRoot::Type::HeapFunctionCapturedPointer }, m_heap_region_start, m_heap_region_end);
 
         for (auto* heap : m_domain) {
             for_each_cell_among_possible_pointers(heap->m_live_heap_blocks, possible_pointers, [&](Cell* cell, FlatPtr) {
@@ -1144,8 +1136,8 @@ public:
 private:
     ReadonlySpan<Heap* const> m_domain;
     Vector<Ref<Cell>> m_work_queue;
-    FlatPtr m_min_block_address;
-    FlatPtr m_max_block_address;
+    FlatPtr m_heap_region_start;
+    FlatPtr m_heap_region_end;
 };
 
 void Heap::mark_live_cells(HashMap<Cell*, HeapRoot> const& roots)

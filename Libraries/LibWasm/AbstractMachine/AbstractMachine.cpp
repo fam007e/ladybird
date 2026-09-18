@@ -6,10 +6,10 @@
 
 #include <AK/Checked.h>
 #include <AK/Enumerate.h>
+#include <AK/MutexProtected.h>
 #include <AK/NeverDestroyed.h>
 #include <AK/SaturatingMath.h>
 #include <LibGC/Heap.h>
-#include <LibSync/MutexProtected.h>
 #include <LibWasm/AbstractMachine/AbstractMachine.h>
 #include <LibWasm/AbstractMachine/BytecodeInterpreter.h>
 #include <LibWasm/AbstractMachine/Configuration.h>
@@ -19,9 +19,17 @@
 
 namespace Wasm {
 
+AbstractMachine::AbstractMachine(GC::Heap* heap)
+{
+    if (heap)
+        adopt_heap(*heap);
+}
+
+AbstractMachine::~AbstractMachine() = default;
+
 static auto& module_stats()
 {
-    static NeverDestroyed<Sync::MutexProtected<Vector<ModuleStats>>> stats;
+    static NeverDestroyed<MutexProtected<Vector<ModuleStats>>> stats;
     return *stats;
 }
 
@@ -143,16 +151,13 @@ void AbstractMachine::RootsProvider::for_each_conservative_range(AK::Function<vo
     };
 
     for (auto* configuration : m_store.active_configurations()) {
-        // Scan up to capacity, not just size.
-        report_values(configuration->value_stack().data(), configuration->value_stack().capacity());
+        report_values(configuration->value_stack().data(), configuration->value_stack().conservative_scan_size());
         report_values(configuration->regs.data(), configuration->regs.size());
-        report_values(configuration->m_current_call_record.data(), configuration->m_current_call_record.size());
+        report_values(configuration->m_call_record_stack.data(), configuration->m_call_record_stack.conservative_scan_size());
         for (auto& arguments : configuration->m_call_argument_freelist)
             report_values(arguments.data(), arguments.capacity());
-        for (auto& frame : configuration->m_frame_stack) {
-            if (frame.owns_locals())
-                report_values(frame.locals_data(), frame.owned_locals().size());
-        }
+        for (auto& owned_locals : configuration->m_owned_locals_stack)
+            report_values(owned_locals.data(), owned_locals.size());
     }
 
     for (auto& table : m_store.tables())
@@ -160,7 +165,7 @@ void AbstractMachine::RootsProvider::for_each_conservative_range(AK::Function<vo
     for (auto& element : m_store.elements())
         report_references(element.references().span());
     for (auto& global : m_store.globals())
-        report_values(&global.value(), 1);
+        report_values(&global->value(), 1);
     for (auto& exception : m_store.exceptions())
         report_values(exception.params().data(), exception.params().size());
 }
@@ -205,7 +210,7 @@ void MemoryBuffer::update_storage_offset()
     m_storage_offset = GC::PrimitiveStorage::the().offset(m_handle);
 }
 
-ErrorOr<void> MemoryBuffer::try_reserve(size_t capacity)
+ErrorOr<void> MemoryBuffer::try_reserve(size_t capacity, size_t guard_size)
 {
     if (m_handle.is_valid()) {
         if (capacity <= m_reserved_capacity)
@@ -216,7 +221,7 @@ ErrorOr<void> MemoryBuffer::try_reserve(size_t capacity)
         return {};
     }
 
-    m_handle = TRY(GC::PrimitiveStorage::the().try_reserve(0, capacity, GC::PrimitiveStorage::ZeroFillNewBytes::Yes));
+    m_handle = TRY(GC::PrimitiveStorage::the().try_reserve(0, capacity, GC::PrimitiveStorage::ZeroFillNewBytes::Yes, guard_size));
     m_reserved_capacity = capacity;
     update_storage_offset();
     return {};
@@ -407,18 +412,20 @@ static ErrorOr<size_t> initial_memory_reservation_size(MemoryType const& type)
     if (initial_size > maximum_size)
         return Error::from_errno(ENOMEM);
 
+    // memory32 storage must never move: compiled code caches its base address for unchecked
+    // accesses, so the backing allocation has to be able to grow to the maximum in place.
+    if (type.limits().address_type() == AddressType::I32)
+        return maximum_size;
+
     if (type.limits().max().has_value())
         return maximum_size;
 
-    if (type.limits().address_type() != AddressType::I32)
-        return initial_size;
-
-    return min(max(initial_size, static_cast<size_t>(Constants::wasm32_default_memory_reservation_size)), maximum_size);
+    return initial_size;
 }
 
 static size_t grown_memory_reservation_size(size_t current_capacity, size_t required_size, size_t maximum_size)
 {
-    auto new_capacity = max(current_capacity, static_cast<size_t>(Constants::wasm32_default_memory_reservation_size));
+    auto new_capacity = max(current_capacity, static_cast<size_t>(Constants::default_memory_reservation_size));
     while (new_capacity < required_size) {
         if (new_capacity > maximum_size / 2) {
             new_capacity = maximum_size;
@@ -434,7 +441,10 @@ ErrorOr<MemoryInstance> MemoryInstance::create(MemoryType const& type)
     MemoryInstance instance { type };
 
     auto reserved_capacity = TRY(initial_memory_reservation_size(type));
-    TRY(instance.m_data.try_reserve(reserved_capacity));
+    size_t guard_size = 0;
+    if (type.limits().address_type() == AddressType::I32)
+        guard_size = Constants::wasm32_guarded_reservation_size - reserved_capacity;
+    TRY(instance.m_data.try_reserve(reserved_capacity, guard_size));
 
     auto initial_size = TRY(size_from_page_count(type.limits().min()));
     if (!instance.grow(initial_size, GrowType::No))
@@ -479,6 +489,30 @@ bool MemoryInstance::grow(size_t size_to_grow, GrowType grow_type, InhibitGrowCa
     return true;
 }
 
+MemoryInstanceTable ModuleInstance::resolved_memories(Store& store) const
+{
+    if (m_resolved_memories_built)
+        return m_resolved_memories.data();
+
+    m_resolved_memories.ensure_capacity(m_memories.size());
+    for (auto address : m_memories)
+        m_resolved_memories.unchecked_append(store.unsafe_get(address));
+    m_resolved_memories_built = true;
+    return m_resolved_memories.data();
+}
+
+GlobalInstanceTable ModuleInstance::resolved_globals(Store& store) const
+{
+    if (m_resolved_globals_built)
+        return m_resolved_globals.data();
+
+    m_resolved_globals.ensure_capacity(m_globals.size());
+    for (auto address : m_globals)
+        m_resolved_globals.unchecked_append(store.unsafe_get(address));
+    m_resolved_globals_built = true;
+    return m_resolved_globals.data();
+}
+
 Vector<CompiledFunctionEntry> const& ModuleInstance::compiled_fn_table(Store& store) const
 {
     if (m_compiled_fn_table_built)
@@ -514,7 +548,7 @@ Vector<CompiledFunctionEntry> const& ModuleInstance::compiled_fn_table(Store& st
         entry.first_insn = ci.dispatches[0].instruction;
         entry.expression = &wasm_fn->code().func().body();
         entry.module = &wasm_fn->module();
-        entry.total_local_count = static_cast<u32>(wasm_fn->code().func().total_local_count());
+        entry.total_local_count = static_cast<u32>(wasm_fn->code().func().total_local_count()) + ci.cranelift_inlined_locals;
         entry.arity = static_cast<u32>(wasm_fn->type().results().size());
         entry.max_call_rec_size = static_cast<u32>(ci.max_call_rec_size);
     }
@@ -576,7 +610,7 @@ Optional<MemoryAddress> Store::allocate(MemoryType const& type)
 Optional<GlobalAddress> Store::allocate(GlobalType const& type, Value value)
 {
     GlobalAddress address { m_globals.size() };
-    m_globals.append(GlobalInstance { value, type.is_mutable(), type.type() });
+    m_globals.append(make<GlobalInstance>(value, type.is_mutable(), type.type()));
     return address;
 }
 
@@ -658,7 +692,7 @@ GlobalInstance* Store::get(GlobalAddress address)
     auto value = address.value();
     if (m_globals.size() <= value)
         return nullptr;
-    return &m_globals[value];
+    return m_globals[value].ptr();
 }
 
 ElementInstance* Store::get(ElementAddress address)
@@ -1139,21 +1173,37 @@ Optional<InstantiationError> AbstractMachine::allocate_all_final_phase(Module co
     return {};
 }
 
-Result AbstractMachine::invoke(FunctionAddress address, Vector<Value> arguments)
+Result AbstractMachine::invoke(FunctionAddress address, Vector<Value, ArgumentsStaticSize> arguments)
 {
-    BytecodeInterpreter interpreter(m_stack_info);
-    auto handle = register_scoped(interpreter);
-    return invoke(interpreter, address, move(arguments));
+    auto interpreter = m_available_interpreters.is_empty()
+        ? make<BytecodeInterpreter>(m_stack_info)
+        : m_available_interpreters.take_last();
+
+    auto result = [&] {
+        auto handle = register_scoped(*interpreter);
+        return invoke(*interpreter, address, move(arguments));
+    }();
+
+    interpreter->clear_trap();
+    if (m_available_interpreters.size() < MAX_AVAILABLE_EXECUTION_STATES)
+        m_available_interpreters.append(move(interpreter));
+    return result;
 }
 
-Result AbstractMachine::invoke(Interpreter& interpreter, FunctionAddress address, Vector<Value> arguments)
+Result AbstractMachine::invoke(Interpreter& interpreter, FunctionAddress address, Vector<Value, ArgumentsStaticSize> arguments)
 {
-    Configuration configuration { m_store };
+    auto configuration = m_available_configurations.is_empty()
+        ? make<Configuration>(m_store)
+        : m_available_configurations.take_last();
     if (m_should_limit_instruction_count)
-        configuration.enable_instruction_count_limit();
+        configuration->enable_instruction_count_limit();
 
-    Vector<Value, ArgumentsStaticSize> args = move(arguments);
-    return configuration.call(interpreter, address, args);
+    auto result = configuration->call(interpreter, address, arguments);
+
+    configuration->reset_after_invoke({});
+    if (m_available_configurations.size() < MAX_AVAILABLE_EXECUTION_STATES)
+        m_available_configurations.append(move(configuration));
+    return result;
 }
 
 void Linker::link(ModuleInstance const& instance)

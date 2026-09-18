@@ -19,14 +19,17 @@
 #include <LibDevTools/Forward.h>
 #include <LibHTTP/Cookie/Cookie.h>
 #include <LibHTTP/Header.h>
+#include <LibRequests/CameFromCache.h>
 #include <LibRequests/NetworkError.h>
 #include <LibRequests/RequestTimingInfo.h>
 #include <LibWeb/CSS/Selector.h>
 #include <LibWeb/CSS/StyleSheetIdentifier.h>
+#include <LibWeb/Fetch/Infrastructure/HTTP/Requests.h>
 #include <LibWeb/Forward.h>
 #include <LibWeb/HTML/Scripting/ScriptRegistry.h>
 #include <LibWeb/StorageAPI/StorageEndpoint.h>
 #include <LibWebView/DOMNodeProperties.h>
+#include <LibWebView/Debugger.h>
 #include <LibWebView/Forward.h>
 
 namespace DevTools {
@@ -139,9 +142,9 @@ public:
     virtual void get_dom_node_outer_html(TabDescription const&, Web::UniqueNodeID, OnDOMNodeHTMLReceived) const { }
     virtual void set_dom_node_outer_html(TabDescription const&, Web::UniqueNodeID, String const&, OnDOMNodeEditComplete) const { }
     virtual void set_dom_node_text(TabDescription const&, Web::UniqueNodeID, String const&, OnDOMNodeEditComplete) const { }
-    virtual void set_dom_node_tag(TabDescription const&, Web::UniqueNodeID, String const&, OnDOMNodeEditComplete) const { }
+    virtual void set_dom_node_tag(TabDescription const&, Web::UniqueNodeID, Utf16FlyString const&, OnDOMNodeEditComplete) const { }
     virtual void add_dom_node_attributes(TabDescription const&, Web::UniqueNodeID, ReadonlySpan<WebView::Attribute>, OnDOMNodeEditComplete) const { }
-    virtual void replace_dom_node_attribute(TabDescription const&, Web::UniqueNodeID, String const&, ReadonlySpan<WebView::Attribute>, OnDOMNodeEditComplete) const { }
+    virtual void replace_dom_node_attribute(TabDescription const&, Web::UniqueNodeID, Utf16FlyString const&, ReadonlySpan<WebView::Attribute>, OnDOMNodeEditComplete) const { }
     virtual void create_child_element(TabDescription const&, Web::UniqueNodeID, OnDOMNodeEditComplete) const { }
     virtual void insert_dom_node_before(TabDescription const&, Web::UniqueNodeID, Web::UniqueNodeID, Optional<Web::UniqueNodeID>, OnDOMNodeEditComplete) const { }
     virtual void clone_dom_node(TabDescription const&, Web::UniqueNodeID, OnDOMNodeEditComplete) const { }
@@ -151,7 +154,7 @@ public:
     virtual void resolve_dom_node_url(TabDescription const&, Optional<Web::UniqueNodeID>, String const&, OnResolvedURLReceived) const { }
 
     using OnStyleSheetsReceived = Function<void(ErrorOr<Vector<Web::CSS::StyleSheetIdentifier>>)>;
-    using OnStyleSheetSourceReceived = Function<void(Web::CSS::StyleSheetIdentifier const&, String)>;
+    using OnStyleSheetSourceReceived = Function<void(Web::CSS::StyleSheetIdentifier const&, Utf16String)>;
     virtual void retrieve_style_sheets(TabDescription const&, OnStyleSheetsReceived) const { }
     virtual void retrieve_style_sheet_source(TabDescription const&, Web::CSS::StyleSheetIdentifier const&) const { }
     virtual void listen_for_style_sheet_sources(TabDescription const&, OnStyleSheetSourceReceived) const { }
@@ -164,6 +167,26 @@ public:
     virtual void retrieve_source(TabDescription const&, Web::HTML::ScriptRegistry::Identifier, OnSourceReceived) const { }
     virtual void listen_for_sources(TabDescription const&, OnSourceAvailable) const { }
     virtual void stop_listening_for_sources(TabDescription const&) const { }
+
+    using OnDebuggerPaused = Function<void(WebView::DebuggerPause)>;
+    using OnDebuggerResumed = Function<void()>;
+    using OnDebuggerBreakpointOperationComplete = Function<void(ErrorOr<void>)>;
+    using OnDebuggerEnvironmentsReceived = Function<void(ErrorOr<Vector<WebView::DebuggerEnvironment>>)>;
+    using OnDebuggerEvaluationComplete = Function<void(ErrorOr<WebView::DebuggerEvaluationResult, String>)>;
+    using OnDebuggerObjectPropertiesReceived = Function<void(ErrorOr<WebView::DebuggerObjectProperties, String>)>;
+    using OnDebuggerSourcePositionsReceived = Function<void(ErrorOr<Vector<WebView::DebuggerSourcePosition>>)>;
+    virtual void attach_debugger(TabDescription const&, OnDebuggerPaused, OnDebuggerResumed) const { }
+    virtual void configure_debugger(TabDescription const&, WebView::DebuggerConfiguration) const { }
+    virtual void detach_debugger(TabDescription const&) const { }
+    virtual void interrupt_debugger(TabDescription const&) const { }
+    virtual void resume_debugger(TabDescription const&, WebView::DebuggerResumeMode) const { }
+    virtual void update_debugger_blackboxing(TabDescription const&, Utf16String, Vector<WebView::DebuggerBlackboxRange>, WebView::DebuggerBlackboxingOperation) const { }
+    virtual void set_debugger_breakpoint(TabDescription const&, WebView::DebuggerBreakpointLocation, WebView::DebuggerBreakpointOptions, OnDebuggerBreakpointOperationComplete) const { }
+    virtual void remove_debugger_breakpoint(TabDescription const&, WebView::DebuggerBreakpointLocation, OnDebuggerBreakpointOperationComplete) const { }
+    virtual void retrieve_debugger_environments(TabDescription const&, u64, OnDebuggerEnvironmentsReceived) const { }
+    virtual void evaluate_javascript_in_debugger_frame(TabDescription const&, u64, String const&, OnDebuggerEvaluationComplete) const { }
+    virtual void retrieve_debugger_object_properties(TabDescription const&, u64, OnDebuggerObjectPropertiesReceived) const { }
+    virtual void retrieve_debugger_source_positions(TabDescription const&, Web::HTML::ScriptRegistry::Identifier, OnDebuggerSourcePositionsReceived) const { }
 
     using OnScriptEvaluationComplete = Function<void(ErrorOr<JsonValue>)>;
     virtual void evaluate_javascript(TabDescription const&, String const&, OnScriptEvaluationComplete) const { }
@@ -180,6 +203,9 @@ public:
         Vector<HTTP::Header> request_headers;
         ByteBuffer request_body;
         Optional<String> initiator_type;
+        String referrer_policy;
+        bool is_navigation_request { false };
+        Web::Fetch::Infrastructure::Request::Priority priority { Web::Fetch::Infrastructure::Request::Priority::Auto };
     };
 
     struct NetworkResponseData {
@@ -187,6 +213,7 @@ public:
         u32 status_code { 0 };
         Optional<String> reason_phrase;
         Vector<HTTP::Header> response_headers;
+        Requests::CameFromCache came_from_cache { Requests::CameFromCache::No };
     };
 
     struct NetworkRequestCompleteData {
@@ -210,6 +237,7 @@ public:
 
     virtual void did_connect_devtools_client(TabDescription const&) const { }
     virtual void did_disconnect_devtools_client(TabDescription const&) const { }
+    virtual void did_close_devtools_connection() { }
 };
 
 }

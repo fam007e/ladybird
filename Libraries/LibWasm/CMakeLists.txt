@@ -3,6 +3,7 @@ set(SOURCES
     AbstractMachine/BytecodeInterpreter.cpp
     AbstractMachine/Configuration.cpp
     AbstractMachine/Validator.cpp
+    AbstractMachine/ValueStack.cpp
     Parser/Parser.cpp
     Printer/Printer.cpp
     TypeSystem.cpp
@@ -12,8 +13,6 @@ set(SOURCES
 if (NOT WIN32)
     list(APPEND SOURCES WASI/Wasi.cpp)
 endif()
-
-option(ENABLE_CRANELIFT_JIT "Enable Cranelift-based AOT compilation for WebAssembly" ON)
 
 set(WASM_COMPILED_FAULT_RECOVERY_SUPPORTED 0)
 
@@ -39,7 +38,7 @@ else()
 endif()
 
 ladybird_lib(LibWasm wasm EXPLICIT_SYMBOL_EXPORT)
-target_link_libraries(LibWasm PRIVATE LibCore PUBLIC LibSync LibGC)
+target_link_libraries(LibWasm PRIVATE LibCore LibFileSystem PUBLIC LibGC)
 
 target_compile_definitions(LibWasm PRIVATE
     WASM_COMPILED_FAULT_RECOVERY_SUPPORTED=${WASM_COMPILED_FAULT_RECOVERY_SUPPORTED}

@@ -20,7 +20,7 @@ static OrderedHashMap<RegistrationKey, Registration>& registration_map()
     return *registrations;
 }
 
-Registration::Registration(StorageAPI::StorageKey storage_key, URL::URL scope, Bindings::ServiceWorkerUpdateViaCache update_via_cache)
+Registration::Registration(StorageAPI::StorageKey storage_key, URL::URL scope, ServiceWorkerUpdateViaCache update_via_cache)
     : m_storage_key(move(storage_key))
     , m_scope_url(move(scope))
     , m_update_via_cache_mode(update_via_cache)
@@ -69,7 +69,7 @@ Optional<Registration&> Registration::get(StorageAPI::StorageKey const& key, Opt
 }
 
 // https://w3c.github.io/ServiceWorker/#set-registration-algorithm
-Registration& Registration::set(StorageAPI::StorageKey const& storage_key, URL::URL const& scope, Bindings::ServiceWorkerUpdateViaCache update_via_cache)
+Registration& Registration::set(StorageAPI::StorageKey const& storage_key, URL::URL const& scope, ServiceWorkerUpdateViaCache update_via_cache)
 {
     // FIXME: 1. Run the following steps atomically.
 
@@ -122,7 +122,7 @@ Optional<Registration&> Registration::match(StorageAPI::StorageKey const& storag
     // 8. If matchingScopeString is not the empty string, then:
     if (!matching_scope_string.is_empty()) {
         // 1. Let matchingScope be the result of parsing matchingScopeString.
-        matching_scope = DOMURL::parse(matching_scope_string);
+        matching_scope = DOMURL::parse_from_byte_string(matching_scope_string);
         // 2. Assert: matchingScope’s origin and clientURL’s origin are same origin.
         VERIFY(matching_scope.value().origin().is_same_origin(client_url.origin()));
     }

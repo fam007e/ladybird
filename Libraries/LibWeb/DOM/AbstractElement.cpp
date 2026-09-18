@@ -4,7 +4,8 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibWeb/CSS/ComputedProperties.h>
+#include <AK/Utf16StringBuilder.h>
+#include <LibWeb/CSS/ComputedValues.h>
 #include <LibWeb/CSS/CustomPropertyData.h>
 #include <LibWeb/DOM/AbstractElement.h>
 #include <LibWeb/DOM/Document.h>
@@ -91,8 +92,15 @@ Layout::NodeWithStyle* AbstractElement::unsafe_layout_node()
 GC::Ptr<Element const> AbstractElement::parent_element() const
 {
     if (m_pseudo_element.has_value())
-        return m_element;
+        return m_element.ptr();
     return m_element->parent_element();
+}
+
+Element* AbstractElement::flat_tree_parent_element() const
+{
+    if (m_pseudo_element.has_value())
+        return m_element.ptr();
+    return m_element->flat_tree_parent_element();
 }
 
 Optional<AbstractElement> AbstractElement::element_to_inherit_style_from() const
@@ -108,30 +116,47 @@ Optional<AbstractElement> AbstractElement::element_to_inherit_style_from() const
     return AbstractElement { const_cast<DOM::Element&>(*element) };
 }
 
+// https://drafts.csswg.org/css-pseudo-4/#highlight-cascade
+// When any supported property is not given a value by the cascade, or given a value of inherit or unset, its
+// specified value is determined by inheritance from the corresponding highlight pseudo-element of its originating
+// element's parent element.
+Optional<AbstractElement> AbstractElement::highlight_inheritance_parent() const
+{
+    if (!m_pseudo_element.has_value() || !CSS::is_highlight_pseudo_element(*m_pseudo_element))
+        return OptionalNone {};
+
+    // An ancestor without a record for this pseudo-element has no declarations for it, so the nearest record is
+    // what its own would have inherited anyway.
+    for (auto ancestor = m_element->element_to_inherit_style_from({}); ancestor; ancestor = ancestor->element_to_inherit_style_from({})) {
+        if (!!ancestor->style_record_identity(*m_pseudo_element))
+            return AbstractElement { *ancestor, m_pseudo_element };
+    }
+    return OptionalNone {};
+}
+
 Optional<AbstractElement> AbstractElement::walk_layout_tree(WalkMethod walk_method)
 {
     // NB: Called during style recalculation.
-    Layout::Node* node = unsafe_layout_node();
-    if (!node)
+    Layout::Node* start_node = unsafe_layout_node();
+    if (!start_node)
         return OptionalNone {};
 
+    auto* arena_handle = start_node->arena_handle();
+    auto slot = Layout::Node::slot_id(start_node);
     while (true) {
-        switch (walk_method) {
-        case WalkMethod::Previous:
-            node = node->previous_in_pre_order();
-            break;
-        case WalkMethod::PreviousSibling:
-            node = node->previous_sibling();
-            break;
-        }
-        if (!node)
+        slot = Layout::RustFFI::layout_arena_previous_dom_backed_or_generated_node(arena_handle, slot, walk_method == WalkMethod::PreviousSibling);
+        if (slot.index == Layout::RustFFI::INVALID_NODE_SLOT_INDEX)
             return OptionalNone {};
 
-        if (auto* previous_element = as_if<Element>(node->dom_node()))
+        if (auto* previous_element = as_if<Element>(static_cast<Node*>(Layout::RustFFI::layout_arena_node_dom_node(arena_handle, slot))))
             return AbstractElement { *previous_element };
 
-        if (node->is_generated_for_pseudo_element())
-            return AbstractElement { *node->pseudo_element_generator(), node->generated_for_pseudo_element() };
+        auto* generated_node = static_cast<Layout::Node*>(Layout::RustFFI::layout_arena_node_shell_if_live(arena_handle, slot));
+        if (generated_node && generated_node->is_generated_for_pseudo_element()) {
+            auto pseudo_element = generated_node->generated_for_pseudo_element();
+            if (pseudo_element.has_value() && CSS::is_tree_abiding_pseudo_element(*pseudo_element))
+                return AbstractElement { *generated_node->pseudo_element_generator(), pseudo_element };
+        }
     }
 }
 
@@ -143,9 +168,19 @@ bool AbstractElement::is_before(AbstractElement const& other) const
     return this_node && other_node && this_node->is_before(*other_node);
 }
 
-CSS::ComputedProperties const* AbstractElement::computed_properties() const
+CSS::ComputedStyleRecordView AbstractElement::computed_style() const
 {
-    return m_element->computed_properties(m_pseudo_element);
+    return m_element->computed_style(m_pseudo_element);
+}
+
+CSS::StyleRecordID AbstractElement::style_record_identity() const
+{
+    return m_element->style_record_identity(m_pseudo_element);
+}
+
+void const* AbstractElement::style_record_payloads() const
+{
+    return m_element->style_record_payloads(m_pseudo_element);
 }
 
 GC::Ptr<CSS::CSSStyleProperties const> AbstractElement::inline_style() const
@@ -172,6 +207,11 @@ RefPtr<CSS::CustomPropertyData const> AbstractElement::custom_property_data() co
 void AbstractElement::set_custom_property_data(RefPtr<CSS::CustomPropertyData const> data)
 {
     m_element->set_custom_property_data(m_pseudo_element, move(data));
+}
+
+void AbstractElement::replace_custom_property_data(Badge<CSS::StyleComputer>, RefPtr<CSS::CustomPropertyData const> data)
+{
+    m_element->replace_custom_property_data(m_pseudo_element, move(data));
 }
 
 RefPtr<CSS::StyleValue const> AbstractElement::get_custom_property(Utf16FlyString const& name) const
@@ -214,14 +254,14 @@ void AbstractElement::set_counters_set(OwnPtr<CSS::CountersSet>&& counters_set)
     }
 }
 
-String AbstractElement::debug_description() const
+Utf16String AbstractElement::debug_description() const
 {
     if (m_pseudo_element.has_value()) {
-        StringBuilder builder;
+        Utf16StringBuilder builder;
         builder.append(m_element->debug_description());
-        builder.append("::"sv);
-        builder.append(CSS::pseudo_element_name(*m_pseudo_element));
-        return builder.to_string_without_validation();
+        builder.append_ascii("::"sv);
+        builder.append_ascii(CSS::pseudo_element_name(*m_pseudo_element));
+        return builder.to_string();
     }
     return m_element->debug_description();
 }
@@ -231,14 +271,14 @@ CSS::StyleScope const& AbstractElement::style_scope() const
     return m_element->style_scope();
 }
 
-HashMap<FlyString, GC::Ref<CSS::CSSAnimation>>* AbstractElement::css_defined_animations() const
+Vector<GC::Ref<CSS::CSSAnimation>> const* AbstractElement::css_defined_animations() const
 {
     return m_element->css_defined_animations(m_pseudo_element);
 }
 
-void AbstractElement::set_has_css_defined_animations()
+void AbstractElement::set_css_defined_animations(Vector<GC::Ref<CSS::CSSAnimation>>&& animations)
 {
-    m_element->set_has_css_defined_animations();
+    m_element->set_css_defined_animations(m_pseudo_element, move(animations));
 }
 
 }

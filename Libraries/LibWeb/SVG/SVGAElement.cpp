@@ -5,14 +5,12 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibWeb/Bindings/SVGAElement.h>
+#include <LibGC/Heap.h>
 #include <LibWeb/CSS/Invalidation/LinkInvalidator.h>
 #include <LibWeb/DOM/DOMTokenList.h>
-#include <LibWeb/HTML/UserNavigationInvolvement.h>
-#include <LibWeb/Layout/SVGGraphicsBox.h>
+#include <LibWeb/Layout/Box.h>
 #include <LibWeb/SVG/AttributeNames.h>
 #include <LibWeb/SVG/SVGAElement.h>
-#include <LibWeb/UIEvents/MouseEvent.h>
 
 namespace Web::SVG {
 
@@ -25,12 +23,6 @@ SVGAElement::SVGAElement(DOM::Document& document, DOM::QualifiedName qualified_n
 
 SVGAElement::~SVGAElement() = default;
 
-void SVGAElement::initialize(JS::Realm& realm)
-{
-    WEB_SET_PROTOTYPE_FOR_INTERFACE(SVGAElement);
-    Base::initialize(realm);
-}
-
 void SVGAElement::visit_edges(Cell::Visitor& visitor)
 {
     Base::visit_edges(visitor);
@@ -39,7 +31,7 @@ void SVGAElement::visit_edges(Cell::Visitor& visitor)
     visitor.visit(m_target);
 }
 
-void SVGAElement::attribute_changed(FlyString const& name, Optional<String> const& old_value, Optional<String> const& value, Optional<FlyString> const& namespace_)
+void SVGAElement::attribute_changed(Utf16FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_)
 {
     Base::attribute_changed(name, old_value, value, namespace_);
 
@@ -47,7 +39,7 @@ void SVGAElement::attribute_changed(FlyString const& name, Optional<String> cons
         CSS::Invalidation::invalidate_style_after_hyperlink_state_change(*this);
     if (name == HTML::AttributeNames::rel) {
         if (m_rel_list)
-            m_rel_list->associated_attribute_changed(value.value_or(String {}));
+            m_rel_list->associated_attribute_changed(value.has_value() ? value->utf16_view() : u""sv);
     }
 }
 
@@ -62,7 +54,7 @@ i32 SVGAElement::default_tab_index_value() const
 GC::Ref<SVGAnimatedString> SVGAElement::target()
 {
     if (!m_target)
-        m_target = SVGAnimatedString::create(realm(), *this, DOM::QualifiedName { HTML::AttributeNames::target, OptionalNone {}, OptionalNone {} });
+        m_target = SVGAnimatedString::create(*this, DOM::QualifiedName { HTML::AttributeNames::target, OptionalNone {}, OptionalNone {} });
     return *m_target;
 }
 
@@ -75,44 +67,14 @@ GC::Ref<DOM::DOMTokenList> SVGAElement::rel_list()
     return *m_rel_list;
 }
 
-RefPtr<Layout::Node> SVGAElement::create_layout_node(CSS::ComputedProperties const& style)
+Layout::Node* SVGAElement::create_layout_node(CSS::LayoutStyle style)
 {
-    return make_ref_counted<Layout::SVGGraphicsBox>(document(), *this, style);
+    return &Layout::allocate_layout_node<Layout::Box>(document(), *this, style, Layout::RustFFI::NodeKind::SVGGraphicsBox);
 }
 
-// https://html.spec.whatwg.org/multipage/links.html#links-created-by-a-and-area-elements
 void SVGAElement::activation_behavior(DOM::Event const& event)
 {
-    // The activation behavior of an a or area element element given an event event is:
-
-    // 1. If element has no href attribute, then return.
-    if (href()->base_val().is_empty())
-        return;
-
-    // AD-HOC: Do not activate the element for clicks with the ctrl/cmd modifier present. This lets
-    //         the browser process open the link in a new tab.
-    if (is<UIEvents::MouseEvent>(event)) {
-        auto const& mouse_event = static_cast<UIEvents::MouseEvent const&>(event);
-        if (mouse_event.platform_ctrl_key())
-            return;
-    }
-
-    // 2. Let hyperlinkSuffix be null.
-    Optional<String> hyperlink_suffix {};
-
-    // FIXME: 3. If element is an a element, and event's target is an img with an ismap attribute specified, then:
-
-    // 4. Let userInvolvement be event's user navigation involvement.
-    auto user_involvement = HTML::user_navigation_involvement(event);
-
-    // FIXME: 5. If the user has expressed a preference to download the hyperlink, then set userInvolvement to "browser UI".
-
-    // FIXME: 6. If element has a download attribute, or if the user has expressed a preference to download the
-    //     hyperlink, then download the hyperlink created by element with hyperlinkSuffix set to hyperlinkSuffix and
-    //     userInvolvement set to userInvolvement.
-
-    // 7. Otherwise, follow the hyperlink created by element with hyperlinkSuffix set to hyperlinkSuffix and userInvolvement set to userInvolvement.
-    follow_the_hyperlink(hyperlink_suffix, user_involvement);
+    activate_the_hyperlink(event);
 }
 
 }

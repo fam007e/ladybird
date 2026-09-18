@@ -174,6 +174,7 @@ class Completion;
 class Console;
 class ConsoleClient;
 class CyclicModule;
+class Debugger;
 class DeclarativeEnvironment;
 struct DisposeCapability;
 struct DisposableResource;
@@ -320,7 +321,9 @@ class Executable;
 class Generator;
 class Instruction;
 class Operand;
+struct KeyedPropertyLookupCache;
 struct PropertyLookupCache;
+struct StaticPropertyLookupCache;
 class RegexTable;
 class Register;
 

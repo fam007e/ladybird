@@ -13,6 +13,9 @@
 #include <AK/NonnullOwnPtr.h>
 #include <AK/OwnPtr.h>
 #include <LibGC/Root.h>
+#include <LibWeb/HTML/CrossProcessId.h>
+#include <LibWeb/HTML/VisibilityState.h>
+#include <LibWeb/Page/PageId.h>
 #include <WebContent/Forward.h>
 
 namespace Web {
@@ -35,15 +38,18 @@ public:
     static NonnullOwnPtr<PageHost> create(ConnectionFromClient& client) { return adopt_own(*new PageHost(client)); }
     virtual ~PageHost();
 
-    void initialize(u64 initial_page_id);
-    Optional<PageClient&> page(u64 page_id);
-    PageClient& create_page(u64 page_id);
-    void remove_page(Badge<PageClient>, u64 page_id);
+    void initialize(Web::PageId initial_page_id, Vector<Web::HTML::RemoteNavigableDescriptor> remote_navigables, Web::HTML::CrossProcessId root_navigable_id, Web::HTML::CrossProcessIdAllocator, Web::HTML::SessionHistoryEntryDescriptor initial_history_entry, Web::HTML::VisibilityState system_visibility_state);
+    Optional<PageClient&> page(Web::PageId page_id);
+    PageClient& create_page(Web::PageId page_id, Optional<Web::HTML::CrossProcessId> pending_root_navigable_id = {});
+    void remove_page(Badge<PageClient>, Web::PageId page_id);
+    Web::HTML::CrossProcessId allocate_cross_process_id();
+    Web::HTML::CrossProcessId allocate_navigable_id();
 
     ConnectionFromClient& client() const { return m_client; }
     void ensure_compositor_host();
     void compositor_process_reconnected();
     void compositor_process_lost();
+    void invalidate_user_style();
     Web::Compositor::CompositorHost* compositor_host() { return m_compositor_host.ptr(); }
     Web::Compositor::CompositorHost const* compositor_host() const { return m_compositor_host.ptr(); }
 
@@ -52,7 +58,8 @@ private:
 
     ConnectionFromClient& m_client;
     OwnPtr<Web::Compositor::CompositorHost> m_compositor_host;
-    HashMap<u64, GC::Root<PageClient>> m_pages;
+    HashMap<Web::PageId, GC::Root<PageClient>> m_pages;
+    Optional<Web::HTML::CrossProcessIdAllocator> m_cross_process_id_allocator;
 };
 
 }

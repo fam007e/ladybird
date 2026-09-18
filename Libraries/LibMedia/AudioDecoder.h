@@ -6,7 +6,6 @@
 
 #pragma once
 
-#include <AK/ByteBuffer.h>
 #include <AK/NonnullOwnPtr.h>
 #include <AK/Time.h>
 #include <AK/Vector.h>
@@ -19,9 +18,9 @@ class AudioDecoder {
 public:
     virtual ~AudioDecoder() { }
 
-    virtual DecoderErrorOr<void> receive_coded_data(AK::Duration timestamp, ReadonlyBytes coded_data) = 0;
+    virtual DecoderErrorOr<void> receive_coded_data(CodedFrame const&) = 0;
     virtual void signal_end_of_stream() = 0;
-    // Writes all buffered audio samples to the provided block.
+    // Writes buffered audio samples to the provided block, up to its capacity.
     virtual DecoderErrorOr<void> write_next_block(AudioBlock&) = 0;
 
     virtual void flush() = 0;

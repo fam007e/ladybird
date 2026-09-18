@@ -7,8 +7,6 @@
 #pragma once
 
 #include <AK/FlyString.h>
-#include <LibWeb/CSS/Parser/ComponentValue.h>
-#include <LibWeb/CSS/Parser/Token.h>
 #include <LibWeb/CSS/StyleValues/StyleValue.h>
 
 namespace Web::CSS {
@@ -18,13 +16,12 @@ public:
     virtual ~DimensionStyleValue() override = default;
 
     virtual double raw_value() const = 0;
-    virtual FlyString unit_name() const = 0;
-    virtual Vector<Parser::ComponentValue> tokenize() const override;
-    virtual GC::Ref<CSSStyleValue> reify(JS::Realm&, Utf16FlyString const& associated_property) const override;
+    virtual Utf16FlyString unit_name() const = 0;
+    GC::Ref<CSSStyleValue> reify(Utf16FlyString const& associated_property) const;
 
 protected:
-    explicit DimensionStyleValue(Type type)
-        : StyleValue(type)
+    DimensionStyleValue(Type type, StyleValueFFI::StyleValueData const* value)
+        : StyleValue(type, value)
     {
     }
 };

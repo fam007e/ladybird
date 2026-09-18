@@ -39,25 +39,28 @@ ErrorOr<Database::MigrationOutcome> CookieJar::migrate_schema(Database::Database
     // SameSite value instead of deriving it from the enum.
     static_assert(to_underlying(HTTP::Cookie::SameSite::Lax) == 3);
 
-    Array<Database::Migration, 1> migrations { {
-        { .version = COOKIES_SCHEMA_BASELINE_VERSION, .sql = R"#(
-            CREATE TABLE IF NOT EXISTS Cookies (
-                name TEXT,
-                value TEXT,
-                same_site INTEGER CHECK (same_site >= 0 AND same_site <= 3),
-                creation_time INTEGER,
-                last_access_time INTEGER,
-                expiry_time INTEGER,
-                domain TEXT,
-                path TEXT,
-                secure BOOLEAN,
-                http_only BOOLEAN,
-                host_only BOOLEAN,
-                persistent BOOLEAN,
-                PRIMARY KEY(name, domain, path)
-            );
-        )#"sv },
-    } };
+    auto migrations = to_array<Database::Migration>({
+        {
+            .version = COOKIES_SCHEMA_BASELINE_VERSION,
+            .sql = R"#(
+                CREATE TABLE IF NOT EXISTS Cookies (
+                    name TEXT,
+                    value TEXT,
+                    same_site INTEGER CHECK (same_site >= 0 AND same_site <= 3),
+                    creation_time INTEGER,
+                    last_access_time INTEGER,
+                    expiry_time INTEGER,
+                    domain TEXT,
+                    path TEXT,
+                    secure BOOLEAN,
+                    http_only BOOLEAN,
+                    host_only BOOLEAN,
+                    persistent BOOLEAN,
+                    PRIMARY KEY(name, domain, path)
+                );
+            )#"sv,
+        },
+    });
 
     return database.migrate("Cookies"sv, migrations, mode);
 }
@@ -70,16 +73,17 @@ ErrorOr<NonnullOwnPtr<CookieJar>> CookieJar::create(Database::Database& database
     statements.expire_cookie = TRY(database.prepare_statement("DELETE FROM Cookies WHERE (expiry_time < ?);"sv));
     statements.select_all_cookies = TRY(database.prepare_statement("SELECT name, value, same_site, creation_time, last_access_time, expiry_time, domain, path, secure, http_only, host_only, persistent FROM Cookies;"sv));
 
-    return adopt_own(*new CookieJar { PersistedStorage { database, statements } });
+    return adopt_own(*new CookieJar { PersistedStorage { database, statements }, IsPrivate::No });
 }
 
-NonnullOwnPtr<CookieJar> CookieJar::create()
+NonnullOwnPtr<CookieJar> CookieJar::create(IsPrivate is_private)
 {
-    return adopt_own(*new CookieJar { OptionalNone {} });
+    return adopt_own(*new CookieJar { OptionalNone {}, is_private });
 }
 
-CookieJar::CookieJar(Optional<PersistedStorage> persisted_storage)
+CookieJar::CookieJar(Optional<PersistedStorage> persisted_storage, IsPrivate is_private)
     : m_persisted_storage(move(persisted_storage))
+    , m_transient_storage(is_private)
 {
     if (!m_persisted_storage.has_value())
         return;
@@ -358,6 +362,13 @@ void CookieJar::set_cookie(URL::URL const& url, HTTP::Cookie::ParsedCookie const
     if (has_case_insensitive_prefix(cookie.name, "__Secure-"sv) && !cookie.secure)
         return;
 
+    if (has_case_insensitive_prefix(cookie.name, "__Http-"sv) && (!cookie.secure || !cookie.http_only))
+        return;
+
+    if (has_case_insensitive_prefix(cookie.name, "__Host-Http-"sv)
+        && (!cookie.secure || !cookie.http_only || !cookie.host_only || parsed_cookie.path != "/"sv))
+        return;
+
     // 21. If the cookie-name begins with a case-insensitive match for the string "__Host-", abort this algorithm and
     //     ignore the cookie entirely unless the cookie meets all the following criteria:
     if (has_case_insensitive_prefix(cookie.name, "__Host-"sv)) {
@@ -379,6 +390,9 @@ void CookieJar::set_cookie(URL::URL const& url, HTTP::Cookie::ParsedCookie const
     if (cookie.name.is_empty()) {
         // * the cookie-value begins with a case-insensitive match for the string "__Secure-"
         if (has_case_insensitive_prefix(cookie.value, "__Secure-"sv))
+            return;
+
+        if (has_case_insensitive_prefix(cookie.value, "__Http-"sv))
             return;
 
         // * the cookie-value begins with a case-insensitive match for the string "__Host-"
@@ -600,6 +614,11 @@ Vector<HTTP::Cookie::Cookie> CookieJar::get_matching_cookies(URL::URL const& url
     return cookie_list;
 }
 
+CookieJar::TransientStorage::TransientStorage(IsPrivate is_private)
+    : m_is_private(is_private)
+{
+}
+
 void CookieJar::TransientStorage::set_cookies(Cookies cookies)
 {
     m_cookies = move(cookies);
@@ -685,6 +704,9 @@ Requests::CacheSizes CookieJar::TransientStorage::estimate_storage_size_accessed
 void CookieJar::TransientStorage::send_cookie_changed_notifications(ReadonlySpan<CookieEntry> cookies, bool inform_web_view_about_changed_domains)
 {
     ViewImplementation::for_each_view([&](ViewImplementation& view) {
+        if (view.is_private() != m_is_private)
+            return IterationDecision::Continue;
+
         auto retrieval_host_canonical = HTTP::Cookie::canonicalize_domain(view.url());
         if (!retrieval_host_canonical.has_value())
             return IterationDecision::Continue;
@@ -767,11 +789,12 @@ CookieJar::TransientStorage::Cookies CookieJar::PersistedStorage::select_all_coo
 
     database.execute_statement(
         statements.select_all_cookies,
-        [&](auto statement_id) {
+        [&](auto statement_id) -> ErrorOr<void> {
             auto cookie = parse_cookie(database, statement_id);
 
             CookieStorageKey key { cookie.name, cookie.domain, cookie.path };
             cookies.set(move(key), move(cookie));
+            return {};
         });
 
     return cookies;

@@ -7,8 +7,6 @@
 
 #include <AK/Utf16StringBuilder.h>
 #include <LibWeb/ARIA/Roles.h>
-#include <LibWeb/Bindings/HTMLOptionElement.h>
-#include <LibWeb/Bindings/Intrinsics.h>
 #include <LibWeb/CSS/Invalidation/ElementStateInvalidator.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/DocumentFragment.h>
@@ -38,12 +36,6 @@ HTMLOptionElement::HTMLOptionElement(DOM::Document& document, DOM::QualifiedName
 
 HTMLOptionElement::~HTMLOptionElement() = default;
 
-void HTMLOptionElement::initialize(JS::Realm& realm)
-{
-    WEB_SET_PROTOTYPE_FOR_INTERFACE(HTMLOptionElement);
-    Base::initialize(realm);
-}
-
 void HTMLOptionElement::visit_edges(Cell::Visitor& visitor)
 {
     Base::visit_edges(visitor);
@@ -60,7 +52,7 @@ void HTMLOptionElement::update_selection_label()
     }
 }
 
-void HTMLOptionElement::attribute_changed(FlyString const& name, Optional<String> const& old_value, Optional<String> const& value, Optional<FlyString> const& namespace_)
+void HTMLOptionElement::attribute_changed(Utf16FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_)
 {
     Base::attribute_changed(name, old_value, value, namespace_);
 
@@ -92,15 +84,14 @@ void HTMLOptionElement::set_selected(bool selected)
 
 void HTMLOptionElement::set_selected_internal(bool selected)
 {
-    if (m_selected != selected)
-        CSS::Invalidation::invalidate_style_after_option_selected_state_change(*this);
+    if (m_selected != selected) {
+        CSS::Invalidation::invalidate_style_after_option_selected_state_change(*this, selected);
+        document().bump_option_selectedness_version();
+    }
 
     m_selected = selected;
     if (selected)
         m_selectedness_update_index = m_next_selectedness_update_index++;
-
-    // this is here to invalidate the cache on the HTMLCollection in HTMLSelectElement::selected_options
-    document().bump_dom_tree_version();
 }
 
 // https://html.spec.whatwg.org/multipage/form-elements.html#dom-option-value
@@ -109,14 +100,14 @@ Utf16String HTMLOptionElement::value() const
     // The value of an option element is the value of the value content attribute, if there is one.
     // ...or, if there is not, the value of the element's text IDL attribute.
     if (auto value = attribute(HTML::AttributeNames::value); value.has_value())
-        return Utf16String::from_utf8(*value);
+        return value.release_value();
     return text();
 }
 
 // https://html.spec.whatwg.org/multipage/form-elements.html#dom-option-value
-void HTMLOptionElement::set_value(Utf16String const& value)
+void HTMLOptionElement::set_value(Utf16View value)
 {
-    set_attribute_value(HTML::AttributeNames::value, value.to_utf8_but_should_be_ported_to_utf16());
+    set_attribute_value(HTML::AttributeNames::value, value);
 }
 
 static void concatenate_descendants_text_content(DOM::Node const* node, Utf16StringBuilder& builder)
@@ -132,17 +123,17 @@ static void concatenate_descendants_text_content(DOM::Node const* node, Utf16Str
 }
 
 // https://html.spec.whatwg.org/multipage/form-elements.html#dom-option-label
-String HTMLOptionElement::label() const
+Utf16String HTMLOptionElement::label() const
 {
     // The label IDL attribute, on getting, if there is a label content attribute,
     // must return that attribute's value; otherwise, it must return the element's label.
     if (auto label = attribute(HTML::AttributeNames::label); label.has_value())
         return label.release_value();
-    return text().to_utf8_but_should_be_ported_to_utf16();
+    return text();
 }
 
 // https://html.spec.whatwg.org/multipage/form-elements.html#dom-option-label
-void HTMLOptionElement::set_label(String const& label)
+void HTMLOptionElement::set_label(Utf16View label)
 {
     set_attribute_value(HTML::AttributeNames::label, label);
     // Note: this causes attribute_changed() to be called, which will update the <select>'s label
@@ -162,11 +153,11 @@ Utf16String HTMLOptionElement::text() const
     });
 
     // Return the result of stripping and collapsing ASCII whitespace from the above concatenation.
-    return Infra::strip_and_collapse_whitespace(builder.to_string());
+    return Infra::strip_and_collapse_whitespace(builder.view());
 }
 
 // https://html.spec.whatwg.org/multipage/form-elements.html#dom-option-text
-void HTMLOptionElement::set_text(Utf16String const& text)
+void HTMLOptionElement::set_text(Utf16View text)
 {
     string_replace_all(text);
     // Note: this causes children_changed() to be called, which will update the <select>'s label
@@ -280,7 +271,7 @@ WebIDL::ExceptionOr<void> HTMLOptionElement::clone_into_selectedcontent(GC::Ref<
     // To clone an option into a selectedcontent, given an option element option and a selectedcontent element selectedcontent:
 
     // 1. Let documentFragment be a new DocumentFragment whose node document is option's node document.
-    auto fragment = realm().create<DOM::DocumentFragment>(document());
+    auto fragment = DOM::DocumentFragment::create(document());
 
     // 2. For each child of option's children:
     for (auto* child = first_child(); child; child = child->next_sibling()) {

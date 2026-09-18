@@ -7,6 +7,7 @@
 #pragma once
 
 #include <AK/Function.h>
+#include <AK/Utf16View.h>
 #include <LibWeb/DOM/DocumentLoadEventDelayer.h>
 #include <LibWeb/HTML/CORSSettingAttribute.h>
 #include <LibWeb/HTML/HTMLElement.h>
@@ -19,7 +20,7 @@
 namespace Web::HTML {
 
 class HTMLScriptElement final : public HTMLElement {
-    WEB_PLATFORM_OBJECT(HTMLScriptElement, HTMLElement);
+    WEB_WRAPPABLE(HTMLScriptElement, HTMLElement);
     GC_DECLARE_ALLOCATOR(HTMLScriptElement);
 
 public:
@@ -38,6 +39,7 @@ public:
     void prepare_script(Badge<XMLDocumentBuilder, HTMLParser>) { prepare_script(); }
 
     void execute_script();
+    void stop_delaying_document_load_event(Badge<DOM::Document>) { m_document_load_event_delayer.clear(); }
 
     bool is_parser_inserted() const { return !!m_parser_document; }
 
@@ -45,7 +47,7 @@ public:
     virtual void post_connection() override;
 
     // https://html.spec.whatwg.org/multipage/scripting.html#dom-script-supports
-    static bool supports(JS::VM&, StringView type)
+    static bool supports(Utf16String const& type)
     {
         return type.is_one_of("classic"sv, "module"sv, "importmap"sv);
     }
@@ -72,7 +74,7 @@ public:
 
     virtual WebIDL::ExceptionOr<void> cloned(Node&, bool) const override;
 
-    void set_string_text(Utf16String const& value) { m_script_text = value; }
+    void set_string_text(Utf16View value) { m_script_text = Utf16String::from_utf16(value); }
 
 protected:
     // https://html.spec.whatwg.org/multipage/urls-and-fetching.html#implicitly-potentially-render-blocking
@@ -82,12 +84,10 @@ private:
     HTMLScriptElement(DOM::Document&, DOM::QualifiedName);
 
     virtual bool is_html_script_element() const override { return true; }
-
-    virtual void initialize(JS::Realm&) override;
     virtual void visit_edges(Cell::Visitor&) override;
     virtual void adopted_from(DOM::Document&) override;
 
-    virtual void attribute_changed(FlyString const& name, Optional<String> const& old_value, Optional<String> const& value, Optional<FlyString> const& namespace_) override;
+    virtual void attribute_changed(Utf16FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_) override;
 
     // https://www.w3.org/TR/trusted-types/#prepare-script-text
     WebIDL::ExceptionOr<void> prepare_script_text();

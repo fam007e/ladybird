@@ -8,79 +8,64 @@
 
 #pragma once
 
+#include <AK/Utf16String.h>
 #include <LibWeb/CSS/CSSRule.h>
-#include <LibWeb/CSS/CSSStyleSheet.h>
+#include <LibWeb/CSS/RustImportRule.h>
+#include <LibWeb/CSS/RustScopeSelectors.h>
 #include <LibWeb/CSS/Selector.h>
+#include <LibWeb/CSS/StyleSheetImport.h>
 #include <LibWeb/CSS/URL.h>
 #include <LibWeb/Export.h>
 #include <LibWeb/Forward.h>
 
 namespace Web::CSS {
 
-class WEB_API CSSImportRule final
-    : public CSSRule
-    , public CSSStyleSheet::Subresource {
-    WEB_PLATFORM_OBJECT(CSSImportRule, CSSRule);
+class WEB_API CSSImportRule final : public CSSRule {
+    WEB_WRAPPABLE(CSSImportRule, CSSRule);
     GC_DECLARE_ALLOCATOR(CSSImportRule);
 
 public:
-    struct ImportScope {
-        Optional<SelectorList> start_selectors;
-        Optional<SelectorList> end_selectors;
-    };
-
-    [[nodiscard]] static GC::Ref<CSSImportRule> create(JS::Realm&, URL, GC::Ptr<DOM::Document>, Optional<FlyString> layer, Optional<ImportScope>&& scope, RefPtr<Supports>, GC::Ref<MediaList>);
+    [[nodiscard]] static GC::Ref<CSSImportRule> create(StyleSheetImport&);
 
     virtual ~CSSImportRule() override;
 
-    URL const& url() const { return m_url; }
-    String href() const { return m_url.url(); }
+    URL const& url() const;
+    Utf16String const& href() const { return url().url(); }
+    Utf16String href_for_bindings() const { return href(); }
 
-    CSSStyleSheet* loaded_style_sheet() { return m_style_sheet; }
-    CSSStyleSheet const* loaded_style_sheet() const { return m_style_sheet; }
+    StyleSheetState* loaded_style_sheet() { return m_import->loaded_style_sheet(); }
+    StyleSheetState const* loaded_style_sheet() const { return m_import->loaded_style_sheet(); }
     GC::Ref<MediaList> media() const;
-    CSSStyleSheet* style_sheet_for_bindings() { return m_style_sheet; }
+    CSSStyleSheet* style_sheet_for_bindings()
+    {
+        auto* sheet = loaded_style_sheet();
+        return sheet ? &sheet->cssom_sheet() : nullptr;
+    }
+    StyleSheetImport& import() const { return *m_import; }
 
-    Optional<FlyString> layer_name() const;
-    Optional<String> supports_text() const;
+    Optional<Utf16FlyString> layer_name() const;
+    Optional<Utf16String> supports_text() const;
 
     bool matches() const;
-    bool has_scope() const { return m_scope.has_value(); }
-    Optional<SelectorList> const& scope_start_selectors() const;
-    Optional<SelectorList> const& scope_end_selectors() const;
-    Optional<SelectorList> const& scope_start_selectors_for_matching() const;
-    Optional<SelectorList> const& scope_end_selectors_for_matching() const;
+    bool has_scope() const { return m_scope; }
 
-    Optional<FlyString> internal_layer_name() const { return m_layer_internal; }
-    Optional<FlyString> internal_qualified_layer_name(Badge<StyleScope>) const;
+    Optional<Utf16FlyString> internal_layer_name() const;
 
 private:
-    CSSImportRule(JS::Realm&, URL, GC::Ptr<DOM::Document>, Optional<FlyString>, Optional<ImportScope>&&, RefPtr<Supports>, GC::Ref<MediaList>);
+    explicit CSSImportRule(StyleSheetImport&);
 
-    virtual void initialize(JS::Realm&) override;
-    virtual void visit_edges(Cell::Visitor&) override;
-    virtual void clear_caches() override;
+    virtual void visit_edges(GC::Cell::Visitor&) override;
     virtual void dump(StringBuilder&, int indent_levels) const override;
 
-    virtual void set_parent_style_sheet(CSSStyleSheet*) override;
+    virtual void set_parent_style_sheet(StyleSheetState*) override;
 
-    virtual GC::Ptr<CSSStyleSheet> parent_style_sheet_for_subresource() override { return m_parent_style_sheet; }
+    virtual Utf16String serialized() const override;
 
-    virtual String serialized() const override;
-
-    void fetch();
-    void set_style_sheet(GC::Ref<CSSStyleSheet>);
-
-    URL m_url;
-    GC::Ptr<DOM::Document> m_document;
-    Optional<FlyString> m_layer;
-    Optional<FlyString> m_layer_internal;
-    Optional<ImportScope> m_scope;
-    mutable Optional<SelectorList> m_cached_scope_start_selectors_for_matching;
-    mutable Optional<SelectorList> m_cached_scope_end_selectors_for_matching;
-    RefPtr<Supports> m_supports;
-    GC::Ref<MediaList> m_media;
-    GC::Ptr<CSSStyleSheet> m_style_sheet;
+    RustImportRule m_rule;
+    NonnullRefPtr<StyleSheetImport> m_import;
+    mutable Optional<Utf16FlyString> m_layer_internal;
+    RefPtr<RustScopeSelectors> m_scope;
+    Optional<RustQueryHandle> m_supports;
 };
 
 template<>

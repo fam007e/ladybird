@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <AK/Utf16View.h>
 #include <LibWeb/ARIA/Roles.h>
 #include <LibWeb/HTML/HTMLElement.h>
 #include <LibWeb/HTML/PopoverTargetAttributes.h>
@@ -21,26 +22,22 @@ namespace Web::HTML {
 class HTMLButtonElement final
     : public HTMLElement
     , public PopoverTargetAttributes {
-    WEB_PLATFORM_OBJECT(HTMLButtonElement, HTMLElement);
+    WEB_WRAPPABLE(HTMLButtonElement, HTMLElement);
     GC_DECLARE_ALLOCATOR(HTMLButtonElement);
 
 public:
     virtual ~HTMLButtonElement() override;
-
-    virtual void initialize(JS::Realm&) override;
-    virtual void adjust_computed_style(CSS::ComputedProperties::Builder&) override;
-
     enum class TypeAttributeState {
 #define __ENUMERATE_HTML_BUTTON_TYPE_ATTRIBUTE(_, state) state,
         ENUMERATE_HTML_BUTTON_TYPE_ATTRIBUTES
 #undef __ENUMERATE_HTML_BUTTON_TYPE_ATTRIBUTE
     };
 
-    TypeAttributeState type_state() const;
-    String type_for_bindings() const;
-    void set_type_for_bindings(String const&);
+    TypeAttributeState type_state() const { return m_type_state; }
+    Utf16FlyString type_for_bindings() const;
+    void set_type_for_bindings(Utf16View);
 
-    virtual void form_associated_element_attribute_changed(FlyString const& name, Optional<String> const& old_value, Optional<String> const& value, Optional<FlyString> const& namespace_) override;
+    virtual void form_associated_element_attribute_changed(Utf16FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_) override;
 
     // ^EventTarget
     // https://html.spec.whatwg.org/multipage/interaction.html#the-tabindex-attribute:the-button-element
@@ -76,13 +73,13 @@ public:
 
     Utf16String value() const;
     virtual Utf16String form_value() const override { return value(); }
-    virtual Optional<String> optional_value() const override;
+    virtual Optional<Utf16String> optional_value() const override;
 
     virtual bool has_activation_behavior() const override;
     virtual void activation_behavior(DOM::Event const&) override;
 
-    String command() const;
-    void set_command(String const&);
+    Utf16String command() const;
+    void set_command(Utf16View);
 
     GC::Ptr<DOM::Element> command_for_element() { return m_command_for_element; }
     void set_command_for_element(GC::Ptr<DOM::Element> value) { m_command_for_element = value; }
@@ -100,6 +97,9 @@ private:
     // ^DOM::Element
     virtual i32 default_tab_index_value() const override;
 
+    static TypeAttributeState parse_type_attribute(Optional<Utf16String> const&);
+
+    TypeAttributeState m_type_state { TypeAttributeState::Auto };
     GC::Ptr<DOM::Element> m_command_for_element;
 };
 

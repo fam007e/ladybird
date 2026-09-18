@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <LibCore/GeolocationProvider.h>
 #include <LibMain/Main.h>
 #include <LibWebView/Application.h>
 #include <LibWebView/BrowserProcess.h>
@@ -11,13 +12,20 @@
 #include <LibWebView/Utilities.h>
 #include <UI/Qt/Application.h>
 #include <UI/Qt/BrowserWindow.h>
+#if defined(LADYBIRD_QT_HAVE_POSITIONING)
+#    include <UI/Qt/GeolocationProviderQt.h>
+#endif
 #include <UI/Qt/Settings.h>
 
 #include <QCoreApplication>
+#include <QStyleHints>
 #include <QtGlobal>
 
-#if QT_VERSION >= QT_VERSION_CHECK(6, 5, 0)
-#    include <QStyleHints>
+#if defined(AK_OS_MACOS)
+#    include <QColorSpace>
+#    include <QSurfaceFormat>
+#    include <UI/AppKit/Utilities/ApplicationIcon.h>
+#    include <UI/Qt/MacWindow.h>
 #endif
 
 namespace Ladybird {
@@ -26,12 +34,10 @@ namespace Ladybird {
 bool is_using_dark_system_theme(QWidget&);
 bool is_using_dark_system_theme(QWidget& widget)
 {
-#if QT_VERSION >= QT_VERSION_CHECK(6, 5, 0)
     // Use the explicitly set or system default color scheme whenever available
     auto color_scheme = QGuiApplication::styleHints()->colorScheme();
     if (color_scheme != Qt::ColorScheme::Unknown)
         return color_scheme == Qt::ColorScheme::Dark;
-#endif
 
     // Calculate luma based on Rec. 709 coefficients
     // https://en.wikipedia.org/wiki/Rec._709#Luma_coefficients
@@ -46,29 +52,48 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
 {
     AK::set_rich_debug_enabled(true);
 
-#ifdef AK_OS_MACOS
-    // The web content view is a native QRhiWidget child. Keep it from forcing
-    // every sibling in the tab UI to become native as well.
+    // The web content view is presented in a native child window. Without this attribute, a widget
+    // gaining a native window would force every other widget in the browser window to become native
+    // as well.
     QCoreApplication::setAttribute(Qt::AA_DontCreateNativeWidgetSiblings);
+
+#ifdef AK_OS_MACOS
+    auto surface_format = QSurfaceFormat::defaultFormat();
+    surface_format.setColorSpace(QColorSpace::SRgb);
+    QSurfaceFormat::setDefaultFormat(surface_format);
+#endif
+
+#if defined(LADYBIRD_QT_HAVE_POSITIONING)
+    // Only fall back to Qt on platforms that have no geolocation provider of their own.
+    if (!Core::GeolocationProvider::is_available())
+        Ladybird::install_qt_geolocation_provider();
 #endif
 
     auto app = TRY(Ladybird::Application::create(arguments));
-    app->initialize_macos_application_menu();
-    WebView::BrowserProcess browser_process;
+    if (app->should_exit_after_profile_coordination()) {
+        outln("Opening in existing process");
+        return 0;
+    }
+
+    auto& browser_process = app->browser_process();
 
     if (auto const& browser_options = Ladybird::Application::browser_options(); !browser_options.headless_mode.has_value()) {
-        if (browser_options.force_new_process == WebView::ForceNewProcess::No) {
-            auto disposition = TRY(browser_process.connect(browser_options.raw_urls, browser_options.new_window));
-
-            if (disposition == WebView::BrowserProcess::ProcessDisposition::ExitProcess) {
-                outln("Opening in existing process");
-                return 0;
-            }
-        }
+#if defined(AK_OS_MACOS)
+        Ladybird::set_profile_application_icon(Ladybird::Application::profile());
+#endif
 
         app->on_open_file = [&](auto const& file_url) {
-            if (auto* window = app->active_window_if_any()) {
-                window->view().load(file_url);
+            if (auto* window = app->non_private_window_if_any()) {
+                auto& tab = window->new_tab_from_url(file_url, Web::HTML::ActivateTab::Yes, Ladybird::BrowserWindow::TabLocation::end());
+                tab.set_url_is_hidden(false);
+                auto& view = tab.view();
+#if defined(AK_OS_MACOS)
+                Ladybird::make_appkit_window_first_responder(view);
+#endif
+                view.setFocus();
+                window->show();
+                window->activateWindow();
+                window->raise();
                 return;
             }
             app->new_window({ file_url });
@@ -82,7 +107,7 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
 
             auto& window = *app->active_window_if_any();
             for (size_t i = 0; i < urls.size(); ++i) {
-                window.new_tab_from_url(urls[i], (i == 0) ? Web::HTML::ActivateTab::Yes : Web::HTML::ActivateTab::No);
+                window.new_tab_from_url(urls[i], (i == 0) ? Web::HTML::ActivateTab::Yes : Web::HTML::ActivateTab::No, Ladybird::BrowserWindow::TabLocation::end());
             }
             window.show();
             window.activateWindow();

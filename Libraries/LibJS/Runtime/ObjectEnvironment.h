@@ -32,7 +32,7 @@ public:
     virtual Object* with_base_object() const override
     {
         if (is_with_environment())
-            return m_binding_object;
+            return m_binding_object.ptr();
         return nullptr;
     }
 
@@ -43,12 +43,16 @@ public:
     bool is_with_environment() const { return m_with_environment; }
 
 private:
-    ObjectEnvironment(Object& binding_object, IsWithEnvironment, Environment* outer_environment);
+    ObjectEnvironment(Object& binding_object, IsWithEnvironment, GC::Ptr<Environment> outer_environment);
 
+    virtual bool is_object_environment() const override { return true; }
     virtual void visit_edges(Visitor&) override;
 
     GC::Ref<Object> m_binding_object;
     bool m_with_environment { false };
 };
+
+template<>
+inline bool Environment::fast_is<ObjectEnvironment>() const { return is_object_environment(); }
 
 }

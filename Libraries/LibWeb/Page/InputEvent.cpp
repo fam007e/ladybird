@@ -13,12 +13,12 @@ namespace Web {
 
 KeyEvent KeyEvent::clone_without_browser_data() const
 {
-    return { type, key, modifiers, code_point, repeat, should_insert_text, nullptr };
+    return { type, key, modifiers, code_point, repeat, should_insert_text, nullptr, async_scroll_performed_default_action };
 }
 
 MouseEvent MouseEvent::clone_without_browser_data() const
 {
-    return { type, position, screen_position, button, buttons, modifiers, wheel_delta_x, wheel_delta_y, click_count, nullptr, async_scroll_performed_default_action };
+    return { type, position, screen_position, button, buttons, modifiers, wheel_delta_x, wheel_delta_y, wheel_delta_precision, scroll_gesture_phase, click_count, nullptr, async_scroll_performed_default_action };
 }
 
 DragEvent DragEvent::clone_without_browser_data() const
@@ -37,6 +37,7 @@ ErrorOr<void> IPC::encode(Encoder& encoder, Web::KeyEvent const& event)
     TRY(encoder.encode(event.code_point));
     TRY(encoder.encode(event.repeat));
     TRY(encoder.encode(event.should_insert_text));
+    TRY(encoder.encode(event.async_scroll_performed_default_action));
     return {};
 }
 
@@ -49,8 +50,9 @@ ErrorOr<Web::KeyEvent> IPC::decode(Decoder& decoder)
     auto code_point = TRY(decoder.decode<u32>());
     auto repeat = TRY(decoder.decode<bool>());
     auto should_insert_text = TRY(decoder.decode<bool>());
+    auto async_scroll_performed_default_action = TRY(decoder.decode<bool>());
 
-    return Web::KeyEvent { type, key, modifiers, code_point, repeat, should_insert_text, nullptr };
+    return Web::KeyEvent { type, key, modifiers, code_point, repeat, should_insert_text, nullptr, async_scroll_performed_default_action };
 }
 
 template<>
@@ -64,6 +66,8 @@ ErrorOr<void> IPC::encode(Encoder& encoder, Web::MouseEvent const& event)
     TRY(encoder.encode(event.modifiers));
     TRY(encoder.encode(event.wheel_delta_x));
     TRY(encoder.encode(event.wheel_delta_y));
+    TRY(encoder.encode(event.wheel_delta_precision));
+    TRY(encoder.encode(event.scroll_gesture_phase));
     TRY(encoder.encode(event.click_count));
     TRY(encoder.encode(event.async_scroll_performed_default_action));
     return {};
@@ -80,10 +84,12 @@ ErrorOr<Web::MouseEvent> IPC::decode(Decoder& decoder)
     auto modifiers = TRY(decoder.decode<Web::UIEvents::KeyModifier>());
     auto wheel_delta_x = TRY(decoder.decode<double>());
     auto wheel_delta_y = TRY(decoder.decode<double>());
+    auto wheel_delta_precision = TRY(decoder.decode<Web::WheelDeltaPrecision>());
+    auto scroll_gesture_phase = TRY(decoder.decode<Web::ScrollGesturePhase>());
     auto click_count = TRY(decoder.decode<int>());
     auto async_scroll_performed_default_action = TRY(decoder.decode<bool>());
 
-    return Web::MouseEvent { type, position, screen_position, button, buttons, modifiers, wheel_delta_x, wheel_delta_y, click_count, nullptr, async_scroll_performed_default_action };
+    return Web::MouseEvent { type, position, screen_position, button, buttons, modifiers, wheel_delta_x, wheel_delta_y, wheel_delta_precision, scroll_gesture_phase, click_count, nullptr, async_scroll_performed_default_action };
 }
 
 template<>

@@ -10,16 +10,21 @@
 #include <AK/Optional.h>
 #include <LibGfx/DecodedImageFrame.h>
 #include <LibGfx/Forward.h>
-#include <LibWeb/Bindings/PlatformObject.h>
-#include <LibWeb/Bindings/ViewTransition.h>
+#include <LibWeb/Bindings/Wrappable.h>
 #include <LibWeb/CSS/Filter.h>
 #include <LibWeb/CSS/PreferredColorScheme.h>
-#include <LibWeb/CSS/StyleValues/TransformationStyleValue.h>
+#include <LibWeb/CSS/StyleValues/RustStyleValueHandle.h>
 #include <LibWeb/DOM/PseudoElement.h>
+#include <LibWeb/Export.h>
 #include <LibWeb/Forward.h>
 #include <LibWeb/PixelUnits.h>
 
 namespace Web::ViewTransition {
+
+// A translate() <transform-function> style value built as a bare Rust handle: captured transforms
+// are only stored and (eventually) serialized into the dynamic view transition style sheet, so no
+// C++ wrapper facade is needed.
+CSS::RustStyleValueHandle make_translation_transform(CSSPixels x, CSSPixels y);
 
 // https://drafts.csswg.org/css-view-transitions-1/#named-view-transition-pseudo
 class NamedViewTransitionPseudoElement
@@ -27,13 +32,13 @@ class NamedViewTransitionPseudoElement
     GC_CELL(NamedViewTransitionPseudoElement, DOM::SyntheticPseudoElementTreeNode);
     GC_DECLARE_ALLOCATOR(NamedViewTransitionPseudoElement);
 
-    NamedViewTransitionPseudoElement(CSS::PseudoElement, FlyString);
+    NamedViewTransitionPseudoElement(CSS::PseudoElement, Utf16FlyString);
 
     CSS::PseudoElement m_type;
 
     // Several of the view transition pseudo-elements are named view transition pseudo-elements, which are
     // functional tree-abiding view transition pseudo-elements associated with a view transition name.
-    FlyString m_view_transition_name;
+    Utf16FlyString m_view_transition_name;
 };
 
 // https://drafts.csswg.org/css-view-transitions-1/#::view-transition-old
@@ -43,7 +48,7 @@ class ReplacedNamedViewTransitionPseudoElement
     GC_CELL(ReplacedNamedViewTransitionPseudoElement, NamedViewTransitionPseudoElement);
     GC_DECLARE_ALLOCATOR(ReplacedNamedViewTransitionPseudoElement);
 
-    ReplacedNamedViewTransitionPseudoElement(CSS::PseudoElement, FlyString, Optional<Gfx::DecodedImageFrame>);
+    ReplacedNamedViewTransitionPseudoElement(CSS::PseudoElement, Utf16FlyString, Optional<Gfx::DecodedImageFrame>);
 
     Optional<Gfx::DecodedImageFrame> m_content;
 };
@@ -56,8 +61,7 @@ struct CapturedElement : public JS::Cell {
     Optional<Gfx::DecodedImageFrame> old_image {};
     CSSPixels old_width = 0;
     CSSPixels old_height = 0;
-    // FIXME: Make this an identity transform function by default.
-    NonnullRefPtr<CSS::TransformationStyleValue const> old_transform = CSS::TransformationStyleValue::identity_transformation(CSS::TransformFunction::Translate);
+    CSS::RustStyleValueHandle old_transform = make_translation_transform(0, 0);
     Optional<CSS::WritingMode> old_writing_mode {};
     Optional<CSS::Direction> old_direction {};
     // FIXME: old_text_orientation
@@ -79,12 +83,13 @@ private:
 // https://drafts.csswg.org/css-view-transitions-1/#callbackdef-viewtransitionupdatecallback
 using ViewTransitionUpdateCallback = GC::Ptr<WebIDL::CallbackType>;
 
-class ViewTransition final : public Bindings::PlatformObject {
-    WEB_PLATFORM_OBJECT(ViewTransition, Bindings::PlatformObject);
+class ViewTransition final : public Bindings::GCAllocatedWrappable {
+    WEB_WRAPPABLE(ViewTransition, Bindings::GCAllocatedWrappable);
     GC_DECLARE_ALLOCATOR(ViewTransition);
 
 public:
-    static GC::Ref<ViewTransition> create(JS::Realm&);
+    static GC::Ref<ViewTransition> create(GC::Ref<DOM::Document>, GC::Ref<WebIDL::Promise> ready_promise,
+        GC::Ref<WebIDL::Promise> update_callback_done_promise, GC::Ref<WebIDL::Promise> finished_promise);
     virtual ~ViewTransition() override = default;
 
     // https://drafts.csswg.org/css-view-transitions-1/#dom-viewtransition-updatecallbackdone
@@ -119,6 +124,7 @@ public:
 
     // https://drafts.csswg.org/css-view-transitions-1/#skip-the-view-transition
     void skip_the_view_transition(JS::Value reason);
+    void skip_the_view_transition(GC::Ref<WebIDL::DOMException> reason);
 
     // https://drafts.csswg.org/css-view-transitions-1/#handle-transition-frame
     void handle_transition_frame();
@@ -140,13 +146,16 @@ public:
     void set_update_callback(ViewTransitionUpdateCallback callback) { m_update_callback = callback; }
 
 private:
-    ViewTransition(JS::Realm&, GC::Ref<WebIDL::Promise>, GC::Ref<WebIDL::Promise>, GC::Ref<WebIDL::Promise>);
-    virtual void initialize(JS::Realm&) override;
+    ViewTransition(GC::Ref<DOM::Document>, GC::Ref<WebIDL::Promise>, GC::Ref<WebIDL::Promise>, GC::Ref<WebIDL::Promise>);
 
-    virtual void visit_edges(JS::Cell::Visitor&) override;
+    DOM::Document& document() const { return m_document; }
+
+    virtual void visit_edges(GC::Cell::Visitor&) override;
+
+    GC::Ref<DOM::Document> m_document;
 
     // https://drafts.csswg.org/css-view-transitions-1/#viewtransition-named-elements
-    HashMap<FlyString, GC::Ptr<CapturedElement>> m_named_elements = {};
+    HashMap<Utf16FlyString, GC::Ptr<CapturedElement>> m_named_elements = {};
 
     // https://drafts.csswg.org/css-view-transitions-1/#viewtransition-phase
     Phase m_phase = Phase::PendingCapture;

@@ -10,7 +10,9 @@
 #include <LibCore/Socket.h>
 #include <LibCore/StandardPaths.h>
 #include <LibCore/System.h>
+#include <LibFileSystem/FileSystem.h>
 #include <LibWebView/Process.h>
+#include <LibWebView/ProcessManager.h>
 
 #include <fcntl.h>
 
@@ -33,10 +35,20 @@ Process::Process(ProcessType type, RefPtr<IPC::ConnectionBase> connection, Core:
 {
 }
 
+void Process::save_crash_report(Optional<int> exit_status)
+{
+    if (m_crash_report && exit_status.has_value()) {
+        if (auto result = m_crash_report->save(*exit_status); result.is_error())
+            warnln("Could not save {} crash report: {}", process_name_from_type(m_type), result.error());
+    }
+    m_crash_report = nullptr;
+}
+
 Process::~Process()
 {
-    if (m_connection)
-        m_connection->shutdown();
+    // shutdown() can release the connection's last owner while dispatching die().
+    if (auto connection = m_connection.strong_ref())
+        connection->shutdown();
 }
 
 ErrorOr<Process::ProcessAndIPCTransport> Process::spawn_and_connect_to_process(Core::ProcessSpawnOptions const& options, bool capture_output)
@@ -70,7 +82,10 @@ ErrorOr<Process::ProcessAndIPCTransport> Process::spawn_and_connect_to_process(C
     auto port_b_recv = TRY(Core::MachPort::create_with_right(Core::MachPort::PortRight::Receive));
     auto port_b_send = TRY(port_b_recv.insert_right(Core::MachPort::MessageRight::MakeSend));
 
-    Sync::MutexLocker child_registration_locker(Application::transport_bootstrap_server().child_registration_lock());
+    // The child may receive startup messages before it has constructed its transport.
+    IPC::TransportMachPort::raise_receive_queue_limit(port_b_recv);
+
+    MutexLocker child_registration_locker(Application::transport_bootstrap_server().child_registration_lock());
     auto process = TRY(Core::Process::spawn(spawn_options));
 
     Application::transport_bootstrap_server().register_child_transport(process.pid(), IPC::TransportBootstrapMachPorts { move(port_b_recv), move(port_a_send) });
@@ -113,7 +128,7 @@ ErrorOr<Process::ProcessAndIPCTransport> Process::spawn_and_connect_to_process(C
 
 ErrorOr<Optional<pid_t>> Process::get_process_pid(StringView process_name, StringView pid_path)
 {
-    if (Core::System::stat(pid_path).is_error())
+    if (!FileSystem::exists(pid_path))
         return OptionalNone {};
 
     Optional<pid_t> pid;
@@ -135,7 +150,7 @@ ErrorOr<Optional<pid_t>> Process::get_process_pid(StringView process_name, Strin
 
     if (!pid.has_value()) {
         warnln("{} PID file '{}' exists, but with an invalid PID", process_name, pid_path);
-        TRY(Core::System::unlink(pid_path));
+        TRY(FileSystem::remove(pid_path, FileSystem::RecursionMode::Disallowed));
         return OptionalNone {};
     }
 
@@ -160,7 +175,7 @@ ErrorOr<Optional<pid_t>> Process::get_process_pid(StringView process_name, Strin
 
     if (process_not_found) {
         warnln("{} PID file '{}' exists with PID {}, but process cannot be found", process_name, pid_path, *pid);
-        TRY(Core::System::unlink(pid_path));
+        TRY(FileSystem::remove(pid_path, FileSystem::RecursionMode::Disallowed));
         return OptionalNone {};
     }
 
@@ -170,13 +185,12 @@ ErrorOr<Optional<pid_t>> Process::get_process_pid(StringView process_name, Strin
 // This is heavily based on how SystemServer's Service creates its socket.
 ErrorOr<int> Process::create_ipc_socket(ByteString const& socket_path)
 {
-    if (!Core::System::stat(socket_path).is_error())
-        TRY(Core::System::unlink(socket_path));
+    if (FileSystem::exists(socket_path))
+        TRY(FileSystem::remove(socket_path, FileSystem::RecursionMode::Disallowed));
 
 #if defined(AK_OS_WINDOWS)
     auto socket_fd = TRY(Core::System::socket(AF_LOCAL, SOCK_STREAM, 0));
-    int option = 1;
-    TRY(Core::System::ioctl(socket_fd, FIONBIO, &option));
+    TRY(Core::System::set_socket_blocking(socket_fd, false));
     if (SetHandleInformation(to_handle(socket_fd), HANDLE_FLAG_INHERIT, 0) == 0)
         return Error::from_windows_error();
 #else
@@ -204,9 +218,8 @@ ErrorOr<int> Process::create_ipc_socket(ByteString const& socket_path)
     return socket_fd;
 }
 
-ErrorOr<Process::ProcessPaths> Process::paths_for_process(StringView process_name)
+ErrorOr<Process::ProcessPaths> Process::paths_for_process(StringView process_name, StringView runtime_directory)
 {
-    auto runtime_directory = TRY(Core::StandardPaths::runtime_directory());
     auto socket_path = ByteString::formatted("{}/{}.socket", runtime_directory, process_name);
     auto pid_path = ByteString::formatted("{}/{}.pid", runtime_directory, process_name);
 

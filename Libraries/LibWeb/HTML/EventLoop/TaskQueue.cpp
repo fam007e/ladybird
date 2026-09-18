@@ -24,8 +24,10 @@ void TaskQueue::visit_edges(Visitor& visitor)
 {
     Base::visit_edges(visitor);
     visitor.visit(m_event_loop);
-    visitor.visit(m_tasks);
-    visitor.visit(m_idle_tasks);
+    for (auto& task : m_tasks)
+        visitor.visit(task);
+    for (auto& task : m_idle_tasks)
+        visitor.visit(task);
     visitor.visit(m_last_added_task);
 }
 
@@ -36,11 +38,18 @@ void TaskQueue::add(GC::Ref<Task> task)
     if (task->document() && task->document()->is_temporary_document_for_fragment_parsing())
         return;
 
+    // AD-HOC: Don't enqueue a task for a destroyed document either: "destroy a document" removes the document's
+    //         tasks from every task queue, and a destroyed document is never fully active again, so a task queued
+    //         for it afterwards could never run. It would only sit in the queue — and queuing it wakes the event
+    //         loop, which then scans the whole queue for a runnable task, but finds none.
+    if (task->document() && task->document()->has_been_destroyed())
+        return;
+
     m_last_added_task = task.ptr();
-    if (task->source() == Task::Source::IdleTask)
-        m_idle_tasks.append(task);
+    if (task->priority() == Task::Priority::Idle)
+        m_idle_tasks.append(*task);
     else
-        m_tasks.append(task);
+        m_tasks.append(*task);
     m_event_loop->schedule();
 }
 
@@ -49,8 +58,8 @@ GC::Ptr<Task> TaskQueue::dequeue()
     auto take_task = [&](auto& tasks) -> GC::Ptr<Task> {
         if (tasks.is_empty())
             return {};
-        auto task = tasks.take_first();
-        if (m_last_added_task == task.ptr())
+        auto* task = tasks.take_first();
+        if (m_last_added_task.ptr() == task)
             m_last_added_task = {};
         return task;
     };
@@ -65,43 +74,49 @@ GC::Ptr<Task> TaskQueue::take_first_runnable()
     if (m_event_loop->execution_paused())
         return nullptr;
 
-    for (size_t i = 0; i < m_tasks.size();) {
-        if (m_event_loop->running_rendering_task() && m_tasks[i]->source() == Task::Source::Rendering) {
-            ++i;
+    for (auto it = m_tasks.begin(); it != m_tasks.end();) {
+        auto& task = *it;
+
+        if (m_event_loop->running_rendering_task() && task.source() == Task::Source::Rendering) {
+            ++it;
             continue;
         }
 
-        if (m_tasks[i]->is_runnable()) {
-            if (m_last_added_task == m_tasks[i].ptr())
+        if (task.is_runnable()) {
+            if (m_last_added_task.ptr() == &task)
                 m_last_added_task = {};
-            return m_tasks.take(i);
+            it.erase();
+            return &task;
         }
 
-        if (m_tasks[i]->is_permanently_unrunnable()) {
-            if (m_last_added_task == m_tasks[i].ptr())
+        if (task.is_permanently_unrunnable()) {
+            if (m_last_added_task.ptr() == &task)
                 m_last_added_task = {};
-            m_tasks.remove(i);
+            it.erase();
             continue;
         }
 
-        ++i;
+        ++it;
     }
 
-    for (size_t i = 0; i < m_idle_tasks.size();) {
-        if (m_idle_tasks[i]->is_runnable()) {
-            if (m_last_added_task == m_idle_tasks[i].ptr())
+    for (auto it = m_idle_tasks.begin(); it != m_idle_tasks.end();) {
+        auto& task = *it;
+
+        if (task.is_runnable()) {
+            if (m_last_added_task.ptr() == &task)
                 m_last_added_task = {};
-            return m_idle_tasks.take(i);
+            it.erase();
+            return &task;
         }
 
-        if (m_idle_tasks[i]->is_permanently_unrunnable()) {
-            if (m_last_added_task == m_idle_tasks[i].ptr())
+        if (task.is_permanently_unrunnable()) {
+            if (m_last_added_task.ptr() == &task)
                 m_last_added_task = {};
-            m_idle_tasks.remove(i);
+            it.erase();
             continue;
         }
 
-        ++i;
+        ++it;
     }
     return nullptr;
 }
@@ -112,14 +127,14 @@ bool TaskQueue::has_runnable_tasks() const
         return false;
 
     for (auto& task : m_tasks) {
-        if (m_event_loop->running_rendering_task() && task->source() == Task::Source::Rendering)
+        if (m_event_loop->running_rendering_task() && task.source() == Task::Source::Rendering)
             continue;
-        if (task->is_runnable())
+        if (task.is_runnable())
             return true;
     }
 
     for (auto& task : m_idle_tasks) {
-        if (task->is_runnable())
+        if (task.is_runnable())
             return true;
     }
     return false;
@@ -127,55 +142,62 @@ bool TaskQueue::has_runnable_tasks() const
 
 void TaskQueue::remove_tasks_matching(Function<bool(HTML::Task const&)> filter)
 {
-    auto wrapped_filter = [&](HTML::Task const& task) {
-        if (!filter(task))
-            return false;
-        if (m_last_added_task == &task)
-            m_last_added_task = {};
-        return true;
+    auto remove_matching_tasks = [&](auto& tasks) {
+        for (auto it = tasks.begin(); it != tasks.end();) {
+            auto& task = *it;
+            if (!filter(task)) {
+                ++it;
+                continue;
+            }
+            if (m_last_added_task.ptr() == &task)
+                m_last_added_task = {};
+            it.erase();
+        }
     };
-    m_tasks.remove_all_matching(wrapped_filter);
-    m_idle_tasks.remove_all_matching(wrapped_filter);
+    remove_matching_tasks(m_tasks);
+    remove_matching_tasks(m_idle_tasks);
 }
 
 GC::Ptr<Task> TaskQueue::take_first_runnable_matching(Function<bool(HTML::Task const&)> filter)
 {
-    for (size_t i = 0; i < m_tasks.size();) {
-        auto& task = m_tasks.at(i);
+    for (auto it = m_tasks.begin(); it != m_tasks.end();) {
+        auto& task = *it;
 
-        if (task->is_runnable() && filter(*task)) {
-            if (m_last_added_task == task.ptr())
+        if (task.is_runnable() && filter(task)) {
+            if (m_last_added_task.ptr() == &task)
                 m_last_added_task = {};
-            return m_tasks.take(i);
+            it.erase();
+            return &task;
         }
 
-        if (task->is_permanently_unrunnable()) {
-            if (m_last_added_task == task.ptr())
+        if (task.is_permanently_unrunnable()) {
+            if (m_last_added_task.ptr() == &task)
                 m_last_added_task = {};
-            m_tasks.remove(i);
+            it.erase();
             continue;
         }
 
-        ++i;
+        ++it;
     }
 
-    for (size_t i = 0; i < m_idle_tasks.size();) {
-        auto& task = m_idle_tasks.at(i);
+    for (auto it = m_idle_tasks.begin(); it != m_idle_tasks.end();) {
+        auto& task = *it;
 
-        if (task->is_runnable() && filter(*task)) {
-            if (m_last_added_task == task.ptr())
+        if (task.is_runnable() && filter(task)) {
+            if (m_last_added_task.ptr() == &task)
                 m_last_added_task = {};
-            return m_idle_tasks.take(i);
+            it.erase();
+            return &task;
         }
 
-        if (task->is_permanently_unrunnable()) {
-            if (m_last_added_task == task.ptr())
+        if (task.is_permanently_unrunnable()) {
+            if (m_last_added_task.ptr() == &task)
                 m_last_added_task = {};
-            m_idle_tasks.remove(i);
+            it.erase();
             continue;
         }
 
-        ++i;
+        ++it;
     }
 
     return nullptr;
@@ -188,7 +210,11 @@ Task const* TaskQueue::last_added_task() const
 
 bool TaskQueue::has_rendering_tasks() const
 {
-    return m_tasks.contains([](auto const& task) { return task->source() == Task::Source::Rendering; });
+    for (auto const& task : m_tasks) {
+        if (task.source() == Task::Source::Rendering)
+            return true;
+    }
+    return false;
 }
 
 }

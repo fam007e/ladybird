@@ -1,0 +1,38 @@
+/*
+ * Copyright (c) 2026-present, the Ladybird developers.
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#pragma once
+
+#include <AK/Optional.h>
+#include <AK/Span.h>
+#include <LibGfx/Rect.h>
+#include <LibWeb/Export.h>
+#include <LibWeb/Forward.h>
+#include <LibWeb/Painting/ScrollState.h>
+
+namespace Web::Painting {
+
+class AccumulatedVisualContextTree;
+class ScrollStateSnapshot;
+
+WEB_API Optional<Gfx::IntRect> compute_display_list_damage(
+    DisplayList const& old_display_list,
+    AccumulatedVisualContextTree const& old_visual_context_tree,
+    ScrollStateSnapshot const& old_scroll_state,
+    DisplayList const& new_display_list,
+    AccumulatedVisualContextTree const& new_visual_context_tree,
+    ScrollStateSnapshot const& new_scroll_state,
+    Gfx::IntRect viewport_rect);
+
+WEB_API bool animated_content_may_affect_viewport(
+    ReadonlyBytes display_list_commands,
+    AccumulatedVisualContextTree const&,
+    ScrollStateSnapshot const&,
+    ReadonlySpan<SpatialNodeIndex> rotation_nodes,
+    ReadonlySpan<EffectNodeIndex> opacity_nodes,
+    Gfx::IntRect viewport_rect);
+
+}

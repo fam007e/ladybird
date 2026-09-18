@@ -6,6 +6,9 @@
 
 #include <AK/HashMap.h>
 #include <AK/IDAllocator.h>
+#include <AK/Mutex.h>
+#include <AK/MutexProtected.h>
+#include <AK/RWLock.h>
 #include <AK/Singleton.h>
 #include <AK/TemporaryChange.h>
 #include <LibCore/Event.h>
@@ -14,12 +17,10 @@
 #include <LibCore/SocketAddress.h>
 #include <LibCore/System.h>
 #include <LibCore/ThreadEventQueue.h>
-#include <LibSync/Mutex.h>
-#include <LibSync/MutexProtected.h>
-#include <LibSync/RWLock.h>
 #include <UI/Qt/EventLoopImplementationQt.h>
 #include <UI/Qt/EventLoopImplementationQtEventTarget.h>
 
+#include <QAbstractEventDispatcher>
 #include <QCoreApplication>
 #include <QEvent>
 #include <QEventLoop>
@@ -36,10 +37,10 @@ namespace Ladybird {
 struct ThreadData;
 static thread_local OwnPtr<ThreadData> s_this_thread_data;
 static HashMap<pthread_t, ThreadData*> s_thread_data;
-static Sync::RWLock s_thread_data_lock;
+static RWLock s_thread_data_lock;
 static thread_local Optional<pthread_t> s_thread_id;
 #if defined(AK_OS_WINDOWS)
-static Sync::MutexProtected<HashMap<pid_t, QWinEventNotifier*>> s_processes;
+static MutexProtected<HashMap<pid_t, QWinEventNotifier*>> s_processes;
 #endif
 
 struct ThreadData {
@@ -49,7 +50,7 @@ struct ThreadData {
             s_thread_id = pthread_self();
         if (!s_this_thread_data) {
             s_this_thread_data = make<ThreadData>();
-            Sync::RWLockLocker<Sync::LockMode::Write> locker(s_thread_data_lock);
+            RWLockLocker<RWLock::Mode::Write> locker(s_thread_data_lock);
             s_thread_data.set(s_thread_id.value(), s_this_thread_data.ptr());
         }
         return *s_this_thread_data;
@@ -57,17 +58,17 @@ struct ThreadData {
 
     static ThreadData* for_thread(pthread_t thread_id)
     {
-        Sync::RWLockLocker<Sync::LockMode::Read> locker(s_thread_data_lock);
+        RWLockLocker<RWLock::Mode::Read> locker(s_thread_data_lock);
         return s_thread_data.get(thread_id).value_or(nullptr);
     }
 
     ~ThreadData()
     {
-        Sync::RWLockLocker<Sync::LockMode::Write> locker(s_thread_data_lock);
+        RWLockLocker<RWLock::Mode::Write> locker(s_thread_data_lock);
         s_thread_data.remove(s_thread_id.value());
     }
 
-    Sync::Mutex mutex;
+    Mutex mutex;
     HashMap<Core::Notifier*, NonnullOwnPtr<QSocketNotifier>> notifiers;
 };
 
@@ -215,16 +216,26 @@ static void dispatch_signal(int signal_number)
 
 EventLoopImplementationQt::EventLoopImplementationQt()
     : m_event_loop(make<QEventLoop>())
+    , m_event_dispatcher(QAbstractEventDispatcher::instance())
 {
+    VERIFY(m_event_dispatcher);
 }
 
 EventLoopImplementationQt::~EventLoopImplementationQt() = default;
 
 int EventLoopImplementationQt::exec()
 {
+    if (auto exit_code = exit_code_if_requested(); exit_code.has_value())
+        return exit_code.release_value();
+
     if (is_main_loop())
         return QCoreApplication::exec();
-    return m_event_loop->exec();
+
+    for (;;) {
+        pump(PumpMode::WaitForEvents);
+        if (auto exit_code = exit_code_if_requested(); exit_code.has_value())
+            return exit_code.release_value();
+    }
 }
 
 size_t EventLoopImplementationQt::pump(PumpMode mode)
@@ -241,23 +252,31 @@ size_t EventLoopImplementationQt::pump(PumpMode mode)
 
 void EventLoopImplementationQt::quit(int code)
 {
-    if (is_main_loop())
+    request_exit(code);
+    if (!is_main_loop())
+        return;
+
+    auto* application = QCoreApplication::instance();
+    VERIFY(application);
+    if (QThread::currentThread() == application->thread()) {
         QCoreApplication::exit(code);
-    else
-        m_event_loop->exit(code);
+        return;
+    }
+
+    QMetaObject::invokeMethod(application, [code] { QCoreApplication::exit(code); }, Qt::QueuedConnection);
 }
 
 void EventLoopImplementationQt::wake()
 {
     if (!is_main_loop())
-        m_event_loop->wakeUp();
+        m_event_dispatcher->wakeUp();
 }
 
 bool EventLoopImplementationQt::was_exit_requested() const
 {
-    if (is_main_loop())
-        return QCoreApplication::closingDown();
-    return !m_event_loop->isRunning();
+    if (Core::EventLoopImplementation::was_exit_requested())
+        return true;
+    return is_main_loop() && QCoreApplication::closingDown();
 }
 
 void EventLoopImplementationQt::set_main_loop()
@@ -316,16 +335,16 @@ void EventLoopManagerQt::register_notifier(Core::Notifier& notifier)
     default:
         TODO();
     }
+
     auto socket_notifier = make<QSocketNotifier>(notifier.fd(), type);
     QObject::connect(socket_notifier, &QSocketNotifier::activated, [weak_notifier = notifier.make_weak_ptr()] {
-        if (!weak_notifier)
-            return;
-        qt_notifier_activated(static_cast<Core::Notifier&>(*weak_notifier));
+        if (auto notifier = weak_notifier.strong_ref())
+            qt_notifier_activated(static_cast<Core::Notifier&>(*notifier));
     });
 
     {
         auto& thread_data = ThreadData::the();
-        Sync::MutexLocker locker(thread_data.mutex);
+        MutexLocker locker(thread_data.mutex);
         thread_data.notifiers.set(&notifier, move(socket_notifier));
     }
     notifier.set_owner_thread(s_thread_id.value());
@@ -336,7 +355,7 @@ void EventLoopManagerQt::unregister_notifier(Core::Notifier& notifier)
     auto* thread_data = ThreadData::for_thread(notifier.owner_thread());
     if (!thread_data)
         return;
-    Sync::MutexLocker locker(thread_data->mutex);
+    MutexLocker locker(thread_data->mutex);
     auto deleted_notifier = thread_data->notifiers.take(&notifier).release_value();
     if (QThread::currentThread() != deleted_notifier->thread()) {
         auto* deleted_notifier_ptr = deleted_notifier.ptr();

@@ -7,11 +7,14 @@
 #pragma once
 
 #include <AK/HashMap.h>
+#include <AK/Utf16String.h>
+#include <AK/Utf16View.h>
 #include <LibGC/Function.h>
 #include <LibGC/Ptr.h>
 #include <LibJS/Heap/Cell.h>
 #include <LibURL/URL.h>
 #include <LibWeb/Fetch/Infrastructure/HTTP/Requests.h>
+#include <LibWeb/Fetch/Infrastructure/Task.h>
 #include <LibWeb/Forward.h>
 
 namespace Web::HTML {
@@ -41,7 +44,7 @@ struct PreloadKey {
 PreloadKey create_a_preload_key(Fetch::Infrastructure::Request const&);
 
 // https://html.spec.whatwg.org/multipage/links.html#translate-a-preload-destination
-Variant<Empty, Optional<Fetch::Infrastructure::Request::Destination>> translate_a_preload_destination(Optional<String> const& destination);
+Variant<Empty, Optional<Fetch::Infrastructure::Request::Destination>> translate_a_preload_destination(Utf16View destination);
 
 // https://html.spec.whatwg.org/multipage/links.html#preload-entry
 class PreloadEntry final : public JS::Cell {
@@ -49,11 +52,13 @@ class PreloadEntry final : public JS::Cell {
     GC_DECLARE_ALLOCATOR(PreloadEntry);
 
 public:
+    static GC::Ref<PreloadEntry> create();
+
     virtual void visit_edges(Cell::Visitor&) override;
 
     // integrity metadata
     //     A string
-    String integrity_metadata;
+    Utf16String integrity_metadata;
 
     // response
     //     Null or a response
@@ -64,6 +69,11 @@ public:
     // The callback is always invoked with a non-null response — either entry's resolved response,
     // or the response delivered by the preload's fetch.
     GC::Ptr<GC::Function<void(GC::Ref<Fetch::Infrastructure::Response>)>> on_response_available;
+
+    // AD-HOC: The controller of the fetch loading this entry. A consumer whose own fetch runs on a parallel queue (a
+    //         sync XHR send(), whose event loop is paused while it's blocked) re-targets that fetch thru this, so it
+    //         delivers its response without the event loop as well; see consume_a_preloaded_resource().
+    GC::Ptr<Fetch::Infrastructure::FetchController> controller;
 };
 
 // https://html.spec.whatwg.org/multipage/links.html#consume-a-preloaded-resource
@@ -73,8 +83,9 @@ bool consume_a_preloaded_resource(
     Optional<Fetch::Infrastructure::Request::Destination> destination,
     Fetch::Infrastructure::Request::Mode mode,
     Fetch::Infrastructure::Request::CredentialsMode credentials_mode,
-    String const& integrity_metadata,
-    GC::Ref<GC::Function<void(GC::Ref<Fetch::Infrastructure::Response>)>> on_response_available);
+    Utf16View integrity_metadata,
+    GC::Ref<GC::Function<void(GC::Ref<Fetch::Infrastructure::Response>)>> on_response_available,
+    Fetch::Infrastructure::TaskDestination const& consumer_task_destination);
 
 }
 

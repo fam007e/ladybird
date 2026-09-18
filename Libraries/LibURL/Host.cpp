@@ -154,7 +154,36 @@ bool Host::is_domain() const
 bool Host::is_empty_host() const
 {
     // An empty host is the empty string.
-    return m_value.has<String>() && m_value.get<String>().is_empty();
+    return m_value.visit(
+        [](String const& domain) { return domain.is_empty(); },
+        [](OpaqueHost const& opaque_host) { return opaque_host.value.is_empty(); },
+        [](auto const&) { return false; });
+}
+
+// AD-HOC: This isn't a standalone spec concept; instead, it's the host-focused portion of steps 4 and 5 of
+//         https://w3c.github.io/webappsec-secure-contexts/#is-origin-trustworthy — shared here so LibWeb's Secure
+//         Contexts implementation and other components can identify hosts guaranteed to name the loopback interface.
+bool Host::is_loopback_or_localhost() const
+{
+    // If origin's host matches one of the CIDR notations 127.0.0.0/8 or ::1/128 [RFC4632], return "Potentially Trustworthy".
+    // NOTE: For hosts produced by the URL parser, to_u32() is the URL spec's IPv4 number — with the first octet in the
+    //       most-significant byte.
+    if (auto const* ipv4_address = m_value.get_pointer<IPv4Address>())
+        return (ipv4_address->to_u32() & 0xff000000) == 0x7f000000;
+
+    if (auto const* ipv6_address = m_value.get_pointer<IPv6Address>())
+        return *ipv6_address == IPv6Address::loopback();
+
+    // If the user agent conforms to the name resolution rules in [let-localhost-be-localhost] and one of the following is true:
+    // - origin's host is "localhost" or "localhost."
+    // - origin's host ends with ".localhost" or ".localhost."
+    // then return "Potentially Trustworthy".
+    auto const* domain = m_value.get_pointer<String>();
+    if (!domain)
+        return false;
+    return domain->is_one_of("localhost"sv, "localhost."sv)
+        || domain->ends_with_bytes(".localhost"sv)
+        || domain->ends_with_bytes(".localhost."sv);
 }
 
 // https://url.spec.whatwg.org/#concept-host-serializer
@@ -176,6 +205,9 @@ String Host::serialize() const
         // 3. Otherwise, host is a domain, opaque host, or empty host, return host.
         [](String const& string) {
             return string;
+        },
+        [](OpaqueHost const& opaque_host) {
+            return opaque_host.value;
         });
 }
 

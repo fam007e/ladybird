@@ -1,9 +1,12 @@
 set(TEST_SOURCES
+    TestBlockAllocator.cpp
+    TestExternalEntityTable.cpp
     TestGCContainers.cpp
     TestGCHeapGroup.cpp
     TestGCIdleCollection.cpp
     TestPrimitiveStorage.cpp
     TestGCVisitor.cpp
+    TestNanBoxedValue.cpp
 )
 
 foreach(source IN LISTS TEST_SOURCES)

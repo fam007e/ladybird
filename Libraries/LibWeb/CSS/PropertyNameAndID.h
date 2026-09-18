@@ -6,7 +6,9 @@
 
 #pragma once
 
+#include <AK/HashFunctions.h>
 #include <AK/Optional.h>
+#include <AK/Traits.h>
 #include <AK/Utf16FlyString.h>
 #include <LibWeb/CSS/PropertyName.h>
 #include <LibWeb/CSS/Serialize.h>
@@ -20,11 +22,7 @@ public:
         if (is_a_custom_property_name_string(name))
             return PropertyNameAndID(move(name), PropertyID::Custom);
 
-        if (!name.is_ascii())
-            return {};
-
-        auto name_string = name.to_utf16_string();
-        if (auto property_id = property_id_from_string(name_string.ascii_view()); property_id.has_value())
+        if (auto property_id = property_id_from_string(name); property_id.has_value())
             return PropertyNameAndID(string_from_property_id(property_id.value()), property_id.value());
 
         return {};
@@ -34,6 +32,12 @@ public:
     {
         VERIFY(property_id != PropertyID::Custom);
         return PropertyNameAndID({}, property_id);
+    }
+
+    PropertyNameAndID(Badge<StyleComputer>, PropertyID property_id, Utf16FlyString name)
+        : m_name(move(name))
+        , m_property_id(property_id)
+    {
     }
 
     bool is_custom_property() const { return m_property_id == PropertyID::Custom; }
@@ -48,7 +52,26 @@ public:
 
     String to_string() const
     {
-        return serialize_an_identifier(name().to_utf16_string().to_utf8_but_should_be_ported_to_utf16());
+        return serialize_an_identifier(name());
+    }
+
+    Utf16String to_utf16_string() const
+    {
+        return serialize_an_identifier_to_utf16(name());
+    }
+
+    bool operator==(PropertyNameAndID const& other) const
+    {
+        if (m_property_id != other.m_property_id)
+            return false;
+        return !is_custom_property() || name() == other.name();
+    }
+
+    unsigned hash() const
+    {
+        if (is_custom_property())
+            return name().hash();
+        return u32_hash(to_underlying(m_property_id));
     }
 
 private:
@@ -63,3 +86,8 @@ private:
 };
 
 }
+
+template<>
+struct AK::Traits<Web::CSS::PropertyNameAndID> : public DefaultTraits<Web::CSS::PropertyNameAndID> {
+    static unsigned hash(Web::CSS::PropertyNameAndID const& property) { return property.hash(); }
+};

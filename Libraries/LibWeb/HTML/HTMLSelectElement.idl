@@ -24,11 +24,11 @@ interface HTMLSelectElement : HTMLElement {
 
     [SameObject] readonly attribute HTMLCollection selectedOptions;
     attribute long selectedIndex;
-    attribute Utf16DOMString value;
+    attribute DOMString value;
 
     readonly attribute boolean willValidate;
     readonly attribute ValidityState validity;
-    readonly attribute Utf16DOMString validationMessage;
+    readonly attribute DOMString validationMessage;
     boolean checkValidity();
     boolean reportValidity();
     undefined setCustomValidity(DOMString error);

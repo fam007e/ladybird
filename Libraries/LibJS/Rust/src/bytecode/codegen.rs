@@ -714,7 +714,8 @@ fn generate_function_expression(
     } else {
         None
     };
-    let lhs_name_str: Option<Utf16String> = lhs_name.map(|index| generator.identifier_table[index.0 as usize].clone());
+    let lhs_name_str: Option<Utf16String> =
+        lhs_name.map(|index| Utf16String::from(generator.identifier_table[index.0 as usize].to_utf16().as_ref()));
     let name_override = if !has_name { lhs_name_str.as_deref() } else { None };
     let shared_function_data_index = emit_new_function(generator, data, name_override);
     if should_eager_compile
@@ -1026,7 +1027,10 @@ pub fn generate_statement(
 
     let result = match &statement.inner {
         StatementKind::Empty | StatementKind::Error | StatementKind::ErrorDeclaration => None,
-        StatementKind::Debugger => None,
+        StatementKind::Debugger => {
+            generator.emit(Instruction::Debugger {});
+            None
+        }
 
         // === ExpressionStatement ===
         StatementKind::Expression(expression) => generate_expression(expression, generator, None),
@@ -2938,6 +2942,102 @@ fn emit_set_variable_or_resolved_binding(
     }
 }
 
+/// Reports whether evaluating `expression` can read or write the local variable at `local_index`.
+///
+/// A binding only becomes a local when no nested function captures it, no `with` statement covers it
+/// and no direct eval can see it. Code that runs from inside this expression therefore has no way to
+/// name the binding, and a textual reference in the expression itself is the only way to reach it.
+/// That makes this a plain search for such references. The match is exhaustive on purpose: a new
+/// kind of expression must be classified here rather than silently defaulting to one answer.
+fn expression_may_reach_local(arena: &AstArena, expression: &Expression, local_index: u32) -> bool {
+    let reaches = |expression: &Expression| expression_may_reach_local(arena, expression, local_index);
+    let arguments_reach = |arguments: &Vec<CallArgument>| arguments.iter().any(|argument| reaches(&argument.value));
+    match &expression.inner {
+        ExpressionKind::NumericLiteral(_)
+        | ExpressionKind::StringLiteral(_)
+        | ExpressionKind::BooleanLiteral(_)
+        | ExpressionKind::NullLiteral
+        | ExpressionKind::BigIntLiteral(_)
+        | ExpressionKind::RegExpLiteral(_)
+        | ExpressionKind::This
+        | ExpressionKind::Super
+        | ExpressionKind::MetaProperty(_)
+        | ExpressionKind::Error => false,
+
+        // A function body that referred to the binding would have captured it, and a captured
+        // binding never becomes a local. The same holds for its default parameter expressions.
+        ExpressionKind::Function(_) => false,
+
+        ExpressionKind::Identifier(id) => {
+            let ident = &arena.identifiers[*id];
+            ident.local_type == Some(LocalType::Variable) && ident.local_index == local_index
+        }
+
+        ExpressionKind::Unary { operand, .. } => reaches(operand),
+        ExpressionKind::Spread(operand) | ExpressionKind::Await(operand) => reaches(operand),
+        ExpressionKind::Binary(data) => reaches(&data.lhs) || reaches(&data.rhs),
+        ExpressionKind::Logical(data) => reaches(&data.lhs) || reaches(&data.rhs),
+        ExpressionKind::Conditional(data) => {
+            reaches(&data.test) || reaches(&data.consequent) || reaches(&data.alternate)
+        }
+        ExpressionKind::Sequence(expressions) => expressions.iter().any(reaches),
+        ExpressionKind::TemplateLiteral(data) => data.expressions.iter().any(reaches),
+        ExpressionKind::Array(elements) => elements.iter().flatten().any(reaches),
+
+        ExpressionKind::Object(properties) => properties
+            .iter()
+            .any(|property| reaches(&property.key) || property.value.as_ref().is_some_and(|value| reaches(value))),
+
+        ExpressionKind::Update(data) => reaches(&data.argument),
+        ExpressionKind::Assignment(data) => {
+            let lhs_reaches = match &data.lhs {
+                AssignmentLhs::Expression(lhs) => reaches(lhs),
+                // Destructuring patterns can bind the local, and their shape is not walked here.
+                AssignmentLhs::Pattern(_) => true,
+            };
+            lhs_reaches || reaches(&data.rhs)
+        }
+
+        // A non-computed member name is a plain property name, not a reference.
+        ExpressionKind::Member(data) => reaches(&data.object) || (data.computed && reaches(&data.property)),
+
+        ExpressionKind::Call(data) | ExpressionKind::New(data) => {
+            reaches(&data.callee) || arguments_reach(&data.arguments)
+        }
+        ExpressionKind::SuperCall(data) => arguments_reach(&data.arguments),
+        ExpressionKind::TaggedTemplateLiteral(data) => reaches(&data.tag) || reaches(&data.template_literal),
+        ExpressionKind::ImportCall(data) => {
+            reaches(&data.specifier) || data.options.as_ref().is_some_and(|options| reaches(options))
+        }
+        ExpressionKind::Yield(data) => data.argument.as_ref().is_some_and(|argument| reaches(argument)),
+
+        ExpressionKind::OptionalChain(data) => {
+            reaches(&data.base)
+                || data.references.iter().any(|reference| match reference {
+                    OptionalChainReference::Call { arguments, .. } => arguments_reach(arguments),
+                    OptionalChainReference::ComputedReference { expression, .. } => reaches(expression),
+                    OptionalChainReference::MemberReference { .. }
+                    | OptionalChainReference::PrivateMemberReference { .. } => false,
+                })
+        }
+
+        // The superclass and the element keys are evaluated in the enclosing scope. Method bodies,
+        // field initializers and static blocks belong to the class scope, so a binding they refer to
+        // counts as captured and never becomes a local.
+        ExpressionKind::Class(data) => {
+            data.super_class
+                .as_ref()
+                .is_some_and(|super_class| reaches(super_class))
+                || data.elements.iter().any(|element| match &element.inner {
+                    ClassElement::Method { key, .. } | ClassElement::Field { key, .. } => reaches(key),
+                    ClassElement::StaticInitializer { .. } => false,
+                })
+        }
+
+        ExpressionKind::PrivateIdentifier(_) => false,
+    }
+}
+
 fn generate_variable_declaration(
     generator: &mut Generator,
     kind: DeclarationKind,
@@ -2950,11 +3050,21 @@ fn generate_variable_declaration(
         // Add, etc. to write directly to the local instead of temp+Mov.
         // NB: Not safe for `var` since var declarations can have duplicates, meaning the
         // preferred_dst could be used as input in the initializer.
+        // NB: Also not safe when the initializer can reach the binding itself. Until the
+        // declaration finishes, the local must keep holding the Empty sentinel that marks the
+        // binding uninitialized, and generators like NewObject write their destination before
+        // they are done with it.
         let init_dst = if kind != DeclarationKind::Var {
             if let VariableDeclaratorTarget::Identifier(id) = &declaration.target {
                 let ident = &arena.identifiers[*id];
-                if ident.is_local() && ident.local_type == Some(LocalType::Variable) {
-                    Some(generator.local(ident.local_index))
+                let local_index = ident.local_index;
+                let initializer_is_self_referential = declaration
+                    .init
+                    .as_ref()
+                    .is_some_and(|init| expression_may_reach_local(&arena, init, local_index));
+                if ident.is_local() && ident.local_type == Some(LocalType::Variable) && !initializer_is_self_referential
+                {
+                    Some(generator.local(local_index))
                 } else {
                     None
                 }
@@ -4228,7 +4338,7 @@ fn emit_get_by_value(
     base_identifier: Option<IdentifierTableIndex>,
 ) {
     if let Some(key) = generator.try_constant_string_to_property_key(property) {
-        if generator.property_key_table[key.0 as usize].0 == utf16!("length") {
+        if generator.property_key_table[key.0 as usize] == ak::Utf16FlyString::from_utf8("length") {
             generator.length_identifier = Some(key);
             let cache = generator.next_property_lookup_cache();
             generator.emit(Instruction::GetLength {
@@ -4266,7 +4376,7 @@ fn emit_get_by_value_with_this(
     this_value: &ScopedOperand,
 ) {
     if let Some(key) = generator.try_constant_string_to_property_key(property) {
-        if generator.property_key_table[key.0 as usize].0 == utf16!("length") {
+        if generator.property_key_table[key.0 as usize] == ak::Utf16FlyString::from_utf8("length") {
             generator.length_identifier = Some(key);
             let cache = generator.next_property_lookup_cache();
             generator.emit(Instruction::GetLengthWithThis {
@@ -6914,16 +7024,22 @@ fn generate_labelled_statement(
         generator.pending_labels = previous_labels;
         result
     } else {
-        // Non-iteration: wrap in a breakable scope so `break label;` works.
+        // Non-iteration: wrap in a breakable scope so `break label;` works. When completion
+        // propagation is on we allocate a completion register initialized to undefined and hand it
+        // to the breakable scope. `break label;` then yields undefined, the empty completion the
+        // spec requires. Without it the break path would leave whatever stale value the reused
+        // completion register last held, which can surface an internal object (such as a for-in
+        // iterator) as the statement's completion value.
         let end_block = generator.make_block();
-        generator.begin_breakable_scope(end_block, labels, None);
-        let result = generate_statement(inner, generator, preferred_dst);
+        let completion = generator.allocate_completion_register();
+        generator.begin_breakable_scope(end_block, labels, completion.clone());
+        let result = generate_with_completion(inner, generator, completion.as_ref(), preferred_dst);
         generator.end_breakable_scope();
         if !generator.is_current_block_terminated() {
             generator.emit(Instruction::Jump { target: end_block });
         }
         generator.switch_to_basic_block(end_block);
-        result
+        if completion.is_some() { completion } else { result }
     }
 }
 
@@ -7889,6 +8005,10 @@ fn generate_object_binding_pattern(
 ) {
     generator.emit(Instruction::ThrowIfNullish { src: object.operand() });
 
+    // Every property is read from the value the pattern started with, even after an earlier entry
+    // has assigned the variable that value came from (`var { a, b: e } = e`).
+    let object = &generator.copy_if_needed_to_preserve_evaluation_order(object);
+
     let mut excluded_names: Vec<ScopedOperand> = Vec::new();
     let has_rest = pattern.entries.last().is_some_and(|e| e.is_rest);
 
@@ -8074,6 +8194,7 @@ fn generate_try_statement(
     let mut handler_block: Option<Label> = None;
     if let Some(catch) = &data.handler {
         let hb = generator.make_block();
+        generator.catch_handler_labels.insert(hb.0);
         handler_block = Some(hb);
         generator.switch_to_basic_block(hb);
 
@@ -8487,10 +8608,11 @@ pub fn emit_function_declaration_instantiation(
     // function, not a real arguments-object reference.
     let function_scope_data = body_scope.function_scope_data.as_ref();
     let has_function_named_arguments = function_scope_data.is_some_and(|fsd| fsd.has_function_named_arguments);
+    let arguments_name = ak::Utf16FlyString::from_utf8("arguments");
     let has_arguments_local = generator
         .local_variables
         .iter()
-        .any(|lv| lv.name == utf16!("arguments") && !lv.is_lexically_declared);
+        .any(|lv| lv.name == arguments_name && !lv.is_lexically_declared);
     let mut arguments_object_needed = if is_arrow || parameter_names.iter().any(|p| p.name == utf16!("arguments")) {
         false
     } else {
@@ -8542,7 +8664,7 @@ pub fn emit_function_declaration_instantiation(
         let arguments_local_index = generator
             .local_variables
             .iter()
-            .position(|lv| lv.name == utf16!("arguments") && !lv.is_lexically_declared);
+            .position(|lv| lv.name == arguments_name && !lv.is_lexically_declared);
 
         let dst = arguments_local_index.map(|index| Operand::local(u32_from_usize(index)));
 

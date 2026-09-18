@@ -8,13 +8,10 @@
 #include <LibGC/Heap.h>
 #include <LibGfx/Bitmap.h>
 #include <LibJS/Runtime/ExternalMemory.h>
-#include <LibJS/Runtime/Realm.h>
 #include <LibJS/Runtime/VM.h>
 #include <LibWeb/CSS/ComputedValues.h>
 #include <LibWeb/DOM/DocumentObserver.h>
 #include <LibWeb/HTML/AnimatedBitmapDecodedImageData.h>
-#include <LibWeb/Painting/DisplayListRecorder.h>
-#include <LibWeb/Painting/DisplayListRecordingContext.h>
 #include <LibWeb/Platform/ImageCodecPlugin.h>
 #include <LibWeb/Platform/Timer.h>
 
@@ -57,7 +54,6 @@ void AnimatedBitmapDecodedImageData::deliver_frames_for_session(i64 session_id, 
 }
 
 GC::Ref<AnimatedBitmapDecodedImageData> AnimatedBitmapDecodedImageData::create(
-    JS::Realm& realm,
     DOM::Document& document,
     i64 session_id,
     u32 frame_count,
@@ -67,10 +63,10 @@ GC::Ref<AnimatedBitmapDecodedImageData> AnimatedBitmapDecodedImageData::create(
     Vector<u32> durations,
     Vector<NonnullRefPtr<Gfx::Bitmap>> initial_bitmaps)
 {
-    auto animation_timer = Platform::Timer::create(realm.heap());
-    auto document_observer = realm.create<DOM::DocumentObserver>(realm, document);
+    auto animation_timer = Platform::Timer::create(GC::Heap::the());
+    auto document_observer = GC::Heap::the().allocate<DOM::DocumentObserver>(document);
 
-    auto data = realm.create<AnimatedBitmapDecodedImageData>(
+    auto data = GC::Heap::the().allocate<AnimatedBitmapDecodedImageData>(
         session_id, frame_count, loop_count, size, move(color_space), move(durations), animation_timer, document_observer);
 
     // Place initial bitmaps into the buffer pool.
@@ -231,6 +227,17 @@ Optional<Gfx::DecodedImageFrame> AnimatedBitmapDecodedImageData::current_frame(G
     return frame(m_current_frame_index, size);
 }
 
+Optional<Gfx::Color> AnimatedBitmapDecodedImageData::color_if_single_pixel_bitmap() const
+{
+    auto frame = current_frame();
+    if (!frame.has_value())
+        return {};
+    auto const& bitmap = frame->bitmap();
+    if (bitmap.width() != 1 || bitmap.height() != 1)
+        return {};
+    return bitmap.get_pixel(0, 0);
+}
+
 int AnimatedBitmapDecodedImageData::frame_duration(size_t frame_index) const
 {
     if (frame_index >= m_durations.size())
@@ -253,15 +260,12 @@ Optional<CSSPixelFraction> AnimatedBitmapDecodedImageData::intrinsic_aspect_rati
     return CSSPixels(m_size.width()) / CSSPixels(m_size.height());
 }
 
-void AnimatedBitmapDecodedImageData::paint(DisplayListRecordingContext& context, Gfx::IntRect dst_rect, CSS::ImageRendering image_rendering) const
+Optional<Painting::ImagePaint> AnimatedBitmapDecodedImageData::image_paint(Painting::ImagePaintRequest const&) const
 {
     auto decoded_frame = current_frame();
     if (!decoded_frame.has_value())
-        return;
-
-    auto scaling_mode = CSS::to_gfx_scaling_mode(image_rendering, m_size, dst_rect.size());
-
-    context.display_list_recorder().draw_scaled_decoded_image_frame(dst_rect, *decoded_frame, scaling_mode);
+        return {};
+    return Painting::ImagePaint { Painting::ImagePaint::DecodedFrame { .frame = *decoded_frame, .natural_size = m_size } };
 }
 
 void AnimatedBitmapDecodedImageData::receive_frames(Vector<NonnullRefPtr<Gfx::Bitmap>> bitmaps, u32 start_frame_index)

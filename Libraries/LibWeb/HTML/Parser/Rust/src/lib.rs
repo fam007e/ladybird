@@ -5,7 +5,7 @@
  */
 
 pub mod entities;
-pub mod interned_names;
+mod known_names;
 pub mod parser;
 pub mod preload_scanner;
 pub mod token;
@@ -24,24 +24,23 @@ pub struct RustFfiTokenizerHandle {
     pub(crate) tokenizer: HtmlTokenizer,
     /// Temporary storage for the last token's string data, kept alive
     /// so that pointers in RustFfiToken remain valid until the next call.
-    last_tag_name: Vec<u8>,
-    last_comment: Vec<u8>,
-    last_doctype_name: Vec<u8>,
-    last_public_id: Vec<u8>,
-    last_system_id: Vec<u8>,
+    last_tag_name: token::HtmlName,
+    last_comment: Vec<u16>,
+    last_doctype_name: Vec<u16>,
+    last_public_id: Vec<u16>,
+    last_system_id: Vec<u16>,
     last_attributes: Vec<RustFfiAttribute>,
-    last_attr_names: Vec<Vec<u8>>,
-    last_attr_values: Vec<Vec<u8>>,
-    last_unparsed_input: Vec<u8>,
+    last_attr_names: Vec<token::HtmlName>,
+    last_attr_values: Vec<Vec<u16>>,
+    last_unparsed_input: Vec<u16>,
 }
 
 /// C-compatible token representation.
 ///
-/// Pointer fields (`tag_name_ptr`, `comment_ptr`, doctype/attribute pointers)
-/// borrow into buffers owned by the `RustFfiTokenizerHandle` that produced this
-/// token. They remain valid only until the next call into the tokenizer for
-/// that handle (any of `next_token`, `insert_input`, `destroy`, etc.).
-/// Callers must consume the data before making the next call.
+/// Pointer fields borrow into buffers owned by the `RustFfiTokenizerHandle` that
+/// produced this token. They remain valid only until the next call into the
+/// tokenizer for that handle (any of `next_token`, `insert_input`, `destroy`,
+/// etc.). Callers must consume the data before making the next call.
 #[repr(C)]
 pub struct RustFfiToken {
     pub token_type: u8,
@@ -49,22 +48,17 @@ pub struct RustFfiToken {
     pub self_closing: bool,
     pub had_duplicate_attribute: bool,
 
-    /// If nonzero, an interned tag-name id (1-based index into
-    /// `interned_names::INTERNED_TAG_NAMES`). When set, `tag_name_ptr` /
-    /// `tag_name_len` are unused and the C++ side uses its parallel
-    /// FlyString table directly.
-    pub tag_name_id: u16,
-    pub tag_name_ptr: *const u8,
-    pub tag_name_len: usize,
+    /// Borrowed `AK::Utf16FlyString` identity owned by the tokenizer handle.
+    pub tag_name: usize,
 
-    pub comment_ptr: *const u8,
+    pub comment_ptr: *const u16,
     pub comment_len: usize,
 
-    pub doctype_name_ptr: *const u8,
+    pub doctype_name_ptr: *const u16,
     pub doctype_name_len: usize,
-    pub public_id_ptr: *const u8,
+    pub public_id_ptr: *const u16,
     pub public_id_len: usize,
-    pub system_id_ptr: *const u8,
+    pub system_id_ptr: *const u16,
     pub system_id_len: usize,
     pub force_quirks: bool,
     pub missing_name: bool,
@@ -83,13 +77,9 @@ pub struct RustFfiToken {
 /// C-compatible attribute representation.
 #[repr(C)]
 pub struct RustFfiAttribute {
-    /// If nonzero, an interned attribute-name id (1-based index into
-    /// `interned_names::INTERNED_ATTR_NAMES`). When set, `name_ptr` /
-    /// `name_len` are unused.
-    pub name_id: u16,
-    pub name_ptr: *const u8,
-    pub name_len: usize,
-    pub value_ptr: *const u8,
+    /// Borrowed `AK::Utf16FlyString` identity owned by the tokenizer handle.
+    pub name: usize,
+    pub value_ptr: *const u16,
     pub value_len: usize,
     pub name_start_line: u64,
     pub name_start_column: u64,
@@ -108,9 +98,7 @@ impl Default for RustFfiToken {
             code_point: 0,
             self_closing: false,
             had_duplicate_attribute: false,
-            tag_name_id: 0,
-            tag_name_ptr: ptr::null(),
-            tag_name_len: 0,
+            tag_name: 0,
             comment_ptr: ptr::null(),
             comment_len: 0,
             doctype_name_ptr: ptr::null(),
@@ -137,24 +125,47 @@ fn position_to_ffi(pos: &Position) -> (u64, u64) {
     (pos.line, pos.column)
 }
 
-/// Create a new Rust HTML tokenizer from UTF-32 code points.
+/// Create a new Rust HTML tokenizer directly from a UTF-16 code unit buffer.
 ///
 /// # Safety
-/// `input` must point to `len` valid u32 values.
+/// `input` must point to `len` valid UTF-16 code units.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_html_tokenizer_create(input: *const u32, len: usize) -> *mut RustFfiTokenizerHandle {
-    let code_points = if input.is_null() || len == 0 {
+pub unsafe extern "C" fn rust_html_tokenizer_create_from_utf16(
+    input: *const u16,
+    len: usize,
+) -> *mut RustFfiTokenizerHandle {
+    let code_units = if input.is_null() || len == 0 {
         Vec::new()
     } else {
         unsafe { std::slice::from_raw_parts(input, len) }.to_vec()
     };
 
-    make_handle(HtmlTokenizer::new(code_points))
+    make_handle(HtmlTokenizer::new(code_units))
+}
+
+/// Create a new Rust HTML tokenizer directly from an ASCII byte buffer.
+///
+/// # Safety
+/// `input` must point to `len` ASCII bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rust_html_tokenizer_create_from_ascii(
+    input: *const u8,
+    len: usize,
+) -> *mut RustFfiTokenizerHandle {
+    let code_units = if input.is_null() || len == 0 {
+        Vec::new()
+    } else {
+        unsafe { std::slice::from_raw_parts(input, len) }
+            .iter()
+            .map(|byte| u16::from(*byte))
+            .collect()
+    };
+
+    make_handle(HtmlTokenizer::new(code_units))
 }
 
 /// Create a new Rust HTML tokenizer directly from a UTF-8 byte buffer.
-/// Rust decodes the bytes to code points internally, skipping the C++
-/// side's 4x-expanded Vec<u32> copy.
+/// Rust converts the bytes directly to the tokenizer's UTF-16 storage.
 ///
 /// # Safety
 /// `bytes` must point to `len` valid UTF-8 bytes.
@@ -163,58 +174,21 @@ pub unsafe extern "C" fn rust_html_tokenizer_create_from_utf8(
     bytes: *const u8,
     len: usize,
 ) -> *mut RustFfiTokenizerHandle {
-    let code_points = if bytes.is_null() || len == 0 {
+    let code_units = if bytes.is_null() || len == 0 {
         Vec::new()
     } else {
         let slice = unsafe { std::slice::from_raw_parts(bytes, len) };
-        decode_utf8_to_u32(slice)
+        // SAFETY: The caller guarantees valid UTF-8.
+        unsafe { std::str::from_utf8_unchecked(slice) }.encode_utf16().collect()
     };
 
-    make_handle(HtmlTokenizer::new(code_points))
-}
-
-/// Expand a UTF-8 byte slice into a `Vec<u32>` of code points. For the
-/// dominant ASCII case we use a tight loop with a single unchecked
-/// write per byte and only fall back to `str::chars()` decoding when
-/// we see a continuation byte. The caller is responsible for ensuring
-/// the input is valid UTF-8.
-fn decode_utf8_to_u32(bytes: &[u8]) -> Vec<u32> {
-    let mut out: Vec<u32> = Vec::with_capacity(bytes.len());
-    // SAFETY: we reserved `bytes.len()` slots and will only write up to
-    // that many u32s (one per input byte; multi-byte sequences produce
-    // fewer u32s than bytes, so we stay within bounds).
-    let out_ptr = out.as_mut_ptr();
-    let mut write_idx: usize = 0;
-    let mut i: usize = 0;
-    let n = bytes.len();
-    while i < n {
-        let b = bytes[i];
-        if b < 0x80 {
-            unsafe { std::ptr::write(out_ptr.add(write_idx), b as u32) };
-            write_idx += 1;
-            i += 1;
-        } else {
-            // Slow path: decode one code point via str::chars.
-            // SAFETY: the input is valid UTF-8 by precondition.
-            let tail = unsafe { std::str::from_utf8_unchecked(&bytes[i..]) };
-            if let Some(ch) = tail.chars().next() {
-                unsafe { std::ptr::write(out_ptr.add(write_idx), ch as u32) };
-                write_idx += 1;
-                i += ch.len_utf8();
-            } else {
-                break;
-            }
-        }
-    }
-    // SAFETY: we wrote exactly `write_idx` elements, all in-bounds.
-    unsafe { out.set_len(write_idx) };
-    out
+    make_handle(HtmlTokenizer::new(code_units))
 }
 
 fn make_handle(tokenizer: HtmlTokenizer) -> *mut RustFfiTokenizerHandle {
     let handle = Box::new(RustFfiTokenizerHandle {
         tokenizer,
-        last_tag_name: Vec::new(),
+        last_tag_name: Default::default(),
         last_comment: Vec::new(),
         last_doctype_name: Vec::new(),
         last_public_id: Vec::new(),
@@ -309,25 +283,16 @@ fn next_token_slow(
     match token.payload {
         TokenPayload::Tag {
             tag_name,
-            tag_name_id,
             self_closing,
             had_duplicate_attribute,
             attributes,
         } => {
             out.self_closing = self_closing;
             out.had_duplicate_attribute = had_duplicate_attribute;
-            // Tokenizer already resolved intern ids, so we trust tag_name_id.
-            out.tag_name_id = tag_name_id;
-            if tag_name_id == 0 {
-                handle.last_tag_name = tag_name.into_bytes();
-                out.tag_name_ptr = handle.last_tag_name.as_ptr();
-                out.tag_name_len = handle.last_tag_name.len();
-            }
+            handle.last_tag_name = tag_name;
+            out.tag_name = handle.last_tag_name.raw_identity();
 
-            // Convert attributes. Move owned Strings out of each Attribute
-            // instead of cloning, then point the FfiAttribute at the stable
-            // heap bytes that now live in handle.last_attr_{names,values}
-            // (unless the name was interned, in which case skip the copy).
+            // Move names and values into the handle so the borrowed FFI data remains valid until the next call.
             handle.last_attr_names.clear();
             handle.last_attr_values.clear();
             handle.last_attributes.clear();
@@ -337,33 +302,21 @@ fn next_token_slow(
             for attr in attributes {
                 let Attribute {
                     local_name,
-                    local_name_id,
                     value,
                     name_start_position,
                     name_end_position,
                     value_start_position,
                     value_end_position,
                 } = attr;
-                if local_name_id == 0 {
-                    handle.last_attr_names.push(local_name.into_bytes());
-                } else {
-                    // Keep the slot aligned with last_attr_values so index math stays valid.
-                    handle.last_attr_names.push(Vec::new());
-                }
-                handle.last_attr_values.push(value.into_bytes());
+                handle.last_attr_names.push(local_name);
+                handle.last_attr_values.push(value.encode_utf16().collect());
                 let last_idx = handle.last_attr_names.len() - 1;
-                let name_bytes = &handle.last_attr_names[last_idx];
-                let value_bytes = &handle.last_attr_values[last_idx];
+                let name = &handle.last_attr_names[last_idx];
+                let value_code_units = &handle.last_attr_values[last_idx];
                 handle.last_attributes.push(RustFfiAttribute {
-                    name_id: local_name_id,
-                    name_ptr: if local_name_id == 0 {
-                        name_bytes.as_ptr()
-                    } else {
-                        ptr::null()
-                    },
-                    name_len: if local_name_id == 0 { name_bytes.len() } else { 0 },
-                    value_ptr: value_bytes.as_ptr(),
-                    value_len: value_bytes.len(),
+                    name: name.raw_identity(),
+                    value_ptr: value_code_units.as_ptr(),
+                    value_len: value_code_units.len(),
                     name_start_line: name_start_position.line,
                     name_start_column: name_start_position.column,
                     name_end_line: name_end_position.line,
@@ -378,14 +331,14 @@ fn next_token_slow(
             out.attributes_len = handle.last_attributes.len();
         }
         TokenPayload::Comment(data) => {
-            handle.last_comment = data.into_bytes();
+            handle.last_comment = data.encode_utf16().collect();
             out.comment_ptr = handle.last_comment.as_ptr();
             out.comment_len = handle.last_comment.len();
         }
         TokenPayload::Doctype(doctype) => {
-            handle.last_doctype_name = doctype.name.into_bytes();
-            handle.last_public_id = doctype.public_identifier.into_bytes();
-            handle.last_system_id = doctype.system_identifier.into_bytes();
+            handle.last_doctype_name = doctype.name.encode_utf16().collect();
+            handle.last_public_id = doctype.public_identifier.encode_utf16().collect();
+            handle.last_system_id = doctype.system_identifier.encode_utf16().collect();
             out.doctype_name_ptr = handle.last_doctype_name.as_ptr();
             out.doctype_name_len = handle.last_doctype_name.len();
             out.public_id_ptr = handle.last_public_id.as_ptr();
@@ -419,48 +372,92 @@ pub unsafe extern "C" fn rust_html_tokenizer_switch_state(handle: *mut RustFfiTo
     handle.tokenizer.switch_to(state);
 }
 
-/// Insert input (as UTF-32 code points) at the current insertion point.
+/// Insert UTF-16 input at the current insertion point.
 ///
 /// # Safety
-/// `handle` must be a valid pointer. `input` must point to `len` valid u32 values.
+/// `handle` must be valid. `input` must point to `len` valid UTF-16 code units.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_html_tokenizer_insert_input(
+pub unsafe extern "C" fn rust_html_tokenizer_insert_utf16_input(
     handle: *mut RustFfiTokenizerHandle,
-    input: *const u32,
+    input: *const u16,
     len: usize,
 ) {
     if handle.is_null() {
         return;
     }
-    let handle = unsafe { &mut *handle };
-    let code_points = if input.is_null() || len == 0 {
+    let code_units = if input.is_null() || len == 0 {
         &[]
     } else {
         unsafe { std::slice::from_raw_parts(input, len) }
     };
-    handle.tokenizer.insert_input_at_insertion_point(code_points);
+    unsafe { &mut *handle }
+        .tokenizer
+        .insert_input_at_insertion_point(code_units);
 }
 
-/// Append input (as UTF-32 code points) to the tokenizer input stream.
+/// Insert ASCII input at the current insertion point.
 ///
 /// # Safety
-/// `handle` must be a valid pointer. `input` must point to `len` valid u32 values.
+/// `handle` must be valid. `input` must point to `len` ASCII bytes.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_html_tokenizer_append_input(
+pub unsafe extern "C" fn rust_html_tokenizer_insert_ascii_input(
     handle: *mut RustFfiTokenizerHandle,
-    input: *const u32,
+    input: *const u8,
     len: usize,
 ) {
     if handle.is_null() {
         return;
     }
-    let handle = unsafe { &mut *handle };
-    let code_points = if input.is_null() || len == 0 {
+    let input = if input.is_null() || len == 0 {
         &[]
     } else {
         unsafe { std::slice::from_raw_parts(input, len) }
     };
-    handle.tokenizer.append_input(code_points);
+    unsafe { &mut *handle }
+        .tokenizer
+        .insert_ascii_input_at_insertion_point(input);
+}
+
+/// Append UTF-16 input to the tokenizer input stream.
+///
+/// # Safety
+/// `handle` must be valid. `input` must point to `len` valid UTF-16 code units.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rust_html_tokenizer_append_utf16_input(
+    handle: *mut RustFfiTokenizerHandle,
+    input: *const u16,
+    len: usize,
+) {
+    if handle.is_null() {
+        return;
+    }
+    let code_units = if input.is_null() || len == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(input, len) }
+    };
+    unsafe { &mut *handle }.tokenizer.append_input(code_units);
+}
+
+/// Append ASCII input to the tokenizer input stream.
+///
+/// # Safety
+/// `handle` must be valid. `input` must point to `len` ASCII bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rust_html_tokenizer_append_ascii_input(
+    handle: *mut RustFfiTokenizerHandle,
+    input: *const u8,
+    len: usize,
+) {
+    if handle.is_null() {
+        return;
+    }
+    let input = if input.is_null() || len == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(input, len) }
+    };
+    unsafe { &mut *handle }.tokenizer.append_ascii_input(input);
 }
 
 /// Get the tokenizer input that has not been consumed yet.
@@ -470,14 +467,14 @@ pub unsafe extern "C" fn rust_html_tokenizer_append_input(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_html_tokenizer_unparsed_input(
     handle: *mut RustFfiTokenizerHandle,
-    out_ptr: *mut *const u8,
+    out_ptr: *mut *const u16,
     out_len: *mut usize,
 ) {
     if handle.is_null() || out_ptr.is_null() || out_len.is_null() {
         return;
     }
     let handle = unsafe { &mut *handle };
-    handle.last_unparsed_input = handle.tokenizer.unparsed_input().into_bytes();
+    handle.last_unparsed_input = handle.tokenizer.unparsed_input().encode_utf16().collect();
     unsafe {
         *out_ptr = handle.last_unparsed_input.as_ptr();
         *out_len = handle.last_unparsed_input.len();
@@ -608,67 +605,5 @@ pub unsafe extern "C" fn rust_html_tokenizer_abort(handle: *mut RustFfiTokenizer
 pub unsafe extern "C" fn rust_html_tokenizer_destroy(handle: *mut RustFfiTokenizerHandle) {
     if !handle.is_null() {
         drop(unsafe { Box::from_raw(handle) });
-    }
-}
-
-// -- Interned name table enumeration --------------------------------------
-//
-// The C++ side builds a parallel FlyString array at static-init time by
-// enumerating the Rust-owned list once. Ids are 1-based; id 0 is reserved
-// for "not interned" in the per-token FFI struct.
-
-/// Number of interned HTML tag names known to the Rust tokenizer.
-#[unsafe(no_mangle)]
-pub extern "C" fn rust_html_tokenizer_interned_tag_name_count() -> usize {
-    interned_names::tag_name_count()
-}
-
-/// Number of interned HTML attribute names known to the Rust tokenizer.
-#[unsafe(no_mangle)]
-pub extern "C" fn rust_html_tokenizer_interned_attr_name_count() -> usize {
-    interned_names::attr_name_count()
-}
-
-/// Write the bytes and length of the interned tag name with the given
-/// 1-based id to the caller-provided out parameters. On unknown ids the
-/// out parameters are set to (null, 0).
-///
-/// # Safety
-/// `out_ptr` and `out_len` must be valid pointers.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_html_tokenizer_interned_tag_name(id: u16, out_ptr: *mut *const u8, out_len: *mut usize) {
-    if out_ptr.is_null() || out_len.is_null() {
-        return;
-    }
-    match interned_names::tag_name_by_id(id) {
-        Some(bytes) => unsafe {
-            *out_ptr = bytes.as_ptr();
-            *out_len = bytes.len();
-        },
-        None => unsafe {
-            *out_ptr = ptr::null();
-            *out_len = 0;
-        },
-    }
-}
-
-/// Same as `rust_html_tokenizer_interned_tag_name` for attribute names.
-///
-/// # Safety
-/// `out_ptr` and `out_len` must be valid pointers.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_html_tokenizer_interned_attr_name(id: u16, out_ptr: *mut *const u8, out_len: *mut usize) {
-    if out_ptr.is_null() || out_len.is_null() {
-        return;
-    }
-    match interned_names::attr_name_by_id(id) {
-        Some(bytes) => unsafe {
-            *out_ptr = bytes.as_ptr();
-            *out_len = bytes.len();
-        },
-        None => unsafe {
-            *out_ptr = ptr::null();
-            *out_len = 0;
-        },
     }
 }

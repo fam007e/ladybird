@@ -9,8 +9,7 @@
 #include <AK/Optional.h>
 #include <LibGfx/Color.h>
 #include <LibGfx/Cursor.h>
-#include <LibWeb/CSS/Length.h>
-#include <LibWeb/CSS/StyleValues/StyleValue.h>
+#include <LibWeb/CSS/StyleValues/AbstractImageStyleValue.h>
 #include <LibWeb/Forward.h>
 
 namespace Web::CSS {
@@ -25,35 +24,36 @@ public:
     }
     virtual ~CursorStyleValue() override = default;
 
-    AbstractImageStyleValue const& image() const { return *m_properties.image; }
+    AbstractImageStyleValue const& image() const { return m_image; }
 
-    Optional<Gfx::ImageCursor> make_image_cursor(Layout::NodeWithStyle const&) const;
+    Optional<Gfx::ImageCursor> make_image_cursor(Layout::NodeWithStyle const&, GC::Ptr<HTML::DecodedImageData>) const;
 
-    virtual void serialize(StringBuilder&, SerializationMode) const override;
-
-    virtual ValueComparingNonnullRefPtr<StyleValue const> absolutized(ComputationContext const&) const override;
-
-    bool properties_equal(CursorStyleValue const& other) const { return m_properties == other.m_properties; }
-
-    virtual bool is_computationally_independent() const override;
+    ValueComparingNonnullRefPtr<StyleValue const> absolutized(ComputationContext const&) const;
 
 private:
+    friend class StyleValue;
+
     CursorStyleValue(ValueComparingNonnullRefPtr<AbstractImageStyleValue const> image,
         RefPtr<StyleValue const> x,
         RefPtr<StyleValue const> y)
-        : StyleValueWithDefaultOperators(Type::Cursor)
-        , m_properties { .image = move(image), .x = move(x), .y = move(y) }
+        : StyleValueWithDefaultOperators(Type::Cursor, make_cursor_data(image, x, y))
+        , m_image(move(image))
     {
     }
 
-    struct Properties {
-        ValueComparingNonnullRefPtr<AbstractImageStyleValue const> image;
-        ValueComparingRefPtr<StyleValue const> x;
-        ValueComparingRefPtr<StyleValue const> y;
-        bool operator==(Properties const&) const = default;
-    } m_properties;
+    explicit CursorStyleValue(StyleValueFFI::StyleValueData const*);
+
+    static StyleValueFFI::StyleValueData const* make_cursor_data(NonnullRefPtr<AbstractImageStyleValue const> const&, RefPtr<StyleValue const> const&, RefPtr<StyleValue const> const&);
+
+    ValueComparingRefPtr<StyleValue const> x() const { return wrap_rust_child_or_null(m_value->cursor.x); }
+    ValueComparingRefPtr<StyleValue const> y() const { return wrap_rust_child_or_null(m_value->cursor.y); }
+
+    // NB: The image wrapper stays a member: image style values carry C++-side loading state
+    // (clients, resource requests) keyed on wrapper identity.
+    ValueComparingNonnullRefPtr<AbstractImageStyleValue const> m_image;
 
     mutable Optional<Color> m_cached_bitmap_color;
+    mutable Optional<PreferredColorScheme> m_cached_bitmap_color_scheme;
     mutable Optional<Gfx::ShareableBitmap> m_cached_bitmap;
 };
 

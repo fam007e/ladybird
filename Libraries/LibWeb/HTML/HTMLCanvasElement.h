@@ -7,15 +7,18 @@
 #pragma once
 
 #include <AK/Optional.h>
+#include <LibGC/Function.h>
 #include <LibGfx/Forward.h>
+#include <LibWeb/HTML/Canvas/CanvasSettings.h>
 #include <LibWeb/HTML/HTMLElement.h>
 #include <LibWeb/Painting/DisplayListResourceIds.h>
+#include <LibWeb/WebGL/WebGLContextAttributes.h>
 #include <LibWeb/WebIDL/Types.h>
 
 namespace Web::HTML {
 
 class HTMLCanvasElement final : public HTMLElement {
-    WEB_PLATFORM_OBJECT(HTMLCanvasElement, HTMLElement);
+    WEB_WRAPPABLE(HTMLCanvasElement, HTMLElement);
     GC_DECLARE_ALLOCATOR(HTMLCanvasElement);
 
 public:
@@ -27,23 +30,25 @@ public:
 
     Gfx::IntSize bitmap_size_for_canvas(size_t minimum_width = 0, size_t minimum_height = 0) const;
 
-    JS::ThrowCompletionOr<RenderingContext> get_context(String const& type, JS::Value options);
+    JS::ThrowCompletionOr<RenderingContext> get_context(Utf16View type, JS::Value options);
     enum class HasOrCreatedContext {
         No,
         Yes,
     };
-    JS::ThrowCompletionOr<HasOrCreatedContext> create_2d_context(JS::Value options);
+    HasOrCreatedContext create_2d_context(CanvasRenderingContext2DSettings);
+    HasOrCreatedContext create_webgl_context(WebGL::WebGLContextAttributes);
+    HasOrCreatedContext create_webgl2_context(WebGL::WebGLContextAttributes);
+    RenderingContext const& context() const { return m_context; }
 
     WebIDL::UnsignedLong width() const;
     WebIDL::UnsignedLong height() const;
 
     void set_width(WebIDL::UnsignedLong);
     void set_height(WebIDL::UnsignedLong);
+    virtual void attribute_changed(Utf16FlyString const& local_name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_) override;
 
-    virtual void attribute_changed(FlyString const& local_name, Optional<String> const& old_value, Optional<String> const& value, Optional<FlyString> const& namespace_) override;
-
-    WebIDL::ExceptionOr<String> to_data_url(StringView type, Optional<JS::Value> quality);
-    WebIDL::ExceptionOr<void> to_blob(GC::Ref<WebIDL::CallbackType> callback, StringView type, Optional<JS::Value> quality);
+    WebIDL::ExceptionOr<Utf16String> to_data_url(Utf16View type, Optional<JS::Value> quality);
+    WebIDL::ExceptionOr<void> to_blob(GC::Ref<WebIDL::CallbackType> callback, Utf16View type, Optional<JS::Value> quality);
     bool is_origin_clean() const;
     RefPtr<Gfx::Bitmap> get_bitmap_from_surface();
 
@@ -59,6 +64,8 @@ public:
 
     Optional<Painting::CanvasId> canvas_id() const;
 
+    u64 content_generation() const { return m_content_generation; }
+
     Optional<Gfx::IntSize> canvas_surface_content_size() const;
 
     void ensure_backing_storage();
@@ -70,15 +77,16 @@ public:
 private:
     HTMLCanvasElement(DOM::Document&, DOM::QualifiedName);
 
-    virtual void initialize(JS::Realm&) override;
+    virtual void initialize_element() override;
     virtual void finalize() override;
     virtual void visit_edges(Cell::Visitor&) override;
 
-    virtual bool is_presentational_hint(FlyString const&) const override;
+    virtual bool is_html_canvas_element() const override { return true; }
+
+    virtual bool is_presentational_hint(Utf16FlyString const&) const override;
     virtual void apply_presentational_hints(Vector<CSS::StyleProperty>&) const override;
 
-    virtual RefPtr<Layout::Node> create_layout_node(CSS::ComputedProperties const&) override;
-    virtual void adjust_computed_style(CSS::ComputedProperties::Builder&) override;
+    virtual Layout::Node* create_layout_node(CSS::LayoutStyle) override;
 
     template<typename ContextType>
     JS::ThrowCompletionOr<HasOrCreatedContext> create_webgl_context(JS::Value options);
@@ -88,6 +96,14 @@ private:
 
     Variant<GC::Ref<HTML::CanvasRenderingContext2D>, GC::Ref<WebGL::WebGLRenderingContext>, GC::Ref<WebGL::WebGL2RenderingContext>, Empty> m_context;
     bool m_canvas_content_dirty { false };
+    u64 m_content_generation { 0 };
 };
+
+}
+
+namespace Web::DOM {
+
+template<>
+inline bool Node::fast_is<HTML::HTMLCanvasElement>() const { return is_html_canvas_element(); }
 
 }

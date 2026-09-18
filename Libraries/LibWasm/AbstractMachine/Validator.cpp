@@ -411,6 +411,9 @@ ErrorOr<void, ValidationError> Validator::validate(TableSection const& section)
 
 ErrorOr<void, ValidationError> Validator::validate(CodeSection const& section)
 {
+    Vector<CodeSection::Func const*> callee_bodies;
+    callee_bodies.resize(m_context.imported_function_count + section.functions().size());
+
     size_t index = m_context.imported_function_count;
     for (auto& entry : section.functions()) {
         auto function_index = index++;
@@ -445,9 +448,11 @@ ErrorOr<void, ValidationError> Validator::validate(CodeSection const& section)
 
         function_validator.push_frame(Frame { function_type, FrameKind::Function, (size_t)0 });
 
-        auto results = TRY(function_validator.validate(function.body(), function_type.results()));
+        auto results = TRY(function_validator.validate(function.body(), function_type.results(), callee_bodies.span(), function_index));
         if (results.result_types.size() != function_type.results().size())
             return Errors::invalid("function result"sv, function_type.results(), results.result_types);
+
+        callee_bodies[function_index] = &function;
 
         if (function.body().compiled_instructions.max_call_rec_size != 0) {
             size_t max_callee_locals = 0;
@@ -5067,6 +5072,116 @@ VALIDATE_INSTRUCTION(synthetic_end_expression)
     return {}; // Always valid.
 }
 
+// https://webassembly.github.io/threads/core/valid/instructions.html#atomic-memory-instructions
+ErrorOr<void, ValidationError> Validator::validate_atomic_memory_argument(Instruction::MemoryArgument const& arg, size_t access_size)
+{
+    if (arg.align > 64)
+        return Errors::out_of_bounds("memory op alignment value"sv, arg.align, 0, 64);
+
+    // Unlike plain memory accesses, atomic accesses must be exactly naturally aligned.
+    if ((1ull << arg.align) != access_size)
+        return Errors::invalid("atomic memory op alignment"sv, access_size, 1ull << arg.align);
+
+    return {};
+}
+
+VALIDATE_INSTRUCTION(atomic_load)
+{
+    auto const& arg = instruction.arguments().get<Instruction::AtomicMemoryArgument>();
+    auto memory = TRY(validate(arg.memory.memory_index));
+    TRY(validate_atomic_memory_argument(arg.memory, arg.access_size()));
+
+    TRY((take_memory_address(stack, memory, arg.memory)));
+    stack.append(arg.value_type());
+
+    return {};
+}
+
+VALIDATE_INSTRUCTION(atomic_store)
+{
+    auto const& arg = instruction.arguments().get<Instruction::AtomicMemoryArgument>();
+    auto memory = TRY(validate(arg.memory.memory_index));
+    TRY(validate_atomic_memory_argument(arg.memory, arg.access_size()));
+
+    TRY(stack.take(arg.value_type()));
+    TRY((take_memory_address(stack, memory, arg.memory)));
+
+    return {};
+}
+
+VALIDATE_INSTRUCTION(atomic_rmw)
+{
+    auto const& arg = instruction.arguments().get<Instruction::AtomicMemoryArgument>();
+    auto memory = TRY(validate(arg.memory.memory_index));
+    TRY(validate_atomic_memory_argument(arg.memory, arg.access_size()));
+
+    TRY(stack.take(arg.value_type()));
+    TRY((take_memory_address(stack, memory, arg.memory)));
+    stack.append(arg.value_type());
+
+    return {};
+}
+
+VALIDATE_INSTRUCTION(atomic_rmw_cmpxchg)
+{
+    auto const& arg = instruction.arguments().get<Instruction::AtomicMemoryArgument>();
+    auto memory = TRY(validate(arg.memory.memory_index));
+    TRY(validate_atomic_memory_argument(arg.memory, arg.access_size()));
+
+    TRY(stack.take(arg.value_type())); // replacement
+    TRY(stack.take(arg.value_type())); // expected
+    TRY((take_memory_address(stack, memory, arg.memory)));
+    stack.append(arg.value_type());
+
+    return {};
+}
+
+VALIDATE_INSTRUCTION(memory_atomic_notify)
+{
+    auto const& arg = instruction.arguments().get<Instruction::MemoryArgument>();
+    auto memory = TRY(validate(arg.memory_index));
+    TRY(validate_atomic_memory_argument(arg, sizeof(i32)));
+
+    TRY((stack.take<ValueType::I32>())); // count
+    TRY((take_memory_address(stack, memory, arg)));
+    stack.append(ValueType(ValueType::I32));
+
+    return {};
+}
+
+VALIDATE_INSTRUCTION(memory_atomic_wait32)
+{
+    auto const& arg = instruction.arguments().get<Instruction::MemoryArgument>();
+    auto memory = TRY(validate(arg.memory_index));
+    TRY(validate_atomic_memory_argument(arg, sizeof(i32)));
+
+    TRY((stack.take<ValueType::I64>())); // timeout
+    TRY((stack.take<ValueType::I32>())); // expected
+    TRY((take_memory_address(stack, memory, arg)));
+    stack.append(ValueType(ValueType::I32));
+
+    return {};
+}
+
+VALIDATE_INSTRUCTION(memory_atomic_wait64)
+{
+    auto const& arg = instruction.arguments().get<Instruction::MemoryArgument>();
+    auto memory = TRY(validate(arg.memory_index));
+    TRY(validate_atomic_memory_argument(arg, sizeof(i64)));
+
+    TRY((stack.take<ValueType::I64>())); // timeout
+    TRY((stack.take<ValueType::I64>())); // expected
+    TRY((take_memory_address(stack, memory, arg)));
+    stack.append(ValueType(ValueType::I32));
+
+    return {};
+}
+
+VALIDATE_INSTRUCTION(atomic_fence)
+{
+    return {};
+}
+
 ErrorOr<void, ValidationError> Validator::validate(Instruction const& instruction, Stack& stack, bool& is_constant)
 {
     switch (instruction.opcode().value()) {
@@ -5084,7 +5199,7 @@ ErrorOr<void, ValidationError> Validator::validate(Instruction const& instructio
     }
 }
 
-ErrorOr<Validator::ExpressionTypeResult, ValidationError> Validator::validate(Expression const& expression, Vector<ValueType> const& result_types)
+ErrorOr<Validator::ExpressionTypeResult, ValidationError> Validator::validate(Expression const& expression, Vector<ValueType> const& result_types, Span<CodeSection::Func const* const> callee_bodies, size_t current_function_index)
 {
     if (m_frames.is_empty())
         m_frames.empend(FunctionType { {}, result_types }, FrameKind::Function, (size_t)0);
@@ -5107,13 +5222,11 @@ ErrorOr<Validator::ExpressionTypeResult, ValidationError> Validator::validate(Ex
     m_frames.take_last();
 
     expression.set_stack_usage_hint(stack.max_known_size());
-    expression.set_frame_usage_hint(m_max_frame_size);
 
     VERIFY(m_frames.is_empty());
-    m_max_frame_size = 0;
 
     // Now that we're in happy land, try to compile the expression down to a list of labels to help dispatch.
-    expression.compiled_instructions = try_compile_instructions(expression, m_context.functions.span());
+    expression.compiled_instructions = try_compile_instructions(expression, m_context.functions.span(), callee_bodies, current_function_index, m_context.locals.size(), m_context.imported_function_count);
 
     if (expression.compiled_instructions.direct && !is_constant_expression) {
         bool has_unsupported_types = false;
@@ -5156,6 +5269,11 @@ ErrorOr<Validator::ExpressionTypeResult, ValidationError> Validator::validate(Ex
         if (!has_unsupported_types && result_types.size() <= 1) {
             expression.compiled_instructions.cranelift_eligible = true;
             expression.compiled_instructions.cranelift_result_arity = static_cast<u32>(result_types.size());
+            expression.compiled_instructions.cranelift_local_count = static_cast<u32>(m_context.locals.size()) + expression.compiled_instructions.cranelift_inlined_locals;
+            expression.compiled_instructions.cranelift_param_count = static_cast<u32>(m_context.current_function_parameter_count);
+            expression.compiled_instructions.cranelift_local_types.ensure_capacity(m_context.locals.size());
+            for (auto& type : m_context.locals)
+                expression.compiled_instructions.cranelift_local_types.unchecked_append(to_underlying(type.kind()));
         }
     }
 

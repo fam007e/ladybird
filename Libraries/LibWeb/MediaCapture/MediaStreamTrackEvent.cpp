@@ -1,43 +1,30 @@
 /*
- * Copyright (c) 2026, The Ladybird developers
+ * Copyright (c) 2026-present, the Ladybird developers.
  *
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibWeb/Bindings/Intrinsics.h>
-#include <LibWeb/Bindings/MediaStreamTrackEvent.h>
+#include <LibGC/Heap.h>
 #include <LibWeb/MediaCapture/MediaStreamTrackEvent.h>
 
 namespace Web::MediaCapture {
 
 GC_DEFINE_ALLOCATOR(MediaStreamTrackEvent);
 
-GC::Ref<MediaStreamTrackEvent> MediaStreamTrackEvent::create(JS::Realm& realm, FlyString const& event_name, Bindings::MediaStreamTrackEventInit const& event_init)
+GC::Ref<MediaStreamTrackEvent> MediaStreamTrackEvent::create(Utf16FlyString const& event_name, MediaStreamTrackEventInit const& event_init, HighResolutionTime::DOMHighResTimeStamp time_stamp)
 {
-    return realm.create<MediaStreamTrackEvent>(realm, event_name, event_init);
+    return GC::Heap::the().allocate<MediaStreamTrackEvent>(event_name, event_init, time_stamp);
 }
 
-GC::Ref<MediaStreamTrackEvent> MediaStreamTrackEvent::construct_impl(JS::Realm& realm, FlyString const& event_name, Bindings::MediaStreamTrackEventInit const& event_init)
-{
-    return create(realm, event_name, event_init);
-}
-
-// https://w3c.github.io/mediacapture-main/#mediastreamtrackevent
-MediaStreamTrackEvent::MediaStreamTrackEvent(JS::Realm& realm, FlyString const& event_name, Bindings::MediaStreamTrackEventInit const& event_init)
-    : DOM::Event(realm, event_name, event_init)
+MediaStreamTrackEvent::MediaStreamTrackEvent(Utf16FlyString const& event_name, MediaStreamTrackEventInit const& event_init, HighResolutionTime::DOMHighResTimeStamp time_stamp)
+    : DOM::Event(event_name, event_init, time_stamp)
     , m_track(event_init.track)
 {
 }
 
 MediaStreamTrackEvent::~MediaStreamTrackEvent() = default;
 
-void MediaStreamTrackEvent::initialize(JS::Realm& realm)
-{
-    WEB_SET_PROTOTYPE_FOR_INTERFACE(MediaStreamTrackEvent);
-    Base::initialize(realm);
-}
-
-void MediaStreamTrackEvent::visit_edges(Cell::Visitor& visitor)
+void MediaStreamTrackEvent::visit_edges(GC::Cell::Visitor& visitor)
 {
     Base::visit_edges(visitor);
     visitor.visit(m_track);

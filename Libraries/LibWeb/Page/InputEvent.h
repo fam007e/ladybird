@@ -12,7 +12,9 @@
 #include <LibGfx/Point.h>
 #include <LibIPC/Forward.h>
 #include <LibWeb/Export.h>
+#include <LibWeb/HTML/CrossProcessId.h>
 #include <LibWeb/HTML/SelectedFile.h>
+#include <LibWeb/Page/PageId.h>
 #include <LibWeb/PixelUnits.h>
 #include <LibWeb/UIEvents/KeyCode.h>
 #include <LibWeb/UIEvents/MouseButton.h>
@@ -39,6 +41,40 @@ struct WEB_API KeyEvent {
     bool should_insert_text { false };
 
     OwnPtr<BrowserInputData> browser_data;
+    bool async_scroll_performed_default_action { false };
+};
+
+inline bool is_keyboard_scroll_key(UIEvents::KeyCode key, u32 modifiers)
+{
+    switch (key) {
+    case UIEvents::KeyCode::Key_Space:
+        return (modifiers & ~(UIEvents::Mod_Shift | UIEvents::Mod_Keypad)) == UIEvents::Mod_None;
+    case UIEvents::KeyCode::Key_PageUp:
+    case UIEvents::KeyCode::Key_PageDown:
+    case UIEvents::KeyCode::Key_Up:
+    case UIEvents::KeyCode::Key_Down:
+    case UIEvents::KeyCode::Key_Left:
+    case UIEvents::KeyCode::Key_Right:
+        return (modifiers & ~UIEvents::Mod_Keypad) == UIEvents::Mod_None;
+    default:
+        return false;
+    }
+}
+
+// Discrete wheel deltas come from stepwise input such as mouse wheel notches; precise wheel deltas come from input
+// that reports exact pixel distances, such as touchpad panning gestures.
+enum class WheelDeltaPrecision : u8 {
+    Discrete,
+    Precise,
+};
+
+// Input that scrolls with a gesture, such as a touchpad, reports whether the user is still making that gesture,
+// whether a flick has handed the scrolling over to momentum, and when it ends.
+enum class ScrollGesturePhase : u8 {
+    None,
+    Ongoing,
+    Momentum,
+    Ended,
 };
 
 struct WEB_API MouseEvent {
@@ -60,6 +96,8 @@ struct WEB_API MouseEvent {
     UIEvents::KeyModifier modifiers { UIEvents::KeyModifier::Mod_None };
     double wheel_delta_x { 0 };
     double wheel_delta_y { 0 };
+    WheelDeltaPrecision wheel_delta_precision { WheelDeltaPrecision::Discrete };
+    ScrollGesturePhase scroll_gesture_phase { ScrollGesturePhase::None };
     int click_count { 0 };
 
     OwnPtr<BrowserInputData> browser_data;
@@ -96,9 +134,12 @@ struct WEB_API PinchEvent {
 using InputEvent = Variant<KeyEvent, MouseEvent, DragEvent, PinchEvent>;
 
 struct QueuedInputEvent {
-    u64 page_id { 0 };
+    Web::PageId page_id { 0 };
     InputEvent event;
     size_t coalesced_event_count { 0 };
+    // The local root the event targets when it is not the page's traversable: a navigable whose parent's document
+    // another process hosts, which the UI process addresses by id.
+    Optional<HTML::CrossProcessId> navigable_id;
 };
 
 }

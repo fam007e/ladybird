@@ -83,6 +83,24 @@ TEST_CASE(invalid_filter_bytes_keep_previous_rules)
     EXPECT(blocker.is_filtered(url("https://ads.example.com/script.js"sv), source_url, ContentBlocker::ResourceType::Script));
 }
 
+TEST_CASE(empty_rules_clear_previous_rules)
+{
+    Vector<String> rules = {
+        { "||ads.example.com^"_string },
+    };
+
+    auto& blocker = make_blocker(move(rules));
+    auto source_url = url("https://example.com/"sv);
+
+    EXPECT(blocker.has_rules());
+    EXPECT(blocker.is_filtered(url("https://ads.example.com/script.js"sv), source_url, ContentBlocker::ResourceType::Script));
+
+    MUST(blocker.set_rules_from_bytes({}));
+
+    EXPECT(!blocker.has_rules());
+    EXPECT(!blocker.is_filtered(url("https://ads.example.com/script.js"sv), source_url, ContentBlocker::ResourceType::Script));
+}
+
 TEST_CASE(disable_filtering)
 {
     Vector<String> rules = {
@@ -92,8 +110,8 @@ TEST_CASE(disable_filtering)
 
     auto& blocker = make_blocker(move(rules));
     blocker.set_filtering_enabled(false);
-    Vector<String> classes = { "ad"_string };
-    Vector<String> ids;
+    Vector<Utf16FlyString> classes = { "ad"_utf16_fly_string };
+    Vector<Utf16FlyString> ids;
 
     EXPECT(!blocker.is_filtered(url("https://example.com"sv)));
     EXPECT(!blocker.is_filtered(url("http://example.com/ads"sv)));
@@ -247,8 +265,8 @@ TEST_CASE(cosmetic_style_sheet)
     };
 
     auto& blocker = make_blocker(move(rules));
-    Vector<String> classes = { "generic-ad"_string };
-    Vector<String> ids = { "generic-sponsor"_string };
+    Vector<Utf16FlyString> classes = { "generic-ad"_utf16_fly_string };
+    Vector<Utf16FlyString> ids = { "generic-sponsor"_utf16_fly_string };
 
     auto style_sheet = blocker.cosmetic_style_sheet_for_url(url("https://example.com/"sv), classes, ids);
 
@@ -269,10 +287,10 @@ TEST_CASE(generic_cosmetic_selector_lists_match_later_selectors)
     };
 
     auto& blocker = make_blocker(move(rules));
-    Vector<String> classes = { "second-ad-class"_string };
-    Vector<String> ids = { "second-ad-id"_string };
-    Vector<String> no_classes;
-    Vector<String> no_ids;
+    Vector<Utf16FlyString> classes = { "second-ad-class"_utf16_fly_string };
+    Vector<Utf16FlyString> ids = { "second-ad-id"_utf16_fly_string };
+    Vector<Utf16FlyString> no_classes;
+    Vector<Utf16FlyString> no_ids;
 
     auto style_sheet = blocker.cosmetic_style_sheet_for_url(url("https://example.com/"sv), classes, ids);
     auto style_sheet_without_class_or_id_hints = blocker.cosmetic_style_sheet_for_url(url("https://example.com/"sv), no_classes, no_ids);

@@ -17,6 +17,7 @@ sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 from Utils.utils import title_casify
 from Utils.utils import underlying_type_for_enum
+from Utils.utils import write_case_insensitive_ascii_string_to_enum_lookup
 
 
 def keyword_name(dashy_name: str) -> str:
@@ -30,8 +31,10 @@ def write_header_file(out: TextIO, keyword_data: list) -> None:
     out.write(f"""
 #pragma once
 
-#include <AK/StringView.h>
 #include <AK/Traits.h>
+#include <AK/StringView.h>
+#include <AK/Utf16FlyString.h>
+#include <AK/Utf16View.h>
 #include <LibWeb/Export.h>
 
 namespace Web::CSS {{
@@ -45,11 +48,18 @@ enum class Keyword : {underlying_type} {{
     {keyword_name(name)},
 """)
 
-    out.write("""
-};
+    out.write(f"""
+}};
 
+// Invalid plus every generated keyword.
+static constexpr size_t number_of_keywords = {len(keyword_data) + 1};
+""")
+
+    out.write("""
 WEB_API Optional<Keyword> keyword_from_string(StringView);
+WEB_API Optional<Keyword> keyword_from_string(Utf16View);
 StringView string_from_keyword(Keyword);
+Utf16FlyString utf16_fly_string_from_keyword(Keyword);
 
 // https://www.w3.org/TR/css-values-4/#common-keywords
 // https://drafts.csswg.org/css-cascade-4/#valdef-all-revert
@@ -62,6 +72,29 @@ inline bool is_css_wide_keyword(StringView name)
         || name.equals_ignoring_ascii_case("unset"sv);
 }
 
+inline bool is_css_wide_keyword(Utf16View name)
+{
+    return name.equals_ignoring_ascii_case("inherit"sv)
+        || name.equals_ignoring_ascii_case("initial"sv)
+        || name.equals_ignoring_ascii_case("revert"sv)
+        || name.equals_ignoring_ascii_case("revert-layer"sv)
+        || name.equals_ignoring_ascii_case("unset"sv);
+}
+
+inline bool is_css_wide_keyword(Keyword keyword)
+{
+    switch (keyword) {
+    case Keyword::Inherit:
+    case Keyword::Initial:
+    case Keyword::Revert:
+    case Keyword::RevertLayer:
+    case Keyword::Unset:
+        return true;
+    default:
+        return false;
+    }
+}
+
 }
 
 """)
@@ -70,30 +103,29 @@ inline bool is_css_wide_keyword(StringView name)
 def write_implementation_file(out: TextIO, keyword_data: list) -> None:
     out.write("""
 #include <AK/Assertions.h>
-#include <AK/HashMap.h>
-#include <AK/NeverDestroyed.h>
+#include <AK/CharacterTypes.h>
+#include <AK/Utf16FlyString.h>
 #include <LibWeb/CSS/Keyword.h>
 
 namespace Web::CSS {
-
-static HashMap<StringView, Keyword, AK::CaseInsensitiveASCIIStringViewTraits> const& stringview_to_keyword_map()
-{
-    static auto const& map = *new HashMap<StringView, Keyword, AK::CaseInsensitiveASCIIStringViewTraits> {
 """)
 
-    for name in keyword_data:
-        out.write(f"""
-    {{"{name}"sv, Keyword::{keyword_name(name)}}},
-""")
+    write_case_insensitive_ascii_string_to_enum_lookup(
+        out,
+        "keyword_from_string_impl",
+        "Keyword",
+        {name: f"Keyword::{keyword_name(name)}" for name in keyword_data},
+    )
 
     out.write("""
-    };
-    return map;
-}
-
 Optional<Keyword> keyword_from_string(StringView string)
 {
-    return stringview_to_keyword_map().get(string);
+    return keyword_from_string_impl(string);
+}
+
+Optional<Keyword> keyword_from_string(Utf16View string)
+{
+    return keyword_from_string_impl(string);
 }
 
 StringView string_from_keyword(Keyword keyword) {
@@ -109,6 +141,22 @@ StringView string_from_keyword(Keyword keyword) {
     out.write("""
     default:
         return "(invalid CSS::Keyword)"sv;
+    }
+}
+
+Utf16FlyString utf16_fly_string_from_keyword(Keyword keyword) {
+    switch (keyword) {
+""")
+
+    for name in keyword_data:
+        out.write(f"""
+    case Keyword::{keyword_name(name)}:
+        return "{name}"_utf16_fly_string;
+        """)
+
+    out.write("""
+    default:
+        return "(invalid CSS::Keyword)"_utf16_fly_string;
     }
 }
 

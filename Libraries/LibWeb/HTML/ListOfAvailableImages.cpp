@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <LibGC/Heap.h>
 #include <LibWeb/HTML/DecodedImageData.h>
 #include <LibWeb/HTML/ListOfAvailableImages.h>
 
@@ -15,6 +16,11 @@ static u64 s_next_available_image_cache_touch_serial;
 
 ListOfAvailableImages::ListOfAvailableImages() = default;
 ListOfAvailableImages::~ListOfAvailableImages() = default;
+
+GC::Ref<ListOfAvailableImages> ListOfAvailableImages::create()
+{
+    return GC::Heap::the().allocate<ListOfAvailableImages>();
+}
 
 bool ListOfAvailableImages::Key::operator==(Key const& other) const
 {
@@ -58,11 +64,17 @@ void ListOfAvailableImages::prune_to_limits(size_t external_memory_limit, size_t
         size_t decoded_image_count { 0 };
     };
 
+    // NB: Entries whose image data still has clients (e.g. a live element displaying it) are not counted or pruned.
+    //     Pruning them frees no memory, since the clients keep the decoded data alive, but it forces a refetch if
+    //     script recreates an element with the same URL, e.g. when a framework re-renders the page.
     auto cache_size = [&] {
         CacheSize cache_size;
-        for (auto const& it : m_images)
+        for (auto const& it : m_images) {
+            if (it.value->image_data->has_clients())
+                continue;
             cache_size.decoded_image_size += it.value->image_data->external_memory_size();
-        cache_size.decoded_image_count = m_images.size();
+            ++cache_size.decoded_image_count;
+        }
         return cache_size;
     };
 
@@ -72,6 +84,8 @@ void ListOfAvailableImages::prune_to_limits(size_t external_memory_limit, size_t
         u64 least_recently_used_serial = NumericLimits<u64>::max();
 
         for (auto const& it : m_images) {
+            if (it.value->image_data->has_clients())
+                continue;
             if (it.value->cache_touch_serial >= least_recently_used_serial)
                 continue;
             least_recently_used_key = it.key;

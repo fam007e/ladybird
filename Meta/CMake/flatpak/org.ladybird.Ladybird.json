@@ -1,7 +1,7 @@
 {
   "app-id": "org.ladybird.Ladybird",
   "runtime": "org.kde.Platform",
-  "runtime-version": "6.9",
+  "runtime-version": "6.10",
   "sdk": "org.kde.Sdk",
   "sdk-extensions": [
     "org.freedesktop.Sdk.Extension.llvm20",
@@ -37,7 +37,7 @@
         {
           "type": "git",
           "url": "https://github.com/simdjson/simdjson.git",
-          "tag": "v4.2.4"
+          "tag": "v4.6.4"
         }
       ],
       "config-opts": [
@@ -56,7 +56,7 @@
         {
           "type": "git",
           "url": "https://github.com/simdutf/simdutf.git",
-          "tag": "v7.4.0"
+          "tag": "v9.1.0"
         }
       ],
       "config-opts": [
@@ -76,18 +76,18 @@
         {
           "type": "git",
           "url": "https://github.com/pnggroup/libpng.git",
-          "tag": "v1.6.50"
+          "tag": "v1.6.58"
         },
         {
           "type": "file",
-          "url": "https://downloads.sourceforge.net/project/libpng-apng/libpng16/1.6.49/libpng-1.6.49-apng.patch.gz",
-          "sha512": "d3a7121f892049f5488f32b5de29fb8892f2b329ee1df956b129918601946ab86a542a4412587ee5f660c581484812aaf101f953bcc187c993d98ba9d8d63a00"
+          "url": "https://downloads.sourceforge.net/project/libpng-apng/libpng16/1.6.58/libpng-1.6.58-apng.patch.gz",
+          "sha512": "95a6f5bb7148b5c48dccd73811d7bcf9752a631a7bb4f4856670a7da12a7159581ac1bce1749318343794e0f5cb86972711ba2ec0f523c168f0991fa940687d5"
         },
         {
           "type": "shell",
           "commands": [
-            "gunzip -k libpng-1.6.49-apng.patch.gz",
-            "patch -p1 -i libpng-1.6.49-apng.patch"
+            "gunzip -k libpng-1.6.58-apng.patch.gz",
+            "patch -p1 -i libpng-1.6.58-apng.patch"
           ]
         }
       ],
@@ -170,6 +170,11 @@
           "dest": "angle/build"
         },
         {
+          "type": "patch",
+          "path": "angle/vulkan-descriptor-allocator-instantiation.patch",
+          "dest": "angle"
+        },
+        {
           "type": "file",
           "path": "angle/angle-configure.sh"
         },
@@ -195,7 +200,7 @@
         {
           "type": "git",
           "url": "https://github.com/fmtlib/fmt.git",
-          "tag": "12.1.0"
+          "tag": "12.2.0"
         }
       ],
       "config-opts": [
@@ -270,7 +275,7 @@
         {
           "type": "git",
           "url": "https://github.com/GNOME/libxml2.git",
-          "tag": "v2.13.8"
+          "tag": "v2.15.3"
         }
       ],
       "config-opts": [
@@ -318,7 +323,7 @@
         {
           "type": "git",
           "url": "https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator.git",
-          "tag": "v3.3.0"
+          "tag": "v3.4.0"
         }
       ],
       "config-opts": [
@@ -357,13 +362,18 @@
           "url": "https://github.com/google/woff2.git",
           "tag": "v1.0.2",
           "disable-submodules": true
+        },
+        {
+          "type": "patch",
+          "path": "woff2/output-h-add-missing-stdint-include.patch"
         }
       ],
       "config-opts": [
         "-DCMAKE_BUILD_TYPE=Release",
         "-DCMAKE_PREFIX_PATH=/app",
         "-DCMAKE_INSTALL_LIBDIR=lib",
-        "-DCANONICAL_PREFIXES=ON"
+        "-DCANONICAL_PREFIXES=ON",
+        "-DCMAKE_POLICY_VERSION_MINIMUM=3.5"
       ]
     },
     {
@@ -373,7 +383,7 @@
         {
           "type": "git",
           "url": "https://code.videolan.org/videolan/dav1d.git",
-          "tag": "1.5.1"
+          "tag": "1.5.3"
         }
       ],
       "config-opts": [
@@ -397,7 +407,8 @@
       ],
       "config-opts": [
         "-DCMAKE_BUILD_TYPE=Release",
-        "-DCMAKE_PREFIX_PATH=/app"
+        "-DCMAKE_PREFIX_PATH=/app",
+        "-DCMAKE_POLICY_VERSION_MINIMUM=3.5"
       ],
       "cleanup": [
         "/bin"
@@ -410,7 +421,7 @@
         {
           "type": "git",
           "url": "https://github.com/AOMediaCodec/libavif.git",
-          "tag": "v1.3.0"
+          "tag": "v1.4.2"
         }
       ],
       "config-opts": [
@@ -453,64 +464,6 @@
       "cleanup": [
         "/share/WebP"
       ]
-    },
-    {
-      "name": "highway",
-        "buildsystem": "cmake-ninja",
-        "sources": [
-          {
-            "type": "git",
-            "url": "https://github.com/google/highway.git",
-            "tag": "1.4.0",
-            "disable-submodules": true
-          }
-        ],
-        "config-opts": [
-          "-DCMAKE_BUILD_TYPE=Release",
-          "-DCMAKE_PREFIX_PATH=/app",
-          "-DCMAKE_INSTALL_LIBDIR=lib",
-          "-DHWY_ENABLE_INSTALL=ON",
-          "-DHWY_ENABLE_EXAMPLES=OFF",
-          "-DHWY_ENABLE_TESTS=OFF",
-          "-DHWY_ENABLE_CONTRIB=OFF"
-        ]
-    },
-    {
-      "name": "libjxl",
-        "buildsystem": "cmake-ninja",
-        "sources": [
-          {
-            "type": "git",
-            "url": "https://github.com/libjxl/libjxl.git",
-            "tag": "v0.11.1",
-            "disable-submodules": true
-          }
-        ],
-        "config-opts": [
-          "-DCMAKE_BUILD_TYPE=Release",
-          "-DCMAKE_PREFIX_PATH=/app",
-          "-DCMAKE_INSTALL_LIBDIR=lib",
-          "-DJPEGXL_VERSION=0.11.1",
-          "-DJPEGXL_FORCE_SYSTEM_HWY=ON",
-          "-DJPEGXL_FORCE_SYSTEM_BROTLI=ON",
-          "-DJPEGXL_FORCE_SYSTEM_HWY=ON",
-          "-DJPEGXL_FORCE_SYSTEM_LCMS2=ON",
-          "-DJPEGXL_ENABLE_TOOLS=OFF",
-          "-DJPEGXL_ENABLE_BENCHMARK=OFF",
-          "-DJPEGXL_ENABLE_DOXYGEN=OFF",
-          "-DJPEGXL_ENABLE_EXAMPLES=OFF",
-          "-DJPEGXL_ENABLE_FUZZERS=OFF",
-          "-DJPEGXL_ENABLE_JNI=OFF",
-          "-DJPEGXL_ENABLE_MANPAGES=OFF",
-          "-DJPEGXL_ENABLE_OPENEXR=OFF",
-          "-DJPEGXL_ENABLE_PLUGINS=OFF",
-          "-DJPEGXL_ENABLE_SJPEG=OFF",
-          "-DJPEGXL_ENABLE_SKCMS=OFF",
-          "-DJPEGXL_ENABLE_TCMALLOC=OFF",
-          "-DBUILD_TESTING=OFF",
-          "-DCMAKE_FIND_PACKAGE_TARGETS_GLOBAL=ON",
-          "-DJPEGXL_BUNDLE_LIBPNG=OFF"
-        ]
     },
     {
       "name": "skia",
@@ -580,7 +533,7 @@
           {
             "type": "git",
             "url": "https://github.com/fastfloat/fast_float.git",
-            "tag": "v8.1.0"
+            "tag": "v8.2.10"
           }
         ],
         "config-opts": [
@@ -612,7 +565,7 @@
         {
           "type": "git",
           "url": "https://github.com/davea42/libdwarf-code.git",
-          "tag": "v2.3.0"
+          "tag": "v2.3.1"
         }
       ],
       "config-opts": [
@@ -672,8 +625,8 @@
         {
           "type": "git",
           "url": "https://github.com/openssl/openssl.git",
-          "commit": "c4da9ac23de497ce039a102e6715381047899447",
-          "tag": "openssl-3.5.3"
+          "commit": "aae016bfd52fcad2bc9657c2c782cfdf73b1ed5f",
+          "tag": "openssl-3.6.3"
         }
       ]
     },
@@ -681,7 +634,7 @@
       "name": "ffmpeg",
       "buildsystem": "simple",
       "build-commands": [
-        "./configure --prefix=/app --libdir=lib --enable-pic --disable-doc --enable-debug --enable-runtime-cpudetect --disable-autodetect --disable-ffmpeg --disable-ffplay --disable-ffprobe --enable-avcodec --disable-avdevice --enable-avformat --disable-avfilter --disable-postproc --enable-swresample --disable-swscale --disable-alsa --disable-amf --disable-libaom --disable-libass --disable-avisynth --enable-libdav1d --disable-libfdk-aac --disable-libfontconfig --disable-libharfbuzz --disable-libfreetype --disable-libfribidi --disable-iconv --disable-libilbc --disable-lzma --disable-libmp3lame --disable-libmodplug --disable-cuda --disable-nvenc --disable-nvdec  --disable-cuvid --disable-ffnvcodec --disable-opencl --disable-opengl --enable-libopenh264 --disable-libopenjpeg --disable-libopenmpt --disable-openssl --enable-libopus --disable-sdl2 --disable-libsnappy --disable-libsoxr --disable-libspeex --disable-libssh --disable-libtensorflow --disable-libtesseract --enable-libtheora --enable-libvorbis --enable-libvpx --disable-vulkan --enable-libwebp --disable-libx265 --disable-libxml2 --enable-zlib --disable-libsrt --disable-libmfx --disable-vaapi --disable-optimizations",
+        "./configure --prefix=/app --libdir=lib --enable-pic --disable-doc --enable-debug --enable-runtime-cpudetect --disable-autodetect --disable-ffmpeg --disable-ffplay --disable-ffprobe --enable-avcodec --disable-avdevice --enable-avformat --disable-avfilter --disable-postproc --enable-swresample --disable-swscale --disable-alsa --disable-amf --disable-libaom --disable-libass --disable-avisynth --enable-libdav1d --disable-libfdk-aac --disable-libfontconfig --disable-libharfbuzz --disable-libfreetype --disable-libfribidi --disable-iconv --disable-libilbc --disable-lzma --disable-libmp3lame --disable-libmodplug --disable-cuda --disable-nvenc --disable-nvdec  --disable-cuvid --disable-ffnvcodec --disable-opencl --disable-opengl --disable-libopenh264 --disable-libopenjpeg --disable-libopenmpt --disable-openssl --enable-libopus --disable-sdl2 --disable-libsnappy --disable-libsoxr --disable-libspeex --disable-libssh --disable-libtensorflow --disable-libtesseract --enable-libtheora --enable-libvorbis --enable-libvpx --disable-vulkan --enable-libwebp --disable-libx265 --disable-libxml2 --enable-zlib --disable-libsrt --disable-libmfx --disable-vaapi --disable-optimizations",
         "make -j$(nproc) V=1",
         "make install"
       ],
@@ -714,6 +667,7 @@
         "-DMI_BUILD_SHARED=ON",
         "-DMI_INSTALL_TOPLEVEL=ON",
         "-DMI_OVERRIDE=OFF",
+        "-DMI_SECURE=ON",
         "-DMI_USE_CXX=ON"
       ]
     },

@@ -10,6 +10,7 @@
 
 #include <AK/Forward.h>
 #include <AK/Queue.h>
+#include <AK/ThreadID.h>
 #include <LibCore/EventReceiver.h>
 #include <LibIPC/Attachment.h>
 #include <LibIPC/Forward.h>
@@ -33,6 +34,14 @@ public:
 
     Transport& transport() const { return *m_transport; }
 
+    // Messages of one kind that have arrived and have not been dispatched yet, in
+    // arrival order. A caller that asked the peer for state synchronously reads what the peer sent ahead of
+    // its answer this way, without dispatching anything else out of turn.
+    Vector<NonnullOwnPtr<Message>> take_unprocessed_messages(u32 endpoint_magic, i32 message_id);
+
+    // Dispatch every message the peer has already sent on this connection, without waiting for new ones.
+    void dispatch_pending_messages();
+
 protected:
     explicit ConnectionBase(IPC::Stub&, NonnullOwnPtr<Transport>, u32 local_endpoint_magic);
 
@@ -49,11 +58,14 @@ protected:
 
     void handle_messages();
 
+    AK::ThreadID m_owner_thread_id { AK::ThreadID::current() };
+
     IPC::Stub& m_local_stub;
 
     NonnullOwnPtr<Transport> m_transport;
 
-    Vector<NonnullOwnPtr<Message>> m_unprocessed_messages;
+    Vector<OwnPtr<Message>> m_unprocessed_messages;
+    Vector<Span<OwnPtr<Message>>> m_dispatching_message_batches;
 
     u32 m_local_endpoint_magic { 0 };
 };

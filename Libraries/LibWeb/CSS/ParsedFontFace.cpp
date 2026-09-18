@@ -5,11 +5,9 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibWeb/CSS/CSSFontFaceDescriptors.h>
-#include <LibWeb/CSS/CSSRule.h>
-#include <LibWeb/CSS/CSSStyleSheet.h>
 #include <LibWeb/CSS/Enums.h>
 #include <LibWeb/CSS/ParsedFontFace.h>
+#include <LibWeb/CSS/RustDescriptorBlock.h>
 #include <LibWeb/CSS/StyleComputer.h>
 #include <LibWeb/CSS/StyleValues/CalculatedStyleValue.h>
 #include <LibWeb/CSS/StyleValues/CustomIdentStyleValue.h>
@@ -49,7 +47,7 @@ Vector<ParsedFontFace::Source> ParsedFontFace::sources_from_style_value(StyleVal
     return sources;
 }
 
-ParsedFontFace ParsedFontFace::from_descriptors(CSSFontFaceDescriptors const& descriptors)
+ParsedFontFace ParsedFontFace::from_descriptors(RustDescriptorBlock const& descriptors, DOM::Document const& document)
 {
     auto extract_percentage_or_normal = [](StyleValue const& value) -> Optional<Percentage> {
         if (value.is_percentage())
@@ -64,16 +62,16 @@ ParsedFontFace ParsedFontFace::from_descriptors(CSSFontFaceDescriptors const& de
         return {};
     };
 
-    FlyString font_family;
-    if (auto value = descriptors.descriptor_or_initial_value(DescriptorNameAndID::from_id(DescriptorID::FontFamily)))
+    Utf16FlyString font_family;
+    if (auto value = descriptors.descriptor_or_initial_value(AtRuleID::FontFace, DescriptorNameAndID::from_id(DescriptorID::FontFamily)))
         font_family = string_from_style_value(*value);
 
     ComputationContext computation_context {
-        .length_resolution_context = Length::ResolutionContext::for_document(*descriptors.parent_rule()->parent_style_sheet()->owning_document())
+        .length_resolution_context = Length::ResolutionContext::for_document(document)
     };
 
     Optional<FontWeightRange> weight;
-    if (auto value = descriptors.descriptor_or_initial_value(DescriptorNameAndID::from_id(DescriptorID::FontWeight))) {
+    if (auto value = descriptors.descriptor_or_initial_value(AtRuleID::FontFace, DescriptorNameAndID::from_id(DescriptorID::FontWeight))) {
         // https://drafts.csswg.org/css-fonts-4/#font-prop-desc
         // The auto values for these three descriptors have the following effects:
         //  - For font selection purposes, the font is selected as if the appropriate normal value (normal, normal or normal) is chosen
@@ -82,7 +80,7 @@ ParsedFontFace ParsedFontFace::from_descriptors(CSSFontFaceDescriptors const& de
             weight = { 400, 400 };
         } else {
             auto absolutized = value->absolutized(computation_context);
-            auto& weight_values = absolutized->as_value_list().values();
+            auto weight_values = absolutized->as_value_list().values();
             if (weight_values.size() == 1) {
                 auto one_weight = static_cast<int>(StyleComputer::compute_font_weight(weight_values[0], {})->as_number().number());
                 weight = { one_weight, one_weight };
@@ -102,7 +100,7 @@ ParsedFontFace ParsedFontFace::from_descriptors(CSSFontFaceDescriptors const& de
     }
 
     Optional<int> slope;
-    if (auto value = descriptors.descriptor_or_initial_value(DescriptorNameAndID::from_id(DescriptorID::FontStyle))) {
+    if (auto value = descriptors.descriptor_or_initial_value(AtRuleID::FontFace, DescriptorNameAndID::from_id(DescriptorID::FontStyle))) {
         // https://drafts.csswg.org/css-fonts-4/#font-prop-desc
         // The auto values for these three descriptors have the following effects:
         //  - For font selection purposes, the font is selected as if the appropriate normal value (normal, normal or normal) is chosen
@@ -115,7 +113,7 @@ ParsedFontFace ParsedFontFace::from_descriptors(CSSFontFaceDescriptors const& de
     }
 
     Optional<int> width;
-    if (auto value = descriptors.descriptor_or_initial_value(DescriptorNameAndID::from_id(DescriptorID::FontWidth))) {
+    if (auto value = descriptors.descriptor_or_initial_value(AtRuleID::FontFace, DescriptorNameAndID::from_id(DescriptorID::FontWidth))) {
         // https://drafts.csswg.org/css-fonts-4/#font-prop-desc
         // The auto values for these three descriptors have the following effects:
         //  - For font selection purposes, the font is selected as if the appropriate normal value (normal, normal or normal) is chosen
@@ -128,50 +126,50 @@ ParsedFontFace ParsedFontFace::from_descriptors(CSSFontFaceDescriptors const& de
     }
 
     Vector<Source> sources;
-    if (auto value = descriptors.descriptor_or_initial_value(DescriptorNameAndID::from_id(DescriptorID::Src)))
+    if (auto value = descriptors.descriptor_or_initial_value(AtRuleID::FontFace, DescriptorNameAndID::from_id(DescriptorID::Src)))
         sources = sources_from_style_value(*value);
 
     Vector<Gfx::UnicodeRange> unicode_ranges;
-    if (auto value = descriptors.descriptor_or_initial_value(DescriptorNameAndID::from_id(DescriptorID::UnicodeRange))) {
+    if (auto value = descriptors.descriptor_or_initial_value(AtRuleID::FontFace, DescriptorNameAndID::from_id(DescriptorID::UnicodeRange))) {
         for (auto const& range : value->as_value_list().values())
             unicode_ranges.append(range->as_unicode_range().unicode_range());
     }
 
     Optional<Percentage> ascent_override;
-    if (auto value = descriptors.descriptor_or_initial_value(DescriptorNameAndID::from_id(DescriptorID::AscentOverride)))
+    if (auto value = descriptors.descriptor_or_initial_value(AtRuleID::FontFace, DescriptorNameAndID::from_id(DescriptorID::AscentOverride)))
         ascent_override = extract_percentage_or_normal(*value);
 
     Optional<Percentage> descent_override;
-    if (auto value = descriptors.descriptor_or_initial_value(DescriptorNameAndID::from_id(DescriptorID::DescentOverride)))
+    if (auto value = descriptors.descriptor_or_initial_value(AtRuleID::FontFace, DescriptorNameAndID::from_id(DescriptorID::DescentOverride)))
         descent_override = extract_percentage_or_normal(*value);
 
     Optional<Percentage> line_gap_override;
-    if (auto value = descriptors.descriptor_or_initial_value(DescriptorNameAndID::from_id(DescriptorID::LineGapOverride)))
+    if (auto value = descriptors.descriptor_or_initial_value(AtRuleID::FontFace, DescriptorNameAndID::from_id(DescriptorID::LineGapOverride)))
         line_gap_override = extract_percentage_or_normal(*value);
 
     FontDisplay font_display;
-    if (auto value = descriptors.descriptor_or_initial_value(DescriptorNameAndID::from_id(DescriptorID::FontDisplay)))
+    if (auto value = descriptors.descriptor_or_initial_value(AtRuleID::FontFace, DescriptorNameAndID::from_id(DescriptorID::FontDisplay)))
         font_display = keyword_to_font_display(value->to_keyword()).value_or(FontDisplay::Auto);
 
-    Optional<FlyString> font_named_instance;
-    if (auto value = descriptors.descriptor_or_initial_value(DescriptorNameAndID::from_id(DescriptorID::FontNamedInstance))) {
+    Optional<Utf16FlyString> font_named_instance;
+    if (auto value = descriptors.descriptor_or_initial_value(AtRuleID::FontFace, DescriptorNameAndID::from_id(DescriptorID::FontNamedInstance))) {
         if (value->is_string())
             font_named_instance = value->as_string().string_value();
     }
 
-    Optional<FlyString> font_language_override;
-    if (auto value = descriptors.descriptor_or_initial_value(DescriptorNameAndID::from_id(DescriptorID::FontLanguageOverride))) {
+    Optional<Utf16FlyString> font_language_override;
+    if (auto value = descriptors.descriptor_or_initial_value(AtRuleID::FontFace, DescriptorNameAndID::from_id(DescriptorID::FontLanguageOverride))) {
         if (value->is_string())
             font_language_override = value->as_string().string_value();
     }
 
-    Optional<OrderedHashMap<FlyString, i32>> font_feature_settings;
-    if (auto value = descriptors.descriptor_or_initial_value(DescriptorNameAndID::from_id(DescriptorID::FontFeatureSettings))) {
+    Optional<OrderedHashMap<Utf16FlyString, i32>> font_feature_settings;
+    if (auto value = descriptors.descriptor_or_initial_value(AtRuleID::FontFace, DescriptorNameAndID::from_id(DescriptorID::FontFeatureSettings))) {
         if (value->to_keyword() == Keyword::Normal) {
             font_feature_settings.clear();
         } else if (value->is_value_list()) {
             auto const& feature_tags = value->as_value_list().values();
-            OrderedHashMap<FlyString, i32> settings;
+            OrderedHashMap<Utf16FlyString, i32> settings;
             settings.ensure_capacity(feature_tags.size());
             for (auto const& feature_tag_style_value : feature_tags) {
                 auto const& feature_tag = feature_tag_style_value->as_open_type_tagged();
@@ -183,13 +181,13 @@ ParsedFontFace ParsedFontFace::from_descriptors(CSSFontFaceDescriptors const& de
         }
     }
 
-    Optional<OrderedHashMap<FlyString, double>> font_variation_settings;
-    if (auto value = descriptors.descriptor_or_initial_value(DescriptorNameAndID::from_id(DescriptorID::FontVariationSettings))) {
+    Optional<OrderedHashMap<Utf16FlyString, double>> font_variation_settings;
+    if (auto value = descriptors.descriptor_or_initial_value(AtRuleID::FontFace, DescriptorNameAndID::from_id(DescriptorID::FontVariationSettings))) {
         if (value->to_keyword() == Keyword::Normal) {
             font_variation_settings.clear();
         } else if (value->is_value_list()) {
             auto const& variation_tags = value->as_value_list().values();
-            OrderedHashMap<FlyString, double> settings;
+            OrderedHashMap<Utf16FlyString, double> settings;
             settings.ensure_capacity(variation_tags.size());
 
             // FIXME: Absolutize these values to handle relative lengths within calcs
@@ -201,7 +199,6 @@ ParsedFontFace ParsedFontFace::from_descriptors(CSSFontFaceDescriptors const& de
     }
 
     return ParsedFontFace {
-        *descriptors.parent_rule(),
         move(font_family),
         move(weight),
         move(slope),
@@ -219,9 +216,8 @@ ParsedFontFace ParsedFontFace::from_descriptors(CSSFontFaceDescriptors const& de
     };
 }
 
-ParsedFontFace::ParsedFontFace(GC::Ref<CSSRule> parent_rule, FlyString font_family, Optional<FontWeightRange> weight, Optional<int> slope, Optional<int> width, Vector<Source> sources, Vector<Gfx::UnicodeRange> unicode_ranges, Optional<Percentage> ascent_override, Optional<Percentage> descent_override, Optional<Percentage> line_gap_override, FontDisplay font_display, Optional<FlyString> font_named_instance, Optional<FlyString> font_language_override, Optional<OrderedHashMap<FlyString, i32>> font_feature_settings, Optional<OrderedHashMap<FlyString, double>> font_variation_settings)
-    : m_parent_rule(parent_rule)
-    , m_font_family(move(font_family))
+ParsedFontFace::ParsedFontFace(Utf16FlyString font_family, Optional<FontWeightRange> weight, Optional<int> slope, Optional<int> width, Vector<Source> sources, Vector<Gfx::UnicodeRange> unicode_ranges, Optional<Percentage> ascent_override, Optional<Percentage> descent_override, Optional<Percentage> line_gap_override, FontDisplay font_display, Optional<Utf16FlyString> font_named_instance, Optional<Utf16FlyString> font_language_override, Optional<OrderedHashMap<Utf16FlyString, i32>> font_feature_settings, Optional<OrderedHashMap<Utf16FlyString, double>> font_variation_settings)
+    : m_font_family(move(font_family))
     , m_font_named_instance(move(font_named_instance))
     , m_weight(move(weight))
     , m_slope(slope)
@@ -232,7 +228,7 @@ ParsedFontFace::ParsedFontFace(GC::Ref<CSSRule> parent_rule, FlyString font_fami
     , m_descent_override(move(descent_override))
     , m_line_gap_override(move(line_gap_override))
     , m_font_display(font_display)
-    , m_font_language_override(font_language_override)
+    , m_font_language_override(move(font_language_override))
     , m_font_feature_settings(move(font_feature_settings))
     , m_font_variation_settings(move(font_variation_settings))
 {

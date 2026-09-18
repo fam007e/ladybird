@@ -6,7 +6,6 @@
 
 #pragma once
 
-#include <AK/Vector.h>
 #include <LibJS/Heap/Cell.h>
 #include <LibWeb/HTML/EventLoop/Task.h>
 
@@ -21,6 +20,7 @@ public:
     virtual ~TaskQueue() override;
 
     bool is_empty() const { return m_tasks.is_empty() && m_idle_tasks.is_empty(); }
+    size_t size_slow() const { return m_tasks.size_slow() + m_idle_tasks.size_slow(); }
 
     bool has_runnable_tasks() const;
     bool has_rendering_tasks() const;
@@ -41,8 +41,8 @@ private:
 
     GC::Ref<HTML::EventLoop> m_event_loop;
 
-    Vector<GC::Ref<HTML::Task>> m_tasks;
-    Vector<GC::Ref<HTML::Task>> m_idle_tasks;
+    Task::Queue m_tasks;
+    Task::Queue m_idle_tasks;
     GC::Ptr<HTML::Task const> m_last_added_task;
 };
 

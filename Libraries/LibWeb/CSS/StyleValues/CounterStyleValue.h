@@ -6,7 +6,7 @@
 
 #pragma once
 
-#include <AK/FlyString.h>
+#include <AK/Utf16FlyString.h>
 #include <LibWeb/CSS/StyleValues/StyleValue.h>
 
 namespace Web::CSS {
@@ -19,39 +19,32 @@ public:
         Counters,
     };
 
-    static ValueComparingNonnullRefPtr<CounterStyleValue const> create_counter(FlyString counter_name, ValueComparingNonnullRefPtr<StyleValue const> counter_style)
+    static ValueComparingNonnullRefPtr<CounterStyleValue const> create_counter(Utf16FlyString counter_name, ValueComparingNonnullRefPtr<StyleValue const> counter_style)
     {
         return adopt_ref(*new (nothrow) CounterStyleValue(CounterFunction::Counter, move(counter_name), move(counter_style), {}));
     }
-    static ValueComparingNonnullRefPtr<CounterStyleValue const> create_counters(FlyString counter_name, FlyString join_string, ValueComparingNonnullRefPtr<StyleValue const> counter_style)
+    static ValueComparingNonnullRefPtr<CounterStyleValue const> create_counters(Utf16FlyString counter_name, Utf16FlyString join_string, ValueComparingNonnullRefPtr<StyleValue const> counter_style)
     {
         return adopt_ref(*new (nothrow) CounterStyleValue(CounterFunction::Counters, move(counter_name), move(counter_style), move(join_string)));
     }
     virtual ~CounterStyleValue() override;
 
-    CounterFunction function_type() const { return m_properties.function; }
-    auto counter_name() const { return m_properties.counter_name; }
-    auto counter_style() const { return m_properties.counter_style; }
-    auto join_string() const { return m_properties.join_string; }
+    CounterFunction function_type() const { return static_cast<CounterFunction>(m_value->counter.function); }
+    Utf16FlyString counter_name() const { return css_string_from_rust(&m_value->counter.counter_name); }
+    ValueComparingNonnullRefPtr<StyleValue const> counter_style() const { return wrap_rust_child(m_value->counter.counter_style); }
+    Utf16FlyString join_string() const { return css_string_from_rust(&m_value->counter.join_string); }
 
-    String resolve(DOM::AbstractElement&) const;
-
-    virtual void serialize(StringBuilder&, SerializationMode) const override;
-
-    bool properties_equal(CounterStyleValue const& other) const;
-
-    virtual bool is_computationally_independent() const override { return m_properties.counter_style->is_computationally_independent(); }
+    Utf16String resolve(DOM::AbstractElement&) const;
 
 private:
-    explicit CounterStyleValue(CounterFunction, FlyString counter_name, ValueComparingNonnullRefPtr<StyleValue const> counter_style, FlyString join_string);
+    friend class StyleValue;
 
-    struct Properties {
-        CounterFunction function;
-        FlyString counter_name;
-        ValueComparingNonnullRefPtr<StyleValue const> counter_style;
-        FlyString join_string;
-        bool operator==(Properties const&) const = default;
-    } m_properties;
+    explicit CounterStyleValue(StyleValueFFI::StyleValueData const* data)
+        : StyleValueWithDefaultOperators(Type::Counter, data)
+    {
+    }
+
+    explicit CounterStyleValue(CounterFunction, Utf16FlyString counter_name, ValueComparingNonnullRefPtr<StyleValue const> counter_style, Utf16FlyString join_string);
 };
 
 }

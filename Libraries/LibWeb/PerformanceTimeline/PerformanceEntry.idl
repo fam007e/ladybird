@@ -2,7 +2,7 @@
 [Exposed=(Window,Worker)]
 interface PerformanceEntry {
     readonly attribute DOMString name;
-    readonly attribute DOMString entryType;
+    readonly attribute [FlyString] DOMString entryType;
     readonly attribute DOMHighResTimeStamp startTime;
     readonly attribute DOMHighResTimeStamp duration;
     [Default] object toJSON();

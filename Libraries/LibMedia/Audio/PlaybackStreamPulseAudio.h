@@ -8,9 +8,9 @@
 
 #include "PlaybackStream.h"
 #include "PulseAudioWrappers.h"
+#include <AK/ConditionVariable.h>
+#include <AK/Mutex.h>
 #include <AK/Queue.h>
-#include <LibSync/ConditionVariable.h>
-#include <LibSync/Mutex.h>
 
 namespace Audio {
 
@@ -20,8 +20,6 @@ public:
     static NonnullRefPtr<CreatePromise> create(OutputState, u32 target_latency_ms, AudioDataRequestCallback&&);
 
     virtual SampleSpecification sample_specification() const override;
-
-    virtual void set_underrun_callback(Function<void()>) override;
 
     virtual NonnullRefPtr<Core::ThreadedPromise<AK::Duration>> resume() override;
     virtual NonnullRefPtr<Core::ThreadedPromise<void>> drain_buffer_and_suspend() override;
@@ -50,8 +48,8 @@ private:
         RefPtr<PulseAudioStream> m_stream { nullptr };
 
         Queue<Function<void()>> m_tasks;
-        Sync::Mutex m_mutex;
-        Sync::ConditionVariable m_wake_condition { m_mutex };
+        Mutex m_mutex;
+        ConditionVariable m_wake_condition { m_mutex };
 
         Atomic<bool> m_exit { false };
     };

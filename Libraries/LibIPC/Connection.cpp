@@ -6,6 +6,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/ScopeGuard.h>
 #include <AK/Vector.h>
 #include <LibIPC/Connection.h>
 #include <LibIPC/Message.h>
@@ -62,17 +63,52 @@ void ConnectionBase::shutdown_with_error(Error const& error)
     shutdown();
 }
 
+Vector<NonnullOwnPtr<Message>> ConnectionBase::take_unprocessed_messages(u32 endpoint_magic, i32 message_id)
+{
+    VERIFY(m_owner_thread_id.is_current_thread());
+    Vector<NonnullOwnPtr<Message>> taken;
+    // A handler can make a synchronous request while older messages still await dispatch
+    // in its batch. Take those first, including batches suspended by nested event loops.
+    for (auto batch : m_dispatching_message_batches) {
+        for (auto& message : batch) {
+            if (message && message->endpoint_magic() == endpoint_magic && message->message_id() == message_id)
+                taken.append(message.release_nonnull());
+        }
+    }
+    m_unprocessed_messages.remove_all_matching([&](auto& message) {
+        if (message->endpoint_magic() != endpoint_magic || message->message_id() != message_id)
+            return false;
+        taken.append(message.release_nonnull());
+        return true;
+    });
+    return taken;
+}
+
+void ConnectionBase::dispatch_pending_messages()
+{
+    VERIFY(m_owner_thread_id.is_current_thread());
+    m_transport->wait_until_incoming_is_current();
+    drain_messages_from_peer();
+    handle_messages();
+}
+
 void ConnectionBase::handle_messages()
 {
+    VERIFY(m_owner_thread_id.is_current_thread());
     auto messages = move(m_unprocessed_messages);
+    m_dispatching_message_batches.append(messages.span());
+    ScopeGuard remove_batch = [&] { m_dispatching_message_batches.take_last(); };
     for (auto& message : messages) {
-        if (message->endpoint_magic() != m_local_endpoint_magic)
+        if (!message)
+            continue;
+        auto current_message = message.release_nonnull();
+        if (current_message->endpoint_magic() != m_local_endpoint_magic)
             continue;
 
         if (!is_open())
-            dbgln("Handling message while connection closed: {}", message->message_name());
+            dbgln("Handling message while connection closed: {}", current_message->message_name());
 
-        auto handler_result = m_local_stub.handle(move(message));
+        auto handler_result = m_local_stub.handle(move(current_message));
         if (handler_result.is_error()) {
             dbgln("IPC::ConnectionBase::handle_messages: {}", handler_result.error());
             continue;
@@ -95,6 +131,7 @@ void ConnectionBase::wait_for_transport_to_become_readable()
 
 ConnectionBase::PeerEOF ConnectionBase::drain_messages_from_peer()
 {
+    VERIFY(m_owner_thread_id.is_current_thread());
     bool parse_error = false;
     auto schedule_shutdown = m_transport->read_as_many_messages_as_possible_without_blocking([&](auto&& raw_message) {
         auto bytes = raw_message.bytes.bytes();
@@ -107,7 +144,7 @@ ConnectionBase::PeerEOF ConnectionBase::drain_messages_from_peer()
     });
 
     if (parse_error) {
-        dbgln("IPC::ConnectionBase ({:p}): Disconnecting misbehaving peer due to malformed message", this);
+        dbgln("IPC::ConnectionBase ({:p}): Disconnecting peer after failing to parse a message", this);
         schedule_shutdown = Transport::ShouldShutdown::Yes;
     }
 
@@ -129,11 +166,10 @@ ConnectionBase::PeerEOF ConnectionBase::drain_messages_from_peer()
 
 OwnPtr<IPC::Message> ConnectionBase::wait_for_specific_endpoint_message_impl(u32 endpoint_magic, int message_id)
 {
+    VERIFY(m_owner_thread_id.is_current_thread());
     bool peer_disconnected_during_wait = false;
 
-    for (;;) {
-        // Double check we don't already have the event waiting for us.
-        // Otherwise we might end up blocked for a while for no reason.
+    auto take_matching_message = [&]() -> OwnPtr<IPC::Message> {
         for (size_t i = 0; i < m_unprocessed_messages.size(); ++i) {
             auto& message = m_unprocessed_messages[i];
             if (message->endpoint_magic() != endpoint_magic)
@@ -141,6 +177,14 @@ OwnPtr<IPC::Message> ConnectionBase::wait_for_specific_endpoint_message_impl(u32
             if (message->message_id() == message_id)
                 return m_unprocessed_messages.take(i);
         }
+        return {};
+    };
+
+    for (;;) {
+        // Double check we don't already have the event waiting for us.
+        // Otherwise we might end up blocked for a while for no reason.
+        if (auto message = take_matching_message())
+            return message;
 
         if (!is_open())
             break;
@@ -150,6 +194,14 @@ OwnPtr<IPC::Message> ConnectionBase::wait_for_specific_endpoint_message_impl(u32
             peer_disconnected_during_wait = true;
             break;
         }
+    }
+
+    // The EOF-reporting drain can deliver the awaited response in the same batch. A peer replying then exiting produces
+    // that. Take the response instead of failing; the drain-scheduled deferred handle_messages/shutdown still run after-
+    // wards. So, other messages from that final batch are dispatched in order before the connection close is acted on.
+    if (peer_disconnected_during_wait) {
+        if (auto message = take_matching_message())
+            return message;
     }
 
     dbgln("Failed to receive message_id: {}", message_id);

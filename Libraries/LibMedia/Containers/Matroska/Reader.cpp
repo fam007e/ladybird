@@ -15,6 +15,10 @@
 #include <AK/Time.h>
 #include <AK/Utf8View.h>
 #include <LibMedia/CodecID.h>
+#include <LibMedia/Codecs/AAC.h>
+#include <LibMedia/Codecs/AV1.h>
+#include <LibMedia/Codecs/H264.h>
+#include <LibMedia/Codecs/H265.h>
 #include <LibMedia/Codecs/Opus.h>
 #include <LibMedia/Containers/Matroska/ElementIDs.h>
 #include <LibMedia/Containers/Matroska/Utilities.h>
@@ -23,6 +27,8 @@
 #include "Reader.h"
 
 namespace Media::Matroska {
+
+static constexpr size_t MAX_SEEK_HEADS_TO_PARSE = 8;
 
 DecoderErrorOr<Reader> Reader::from_stream(NonnullRefPtr<MediaStreamCursor> const& stream_cursor)
 {
@@ -179,7 +185,7 @@ DecoderErrorOr<void> Reader::parse_initial_data(Streamer& streamer)
     return {};
 }
 
-static DecoderErrorOr<void> parse_seek_head(Streamer& streamer, size_t base_position, HashMap<u32, size_t>& table)
+DecoderErrorOr<void> Reader::parse_seek_head(Streamer& streamer, HashTable<size_t>& parsed_seek_heads)
 {
     TRY(Reader::parse_master_element(streamer, "SeekHead"sv, [&](u64 seek_head_child_id) -> DecoderErrorOr<ElementIterationDecision> {
         if (seek_head_child_id == SEEK_ELEMENT_ID) {
@@ -209,21 +215,57 @@ static DecoderErrorOr<void> parse_seek_head(Streamer& streamer, size_t base_posi
             if (seek_id.value() > NumericLimits<u32>::max())
                 return DecoderError::corrupted("Seek entry's element ID is too large"sv);
 
-            dbgln_if(MATROSKA_TRACE_DEBUG, "Seek entry found with ID {:#010x} and position {} offset from SeekHead at {}", seek_id.value(), seek_position.value(), base_position);
-            // FIXME: SeekHead can reference another SeekHead, we should recursively parse all SeekHeads.
+            auto element_position = m_segment_contents_position + seek_position.value();
+            dbgln_if(MATROSKA_TRACE_DEBUG, "Seek entry found with ID {:#010x} and position {} offset from Segment contents at {}", seek_id.value(), seek_position.value(), m_segment_contents_position);
 
-            if (table.contains(seek_id.value())) {
-                dbgln_if(MATROSKA_DEBUG, "Warning: Duplicate seek entry with ID {:#010x} at position {}", seek_id.value(), seek_position.value());
+            if (seek_id.value() == SEEK_HEAD_ELEMENT_ID) {
+                auto position_after_seek_entry = streamer.position();
+                TRY(parse_seek_head_at_position(streamer, element_position, parsed_seek_heads));
+                TRY(streamer.seek_to_position(position_after_seek_entry));
                 return ElementIterationDecision::Continue;
             }
 
-            DECODER_TRY_ALLOC(table.try_set(seek_id.release_value(), base_position + seek_position.release_value()));
+            auto insertion_result = DECODER_TRY_ALLOC(m_seek_entries.try_set(static_cast<u32>(seek_id.value()), element_position, AK::HashSetExistingEntryBehavior::Keep));
+            if (insertion_result == AK::HashSetResult::KeptExistingEntry)
+                dbgln_if(MATROSKA_DEBUG, "Duplicate seek entry with ID {:#010x} at position {}", seek_id.value(), seek_position.value());
         } else {
             dbgln_if(MATROSKA_TRACE_DEBUG, "Unknown SeekHead child element ID {:#010x}", seek_head_child_id);
         }
 
         return ElementIterationDecision::Continue;
     }));
+    return {};
+}
+
+DecoderErrorOr<void> Reader::parse_seek_head_at_position(Streamer& streamer, size_t seek_head_position, HashTable<size_t>& parsed_seek_heads)
+{
+    if (parsed_seek_heads.contains(seek_head_position))
+        return {};
+
+    if (parsed_seek_heads.size() >= MAX_SEEK_HEADS_TO_PARSE) {
+        dbgln_if(MATROSKA_DEBUG, "SeekHead chain is longer than {}, ignoring SeekHead at position {}", MAX_SEEK_HEADS_TO_PARSE, seek_head_position);
+        return {};
+    }
+
+    DECODER_TRY_ALLOC(parsed_seek_heads.try_set(seek_head_position));
+
+    auto seek_result = streamer.seek_to_position(seek_head_position);
+    if (seek_result.is_error())
+        return {};
+
+    auto element_id = streamer.read_element_id();
+    if (element_id.is_error())
+        return {};
+    if (element_id.value() != SEEK_HEAD_ELEMENT_ID)
+        return {};
+
+    auto parse_result = parse_seek_head(streamer, parsed_seek_heads);
+    if (parse_result.is_error()) {
+        if (parse_result.error().category() == DecoderErrorCategory::Memory)
+            return parse_result.release_error();
+        return {};
+    }
+
     return {};
 }
 
@@ -248,13 +290,20 @@ DecoderErrorOr<Optional<size_t>> Reader::find_first_top_level_element_with_id(St
 
     while (!segment_contents_end.has_value() || streamer.position() < segment_contents_end.value()) {
         auto found_element_position = streamer.position();
-        auto found_element_id = TRY(streamer.read_element_id());
+        auto found_element_id_or_error = streamer.read_element_id();
+        if (found_element_id_or_error.is_error()) {
+            if (found_element_id_or_error.error().category() != DecoderErrorCategory::EndOfStream)
+                return found_element_id_or_error.release_error();
+            break;
+        }
+        auto found_element_id = found_element_id_or_error.release_value();
         dbgln_if(MATROSKA_TRACE_DEBUG, "Found element ID {:#010x} with position {}.", found_element_id, found_element_position);
 
         if (found_element_id == SEEK_HEAD_ELEMENT_ID) {
             dbgln_if(MATROSKA_TRACE_DEBUG, "Found SeekHead, parsing it into the lookup table.");
-            m_seek_entries.clear();
-            TRY(parse_seek_head(streamer, found_element_position, m_seek_entries));
+            HashTable<size_t> parsed_seek_heads;
+            DECODER_TRY_ALLOC(parsed_seek_heads.try_set(found_element_position));
+            TRY(parse_seek_head(streamer, parsed_seek_heads));
             m_last_top_level_element_position = 0;
             if (m_seek_entries.contains(element_id)) {
                 dbgln_if(MATROSKA_TRACE_DEBUG, "SeekHead hit!");
@@ -271,9 +320,7 @@ DecoderErrorOr<Optional<size_t>> Reader::find_first_top_level_element_with_id(St
             return position;
         }
 
-        TRY(streamer.read_unknown_element());
-
-        m_last_top_level_element_position = streamer.position();
+        auto found_element_size = TRY(streamer.read_element_size());
 
         DECODER_TRY_ALLOC(m_seek_entries.try_set(found_element_id, found_element_position, AK::HashSetExistingEntryBehavior::Keep));
 
@@ -281,6 +328,15 @@ DecoderErrorOr<Optional<size_t>> Reader::find_first_top_level_element_with_id(St
             position = found_element_position;
             break;
         }
+
+        if (!found_element_size.has_value())
+            break;
+
+        if (!segment_contents_end.has_value() && found_element_id == CLUSTER_ELEMENT_ID)
+            break;
+
+        TRY(streamer.seek_to_position(AK::saturating_add(streamer.position(), found_element_size.value())));
+        m_last_top_level_element_position = streamer.position();
 
         dbgln_if(MATROSKA_TRACE_DEBUG, "Skipped to position {}.", m_last_top_level_element_position);
     }
@@ -422,6 +478,32 @@ static DecoderErrorOr<TrackEntry::AudioTrack> parse_audio_track_information(Stre
     return audio_track;
 }
 
+static Optional<ParsedCodec> parse_codec_private_data(CodecID codec_id, ReadonlyBytes codec_private_data)
+{
+    auto parsed_codec_from = [](auto parameters) -> Optional<ParsedCodec> {
+        if (!parameters.has_value())
+            return {};
+        return ParsedCodec { *parameters };
+    };
+
+    switch (codec_id) {
+    case CodecID::AAC:
+        return parsed_codec_from(Codecs::AAC::parse_configuration_record(codec_private_data, Codecs::AAC::MPEG4_AUDIO_OBJECT_TYPE_INDICATION));
+    case CodecID::AV1:
+        return parsed_codec_from(Codecs::AV1::parse_configuration_record(codec_private_data));
+    case CodecID::H264:
+        return parsed_codec_from(Codecs::H264::parse_configuration_record(codec_private_data));
+    case CodecID::H265:
+        return parsed_codec_from(Codecs::H265::parse_configuration_record(codec_private_data));
+    case CodecID::VP9:
+        // According to the WebM Project, VP9's CodecPrivate data uses tagged values, so all fields are optional.
+        // This isn't used by FFmpeg, so we likely won't find any use out of parsing it either.
+        // See: https://www.webmproject.org/docs/container/#vp9-codec-feature-metadata-codecprivate
+    default:
+        return {};
+    }
+}
+
 DecoderErrorOr<NonnullRefPtr<TrackEntry>> Reader::parse_track_entry(Streamer& streamer)
 {
     auto track_entry = DECODER_TRY_ALLOC(try_make_ref_counted<TrackEntry>());
@@ -461,7 +543,7 @@ DecoderErrorOr<NonnullRefPtr<TrackEntry>> Reader::parse_track_entry(Streamer& st
             break;
         case TRACK_CODEC_PRIVATE_ID: {
             auto codec_private_data = TRY(streamer.read_raw_octets(TRY(streamer.read_variable_size_integer())));
-            DECODER_TRY_ALLOC(track_entry->set_codec_private_data(codec_private_data));
+            track_entry->set_codec_private_data(move(codec_private_data));
             dbgln_if(MATROSKA_TRACE_DEBUG, "Read Track's CodecPrivateData element");
             break;
         }
@@ -501,7 +583,7 @@ DecoderErrorOr<NonnullRefPtr<TrackEntry>> Reader::parse_track_entry(Streamer& st
     if (track_entry->track_type() == TrackEntry::TrackType::Complex) {
         // A mix of different other TrackType. The codec needs to define how the Matroska Player
         // should interpret such data.
-        auto codec_track_type = track_type_from_codec_id(codec_id_from_matroska_id_string(track_entry->codec_id()));
+        auto codec_track_type = track_type_from_codec_id(codec_id_from_matroska_track_entry(*track_entry));
         switch (codec_track_type) {
         case TrackType::Video:
             track_entry->set_track_type(TrackEntry::TrackType::Video);
@@ -516,6 +598,10 @@ DecoderErrorOr<NonnullRefPtr<TrackEntry>> Reader::parse_track_entry(Streamer& st
             break;
         }
     }
+
+    if (auto parsed_codec = parse_codec_private_data(codec_id_from_matroska_track_entry(*track_entry), track_entry->codec_private_data()); parsed_codec.has_value())
+        track_entry->set_parsed_codec(*parsed_codec);
+
     return track_entry;
 }
 
@@ -598,7 +684,7 @@ void Reader::fix_ffmpeg_webm_quirk()
         for (auto& [id, track] : m_tracks) {
             auto delay = track->codec_delay();
 
-            if (codec_id_from_matroska_id_string(track->codec_id()) == CodecID::Opus && track->audio_track().has_value()) {
+            if (codec_id_from_matroska_track_entry(track) == CodecID::Opus && track->audio_track().has_value()) {
                 auto sampling_frequency = AK::clamp_to<u64>(track->audio_track()->sampling_frequency);
                 if (sampling_frequency == 0)
                     return;
@@ -704,7 +790,7 @@ static AK::Duration block_timestamp_to_duration(AK::Duration cluster_timestamp, 
     timestamp_offset_in_cluster_offset = saturating_sub(timestamp_offset_in_cluster_offset, AK::clamp_to<i64>(context.codec_delay));
     // This is only mentioned in the elements specification under TrackOffset.
     // https://www.matroska.org/technical/elements.html
-    timestamp_offset_in_cluster_offset = saturating_add(timestamp_offset_in_cluster_offset, AK::clamp_to<i64>(context.timestamp_offset));
+    timestamp_offset_in_cluster_offset = saturating_add(timestamp_offset_in_cluster_offset, context.timestamp_offset);
     return cluster_timestamp + AK::Duration::from_nanoseconds(timestamp_offset_in_cluster_offset);
 }
 
@@ -718,7 +804,7 @@ static DecoderErrorOr<void> maybe_parse_opus_frame_duration(Streamer& streamer, 
 {
     if (block.lacing() != Block::Lacing::None)
         return {};
-    if (codec_id_from_matroska_id_string(context.codec_id) != CodecID::Opus)
+    if (context.codec_id != CodecID::Opus)
         return {};
 
     block.set_duration(TRY(Codecs::Opus::parse_frame_duration(streamer.cursor(), block.data_size())));
@@ -1109,7 +1195,7 @@ Optional<Vector<TrackCuePoint> const&> Reader::cue_points_for_track(u64 track_nu
     return m_cues.get(track_number);
 }
 
-TimeRanges Reader::buffered_time_ranges(NonnullRefPtr<MediaStreamCursor> const& cursor, Vector<MediaStream::ByteRange> const& byte_ranges) const
+HashMap<u64, BufferedRangesScan> Reader::buffered_time_ranges_by_track_number(NonnullRefPtr<MediaStreamCursor> const& cursor, Vector<MediaStream::ByteRange> const& byte_ranges) const
 {
     auto create_iterator = [&](size_t position) -> Optional<SampleIterator> {
         auto iterator = create_sample_iterator_at_byte_position(cursor, position);
@@ -1136,6 +1222,7 @@ TimeRanges Reader::buffered_time_ranges(NonnullRefPtr<MediaStreamCursor> const& 
                 .start = byte_range.start,
                 .end = byte_range.end,
                 .iterator = create_iterator(byte_range.start),
+                .track_intervals = {},
             };
             m_buffered_ranges.insert(cached_range_index, move(new_cached_range));
             cached_range_index++;
@@ -1179,7 +1266,11 @@ TimeRanges Reader::buffered_time_ranges(NonnullRefPtr<MediaStreamCursor> const& 
                 if (!first_block.is_error() && first_block.value().timestamp().has_value()) {
                     cached_range->start = byte_range.start;
                     cached_range->end = byte_range.end;
-                    cached_range->time_start = first_block.value().timestamp().value();
+                    // The evicted front may have carried any track's earliest blocks; the first
+                    // block remaining is the earliest coverage still claimable for every track.
+                    auto new_time_start = first_block.value().timestamp().value();
+                    for (auto& [track_number, interval] : cached_range->track_intervals)
+                        interval.start = max(interval.start, new_time_start);
                     cached_range_index++;
                     byte_range_index++;
                     continue;
@@ -1192,6 +1283,7 @@ TimeRanges Reader::buffered_time_ranges(NonnullRefPtr<MediaStreamCursor> const& 
             .start = byte_range.start,
             .end = byte_range.end,
             .iterator = move(new_iterator),
+            .track_intervals = {},
         };
         cached_range_index++;
         byte_range_index++;
@@ -1200,10 +1292,10 @@ TimeRanges Reader::buffered_time_ranges(NonnullRefPtr<MediaStreamCursor> const& 
     // Remove any leftover ranges. We should be left with only the exact ranges provided to us.
     m_buffered_ranges.remove(cached_range_index, m_buffered_ranges.size() - cached_range_index);
 
-    // All previously known buffered ranges are now matched up or discarded. Iterate the blocks to update the ranges'
-    // end times and append the ranges.
+    // All previously known buffered ranges are now matched up or discarded. Iterate the blocks to update each
+    // track's interval end times and append the intervals to their tracks' ranges.
     VERIFY(m_buffered_ranges.size() == byte_ranges.size());
-    TimeRanges result;
+    HashMap<u64, BufferedRangesScan> scans_by_track_number;
 
     for (size_t i = 0; i < byte_ranges.size(); i++) {
         auto& cached_range = m_buffered_ranges[i];
@@ -1220,20 +1312,24 @@ TimeRanges Reader::buffered_time_ranges(NonnullRefPtr<MediaStreamCursor> const& 
                     break;
                 auto block = block_or_error.release_value();
                 if (block.timestamp().has_value() && block.duration().has_value()) {
-                    if (!cached_range.time_start.has_value())
-                        cached_range.time_start = block.timestamp().value();
-
                     auto block_end = block.timestamp().value() + block.duration().value();
-                    cached_range.time_end = block_end;
+                    auto& interval = cached_range.track_intervals.ensure(block.track_number(), [&] {
+                        return TimeRanges::Range { block.timestamp().value(), block_end };
+                    });
+                    interval.end = max(interval.end, block_end);
                 }
             }
         }
 
-        if (cached_range.time_start.has_value())
-            result.add_range(max(AK::Duration::zero(), cached_range.time_start.value()), cached_range.time_end);
+        for (auto const& [track_number, interval] : cached_range.track_intervals)
+            scans_by_track_number.ensure(track_number).time_ranges.add_range(max(AK::Duration::zero(), interval.start), interval.end);
     }
 
-    return result;
+    if (!m_buffered_ranges.is_empty()) {
+        for (auto const& [track_number, interval] : m_buffered_ranges.last().track_intervals)
+            scans_by_track_number.ensure(track_number).last_byte_range_has_samples = true;
+    }
+    return scans_by_track_number;
 }
 
 }

@@ -10,6 +10,10 @@
 #include <AK/String.h>
 #include <AK/StringView.h>
 #include <AK/Try.h>
+#include <AK/Utf16FlyString.h>
+#include <AK/Utf16String.h>
+#include <AK/Utf16View.h>
+#include <AK/kmalloc.h>
 
 namespace AK {
 
@@ -31,4 +35,82 @@ StringView ffi_string_view(u8 const* ptr, size_t len)
     return { ptr, len };
 }
 
+}
+
+extern "C" FlatPtr ladybird_utf16_string_create_uninitialized(size_t length, bool has_ascii_storage)
+{
+    auto storage_type = has_ascii_storage
+        ? AK::Detail::Utf16StringData::StorageType::ASCII
+        : AK::Detail::Utf16StringData::StorageType::UTF16;
+    auto data = AK::Detail::Utf16StringData::create_uninitialized_for_ffi(storage_type, length);
+    return reinterpret_cast<FlatPtr>(&data.leak_ref());
+}
+
+extern "C" FlatPtr ladybird_utf16_fly_string_from_utf8(u8 const* data, size_t length)
+{
+    VERIFY(data != nullptr || length == 0);
+    return AK::Utf16FlyString::from_utf8(AK::ffi_string_view(data, length)).into_raw();
+}
+
+extern "C" FlatPtr ladybird_utf16_fly_string_from_utf16(u16 const* data, size_t length)
+{
+    if (data == nullptr) {
+        VERIFY(length == 0);
+        return AK::Utf16FlyString {}.into_raw();
+    }
+    return AK::Utf16FlyString::from_utf16({ reinterpret_cast<char16_t const*>(data), length }).into_raw();
+}
+
+extern "C" void ladybird_utf16_string_unref(FlatPtr raw)
+{
+    AK::Utf16String::unref_raw(raw);
+}
+
+extern "C" void* ladybird_alloc(size_t size, size_t alignment)
+{
+    // NB: mimalloc only guarantees natural alignment up to the allocation size.
+    if (alignment <= alignof(max_align_t))
+        return ak_kmalloc(max(size, alignment));
+
+    Checked<size_t> allocation_size = size;
+    allocation_size += alignment - 1;
+    allocation_size += sizeof(void*);
+    if (allocation_size.has_overflow())
+        return nullptr;
+    auto* allocation = ak_kmalloc(allocation_size.value());
+    if (!allocation)
+        return nullptr;
+    auto aligned_address = align_up_to(reinterpret_cast<FlatPtr>(allocation) + sizeof(void*), alignment);
+    auto* pointer = reinterpret_cast<void**>(aligned_address);
+    pointer[-1] = allocation;
+    return pointer;
+}
+
+extern "C" void* ladybird_alloc_zeroed(size_t size, size_t alignment)
+{
+    if (alignment <= alignof(max_align_t))
+        return ak_kcalloc(1, max(size, alignment));
+    auto* pointer = ladybird_alloc(size, alignment);
+    if (pointer)
+        __builtin_memset(pointer, 0, size);
+    return pointer;
+}
+
+extern "C" void ladybird_dealloc(void* pointer, size_t alignment)
+{
+    if (pointer && alignment > alignof(max_align_t))
+        pointer = static_cast<void**>(pointer)[-1];
+    ak_kfree(pointer);
+}
+
+extern "C" void* ladybird_realloc(void* pointer, size_t old_size, size_t new_size, size_t alignment)
+{
+    if (alignment <= alignof(max_align_t))
+        return ak_krealloc(pointer, max(new_size, alignment));
+    auto* new_pointer = ladybird_alloc(new_size, alignment);
+    if (new_pointer) {
+        __builtin_memcpy(new_pointer, pointer, min(old_size, new_size));
+        ladybird_dealloc(pointer, alignment);
+    }
+    return new_pointer;
 }

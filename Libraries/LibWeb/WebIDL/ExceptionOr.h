@@ -10,6 +10,7 @@
 #include <AK/NonnullRefPtr.h>
 #include <AK/Optional.h>
 #include <AK/RefPtr.h>
+#include <AK/Utf16String.h>
 #include <LibJS/Runtime/Completion.h>
 #include <LibWeb/WebIDL/DOMException.h>
 
@@ -30,7 +31,7 @@ enum class SimpleExceptionType {
 
 struct SimpleException {
     SimpleExceptionType type;
-    Variant<String, StringView> message;
+    Utf16String message;
 };
 
 using Exception = Variant<SimpleException, GC::Ref<DOMException>, JS::Completion>;
@@ -59,7 +60,7 @@ public:
     // Disabled for POD types to avoid weird conversion shenanigans.
     template<typename WrappedValueType>
     ExceptionOr(WrappedValueType result)
-    requires(!IsPOD<ValueType>)
+    requires(!IsPOD<ValueType> && IsConstructible<ValueType, WrappedValueType>)
         : m_result_or_exception(ValueType { move(result) })
     {
     }
@@ -146,18 +147,10 @@ public:
 namespace AK {
 
 template<>
-struct Formatter<Web::WebIDL::SimpleException> : Formatter<StringView> {
+struct Formatter<Web::WebIDL::SimpleException> : Formatter<Utf16String> {
     ErrorOr<void> format(FormatBuilder& builder, Web::WebIDL::SimpleException const& exception)
     {
-        auto message_view = exception.message.visit(
-            [](String const& message) -> StringView {
-                return message.bytes_as_string_view();
-            },
-            [](StringView message) -> StringView {
-                return message;
-            });
-
-        return Formatter<StringView>::format(builder, message_view);
+        return Formatter<Utf16String>::format(builder, exception.message);
     }
 };
 

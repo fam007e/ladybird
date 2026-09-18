@@ -4,10 +4,10 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <LibGC/Heap.h>
 #include <LibGfx/DecodedImageFrame.h>
-#include <LibWeb/Bindings/HTMLObjectElement.h>
-#include <LibWeb/CSS/ComputedProperties.h>
 #include <LibWeb/CSS/Invalidation/EmbeddedContentInvalidator.h>
+#include <LibWeb/CSS/PropertyID.h>
 #include <LibWeb/CSS/StyleComputer.h>
 #include <LibWeb/CSS/StyleValues/DisplayStyleValue.h>
 #include <LibWeb/CSS/StyleValues/KeywordStyleValue.h>
@@ -26,13 +26,14 @@
 #include <LibWeb/HTML/HTMLMediaElement.h>
 #include <LibWeb/HTML/HTMLObjectElement.h>
 #include <LibWeb/HTML/ImageRequest.h>
-#include <LibWeb/HTML/LocalNavigable.h>
+#include <LibWeb/HTML/Navigable.h>
 #include <LibWeb/HTML/Numbers.h>
 #include <LibWeb/HTML/Parser/HTMLParser.h>
 #include <LibWeb/HTML/PotentialCORSRequest.h>
+#include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/SharedResourceRequest.h>
-#include <LibWeb/Layout/ImageBox.h>
-#include <LibWeb/Layout/NavigableContainerViewport.h>
+#include <LibWeb/HighResolutionTime/TimeOrigin.h>
+#include <LibWeb/Layout/Box.h>
 #include <LibWeb/Loader/ResourceLoader.h>
 #include <LibWeb/MimeSniff/MimeType.h>
 #include <LibWeb/MimeSniff/Resource.h>
@@ -40,6 +41,16 @@
 namespace Web::HTML {
 
 GC_DEFINE_ALLOCATOR(HTMLObjectElement);
+
+Layout::Node const* HTMLObjectElement::image_provider_layout_node() const
+{
+    return unsafe_layout_node();
+}
+
+static GC::Ref<DOM::Event> create_event_for_element(HTMLElement& element, Utf16FlyString const& event_name)
+{
+    return DOM::Event::create(event_name, HighResolutionTime::current_high_resolution_time(relevant_global_object(element)));
+}
 
 HTMLObjectElement::HTMLObjectElement(DOM::Document& document, DOM::QualifiedName qualified_name)
     : NavigableContainer(document, move(qualified_name))
@@ -57,12 +68,9 @@ HTMLObjectElement::HTMLObjectElement(DOM::Document& document, DOM::QualifiedName
 
 HTMLObjectElement::~HTMLObjectElement() = default;
 
-void HTMLObjectElement::initialize(JS::Realm& realm)
+void HTMLObjectElement::initialize_element()
 {
-    WEB_SET_PROTOTYPE_FOR_INTERFACE(HTMLObjectElement);
-    Base::initialize(realm);
-
-    m_document_observer = realm.create<DOM::DocumentObserver>(realm, document());
+    m_document_observer = DOM::DocumentObserver::create(document());
 
     // https://html.spec.whatwg.org/multipage/iframe-embed-object.html#the-object-element
     // Whenever one of the following conditions occur:
@@ -94,7 +102,7 @@ void HTMLObjectElement::adopted_from(DOM::Document& old_document)
         delayer = DOM::DocumentLoadEventDelayer { document() };
 }
 
-void HTMLObjectElement::form_associated_element_attribute_changed(FlyString const& name, Optional<String> const&, Optional<String> const&, Optional<FlyString> const&)
+void HTMLObjectElement::form_associated_element_attribute_changed(Utf16FlyString const& name, Optional<Utf16String> const&, Optional<Utf16String> const&, Optional<Utf16FlyString> const&)
 {
     // https://html.spec.whatwg.org/multipage/iframe-embed-object.html#the-object-element
     // Whenever one of the following conditions occur:
@@ -116,7 +124,7 @@ void HTMLObjectElement::form_associated_element_was_removed(DOM::Node*)
     destroy_the_child_navigable();
 }
 
-bool HTMLObjectElement::is_presentational_hint(FlyString const& name) const
+bool HTMLObjectElement::is_presentational_hint(Utf16FlyString const& name) const
 {
     if (Base::is_presentational_hint(name))
         return true;
@@ -133,7 +141,7 @@ bool HTMLObjectElement::is_presentational_hint(FlyString const& name) const
 void HTMLObjectElement::apply_presentational_hints(Vector<CSS::StyleProperty>& properties) const
 {
     Base::apply_presentational_hints(properties);
-    for_each_attribute([&](auto& name, auto& value) {
+    for_each_attribute([&](Utf16FlyString const& name, Utf16View value) {
         if (name == HTML::AttributeNames::align) {
             // https://html.spec.whatwg.org/multipage/rendering.html#attributes-for-embedded-content-and-images
             // When an embed, iframe, img, or object element, or an input element whose type attribute is in the Image Button state,
@@ -142,7 +150,7 @@ void HTMLObjectElement::apply_presentational_hints(Vector<CSS::StyleProperty>& p
             // vertical middle of the element with the parent element's baseline.
             // FIXME: This should use legacy baseline-middle alignment instead of CSS vertical-align: middle,
             //        as Firefox and Chrome do with engine-specific legacy values.
-            if (value.equals_ignoring_ascii_case("center"sv) || value.equals_ignoring_ascii_case("middle"sv))
+            if (value.equals_ignoring_ascii_case(u"center"sv) || value.equals_ignoring_ascii_case(u"middle"sv))
                 properties.append({ .property_id = CSS::PropertyID::VerticalAlign, .value = CSS::KeywordStyleValue::create(CSS::Keyword::Middle) });
         } else if (name == HTML::AttributeNames::border) {
             if (auto parsed_value = parse_non_negative_integer(value); parsed_value.has_value()) {
@@ -184,48 +192,22 @@ void HTMLObjectElement::apply_presentational_hints(Vector<CSS::StyleProperty>& p
     });
 }
 
-// https://html.spec.whatwg.org/multipage/iframe-embed-object.html#attr-object-data
-String HTMLObjectElement::data() const
-{
-    auto data = get_attribute(HTML::AttributeNames::data);
-    if (!data.has_value())
-        return {};
-
-    auto maybe_url = document().encoding_parse_url(*data);
-    if (!maybe_url.has_value())
-        return {};
-
-    return maybe_url->to_string();
-}
-
-void HTMLObjectElement::set_data(String const& data)
-{
-    set_attribute_value(HTML::AttributeNames::data, data);
-}
-
-RefPtr<Layout::Node> HTMLObjectElement::create_layout_node(CSS::ComputedProperties const& style)
+Layout::Node* HTMLObjectElement::create_layout_node(CSS::LayoutStyle style)
 {
     switch (m_representation) {
     case Representation::Children:
         return NavigableContainer::create_layout_node(style);
     case Representation::ContentNavigable:
-        return make_ref_counted<Layout::NavigableContainerViewport>(document(), *this, style);
+        return &Layout::allocate_layout_node<Layout::Box>(document(), *this, style, Layout::RustFFI::NodeKind::NavigableContainerViewport);
     case Representation::Image:
         if (image_data())
-            return make_ref_counted<Layout::ImageBox>(document(), *this, style, *this);
+            return &Layout::allocate_layout_node<Layout::Box>(document(), *this, style, Layout::RustFFI::NodeKind::ImageBox);
         break;
     default:
         break;
     }
 
     return nullptr;
-}
-
-void HTMLObjectElement::adjust_computed_style(CSS::ComputedProperties::Builder& style)
-{
-    // https://drafts.csswg.org/css-display-3/#unbox
-    if (style.display().is_contents())
-        style.set_property(CSS::PropertyID::Display, CSS::DisplayStyleValue::create(CSS::Display::from_short(CSS::Display::Short::None)));
 }
 
 bool HTMLObjectElement::has_ancestor_media_element_or_object_element_not_showing_fallback_content() const
@@ -257,9 +239,7 @@ void HTMLObjectElement::queue_element_task_to_run_object_representation_steps()
     queue_an_element_task(HTML::Task::Source::DOMManipulation, [this]() {
         ScopeGuard guard { [&]() { m_document_load_event_delayer_for_object_representation_task.take_last(); } };
 
-        auto& realm = this->realm();
-        auto& vm = realm.vm();
-
+        auto& realm = HTML::relevant_realm(*this);
         // FIXME: 1. If the user has indicated a preference that this object element's fallback content be shown instead of the
         //           element's usual behavior, then jump to the step below labeled fallback.
 
@@ -289,7 +269,7 @@ void HTMLObjectElement::queue_element_task_to_run_object_representation_steps()
 
             // 3. If url is failure, then fire an event named error at the element and jump to the step below labeled fallback.
             if (!url.has_value()) {
-                dispatch_event(DOM::Event::create(realm, HTML::EventNames::error));
+                dispatch_event(create_event_for_element(*this, HTML::EventNames::error));
                 run_object_representation_fallback_steps();
                 return;
             }
@@ -297,7 +277,7 @@ void HTMLObjectElement::queue_element_task_to_run_object_representation_steps()
             // 4. Let request be a new request whose URL is url, client is the element's node document's relevant settings
             //    object, destination is "object", credentials mode is "include", mode is "navigate", initiator type is
             //    "object", and whose use-URL-credentials flag is set.
-            auto request = Fetch::Infrastructure::Request::create(vm);
+            auto request = Fetch::Infrastructure::Request::create();
             request->set_url(url.release_value());
             request->set_client(&document().relevant_settings_object());
             request->set_destination(Fetch::Infrastructure::Request::Destination::Object);
@@ -308,8 +288,8 @@ void HTMLObjectElement::queue_element_task_to_run_object_representation_steps()
 
             Fetch::Infrastructure::FetchAlgorithms::Input fetch_algorithms_input {};
             fetch_algorithms_input.process_response = [this](GC::Ref<Fetch::Infrastructure::Response> response) {
-                auto& realm = this->realm();
-                auto& global = document().realm().global_object();
+                auto& realm = HTML::relevant_realm(*this);
+                auto& global = document().relevant_settings_object().realm().global_object();
 
                 if (response->is_network_error() || !Fetch::Infrastructure::is_ok_status(response->status())) {
                     resource_did_fail();
@@ -321,10 +301,10 @@ void HTMLObjectElement::queue_element_task_to_run_object_representation_steps()
                     response = filtered_response.internal_response();
                 }
 
-                auto on_data_read = GC::create_function(realm.heap(), [this, response](ByteBuffer data) {
+                auto on_data_read = GC::create_function(GC::Heap::the(), [this, response](ByteBuffer data) {
                     resource_did_load(response, data);
                 });
-                auto on_error = GC::create_function(realm.heap(), [this](JS::Value) {
+                auto on_error = GC::create_function(GC::Heap::the(), [this](JS::Value) {
                     resource_did_fail();
                 });
 
@@ -333,7 +313,7 @@ void HTMLObjectElement::queue_element_task_to_run_object_representation_steps()
             };
 
             // 5. Fetch request.
-            (void)Fetch::Fetching::fetch(realm, request, Fetch::Infrastructure::FetchAlgorithms::create(vm, move(fetch_algorithms_input)));
+            (void)Fetch::Fetching::fetch(realm, request, Fetch::Infrastructure::FetchAlgorithms::create(move(fetch_algorithms_input)));
 
             //    Fetching the resource must delay the load event of the element's node document until the task that is
             //    queued by the networking task source once the resource has been fetched (defined next) has been run.
@@ -359,7 +339,7 @@ void HTMLObjectElement::resource_did_fail()
 
     // 3.7. If the load failed (e.g. there was an HTTP 404 error, there was a DNS error), fire an event named error at
     //      the element, then jump to the step below labeled fallback.
-    dispatch_event(DOM::Event::create(realm(), HTML::EventNames::error));
+    dispatch_event(create_event_for_element(*this, HTML::EventNames::error));
     run_object_representation_fallback_steps();
 }
 
@@ -414,7 +394,7 @@ void HTMLObjectElement::resource_did_load(Fetch::Infrastructure::Response const&
         else if (auto type = this->type(); !type.is_empty() && (type != "application/octet-stream"sv)) {
             // 1. If the attribute's value is a type that starts with "image/" that is not also an XML MIME type, then
             //    let the resource type be the type specified in that type attribute.
-            if (type.starts_with_bytes("image/"sv)) {
+            if (type.starts_with(u"image/"sv)) {
                 auto parsed_type = MimeSniff::MimeType::parse(type);
 
                 if (parsed_type.has_value() && !parsed_type->is_xml())
@@ -471,7 +451,7 @@ void HTMLObjectElement::run_object_representation_handler_steps(Fetch::Infrastru
             MUST(m_content_navigable->navigate({
                 .url = *response.url(),
                 .source_document = document(),
-                .history_handling = Bindings::NavigationHistoryBehavior::Replace,
+                .history_handling = NavigationHistoryBehavior::Replace,
             }));
         }
 
@@ -514,7 +494,7 @@ void HTMLObjectElement::run_object_representation_completed_steps(Representation
     //       load at the element.
     if (representation != Representation::ContentNavigable) {
         queue_an_element_task(HTML::Task::Source::DOMManipulation, [&]() {
-            dispatch_event(DOM::Event::create(realm(), HTML::EventNames::load));
+            dispatch_event(create_event_for_element(*this, HTML::EventNames::load));
         });
     }
 
@@ -536,7 +516,7 @@ void HTMLObjectElement::run_object_representation_fallback_steps()
 void HTMLObjectElement::load_image()
 {
     // FIXME: This currently reloads the image instead of reusing the resource we've already downloaded.
-    auto data = get_attribute_value(HTML::AttributeNames::data);
+    auto data = attribute(HTML::AttributeNames::data).value_or({});
     auto url = document().encoding_parse_url(data);
 
     if (!url.has_value()) {
@@ -546,7 +526,7 @@ void HTMLObjectElement::load_image()
 
     m_document_load_event_delayer_for_resource_load.empend(document());
 
-    m_resource_request = HTML::SharedResourceRequest::get_or_create(realm(), document().page(), *url);
+    m_resource_request = HTML::SharedResourceRequest::get_or_create(document(), *url);
     m_resource_request->add_callbacks(
         [this] {
             run_object_representation_completed_steps(Representation::Image);
@@ -558,9 +538,9 @@ void HTMLObjectElement::load_image()
         });
 
     if (m_resource_request->needs_fetching()) {
-        auto request = HTML::create_potential_CORS_request(vm(), *url, Fetch::Infrastructure::Request::Destination::Image, HTML::CORSSettingAttribute::NoCORS);
+        auto request = HTML::create_potential_CORS_request(*url, Fetch::Infrastructure::Request::Destination::Image, HTML::CORSSettingAttribute::NoCORS);
         request->set_client(&document().relevant_settings_object());
-        m_resource_request->fetch_resource(realm(), request);
+        m_resource_request->fetch_resource(request);
     }
 }
 
@@ -574,7 +554,6 @@ void HTMLObjectElement::update_layout_and_child_objects(Representation represent
     }
 
     m_representation = representation;
-    CSS::Invalidation::invalidate_style_after_object_representation_change(*this);
 
     if (auto parent_element = this->parent_element())
         parent_element->set_needs_layout_tree_update(true, DOM::SetNeedsLayoutTreeUpdateReason::HTMLObjectElementUpdateLayoutAndChildObjects);

@@ -19,26 +19,22 @@ public:
     }
     virtual ~ResolutionStyleValue() override = default;
 
-    Resolution const& resolution() const { return m_resolution; }
-    virtual double raw_value() const override { return m_resolution.raw_value(); }
-    virtual FlyString unit_name() const override { return m_resolution.unit_name(); }
-
-    virtual ValueComparingNonnullRefPtr<StyleValue const> absolutized(ComputationContext const&) const override;
-
-    virtual void serialize(StringBuilder& builder, SerializationMode mode) const override { m_resolution.serialize(builder, mode); }
-
-    virtual bool is_computationally_independent() const override { return true; }
-
-    bool equals(StyleValue const& other) const override;
+    Resolution resolution() const { return Resolution(m_value->resolution.value, static_cast<ResolutionUnit>(m_value->resolution.unit)); }
+    virtual double raw_value() const override { return m_value->resolution.value; }
+    virtual Utf16FlyString unit_name() const override { return resolution().unit_name(); }
 
 private:
-    explicit ResolutionStyleValue(Resolution resolution)
-        : DimensionStyleValue(Type::Resolution)
-        , m_resolution(move(resolution))
+    friend class StyleValue;
+
+    explicit ResolutionStyleValue(StyleValueFFI::StyleValueData const* data)
+        : DimensionStyleValue(Type::Resolution, data)
     {
     }
 
-    Resolution m_resolution;
+    explicit ResolutionStyleValue(Resolution resolution)
+        : DimensionStyleValue(Type::Resolution, StyleValueFFI::rust_style_value_create_resolution(resolution.raw_value(), to_underlying(resolution.unit())))
+    {
+    }
 };
 
 }

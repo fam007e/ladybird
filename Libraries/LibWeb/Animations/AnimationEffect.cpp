@@ -4,17 +4,16 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <AK/Bitmap.h>
+#include <AK/ScopeGuard.h>
 #include <LibJS/Runtime/VM.h>
 #include <LibWeb/Animations/Animation.h>
 #include <LibWeb/Animations/AnimationEffect.h>
 #include <LibWeb/Animations/AnimationTimeline.h>
+#include <LibWeb/Animations/KeyframeEffect.h>
 #include <LibWeb/Bindings/AnimationEffect.h>
-#include <LibWeb/Bindings/CSSStyleSheet.h>
-#include <LibWeb/Bindings/Intrinsics.h>
 #include <LibWeb/CSS/CSSNumericValue.h>
-#include <LibWeb/CSS/ComputedProperties.h>
-#include <LibWeb/CSS/Invalidation/SlotInvalidator.h>
+#include <LibWeb/CSS/ComputedStyleWorkingSet.h>
+#include <LibWeb/CSS/ComputedValues.h>
 #include <LibWeb/CSS/Parser/Parser.h>
 #include <LibWeb/CSS/PropertyID.h>
 #include <LibWeb/CSS/StyleComputer.h>
@@ -23,8 +22,9 @@
 #include <LibWeb/CSS/StyleValues/StyleValueList.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/Element.h>
-#include <LibWeb/DOM/ShadowRoot.h>
 #include <LibWeb/Layout/Node.h>
+#include <LibWeb/Painting/BoxViews.h>
+#include <LibWeb/SVG/SVGElement.h>
 #include <LibWeb/WebIDL/ExceptionOr.h>
 
 namespace Web::Animations {
@@ -33,8 +33,8 @@ GC_DEFINE_ALLOCATOR(AnimationEffect);
 
 AnimationUpdateContext::ElementData::ElementData() = default;
 
-AnimationUpdateContext::ElementData::ElementData(RefPtr<CSS::AnimatedProperties const> animated_properties_before_update, RefPtr<CSS::ComputedProperties> target_style)
-    : animated_properties_before_update(move(animated_properties_before_update))
+AnimationUpdateContext::ElementData::ElementData(CSS::StyleRecordID style_record_before_update, RefPtr<CSS::ComputedStyleWorkingSet> target_style)
+    : style_record_before_update(style_record_before_update)
     , target_style(move(target_style))
 {
 }
@@ -85,10 +85,10 @@ Bindings::OptionalEffectTiming to_optional_effect_timing(Bindings::EffectTiming 
         .delay = effect_timing.delay,
         .direction = effect_timing.direction,
         .duration = effect_timing.duration.visit(
-            [](double const& value) -> Variant<double, String> { return value; },
-            [](String const& value) -> Variant<double, String> { return value; },
+            [](double const& value) -> Variant<double, Utf16String> { return value; },
+            [](Utf16String const& value) -> Variant<double, Utf16String> { return value; },
             // NB: We check that this isn't the case in the caller
-            [](GC::Ref<CSS::CSSNumericValue>) -> Variant<double, String> { VERIFY_NOT_REACHED(); }),
+            [](GC::Ref<CSS::CSSNumericValue>) -> Variant<double, Utf16String> { VERIFY_NOT_REACHED(); }),
         .easing = effect_timing.easing,
         .end_delay = effect_timing.end_delay,
         .fill = effect_timing.fill,
@@ -100,12 +100,14 @@ Bindings::OptionalEffectTiming to_optional_effect_timing(Bindings::EffectTiming 
 // https://www.w3.org/TR/web-animations-1/#dom-animationeffect-gettiming
 Bindings::EffectTiming AnimationEffect::get_timing() const
 {
+    update_style_if_needed();
+
     // 1. Returns the specified timing properties for this animation effect.
     return {
         .delay = m_specified_start_delay,
         .direction = m_playback_direction,
         .duration = m_specified_iteration_duration,
-        .easing = m_timing_function.to_string(),
+        .easing = m_timing_function.to_utf16_string(),
         .end_delay = m_specified_end_delay,
         .fill = m_fill_mode,
         .iteration_start = m_iteration_start,
@@ -117,6 +119,16 @@ Bindings::EffectTiming AnimationEffect::get_timing() const
 // https://drafts.csswg.org/web-animations-2/#dom-animationeffect-getcomputedtiming
 Bindings::ComputedEffectTiming AnimationEffect::get_computed_timing() const
 {
+    update_style_if_needed();
+
+    if (m_associated_animation) {
+        m_has_local_time_override_for_observation = true;
+        m_local_time_override_for_observation = m_associated_animation->current_time_for_observation();
+    }
+    ScopeGuard clear_local_time_override = [&] {
+        m_has_local_time_override_for_observation = false;
+    };
+
     // 1. Returns the calculated timing properties for this animation effect.
 
     // Note: Although some of the attributes of the object returned by getTiming() and getComputedTiming() are common,
@@ -129,7 +141,7 @@ Bindings::ComputedEffectTiming AnimationEffect::get_computed_timing() const
     //       If duration is the string auto, this attribute will return the current calculated value of the intrinsic
     //       iteration duration, which may be a expressed as a double representing the duration in milliseconds or a
     //       percentage when the effect is associated with a progress-based timeline.
-    auto duration = m_iteration_duration.as_css_numberish(realm());
+    auto duration = m_iteration_duration.as_css_numberish();
 
     //     - fill: likewise, while getTiming() may return the string auto, getComputedTiming() must return the specific
     //       FillMode used for timing calculations as defined in the description of the fill member of the EffectTiming
@@ -146,11 +158,11 @@ Bindings::ComputedEffectTiming AnimationEffect::get_computed_timing() const
     computed_timing.iterations = m_iteration_count;
     computed_timing.duration = duration;
     computed_timing.direction = m_playback_direction;
-    computed_timing.easing = m_timing_function.to_string();
-    computed_timing.active_duration = active_duration().as_css_numberish(realm());
+    computed_timing.easing = m_timing_function.to_utf16_string();
+    computed_timing.active_duration = active_duration().as_css_numberish();
     computed_timing.current_iteration = current_iteration();
-    computed_timing.end_time = end_time().as_css_numberish(realm());
-    computed_timing.local_time = NullableCSSNumberish::from_optional_css_numberish_time(realm(), local_time());
+    computed_timing.end_time = end_time().as_css_numberish();
+    computed_timing.local_time = NullableCSSNumberish::from_optional_css_numberish_time(local_time());
     computed_timing.progress = transformed_progress();
     return computed_timing;
 }
@@ -211,7 +223,7 @@ void AnimationEffect::convert_a_time_based_animation_to_a_proportional_animation
     // AD-HOC: We use the specified interation duration instead of the iteration duration here, see
     //         https://github.com/w3c/csswg-drafts/pull/13170
     // If the iteration duration is auto, then perform the following steps.
-    if (m_specified_iteration_duration.has<String>()) {
+    if (m_specified_iteration_duration.has<Utf16String>()) {
         // Set start delay and end delay to 0, as it is not possible to mix time and proportions.
         // Note: Future versions may allow these properties to be assigned percentages, at which point the delays are
         //       only to be ignored if their values are expressed as times and not as percentages.
@@ -271,7 +283,7 @@ void AnimationEffect::normalize_specified_timing()
         // 3. If iteration duration is auto:
         // AD-HOC: We use the specified interation duration instead of the iteration duration here, see
         //         https://github.com/w3c/csswg-drafts/pull/13170
-        if (m_specified_iteration_duration.has<String>()) {
+        if (m_specified_iteration_duration.has<Utf16String>()) {
             // Set iteration duration = intrinsic iteration duration
             m_iteration_duration = intrinsic_iteration_duration();
         }
@@ -291,12 +303,12 @@ WebIDL::ExceptionOr<void> AnimationEffect::update_timing(Bindings::OptionalEffec
     // 1. If the iterationStart member of input exists and is less than zero, throw a TypeError and abort this
     //    procedure.
     if (timing.iteration_start.has_value() && timing.iteration_start.value() < 0.0)
-        return WebIDL::SimpleException { WebIDL::SimpleExceptionType::TypeError, "Invalid iteration start value"sv };
+        return WebIDL::SimpleException { WebIDL::SimpleExceptionType::TypeError, "Invalid iteration start value"_utf16 };
 
     // 2. If the iterations member of input exists, and is less than zero or is the value NaN, throw a TypeError and
     //    abort this procedure.
     if (timing.iterations.has_value() && (timing.iterations.value() < 0.0 || isnan(timing.iterations.value())))
-        return WebIDL::SimpleException { WebIDL::SimpleExceptionType::TypeError, "Invalid iteration count value"sv };
+        return WebIDL::SimpleException { WebIDL::SimpleExceptionType::TypeError, "Invalid iteration count value"_utf16 };
 
     // 3. If the duration member of input exists, and is less than zero or is the value NaN, throw a TypeError and
     //    abort this procedure.
@@ -307,12 +319,12 @@ WebIDL::ExceptionOr<void> AnimationEffect::update_timing(Bindings::OptionalEffec
             return true;
         if (duration->has<double>() && (duration->get<double>() < 0.0 || isnan(duration->get<double>())))
             return false;
-        if (duration->has<String>() && (duration->get<String>() != "auto"))
+        if (duration->has<Utf16String>() && (duration->get<Utf16String>() != "auto"sv))
             return false;
         return true;
     }();
     if (!has_valid_duration_value)
-        return WebIDL::SimpleException { WebIDL::SimpleExceptionType::TypeError, "Invalid duration value"sv };
+        return WebIDL::SimpleException { WebIDL::SimpleExceptionType::TypeError, "Invalid duration value"_utf16 };
 
     // 4. If the easing member of input exists but cannot be parsed using the <easing-function> production
     //    [CSS-EASING-1], throw a TypeError and abort this procedure.
@@ -320,7 +332,7 @@ WebIDL::ExceptionOr<void> AnimationEffect::update_timing(Bindings::OptionalEffec
     if (timing.easing.has_value()) {
         easing_value = parse_easing_string(timing.easing.value());
         if (!easing_value.has_value())
-            return WebIDL::SimpleException { WebIDL::SimpleExceptionType::TypeError, "Invalid easing function"sv };
+            return WebIDL::SimpleException { WebIDL::SimpleExceptionType::TypeError, "Invalid easing function"_utf16 };
     }
 
     // 5. Assign each member that exists in input to the corresponding timing property of effect as follows:
@@ -360,6 +372,9 @@ WebIDL::ExceptionOr<void> AnimationEffect::update_timing(Bindings::OptionalEffec
     // 6. Follow the procedure to normalize specified timing.
     normalize_specified_timing();
 
+    if (auto* keyframe_effect = as_if<KeyframeEffect>(*this))
+        keyframe_effect->clear_per_frame_style_update_cache();
+
     // AD-HOC: Notify the associated animation that the effect timing has changed.
     if (auto animation = m_associated_animation)
         animation->effect_timing_changed({});
@@ -370,9 +385,24 @@ WebIDL::ExceptionOr<void> AnimationEffect::update_timing(Bindings::OptionalEffec
 void AnimationEffect::set_associated_animation(GC::Ptr<Animation> value)
 {
     m_associated_animation = value;
+    if (auto* keyframe_effect = as_if<KeyframeEffect>(*this))
+        keyframe_effect->invalidate_animation_preparation();
 
     // NB: The normalization of the specified timing depends on the timeline of the associated animation.
     normalize_specified_timing();
+}
+
+GC::Ptr<Bindings::Wrappable> AnimationEffect::relevant_global_impl() const
+{
+    if (m_associated_animation)
+        return static_cast<Bindings::Wrappable&>(*m_associated_animation).relevant_global_impl();
+    return nullptr;
+}
+
+void AnimationEffect::update_style_if_needed() const
+{
+    if (m_associated_animation)
+        m_associated_animation->update_style_if_needed();
 }
 
 // https://www.w3.org/TR/web-animations-1/#animation-direction
@@ -396,6 +426,9 @@ TimeValue AnimationEffect::end_time() const
 // https://www.w3.org/TR/web-animations-1/#local-time
 Optional<TimeValue> AnimationEffect::local_time() const
 {
+    if (m_has_local_time_override_for_observation)
+        return m_local_time_override_for_observation;
+
     // The local time of an animation effect at a given moment is based on the first matching condition from the
     // following:
 
@@ -428,69 +461,79 @@ Optional<TimeValue> AnimationEffect::active_time() const
     return active_time_using_fill(m_fill_mode);
 }
 
-// https://www.w3.org/TR/web-animations-1/#calculating-the-active-time
 Optional<TimeValue> AnimationEffect::active_time_using_fill(Bindings::FillMode fill_mode) const
+{
+    auto local_time = this->local_time();
+    return active_time_for_phase(phase(local_time), local_time, fill_mode);
+}
+
+// https://www.w3.org/TR/web-animations-1/#calculating-the-active-time
+Optional<TimeValue> AnimationEffect::active_time_for_phase(Phase phase, Optional<TimeValue> const& local_time, Bindings::FillMode fill_mode) const
 {
     // The active time is based on the local time and start delay. However, it is only defined when the animation effect
     // should produce an output and hence depends on its fill mode and phase as follows,
 
+    switch (phase) {
     // -> If the animation effect is in the before phase,
-    if (is_in_the_before_phase()) {
+    case Phase::Before:
         // The result depends on the first matching condition from the following,
 
         // -> If the fill mode is backwards or both,
         if (fill_mode == Bindings::FillMode::Backwards || fill_mode == Bindings::FillMode::Both) {
             // Return the result of evaluating max(local time - start delay, 0).
-            return max(local_time().value() - m_start_delay, TimeValue::create_zero(associated_timeline()));
+            return max(local_time.value() - m_start_delay, TimeValue::create_zero(associated_timeline()));
         }
 
         // -> Otherwise,
         //    Return an unresolved time value.
         return {};
-    }
 
     // -> If the animation effect is in the active phase,
-    if (is_in_the_active_phase()) {
+    case Phase::Active:
         // Return the result of evaluating local time - start delay.
-        return local_time().value() - m_start_delay;
-    }
+        return local_time.value() - m_start_delay;
 
     // -> If the animation effect is in the after phase,
-    if (is_in_the_after_phase()) {
+    case Phase::After:
         // The result depends on the first matching condition from the following,
 
         // -> If the fill mode is forwards or both,
         if (fill_mode == Bindings::FillMode::Forwards || fill_mode == Bindings::FillMode::Both) {
             // Return the result of evaluating max(min(local time - start delay, active duration), 0).
-            return max(min(local_time().value() - m_start_delay, active_duration()), TimeValue::create_zero(associated_timeline()));
+            return max(min(local_time.value() - m_start_delay, active_duration()), TimeValue::create_zero(associated_timeline()));
         }
 
         // -> Otherwise,
         //    Return an unresolved time value.
         return {};
-    }
 
     // -> Otherwise (the local time is unresolved),
     //    Return an unresolved time value.
-    return {};
+    case Phase::Idle:
+        return {};
+    }
+
+    VERIFY_NOT_REACHED();
 }
 
 // https://www.w3.org/TR/web-animations-1/#in-play
-bool AnimationEffect::is_in_play() const
+bool AnimationEffect::is_in_play(Phase phase) const
 {
     // An animation effect is in play if all of the following conditions are met:
     // - the animation effect is in the active phase, and
     // - the animation effect is associated with an animation that is not finished.
-    return is_in_the_active_phase() && m_associated_animation && !m_associated_animation->is_finished();
+    return phase == Phase::Active && m_associated_animation && !m_associated_animation->is_finished();
 }
 
 // https://www.w3.org/TR/web-animations-1/#current
 bool AnimationEffect::is_current() const
 {
+    auto phase = this->phase();
+
     // An animation effect is current if any of the following conditions are true:
 
     // - the animation effect is in play, or
-    if (is_in_play())
+    if (is_in_play(phase))
         return true;
 
     if (auto animation = m_associated_animation) {
@@ -498,12 +541,12 @@ bool AnimationEffect::is_current() const
 
         // - the animation effect is associated with an animation with a playback rate > 0 and the animation effect is
         //   in the before phase, or
-        if (playback_rate > 0.0 && is_in_the_before_phase())
+        if (playback_rate > 0.0 && phase == Phase::Before)
             return true;
 
         // - the animation effect is associated with an animation with a playback rate < 0 and the animation effect is
         //   in the after phase, or
-        if (playback_rate < 0.0 && is_in_the_after_phase())
+        if (playback_rate < 0.0 && phase == Phase::After)
             return true;
 
         // - the animation effect is associated with an animation not in the idle play state with a non-null associated
@@ -537,88 +580,59 @@ TimeValue AnimationEffect::after_active_boundary_time() const
     return max(min(m_start_delay + active_duration(), end_time()), TimeValue::create_zero(associated_timeline()));
 }
 
-// https://www.w3.org/TR/web-animations-1/#animation-effect-before-phase
-bool AnimationEffect::is_in_the_before_phase() const
-{
-    // An animation effect is in the before phase if the animation effect’s local time is not unresolved and either of
-    // the following conditions are met:
-    auto local_time = this->local_time();
-    if (!local_time.has_value())
-        return false;
-
-    // - the local time is less than the before-active boundary time, or
-    auto before_active_boundary_time = this->before_active_boundary_time();
-    if (local_time.value() < before_active_boundary_time)
-        return true;
-
-    // - the animation direction is "backwards" and the local time is equal to the before-active boundary time.
-    return animation_direction() == AnimationDirection::Backwards && local_time.value() == before_active_boundary_time;
-}
-
-// https://www.w3.org/TR/web-animations-1/#animation-effect-after-phase
-bool AnimationEffect::is_in_the_after_phase() const
-{
-    // An animation effect is in the after phase if the animation effect’s local time is not unresolved and either of
-    // the following conditions are met:
-    auto local_time = this->local_time();
-    if (!local_time.has_value())
-        return false;
-
-    // - the local time is greater than the active-after boundary time, or
-    auto after_active_boundary_time = this->after_active_boundary_time();
-    if (local_time.value() > after_active_boundary_time)
-        return true;
-
-    // - the animation direction is "forwards" and the local time is equal to the active-after boundary time.
-    return animation_direction() == AnimationDirection::Forwards && local_time.value() == after_active_boundary_time;
-}
-
-// https://www.w3.org/TR/web-animations-1/#animation-effect-active-phase
-bool AnimationEffect::is_in_the_active_phase() const
-{
-    // An animation effect is in the active phase if the animation effect’s local time is not unresolved and it is not
-    // in either the before phase nor the after phase.
-    return local_time().has_value() && !is_in_the_before_phase() && !is_in_the_after_phase();
-}
-
-// https://www.w3.org/TR/web-animations-1/#animation-effect-idle-phase
-bool AnimationEffect::is_in_the_idle_phase() const
-{
-    // It is often convenient to refer to the case when an animation effect is in none of the above phases as being in
-    // the idle phase
-    return !is_in_the_before_phase() && !is_in_the_active_phase() && !is_in_the_after_phase();
-}
-
 AnimationEffect::Phase AnimationEffect::phase() const
+{
+    return phase(local_time());
+}
+
+AnimationEffect::Phase AnimationEffect::phase(Optional<TimeValue> const& local_time) const
 {
     // This is a convenience method that returns the phase of the animation effect, to avoid having to call all of the
     // phase functions separately.
-    auto local_time = this->local_time();
     if (!local_time.has_value())
         return Phase::Idle;
 
     auto before_active_boundary_time = this->before_active_boundary_time();
+    // https://www.w3.org/TR/web-animations-1/#animation-effect-before-phase
+    // An animation effect is in the before phase if the animation effect’s local time is not unresolved and either of
+    // the following conditions are met:
     // - the local time is less than the before-active boundary time, or
     // - the animation direction is "backwards" and the local time is equal to the before-active boundary time.
     if (local_time.value() < before_active_boundary_time || (animation_direction() == AnimationDirection::Backwards && local_time.value() == before_active_boundary_time))
         return Phase::Before;
 
     auto after_active_boundary_time = this->after_active_boundary_time();
+    // https://www.w3.org/TR/web-animations-1/#animation-effect-after-phase
+    // An animation effect is in the after phase if the animation effect’s local time is not unresolved and either of
+    // the following conditions are met:
     // - the local time is greater than the active-after boundary time, or
     // - the animation direction is "forwards" and the local time is equal to the active-after boundary time.
     if (local_time.value() > after_active_boundary_time || (animation_direction() == AnimationDirection::Forwards && local_time.value() == after_active_boundary_time))
         return Phase::After;
 
-    // - An animation effect is in the active phase if the animation effect’s local time is not unresolved and it is not
-    // - in either the before phase nor the after phase.
+    // https://www.w3.org/TR/web-animations-1/#animation-effect-active-phase
+    // An animation effect is in the active phase if the animation effect’s local time is not unresolved and it is not
+    // in either the before phase nor the after phase.
     return Phase::Active;
 }
 
+AnimationEffect::ResolvedTiming AnimationEffect::resolve_timing() const
+{
+    auto local_time = this->local_time();
+    auto phase = this->phase(local_time);
+    auto active_time = active_time_for_phase(phase, local_time, m_fill_mode);
+    return {
+        .phase = phase,
+        .local_time = local_time,
+        .active_time = active_time,
+        .overall_progress = overall_progress_for_phase(phase, active_time),
+    };
+}
+
 // https://www.w3.org/TR/web-animations-1/#overall-progress
-Optional<double> AnimationEffect::overall_progress() const
+Optional<double> AnimationEffect::overall_progress_for_phase(Phase phase, Optional<TimeValue> const& active_time) const
 {
     // 1. If the active time is unresolved, return unresolved.
-    auto active_time = this->active_time();
     if (!active_time.has_value())
         return {};
 
@@ -629,7 +643,7 @@ Optional<double> AnimationEffect::overall_progress() const
     if (m_iteration_duration.value == 0) {
         // If the animation effect is in the before phase, let overall progress be zero, otherwise, let it be equal to
         // the iteration count.
-        if (is_in_the_before_phase())
+        if (phase == Phase::Before)
             overall_progress = 0.0;
         else
             overall_progress = m_iteration_count;
@@ -645,15 +659,15 @@ Optional<double> AnimationEffect::overall_progress() const
 }
 
 // https://www.w3.org/TR/web-animations-1/#directed-progress
-Optional<double> AnimationEffect::directed_progress() const
+Optional<double> AnimationEffect::directed_progress(ResolvedTiming const& timing) const
 {
     // 1. If the simple iteration progress is unresolved, return unresolved.
-    auto simple_iteration_progress = this->simple_iteration_progress();
+    auto simple_iteration_progress = this->simple_iteration_progress(timing);
     if (!simple_iteration_progress.has_value())
         return {};
 
     // 2. Calculate the current direction using the first matching condition from the following list:
-    auto current_direction = this->current_direction();
+    auto current_direction = this->current_direction(timing);
 
     // 3. If the current direction is forwards then return the simple iteration progress.
     if (current_direction == AnimationDirection::Forwards)
@@ -664,7 +678,7 @@ Optional<double> AnimationEffect::directed_progress() const
 }
 
 // https://www.w3.org/TR/web-animations-1/#directed-progress
-AnimationDirection AnimationEffect::current_direction() const
+AnimationDirection AnimationEffect::current_direction(ResolvedTiming const& timing) const
 {
     // 2. Calculate the current direction using the first matching condition from the following list:
     // -> If playback direction is normal,
@@ -680,7 +694,7 @@ AnimationDirection AnimationEffect::current_direction() const
     }
     // -> Otherwise,
     //    1. Let d be the current iteration.
-    double d = current_iteration().value();
+    double d = current_iteration(timing).value();
 
     //    2. If playback direction is alternate-reverse increment d by 1.
     if (m_playback_direction == Bindings::PlaybackDirection::AlternateReverse)
@@ -696,24 +710,22 @@ AnimationDirection AnimationEffect::current_direction() const
 }
 
 // https://www.w3.org/TR/web-animations-1/#simple-iteration-progress
-Optional<double> AnimationEffect::simple_iteration_progress() const
+Optional<double> AnimationEffect::simple_iteration_progress(ResolvedTiming const& timing) const
 {
     // 1. If the overall progress is unresolved, return unresolved.
-    auto overall_progress = this->overall_progress();
-    if (!overall_progress.has_value())
+    if (!timing.overall_progress.has_value())
         return {};
 
     // 2. If overall progress is infinity, let the simple iteration progress be iteration start % 1.0, otherwise, let
     //    the simple iteration progress be overall progress % 1.0.
-    double simple_iteration_progress = isinf(overall_progress.value()) ? fmod(m_iteration_start, 1.0) : fmod(overall_progress.value(), 1.0);
+    double simple_iteration_progress = isinf(timing.overall_progress.value()) ? fmod(m_iteration_start, 1.0) : fmod(timing.overall_progress.value(), 1.0);
 
     // 3. If all of the following conditions are true,
     //    - the simple iteration progress calculated above is zero, and
     //    - the animation effect is in the active phase or the after phase, and
     //    - the active time is equal to the active duration, and
     //    - the iteration count is not equal to zero.
-    auto active_time = this->active_time();
-    if (simple_iteration_progress == 0.0 && (is_in_the_active_phase() || is_in_the_after_phase()) && active_time.has_value() && active_time.value() == active_duration() && m_iteration_count != 0.0) {
+    if (simple_iteration_progress == 0.0 && (timing.phase == Phase::Active || timing.phase == Phase::After) && timing.active_time.has_value() && timing.active_time.value() == active_duration() && m_iteration_count != 0.0) {
         // let the simple iteration progress be 1.0.
         simple_iteration_progress = 1.0;
     }
@@ -722,53 +734,59 @@ Optional<double> AnimationEffect::simple_iteration_progress() const
     return simple_iteration_progress;
 }
 
-// https://www.w3.org/TR/web-animations-1/#current-iteration
 Optional<double> AnimationEffect::current_iteration() const
 {
+    return current_iteration(resolve_timing());
+}
+
+// https://www.w3.org/TR/web-animations-1/#current-iteration
+Optional<double> AnimationEffect::current_iteration(ResolvedTiming const& timing) const
+{
     // 1. If the active time is unresolved, return unresolved.
-    auto active_time = this->active_time();
-    if (!active_time.has_value())
+    if (!timing.active_time.has_value())
         return {};
 
     // 2. If the animation effect is in the after phase and the iteration count is infinity, return infinity.
-    if (is_in_the_after_phase() && isinf(m_iteration_count))
+    if (timing.phase == Phase::After && isinf(m_iteration_count))
         return m_iteration_count;
 
     // 3. If the simple iteration progress is 1.0, return floor(overall progress) - 1.
-    auto simple_iteration_progress = this->simple_iteration_progress();
+    auto simple_iteration_progress = this->simple_iteration_progress(timing);
     if (simple_iteration_progress.has_value() && simple_iteration_progress.value() == 1.0)
-        return floor(overall_progress().value()) - 1.0;
+        return floor(timing.overall_progress.value()) - 1.0;
 
     // 4. Otherwise, return floor(overall progress).
-    return floor(overall_progress().value());
+    return floor(timing.overall_progress.value());
 }
 
 // https://www.w3.org/TR/web-animations-1/#transformed-progress
 Optional<double> AnimationEffect::transformed_progress() const
 {
+    auto timing = resolve_timing();
+
     // 1. If the directed progress is unresolved, return unresolved.
-    auto directed_progress = this->directed_progress();
+    auto directed_progress = this->directed_progress(timing);
     if (!directed_progress.has_value())
         return {};
 
     // 2. Calculate the value of the before flag as follows:
 
     //    1. Determine the current direction using the procedure defined in §4.9.1 Calculating the directed progress.
-    auto current_direction = this->current_direction();
+    auto current_direction = this->current_direction(timing);
 
     //    2. If the current direction is forwards, let going forwards be true, otherwise it is false.
     auto going_forwards = current_direction == AnimationDirection::Forwards;
 
     //    3. The before flag is set if the animation effect is in the before phase and going forwards is true; or if the animation effect
     //       is in the after phase and going forwards is false.
-    auto before_flag = (is_in_the_before_phase() && going_forwards) || (is_in_the_after_phase() && !going_forwards);
+    auto before_flag = (timing.phase == Phase::Before && going_forwards) || (timing.phase == Phase::After && !going_forwards);
 
     // 3. Return the result of evaluating the animation effect’s timing function passing directed progress as the input progress value and
     //    before flag as the before flag.
     return m_timing_function.evaluate_at(directed_progress.value(), before_flag);
 }
 
-Optional<CSS::EasingFunction> AnimationEffect::parse_easing_string(StringView value)
+Optional<CSS::EasingFunction> AnimationEffect::parse_easing_string(Utf16View value)
 {
     if (auto style_value = parse_css_value(CSS::Parser::ParsingParams(), value, CSS::PropertyID::AnimationTimingFunction)) {
         if (style_value->is_unresolved() || style_value->is_css_wide_keyword())
@@ -786,59 +804,21 @@ Optional<CSS::EasingFunction> AnimationEffect::parse_easing_string(StringView va
     return {};
 }
 
-AnimationEffect::AnimationEffect(JS::Realm& realm)
-    : Bindings::PlatformObject(realm)
-{
-}
+AnimationEffect::AnimationEffect() = default;
 
-void AnimationEffect::initialize(JS::Realm& realm)
-{
-    WEB_SET_PROTOTYPE_FOR_INTERFACE(AnimationEffect);
-    Base::initialize(realm);
-}
-
-void AnimationEffect::visit_edges(JS::Cell::Visitor& visitor)
+void AnimationEffect::visit_edges(GC::Cell::Visitor& visitor)
 {
     Base::visit_edges(visitor);
     visitor.visit(m_associated_animation);
 }
 
-static CSS::StyleValue const* animated_property_value(CSS::AnimatedProperties const* properties, CSS::PropertyID property_id)
+static ReadonlySpan<CSS::ComputedValuesFFI::FfiAnimatedOverlayEntry> animated_overlay_entries(CSS::ComputedValuesFFI::AnimatedOverlay const* overlay)
 {
-    if (!properties)
-        return nullptr;
-    auto value = properties->values().get(property_id);
-    if (!value.has_value())
-        return nullptr;
-    return value.value();
-}
-
-static CSS::RequiredInvalidationAfterStyleChange compute_required_invalidation_for_animated_properties(CSS::AnimatedProperties const* old_properties, CSS::AnimatedProperties const* new_properties)
-{
-    CSS::RequiredInvalidationAfterStyleChange invalidation;
-    auto old_and_new_properties = MUST(Bitmap::create(CSS::number_of_longhand_properties, 0));
-    if (old_properties) {
-        for (auto const& [property_id, _] : old_properties->values())
-            old_and_new_properties.set(to_underlying(property_id) - to_underlying(CSS::first_longhand_property_id), 1);
-    }
-    if (new_properties) {
-        for (auto const& [property_id, _] : new_properties->values())
-            old_and_new_properties.set(to_underlying(property_id) - to_underlying(CSS::first_longhand_property_id), 1);
-    }
-    for (auto i = to_underlying(CSS::first_longhand_property_id); i <= to_underlying(CSS::last_longhand_property_id); ++i) {
-        if (!old_and_new_properties.get(i - to_underlying(CSS::first_longhand_property_id)))
-            continue;
-        auto property_id = static_cast<CSS::PropertyID>(i);
-        auto const* old_value = animated_property_value(old_properties, property_id);
-        auto const* new_value = animated_property_value(new_properties, property_id);
-        if (!old_value && !new_value)
-            continue;
-        auto property_invalidation = compute_property_invalidation(property_id, old_value, new_value);
-        if (!property_invalidation.is_none() && CSS::is_inherited_property(property_id))
-            property_invalidation.inherited_style_changed = true;
-        invalidation |= property_invalidation;
-    }
-    return invalidation;
+    if (!overlay)
+        return {};
+    size_t count = 0;
+    auto const* entries = CSS::ComputedValuesFFI::rust_animated_overlay_entries(overlay, &count);
+    return { entries, count };
 }
 
 AnimationUpdateContext::~AnimationUpdateContext()
@@ -849,83 +829,154 @@ AnimationUpdateContext::~AnimationUpdateContext()
             continue;
         auto& element = it.key;
         GC::Ref<DOM::Element> target = element.element();
-        auto animated_properties_after_update = style->animated_properties_snapshot();
-        auto invalidation = compute_required_invalidation_for_animated_properties(it.value.animated_properties_before_update.ptr(), animated_properties_after_update.ptr());
-
-        if (invalidation.is_none())
+        // Disconnected elements no longer have a style-engine row to publish refreshed
+        // animation style into.
+        if (target->style_node_id() == 0)
+            continue;
+        // An earlier entry already republished this style with the current animation values.
+        if (element.style_record_identity() != it.value.style_record_before_update)
+            continue;
+        // Provisionally started transitions are not associated with the element yet, so they are
+        // never among the collected effects, but their values are already part of the published
+        // style. Collect them first, in composite order below every associated effect, or this
+        // update would rebuild the style without them.
+        GC::ConservativeVector<GC::Ref<KeyframeEffect>> effects_to_collect;
+        target->document().style_computer().for_each_provisional_transition_effect(element, [&](KeyframeEffect& effect) {
+            effects_to_collect.append(effect);
+        });
+        for (auto& animation : target->associated_animations_in_composite_order()) {
+            if (animation->is_idle() || !animation->effect() || !is<KeyframeEffect>(*animation->effect()))
+                continue;
+            auto& effect = static_cast<KeyframeEffect&>(*animation->effect());
+            if (effect.target() != target || effect.pseudo_element_type() != element.pseudo_element())
+                continue;
+            effects_to_collect.append(effect);
+        }
+        // A dirty effect may have just become irrelevant. Include it once so rebuilding the
+        // animated overlay removes its terminal contribution.
+        for (auto& dirty_effect : it.value.effects) {
+            if (!effects_to_collect.contains_slow(dirty_effect))
+                effects_to_collect.append(dirty_effect);
+        }
+        if (!effects_to_collect.is_empty())
+            target->document().style_computer().collect_animations_into(element, effects_to_collect.span(), *style, CSS::StyleComputer::AnimationRefresh::Yes);
+        auto& style_computer = target->document().style_computer();
+        if (!style_computer.style_engine().animation_overlay_changed(it.value.style_record_before_update, style->animated_overlay()))
             continue;
 
-        // Traversal of the subtree is necessary to update the animated properties inherited from the target element.
-        bool invalidated_assigned_slottables_for_descendant_slots = false;
-        if (!element.pseudo_element().has_value()) {
-            CSS::Invalidation::invalidate_assigned_slottables_after_slot_style_change(target);
-            if (invalidation.inherited_style_changed || invalidation.rebuild_layout_tree) {
-                CSS::Invalidation::invalidate_assigned_slottables_for_descendant_slots_after_inherited_style_change(target);
-                invalidated_assigned_slottables_for_descendant_slots = true;
-            }
+        auto computed_values = [&] {
+            auto previous_values = element.computed_style();
+            if (previous_values)
+                return style_computer.build_animated_computed_values(*style, element, element.style_scope(), *previous_values);
+            return style_computer.build_computed_values(*style, element, element.style_scope());
+        }();
+        Array<void const*, to_underlying(CSS::StyleGroupIndex::Count)> payloads;
+        for (size_t index = 0; index < payloads.size(); ++index)
+            payloads[index] = computed_values->style_group_payload(static_cast<CSS::StyleGroupIndex>(index));
+        auto animated_property_invalidation = style_computer.style_engine().compare_animation_overlay(
+            it.value.style_record_before_update,
+            style->animated_overlay(),
+            payloads,
+            !element.pseudo_element().has_value() && target->is_document_element());
+        auto invalidation = CSS::decode_style_invalidation(animated_property_invalidation.invalidation);
+        if (style->animated_overlay() && !animated_overlay_entries(style->animated_overlay()).is_empty()
+            && target->document().is_in_style_stabilization_epoch()
+            && (target->document().style_stabilization_has_style_reactions() || animated_property_invalidation.requires_base_style_recomputation)) {
+            target->document().style_computer().record_transition_stabilization_baseline(element);
+        }
+        auto publication = target->document().style_computer().publish_animation_overlay(element, *computed_values);
+        target->refresh_computed_style(element.pseudo_element(), publication.new_style_record);
+        if (auto* svg_element = as_if<SVG::SVGElement>(*target); svg_element && !element.pseudo_element().has_value())
+            svg_element->note_svg_paint_resource_description_may_have_changed();
+
+        // Box-type, overflow, and text-alignment adjustments consume the unadjusted base values,
+        // which an animation-only overlay update deliberately does not reconstruct. Publish an
+        // exact feedback action so the ordinary reaction path re-cascades that base before the
+        // frame becomes observable.
+        if (animated_property_invalidation.requires_base_style_recomputation)
+            target->document().style_computer().style_engine().record_element_style_input_change(target->style_node_id());
+
+        if (!element.pseudo_element().has_value() && invalidation.inherited_style_changed()) {
+            // Recomputing pseudo-element styles can start transitions, which stay provisional until a stabilization
+            // epoch commits them. This update also runs outside any style update (for example when an inert animation
+            // is disassociated from its target), so hold an epoch open around it.
+            auto& document = target->document();
+            document.begin_style_stabilization_epoch();
+            ScopeGuard end_stabilization_epoch = [&] {
+                document.end_style_stabilization_epoch();
+            };
+            invalidation |= target->recompute_pseudo_element_styles();
         }
 
-        target->for_each_shadow_including_descendant([&](auto& node) {
-            if (!is<DOM::Element>(node))
-                return TraversalDecision::Continue;
-            auto& element = static_cast<DOM::Element&>(node);
-            if (!element.computed_properties())
-                return TraversalDecision::SkipChildrenAndContinue;
-            auto element_invalidation = element.recompute_inherited_style();
-            if (element_invalidation.is_none())
-                return TraversalDecision::SkipChildrenAndContinue;
-            CSS::Invalidation::invalidate_assigned_slottables_after_slot_style_change(element);
-            if (!invalidated_assigned_slottables_for_descendant_slots
-                && (element_invalidation.inherited_style_changed || element_invalidation.rebuild_layout_tree)) {
-                CSS::Invalidation::invalidate_assigned_slottables_for_descendant_slots_after_inherited_style_change(target);
-                invalidated_assigned_slottables_for_descendant_slots = true;
-            }
-            // NB: Descendant invalidations are merged into one, so value-only visual context updates must be
-            //     scheduled here, for each affected descendant.
-            if (element_invalidation.update_accumulated_visual_context_values && !element_invalidation.rebuild_accumulated_visual_contexts)
-                element.document().schedule_accumulated_visual_context_value_update(element);
-            invalidation |= element_invalidation;
-            return TraversalDecision::Continue;
-        });
-
-        // NB: Called from animation update context destructor during style recalculation.
+        // An animated value can be inherited through shadow and slot boundaries. Publish the exact
+        // flat-tree descendants as one feedback batch; the ordinary transaction owns their style
+        // materialization and observer consequences.
         if (!element.pseudo_element().has_value()) {
-            if (target->unsafe_layout_node())
-                target->unsafe_layout_node()->apply_style(*style);
-        } else {
-            if (auto pseudo_element_node = target->pseudo_element_unsafe_layout_node(element.pseudo_element().value()))
-                pseudo_element_node->apply_style(*style);
+            auto inherited_style_groups = invalidation.inherited_style_groups_changed();
+            if (!invalidation.inherited_style_changed()) {
+                auto shadow_root = target->shadow_root();
+                auto child_explicit_inheritance_groups = target->children_explicitly_inherited_non_inherited_style_groups();
+                if (shadow_root)
+                    child_explicit_inheritance_groups |= shadow_root->children_explicitly_inherited_non_inherited_style_groups();
+                auto descendants_may_observe_non_inherited_properties = (child_explicit_inheritance_groups & animated_property_invalidation.changed_non_inherited_style_groups) != 0
+                    || invalidation.recompute_descendant_styles
+                    || invalidation.needs_layout_tree_rebuild()
+                    || target->is_html_slot_element();
+                if (descendants_may_observe_non_inherited_properties)
+                    inherited_style_groups = CSS::RequiredInvalidationAfterStyleChange::all_inherited_style_groups;
+            }
+            if (inherited_style_groups != 0)
+                target->document().style_computer().style_engine().record_flat_tree_descendant_style_input_changes(
+                    target->style_node_id(),
+                    CSS::StyleEngine::InheritedStyle,
+                    inherited_style_groups);
         }
 
-        if (invalidation.relayout)
+        // NB: refresh_computed_style() already publishes the new record to the layout node. Only
+        // inherited values and image resources require the additional C++ style side effects.
+        auto apply_layout_node_style_side_effects = [&](Layout::NodeWithStyle& layout_node, CSS::StyleRecordID style_record) {
+            if (animated_property_invalidation.requires_layout_node_style_application)
+                layout_node.apply_style(style_record);
+            else if (animated_property_invalidation.requires_style_resource_update)
+                layout_node.attach_style_resources();
+        };
+        if (!element.pseudo_element().has_value()) {
+            if (auto* layout_node = target->unsafe_layout_node())
+                apply_layout_node_style_side_effects(*layout_node, target->style_record_identity());
+        } else if (auto pseudo_element_node = target->pseudo_element_unsafe_layout_node(element.pseudo_element().value())) {
+            apply_layout_node_style_side_effects(*pseudo_element_node, target->style_record_identity(element.pseudo_element()));
+        }
+
+        if (invalidation.changes_containing_block_establishment)
+            target->document().record_partial_relayout_escape(DOM::PartialRelayoutEscapeReason::ContainingBlockEstablishmentChangedByKeyframeEffect);
+
+        if (invalidation.needs_relayout())
             target->set_needs_layout_update(DOM::SetNeedsLayoutReason::KeyframeEffect);
-        if (invalidation.rebuild_layout_tree) {
-            // We mark layout tree for rebuild starting from parent element to correctly invalidate
-            // "display" property change to/from "contents" value.
-            if (auto parent_element = target->parent_element()) {
-                parent_element->set_needs_layout_tree_update(true, DOM::SetNeedsLayoutTreeUpdateReason::KeyframeEffect);
-            } else {
-                target->set_needs_layout_tree_update(true, DOM::SetNeedsLayoutTreeUpdateReason::KeyframeEffect);
-            }
+        if (invalidation.needs_layout_tree_rebuild()) {
+            auto rebuild_root = element.pseudo_element().has_value()
+                ? CSS::LayoutTreeRebuildRoot::Parent
+                : invalidation.layout_tree_rebuild_root();
+            target->set_needs_layout_tree_rebuild(DOM::SetNeedsLayoutTreeUpdateReason::KeyframeEffect, rebuild_root);
         }
-        if (invalidation.rebuild_accumulated_visual_contexts) {
-            element.document().set_needs_accumulated_visual_contexts_update(true);
-        } else if (invalidation.update_accumulated_visual_context_values) {
+        if (invalidation.accumulated_visual_contexts() != CSS::AccumulatedVisualContextInvalidation::None) {
+            auto scope = invalidation.accumulated_visual_contexts() == CSS::AccumulatedVisualContextInvalidation::Rebuild
+                ? DOM::Document::AccumulatedVisualContextUpdateScope::Structure
+                : DOM::Document::AccumulatedVisualContextUpdateScope::Values;
             // NB: Element-reference pseudo elements (e.g. ::placeholder) are not synthetic, so schedule their
             //     layout node directly instead of going through the owning element.
             if (element.pseudo_element().has_value()) {
                 if (auto pseudo_element_node = target->pseudo_element_unsafe_layout_node(element.pseudo_element().value()))
-                    element.document().schedule_accumulated_visual_context_value_update(*pseudo_element_node);
+                    element.document().schedule_accumulated_visual_context_update(*pseudo_element_node, scope);
             } else {
-                element.document().schedule_accumulated_visual_context_value_update(target);
+                element.document().schedule_accumulated_visual_context_update(target, scope);
             }
         }
 
-        if (invalidation.repaint) {
-            target->set_needs_repaint();
-        }
-        if (invalidation.rebuild_stacking_context_tree)
-            element.document().invalidate_stacking_context_tree();
+        auto* repaint_layout_node = element.pseudo_element().has_value()
+            ? target->pseudo_element_unsafe_layout_node(*element.pseudo_element())
+            : target->unsafe_layout_node();
+        if (repaint_layout_node && Painting::has_committed_box(*repaint_layout_node))
+            Painting::repaint_after_style_change(*repaint_layout_node, invalidation);
     }
 }
 

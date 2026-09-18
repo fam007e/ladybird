@@ -1,5 +1,7 @@
 cmake_minimum_required(VERSION 3.25)
 
+include("Meta/CMake/environment.cmake")
+
 if (VCPKG_TARGET_ANDROID)
     # If we are building for Android, we must load vcpkg_android.cmake before the project() declaration.
     # This ensures that the CMAKE_TOOLCHAIN_FILE is set correctly.
@@ -14,15 +16,9 @@ if (APPLE AND NOT CMAKE_OSX_DEPLOYMENT_TARGET)
     set(CMAKE_OSX_DEPLOYMENT_TARGET 14.0)
 endif()
 
-include("Meta/CMake/gui_framework.cmake")
-
 # Pass additional information to vcpkg if we are using it.
 if (CMAKE_TOOLCHAIN_FILE MATCHES "vcpkg.cmake$")
     set(CMAKE_PROJECT_ladybird_INCLUDE_BEFORE "Meta/CMake/vcpkg/generate_vcpkg_toolchain_variables.cmake")
-    if (LADYBIRD_GUI_FRAMEWORK STREQUAL "Qt" OR LADYBIRD_GUI_FRAMEWORK STREQUAL "Gtk")
-        string(TOLOWER "${LADYBIRD_GUI_FRAMEWORK}" framework_feature)
-        set(VCPKG_MANIFEST_FEATURES "${framework_feature}" CACHE STRING "" FORCE)
-    endif()
 endif()
 
 if (APPLE AND NOT CMAKE_OSX_SYSROOT)
@@ -30,10 +26,10 @@ if (APPLE AND NOT CMAKE_OSX_SYSROOT)
 endif()
 
 project(ladybird
-        VERSION 0.1.0
-        LANGUAGES C CXX
-        DESCRIPTION "Ladybird Web Browser"
-        HOMEPAGE_URL "https://ladybird.org"
+    VERSION 0.1.0
+    LANGUAGES C CXX
+    DESCRIPTION "Ladybird Web Browser"
+    HOMEPAGE_URL "https://ladybird.org"
 )
 
 if (ANDROID OR IOS)
@@ -51,10 +47,11 @@ endif()
 set(LADYBIRD_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
 list(APPEND CMAKE_MODULE_PATH "${LADYBIRD_SOURCE_DIR}/Meta/CMake")
 
+include(cmake_options)
 include(compile_options)
 include(check_for_dependencies)
-include(cmake_options)
 include(ladybird_helper_processes)
+include(revision)
 
 if(ENABLE_ALL_THE_DEBUG_MACROS)
     include(all_the_debug_macros)

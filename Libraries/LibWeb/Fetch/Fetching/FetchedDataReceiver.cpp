@@ -6,23 +6,31 @@
  */
 
 #include <LibGC/Function.h>
+#include <LibGC/Heap.h>
 #include <LibHTTP/Cache/MemoryCache.h>
-#include <LibWeb/Bindings/ExceptionOrUtils.h>
 #include <LibWeb/Fetch/Fetching/FetchedDataReceiver.h>
 #include <LibWeb/Fetch/Infrastructure/FetchParams.h>
 #include <LibWeb/Fetch/Infrastructure/HTTP/Bodies.h>
 #include <LibWeb/Fetch/Infrastructure/HTTP/Responses.h>
+#include <LibWeb/HTML/EventLoop/EventLoop.h>
 #include <LibWeb/HTML/Scripting/TemporaryExecutionContext.h>
-#include <LibWeb/Platform/EventLoopPlugin.h>
 #include <LibWeb/Streams/ReadableByteStreamController.h>
 #include <LibWeb/Streams/ReadableStream.h>
 #include <LibWeb/Streams/ReadableStreamOperations.h>
+#include <LibWeb/WebIDL/ExceptionOrUtils.h>
 
 namespace Web::Fetch::Fetching {
 
 GC_DEFINE_ALLOCATOR(FetchedDataReceiver);
 
-FetchedDataReceiver::FetchedDataReceiver(GC::Ref<Infrastructure::FetchParams const> fetch_params, GC::Ref<Streams::ReadableStream> stream, RefPtr<HTTP::MemoryCache> http_cache)
+static constexpr size_t maximum_pending_bytes = 5 * MiB;
+
+FetchedDataReceiver::FetchedDataReceiver(GC::Ref<Streams::ReadableStream> stream)
+    : FetchedDataReceiver(nullptr, stream, {})
+{
+}
+
+FetchedDataReceiver::FetchedDataReceiver(GC::Ptr<Infrastructure::FetchParams const> fetch_params, GC::Ref<Streams::ReadableStream> stream, RefPtr<HTTP::MemoryCache> http_cache)
     : m_fetch_params(fetch_params)
     , m_stream(stream)
     , m_http_cache(move(http_cache))
@@ -56,7 +64,7 @@ void FetchedDataReceiver::visit_edges(Visitor& visitor)
 
 // This implements the parallel steps of the pullAlgorithm in HTTP-network-fetch.
 // https://fetch.spec.whatwg.org/#ref-for-in-parallel⑤
-void FetchedDataReceiver::handle_network_data(Requests::ResponseData data, NetworkState state)
+void FetchedDataReceiver::handle_network_data(JS::Realm& realm, Requests::ResponseData data, NetworkState state)
 {
     if (state == NetworkState::Complete) {
         VERIFY(data.bytes().is_empty());
@@ -67,9 +75,8 @@ void FetchedDataReceiver::handle_network_data(Requests::ResponseData data, Netwo
 
         // 2. Otherwise, if the bytes transmission for response’s message body is done normally and stream is readable,
         //    then close stream, and abort these in-parallel steps.
-        Platform::EventLoopPlugin::the().deferred_invoke(GC::create_function(heap(), [this]() {
-            close_stream();
-        }));
+        // NB: The close follows any pending bytes through the same task queue; see deliver_pending_bytes().
+        queue_delivery_task(realm);
         return;
     }
 
@@ -112,10 +119,79 @@ void FetchedDataReceiver::handle_network_data(Requests::ResponseData data, Netwo
     }
 
     // 7. Append bytes to buffer.
-    enqueue_into_stream(bytes);
+    m_pending_bytes.append(bytes);
+    queue_delivery_task(realm);
 
-    // FIXME: 8. If the size of buffer is larger than an upper limit chosen by the user agent, ask the user agent
-    //           to suspend the ongoing fetch.
+    // 8. If the size of buffer is larger than an upper limit chosen by the user agent, ask the user agent to suspend
+    //    the ongoing fetch.
+    if (m_pending_bytes.size() >= maximum_pending_bytes && !m_paused_network_delivery) {
+        if (auto request = m_network_request.strong_ref()) {
+            request->set_body_delivery_paused(true);
+            m_paused_network_delivery = true;
+        }
+    }
+}
+
+// AD-HOC: These tasks are queued without a document on purpose. A navigation reads its new document's body through
+//         this receiver while the fetch's task destination is still the previous document's global, and tasks
+//         queued on that document stop running once it is replaced.
+static void queue_networking_task(GC::Ref<GC::Function<void()>> steps)
+{
+    HTML::queue_a_task(HTML::Task::Source::Networking, HTML::main_thread_event_loop(), nullptr, steps);
+}
+
+// This implements the task-queueing half of the pullAlgorithm in HTTP-network-fetch: bytes are handed to the
+// stream from a networking task rather than from the network callback, so consumers see them interleaved with
+// the tasks their own reactions queue.
+// https://fetch.spec.whatwg.org/#ref-for-in-parallel④
+void FetchedDataReceiver::queue_delivery_task(JS::Realm& realm)
+{
+    // AD-HOC: These tasks stand in for in-parallel steps, which a paused event loop doesn't stop — and a sync XHR
+    //         send() keeps it paused for as long as it waits for exactly these bytes (see the parallel-queue path in
+    //         fetch_response_handover()). So, while it's paused, deliver straight from the network callback instead.
+    //         Any bytes a queued task was to deliver go along; that task then finds nothing left to do.
+    if (HTML::main_thread_event_loop().execution_paused()) {
+        deliver_pending_bytes(realm);
+        return;
+    }
+
+    if (m_delivery_task_queued)
+        return;
+    m_delivery_task_queued = true;
+
+    queue_networking_task(GC::create_function(heap(), [this, &realm]() {
+        m_delivery_task_queued = false;
+        deliver_pending_bytes(realm);
+    }));
+}
+
+void FetchedDataReceiver::deliver_pending_bytes(JS::Realm& realm)
+{
+    auto bytes = move(m_pending_bytes);
+    m_pending_bytes = {};
+    if (!bytes.is_empty())
+        enqueue_into_stream(realm, bytes);
+
+    // 1. If the size of buffer is smaller than a lower limit chosen by the user agent and the ongoing fetch is
+    //    suspended, resume the fetch.
+    if (m_paused_network_delivery) {
+        m_paused_network_delivery = false;
+        if (auto request = m_network_request.strong_ref())
+            request->set_body_delivery_paused(false);
+    }
+
+    // The close goes through the queue too, so it lands behind whatever the consumer queued in reaction to the
+    // bytes above, the way it does when a network completion trails the last data.
+    // AD-HOC: Except while the event loop is paused; see queue_delivery_task().
+    if (m_network_complete) {
+        if (HTML::main_thread_event_loop().execution_paused()) {
+            close_stream(realm);
+            return;
+        }
+        queue_networking_task(GC::create_function(heap(), [this, &realm]() {
+            close_stream(realm);
+        }));
+    }
 }
 
 void FetchedDataReceiver::set_cached_response_body(Core::ImmutableBytes body)
@@ -130,33 +206,29 @@ void FetchedDataReceiver::set_cached_response_body(Core::ImmutableBytes body)
 
 // This implements the parallel steps of the pullAlgorithm in HTTP-network-fetch.
 // https://fetch.spec.whatwg.org/#ref-for-in-parallel④
-void FetchedDataReceiver::enqueue_into_stream(ReadonlyBytes bytes)
+void FetchedDataReceiver::enqueue_into_stream(JS::Realm& realm, ReadonlyBytes bytes)
 {
-    // FIXME: 1. If the size of buffer is smaller than a lower limit chosen by the user agent and the ongoing fetch
-    //           is suspended, resume the fetch.
-
     if (!m_stream->is_readable())
         return;
 
-    auto& realm = m_stream->realm();
+    auto& controller = m_stream->controller()->get<GC::Ref<Streams::ReadableByteStreamController>>();
     HTML::TemporaryExecutionContext execution_context { realm, HTML::TemporaryExecutionContext::CallbacksEnabled::Yes };
 
     // 1. Pull from bytes buffer into stream.
     auto byte_buffer = MUST(ByteBuffer::copy(bytes));
 
-    auto& controller = m_stream->controller()->get<GC::Ref<Streams::ReadableByteStreamController>>();
-
-    if (auto result = Streams::readable_byte_stream_controller_enqueue_native_bytes(*controller, move(byte_buffer)); result.is_error()) {
-        auto throw_completion = Bindings::exception_to_throw_completion(realm.vm(), result.release_error());
+    if (auto result = Streams::readable_byte_stream_controller_enqueue_native_bytes(realm, *controller, move(byte_buffer)); result.is_error()) {
+        auto throw_completion = WebIDL::exception_to_throw_completion(realm.vm(), realm, result.release_error());
         // 2. If stream is errored, then terminate fetchParams’s controller.
         Streams::readable_byte_stream_controller_error(*controller, throw_completion.value());
-        m_fetch_params->controller()->terminate();
+        if (m_fetch_params)
+            m_fetch_params->controller()->terminate();
     }
 }
 
-void FetchedDataReceiver::close_stream()
+void FetchedDataReceiver::close_stream(JS::Realm& realm)
 {
-    if (m_http_cache) {
+    if (m_http_cache && m_fetch_params) {
         auto request = m_fetch_params->request();
         if (m_stream->is_readable() && !m_fetch_params->is_canceled()
             && m_response && request->cache_mode() != HTTP::CacheMode::NoStore) {
@@ -173,7 +245,7 @@ void FetchedDataReceiver::close_stream()
     if (!m_stream->is_readable())
         return;
 
-    HTML::TemporaryExecutionContext execution_context { m_stream->realm(), HTML::TemporaryExecutionContext::CallbacksEnabled::Yes };
+    HTML::TemporaryExecutionContext execution_context { realm, HTML::TemporaryExecutionContext::CallbacksEnabled::Yes };
 
     m_stream->close();
 }

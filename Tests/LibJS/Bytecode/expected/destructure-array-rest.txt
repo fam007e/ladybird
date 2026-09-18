@@ -1,13 +1,14 @@
-$89d6cbb5 destructure-array-rest.js:9:1
+$fd650eed destructure-array-rest.js:9:1
   Registers: 7
   Blocks:    1
   Constants:
     [0] = Undefined
 
 block0:
-  [   0] GetGlobal dst:reg6, `f`
-  [  10] Call dst:reg5, callee:reg6, this_value:Undefined, f
-  [  30] End value:reg5
+  [   0] Enter
+  [   8] GetGlobal dst:reg6, `f`
+  [  18] Call dst:reg5, callee:reg6, this_value:Undefined, f
+  [  38] End value:reg5
 
 
 f$26085a1b destructure-array-rest.js:6:5
@@ -21,26 +22,27 @@ f$26085a1b destructure-array-rest.js:6:5
     [3] = Int32(2)
 
 block0:
-  [   0] GetLexicalEnvironment dst:reg4
-  [   8] NewPrimitiveArray dst:reg5, elements:[1, 2, 3]
-  [  30] Mov dst:reg6, src:Bool(false)
-  [  40] GetIterator dst_iterator_object:reg7, dst_iterator_next:reg8, dst_iterator_done:reg9, iterable:reg5
-  [  58] Jump target:block3
+  [   0] Enter
+  [   8] GetLexicalEnvironment dst:reg4
+  [  10] NewPrimitiveArray dst:reg5, elements:[1, 2, 3]
+  [  38] Mov dst:reg6, src:Bool(false)
+  [  48] GetIterator dst_iterator_object:reg7, dst_iterator_next:reg8, dst_iterator_done:reg9, iterable:reg5
+  [  60] Jump target:block3
 
 block1:
-  [  60] Catch dst:reg11
-  [  68] SetLexicalEnvironment environment:reg4
-  [  70] Mov dst:reg10, src:Int32(1)
-  [  80] JumpIf condition:reg9, true_target:block14, false_target:block13
+  [  68] Catch dst:reg11
+  [  70] SetLexicalEnvironment environment:reg4
+  [  78] Mov dst:reg10, src:Int32(1)
+  [  88] JumpIf condition:reg9, true_target:block14, false_target:block13
 
 block2:
-  [  90] Return value:b~1
+  [  98] Return value:b~1
 
 block3:
-  [  98] Jump target:block5
+  [  a0] Jump target:block5
 
 block4:
-  [  a0] Mov dst:reg12, src:Undefined
+  [  a8] MovSrcUndefined dst:reg12
   [  b0] Jump target:block6
 
 block5:
@@ -72,10 +74,10 @@ block12:
   [ 170] Jump target:block11
 
 block13:
-  [ 178] JumpStrictlyEquals lhs:reg10, rhs:Int32(1), true_target:block15, false_target:block16
+  [ 178] JumpStrictlyEqualsRhsInt32 lhs:reg10, rhs:1, true_target:block15, false_target:block16
 
 block14:
-  [ 190] JumpStrictlyEquals lhs:reg10, rhs:Int32(2), true_target:block17, false_target:block18
+  [ 190] JumpStrictlyEqualsRhsInt32 lhs:reg10, rhs:2, true_target:block17, false_target:block18
 
 block15:
   [ 1a8] IteratorClose iterator_object:reg7, iterator_next:reg8, iterator_done:reg9, completion_value:reg11
@@ -92,6 +94,6 @@ block18:
   [ 1f0] Throw src:reg11
 
 Exception handlers:
-  [  98 ..   b8] => handler block1
+  [  a0 ..   b8] => handler block1
   [  e0 ..  118] => handler block1
   [ 130 ..  140] => handler block1

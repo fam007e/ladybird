@@ -10,7 +10,6 @@
 #include <AK/Random.h>
 #include <LibCore/Timer.h>
 #include <LibCrypto/Hash/HashManager.h>
-#include <LibWebSocket/Impl/WebSocketImplSerenity.h>
 #include <LibWebSocket/WebSocket.h>
 
 namespace WebSocket {
@@ -20,12 +19,12 @@ static constexpr int s_closing_handshake_timeout_ms = 30'000;
 // Note : The websocket protocol is defined by RFC 6455, found at https://tools.ietf.org/html/rfc6455
 // In this file, section numbers will refer to the RFC 6455
 
-NonnullRefPtr<WebSocket> WebSocket::create(ConnectionInfo connection, RefPtr<WebSocketImpl> impl)
+NonnullRefPtr<WebSocket> WebSocket::create(ConnectionInfo connection, NonnullRefPtr<WebSocketImpl> impl)
 {
     return adopt_ref(*new WebSocket(move(connection), move(impl)));
 }
 
-WebSocket::WebSocket(ConnectionInfo connection, RefPtr<WebSocketImpl> impl)
+WebSocket::WebSocket(ConnectionInfo connection, NonnullRefPtr<WebSocketImpl> impl)
     : m_connection(move(connection))
     , m_impl(move(impl))
 {
@@ -34,9 +33,7 @@ WebSocket::WebSocket(ConnectionInfo connection, RefPtr<WebSocketImpl> impl)
 void WebSocket::start()
 {
     VERIFY(m_state == WebSocket::InternalState::NotStarted);
-
-    if (!m_impl)
-        m_impl = adopt_ref(*new WebSocketImplSerenity);
+    VERIFY(m_impl);
 
     m_impl->on_connection_error = [this] {
         if (m_state == InternalState::Closing) {
@@ -446,7 +443,13 @@ ErrorOr<void> WebSocket::read_frame()
         return AK::Error::from_errno(ECONNABORTED);
     }
 
-    auto op_code = (WebSocket::OpCode)(head_bytes[0] & 0x0f);
+    auto op_code_value = head_bytes[0] & 0x0f;
+    if ((op_code_value >= 0x3 && op_code_value <= 0x7) || op_code_value >= 0xb) {
+        fail_connection(to_underlying(CloseStatusCode::ProtocolError), WebSocket::Error::ServerClosedSocket, "Server sent a reserved opcode");
+        return AK::Error::from_errno(EPROTO);
+    }
+
+    auto op_code = static_cast<WebSocket::OpCode>(op_code_value);
     bool is_final_frame = head_bytes[0] & 0x80;
     bool is_masked = head_bytes[1] & 0x80;
 

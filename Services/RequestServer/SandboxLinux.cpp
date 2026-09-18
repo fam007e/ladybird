@@ -7,21 +7,20 @@
 #include <AK/LexicalPath.h>
 #include <AK/String.h>
 #include <LibCore/Directory.h>
-#include <LibCore/StandardPaths.h>
 #include <LibSandbox/Sandbox.h>
 #include <LibSandbox/Seccomp.h>
+#include <RequestServer/ResourceSubstitutionMap.h>
 #include <RequestServer/Sandbox.h>
 
 namespace RequestServer {
 
-ErrorOr<void> apply_sandbox(Vector<ByteString> const& certificates)
+ErrorOr<void> apply_sandbox(Vector<ByteString> const& certificates, StringView cache_path)
 {
     TRY(Sandbox::install_no_new_privileges());
     TRY(Sandbox::configure_runtime());
 
     Vector<Sandbox::LandlockPath> paths;
-    auto cache_path = TRY(String::formatted("{}/Ladybird", Core::StandardPaths::cache_directory()));
-    TRY(Core::Directory::create(cache_path.to_byte_string(), Core::Directory::CreateDirectories::Yes));
+    TRY(Core::Directory::create(cache_path, Core::Directory::CreateDirectories::Yes));
 
     TRY(Sandbox::add_landlock_path_if_exists(paths, "/etc/ssl"sv, Sandbox::LandlockPath::Access::ReadOnly));
     TRY(Sandbox::add_landlock_path_if_exists(paths, "/etc/host.conf"sv, Sandbox::LandlockPath::Access::ReadOnly));
@@ -36,6 +35,13 @@ ErrorOr<void> apply_sandbox(Vector<ByteString> const& certificates)
             certificate_path = ".";
 
         TRY(Sandbox::add_landlock_path_if_exists(paths, certificate_path, Sandbox::LandlockPath::Access::ReadOnly));
+    }
+
+    if (g_resource_substitution_map) {
+        TRY(g_resource_substitution_map->for_each_substitution([&](auto const& substitution) -> ErrorOr<void> {
+            TRY(Sandbox::add_landlock_path_if_exists(paths, substitution.file_path, Sandbox::LandlockPath::Access::ReadOnly));
+            return {};
+        }));
     }
 
     TRY(Sandbox::add_landlock_path_if_exists(paths, cache_path, Sandbox::LandlockPath::Access::ReadWrite));

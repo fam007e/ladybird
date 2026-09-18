@@ -18,6 +18,13 @@ static URL::URL parse_url(StringView url)
     return parsed_url.release_value();
 }
 
+static bool stores_cookie(URL::URL const& url, HTTP::Cookie::ParsedCookie cookie, HTTP::Cookie::Source source)
+{
+    auto jar = WebView::CookieJar::create();
+    jar->set_cookie(url, cookie, source);
+    return !jar->get_all_cookies().is_empty();
+}
+
 TEST_CASE(cookies_round_trip_on_fresh_database)
 {
     auto database = TRY_OR_FAIL(Database::Database::create_memory_backed());
@@ -42,6 +49,72 @@ TEST_CASE(cookies_round_trip_on_fresh_database)
     EXPECT_EQ(cookies.size(), 1uz);
     EXPECT_EQ(cookies[0].name, "foo"_string);
     EXPECT_EQ(cookies[0].value, "bar"_string);
+}
+
+TEST_CASE(http_cookie_prefixes_require_secure_http_provenance)
+{
+    auto http_url = parse_url("http://attacker.example.com/"sv);
+    auto https_url = parse_url("https://example.com/"sv);
+
+    EXPECT(!stores_cookie(http_url,
+        HTTP::Cookie::ParsedCookie {
+            .name = "__hTtP-session"_string,
+            .value = "attacker"_string,
+            .domain = "example.com"_string,
+            .path = "/"_string,
+        },
+        HTTP::Cookie::Source::NonHttp));
+
+    EXPECT(!stores_cookie(https_url,
+        HTTP::Cookie::ParsedCookie {
+            .name = "__Host-Http-session"_string,
+            .value = "attacker"_string,
+            .path = "/"_string,
+            .secure_attribute_present = true,
+        },
+        HTTP::Cookie::Source::Http));
+
+    EXPECT(!stores_cookie(https_url,
+        HTTP::Cookie::ParsedCookie {
+            .name = "__Host-Http-session"_string,
+            .value = "attacker"_string,
+            .secure_attribute_present = true,
+            .http_only_attribute_present = true,
+        },
+        HTTP::Cookie::Source::Http));
+
+    EXPECT(!stores_cookie(https_url,
+        HTTP::Cookie::ParsedCookie {
+            .name = {},
+            .value = "__Http-session"_string,
+            .path = "/"_string,
+            .secure_attribute_present = true,
+            .http_only_attribute_present = true,
+        },
+        HTTP::Cookie::Source::Http));
+
+    HTTP::Cookie::Cookie structured_cookie {
+        .name = "__Http-session"_string,
+        .value = "attacker"_string,
+        .path = "/"_string,
+        .secure = true,
+        .host_only = true,
+    };
+    auto jar = WebView::CookieJar::create();
+    EXPECT(jar->set_cookie_from_devtools(https_url, {}, structured_cookie).is_error());
+    structured_cookie.name = "__Host-Http-session"_string;
+    EXPECT(jar->set_cookie_from_devtools(https_url, {}, structured_cookie).is_error());
+    structured_cookie.http_only = true;
+    EXPECT(!jar->set_cookie_from_devtools(https_url, {}, structured_cookie).is_error());
+
+    EXPECT(stores_cookie(http_url,
+        HTTP::Cookie::ParsedCookie {
+            .name = "__Httq-session"_string,
+            .value = "ordinary"_string,
+            .domain = "example.com"_string,
+            .path = "/"_string,
+        },
+        HTTP::Cookie::Source::NonHttp));
 }
 
 TEST_CASE(unversioned_cookie_table_is_stamped_and_preserved)
@@ -72,7 +145,7 @@ TEST_CASE(unversioned_cookie_table_is_stamped_and_preserved)
 
     Optional<u32> version;
     auto statement = TRY_OR_FAIL(database->prepare_statement("SELECT version FROM SchemaVersions WHERE store = 'Cookies';"sv));
-    database->execute_statement(statement, [&](auto statement_id) { version = database->result_column<u32>(statement_id, 0); });
+    database->execute_statement(statement, [&](auto statement_id) -> ErrorOr<void> { version = database->result_column<u32>(statement_id, 0); return {}; });
     EXPECT_EQ(version, Optional<u32> { 1u });
 
     auto jar = TRY_OR_FAIL(WebView::CookieJar::create(*database));

@@ -21,13 +21,14 @@
 
 namespace JS {
 
-// Strings shorter than or equal to this length are cached in the VM and deduplicated.
-// Longer strings are not cached to avoid excessive hashing and lookup costs.
-static constexpr size_t MAX_LENGTH_FOR_STRING_CACHE = 256;
-
 GC_DEFINE_ALLOCATOR(PrimitiveString);
 GC_DEFINE_ALLOCATOR(RopeString);
 GC_DEFINE_ALLOCATOR(Substring);
+
+size_t PrimitiveString::fly_string_cache_hash(Utf16FlyString const& string)
+{
+    return u64_hash(string.raw_identity());
+}
 
 Optional<StringView> PrimitiveString::short_flat_string_storage_view() const
 {
@@ -67,25 +68,15 @@ GC::Ref<PrimitiveString> PrimitiveString::create(VM& vm, Utf16String const& stri
     if (string.is_empty())
         return vm.empty_string();
 
-    auto const length_in_code_units = string.length_in_code_units();
-
-    if (length_in_code_units == 1) {
+    if (string.length_in_code_units() == 1) {
         if (auto code_unit = string.code_unit_at(0); is_ascii(code_unit))
             return vm.single_ascii_character_string(static_cast<u8>(code_unit));
     }
 
-    if (length_in_code_units > MAX_LENGTH_FOR_STRING_CACHE) {
-        return vm.heap().allocate<PrimitiveString>(string);
-    }
+    if (string.has_short_ascii_storage())
+        return create(vm, Utf16FlyString { string });
 
-    auto& string_cache = vm.utf16_string_cache();
-    if (auto it = string_cache.find(string); it != string_cache.end())
-        return *it->value;
-
-    auto new_string = vm.heap().allocate<PrimitiveString>(string);
-    new_string->m_utf16_string_is_in_cache = true;
-    string_cache.set(move(string), new_string);
-    return *new_string;
+    return vm.heap().allocate<PrimitiveString>(string);
 }
 
 GC::Ref<PrimitiveString> PrimitiveString::create(VM& vm, Utf16View const& string)
@@ -95,7 +86,22 @@ GC::Ref<PrimitiveString> PrimitiveString::create(VM& vm, Utf16View const& string
 
 GC::Ref<PrimitiveString> PrimitiveString::create(VM& vm, Utf16FlyString const& string)
 {
-    return create(vm, string.to_utf16_string());
+    if (string.is_empty())
+        return vm.empty_string();
+
+    if (string.length_in_code_units() == 1) {
+        if (auto code_unit = string.code_unit_at(0); is_ascii(code_unit))
+            return vm.single_ascii_character_string(static_cast<u8>(code_unit));
+    }
+
+    auto& string_cache = vm.fly_string_cache();
+    auto& cache_slot = string_cache[fly_string_cache_hash(string) & (string_cache.size() - 1)];
+    if (cache_slot && cache_slot->m_utf16_string->raw_identity() == string.raw_identity())
+        return *cache_slot;
+
+    auto new_string = vm.heap().allocate<PrimitiveString>(string.to_utf16_string());
+    cache_slot = new_string;
+    return *new_string;
 }
 
 GC::Ref<PrimitiveString> PrimitiveString::create_from_unsigned_integer(VM& vm, u64 number)
@@ -104,15 +110,26 @@ GC::Ref<PrimitiveString> PrimitiveString::create_from_unsigned_integer(VM& vm, u
         auto& cache_slot = vm.numeric_string_cache()[number];
         if (!cache_slot) {
             auto string = Utf16String::number(number);
-            cache_slot = create(vm, string);
+            cache_slot = create(vm, Utf16FlyString { string });
         }
         return *cache_slot;
     }
-    return create(vm, Utf16String::number(number));
+
+    auto& large_cache = vm.large_numeric_string_cache();
+    auto& cache_entry = large_cache[number & (large_cache.size() - 1)];
+    if (!cache_entry.string || cache_entry.number != number) {
+        cache_entry.number = number;
+        auto string = Utf16String::number(number);
+        cache_entry.string = create(vm, Utf16FlyString { string });
+    }
+    return *cache_entry.string;
 }
 
-GC::Ref<PrimitiveString> PrimitiveString::create(VM& vm, PrimitiveString& lhs, PrimitiveString& rhs)
+ThrowCompletionOr<GC::Ref<PrimitiveString>> PrimitiveString::create(VM& vm, PrimitiveString& lhs, PrimitiveString& rhs)
 {
+    if (rhs.length_in_utf16_code_units() >= NumericLimits<u32>::max() - lhs.length_in_utf16_code_units())
+        return vm.throw_completion<RangeError>(ErrorType::InvalidLength, "string");
+
     // We're here to concatenate two strings into a new rope string. However, if any of them are empty, no rope is required.
     bool lhs_empty = lhs.is_empty();
     bool rhs_empty = rhs.is_empty();
@@ -157,8 +174,16 @@ GC::Ref<PrimitiveString> PrimitiveString::create(VM& vm, PrimitiveString const& 
     return vm.heap().allocate<Substring>(const_cast<PrimitiveString&>(string), code_unit_offset, code_unit_length);
 }
 
+PrimitiveString::PrimitiveString(DeferredKind deferred_kind, size_t length_in_utf16_code_units)
+    : m_deferred_kind(deferred_kind)
+    , m_length_in_utf16_code_units(static_cast<u32>(length_in_utf16_code_units))
+{
+    VERIFY(length_in_utf16_code_units < NumericLimits<u32>::max());
+}
+
 PrimitiveString::PrimitiveString(Utf16String string)
-    : m_utf16_string(move(string))
+    : m_length_in_utf16_code_units(static_cast<u32>(string.length_in_code_units()))
+    , m_utf16_string(move(string))
 {
 }
 
@@ -175,25 +200,19 @@ size_t PrimitiveString::external_memory_size() const
 void PrimitiveString::finalize()
 {
     Base::finalize();
-    if (m_utf16_string_is_in_cache) {
-        auto const& string = *m_utf16_string;
-        if (string.length_in_code_units() <= MAX_LENGTH_FOR_STRING_CACHE)
-            vm().utf16_string_cache().remove(string);
+    for (auto& entry : vm().string_to_atom_cache()) {
+        if (entry.string.ptr() == this)
+            entry = {};
     }
-}
 
-bool PrimitiveString::is_empty() const
-{
-    if (m_deferred_kind == DeferredKind::Rope) {
-        // NOTE: We never make an empty rope string.
-        return false;
-    }
-    if (m_deferred_kind == DeferredKind::Substring)
-        return static_cast<Substring const&>(*this).m_code_unit_length == 0;
+    if (!m_utf16_string.has_value() || !m_utf16_string->has_fly_string_storage())
+        return;
 
-    if (has_utf16_string())
-        return m_utf16_string->is_empty();
-    VERIFY_NOT_REACHED();
+    auto fly_string = Utf16FlyString { *m_utf16_string };
+    auto& string_cache = vm().fly_string_cache();
+    auto& cache_slot = string_cache[fly_string_cache_hash(fly_string) & (string_cache.size() - 1)];
+    if (cache_slot.ptr() == this)
+        cache_slot = nullptr;
 }
 
 Utf16String PrimitiveString::utf16_string() const
@@ -204,23 +223,42 @@ Utf16String PrimitiveString::utf16_string() const
     return *m_utf16_string;
 }
 
+PropertyKey PrimitiveString::property_key(VM& vm) const
+{
+    resolve_if_needed();
+
+    VERIFY(has_utf16_string());
+    auto& string = *m_utf16_string;
+    if (string.has_fly_string_storage())
+        return Utf16FlyString { string };
+
+    auto& string_to_atom_cache = vm.string_to_atom_cache();
+    for (size_t i = 0; i < string_to_atom_cache.size(); ++i) {
+        if (string_to_atom_cache[i].string.ptr() != this)
+            continue;
+        if (i != 0)
+            swap(string_to_atom_cache[0], string_to_atom_cache[i]);
+        return *string_to_atom_cache[0].atom;
+    }
+
+    Utf16FlyString fly_string { string };
+    if (!string.has_fly_string_storage()) {
+        string_to_atom_cache[1] = move(string_to_atom_cache[0]);
+        string_to_atom_cache[0] = { *this, fly_string };
+    }
+    return fly_string;
+}
+
 Utf16View PrimitiveString::utf16_string_view() const
 {
     if (!has_utf16_string()) {
         if (m_deferred_kind == DeferredKind::Substring) {
             auto const& substring = static_cast<Substring const&>(*this);
-            return substring.m_source_string->utf16_string_view().substring_view(substring.m_code_unit_offset, substring.m_code_unit_length);
+            return substring.m_source_string->utf16_string_view().substring_view(substring.m_code_unit_offset, m_length_in_utf16_code_units);
         }
         (void)utf16_string();
     }
     return *m_utf16_string;
-}
-
-size_t PrimitiveString::length_in_utf16_code_units() const
-{
-    if (m_deferred_kind == DeferredKind::Substring)
-        return static_cast<Substring const&>(*this).m_code_unit_length;
-    return utf16_string_view().length_in_code_units();
 }
 
 bool PrimitiveString::operator==(PrimitiveString const& other) const
@@ -277,16 +315,15 @@ void RopeString::resolve() const
 
     // This vector will hold all the pieces of the rope that need to be assembled
     // into the resolved string.
-    Vector<PrimitiveString const*, 2> pieces;
-    size_t length_in_utf16_code_units = 0;
+    Vector<GC::Ptr<PrimitiveString const>, 2> pieces;
 
     // NOTE: We traverse the rope tree without using recursion, since we'd run out of
     //       stack space quickly when handling a long sequence of unresolved concatenations.
-    Vector<PrimitiveString const*, 2> stack;
+    Vector<GC::Ptr<PrimitiveString const>, 2> stack;
     stack.append(m_rhs);
     stack.append(m_lhs);
     while (!stack.is_empty()) {
-        auto const* current = stack.take_last();
+        auto current = stack.take_last();
         if (current->m_deferred_kind == DeferredKind::Rope) {
             auto& current_rope_string = static_cast<RopeString const&>(*current);
             stack.append(current_rope_string.m_rhs);
@@ -294,12 +331,11 @@ void RopeString::resolve() const
             continue;
         }
 
-        length_in_utf16_code_units += current->length_in_utf16_code_units();
         pieces.append(current);
     }
 
-    Utf16StringBuilder builder(length_in_utf16_code_units);
-    for (auto const* current : pieces) {
+    Utf16StringBuilder builder(m_length_in_utf16_code_units);
+    for (auto const& current : pieces) {
         builder.append(current->utf16_string_view());
     }
 
@@ -310,7 +346,7 @@ void RopeString::resolve() const
 }
 
 RopeString::RopeString(GC::Ref<PrimitiveString> lhs, GC::Ref<PrimitiveString> rhs)
-    : PrimitiveString(DeferredKind::Rope)
+    : PrimitiveString(DeferredKind::Rope, lhs->length_in_utf16_code_units() + rhs->length_in_utf16_code_units())
     , m_lhs(lhs)
     , m_rhs(rhs)
 {
@@ -327,7 +363,7 @@ void RopeString::visit_edges(Cell::Visitor& visitor)
 
 void Substring::resolve() const
 {
-    auto source_view = m_source_string->utf16_string_view().substring_view(m_code_unit_offset, m_code_unit_length);
+    auto source_view = m_source_string->utf16_string_view().substring_view(m_code_unit_offset, m_length_in_utf16_code_units);
 
     m_utf16_string = Utf16String::from_utf16(source_view);
     m_deferred_kind = DeferredKind::None;
@@ -335,10 +371,9 @@ void Substring::resolve() const
 }
 
 Substring::Substring(GC::Ref<PrimitiveString> source_string, size_t code_unit_offset, size_t code_unit_length)
-    : PrimitiveString(DeferredKind::Substring)
+    : PrimitiveString(DeferredKind::Substring, code_unit_length)
     , m_source_string(source_string)
     , m_code_unit_offset(code_unit_offset)
-    , m_code_unit_length(code_unit_length)
 {
 }
 

@@ -8,12 +8,12 @@ interface HTMLOutputElement : HTMLElement {
     [CEReactions, Reflect] attribute DOMString name;
 
     readonly attribute DOMString type;
-    [CEReactions] attribute Utf16DOMString defaultValue;
-    [CEReactions] attribute Utf16DOMString value;
+    [CEReactions] attribute DOMString defaultValue;
+    [CEReactions] attribute DOMString value;
 
     readonly attribute boolean willValidate;
     readonly attribute ValidityState validity;
-    readonly attribute Utf16DOMString validationMessage;
+    readonly attribute DOMString validationMessage;
     boolean checkValidity();
     boolean reportValidity();
     undefined setCustomValidity(DOMString error);

@@ -13,29 +13,29 @@ namespace Wasm {
 
 void Configuration::unwind_impl()
 {
-    if (m_compiled_direct_call_depth > 0) {
-        m_compiled_direct_call_depth--;
-        m_depth--;
-        return;
-    }
-    auto last_frame = m_frame_stack.take_last();
     m_depth--;
 
-    m_locals_base = m_frame_stack.is_empty() ? nullptr : m_frame_stack.last().locals_data();
+    Optional<Vector<Value, ArgumentsStaticSize>> released_locals;
+    auto const* popped_module = &m_frame_stack.last().module();
+    if (m_frame_stack.last().owns_locals())
+        released_locals = m_owned_locals_stack.take_last();
+    m_frame_stack.remove(m_frame_stack.size() - 1);
+
     if (m_frame_stack.is_empty()) {
-        m_default_memory = nullptr;
+        m_locals_base = nullptr;
+        m_memory_instances = nullptr;
+        m_global_instances = nullptr;
     } else {
-        auto const& memories = m_frame_stack.last().module().memories();
-        m_default_memory = memories.is_empty() ? nullptr : m_store.unsafe_get(memories[0]);
+        auto& caller = m_frame_stack.last();
+        m_locals_base = caller.owns_locals() ? m_owned_locals_stack.last().data() : caller.locals_data();
+        if (&caller.module() != popped_module) {
+            m_memory_instances = caller.module().resolved_memories(m_store);
+            m_global_instances = caller.module().resolved_globals(m_store);
+        }
     }
 
-    if (!last_frame.owns_locals()) {
-        // Non-owning frame: just restore the caller's runtime state.
-        return;
-    }
-
-    // Owning frame: full cleanup.
-    release_arguments_allocation(last_frame.owned_locals(), m_locals_base != nullptr);
+    if (released_locals.has_value())
+        release_arguments_allocation(released_locals.value());
 }
 
 Result Configuration::call(Interpreter& interpreter, FunctionAddress address, Vector<Value, ArgumentsStaticSize>& arguments)
@@ -69,11 +69,14 @@ ErrorOr<void, Trap> Configuration::prepare_wasm_call(WasmFunction const& wasm_fu
     if (is_tailcall)
         unwind_impl();
 
-    arguments.ensure_capacity(arguments.size() + wasm_function.code().func().total_local_count());
+    auto inlined_locals = wasm_function.code().func().body().compiled_instructions.cranelift_inlined_locals;
+    arguments.ensure_capacity(arguments.size() + wasm_function.code().func().total_local_count() + inlined_locals);
     for (auto const& local : wasm_function.code().func().locals()) {
         for (size_t i = 0; i < local.n(); ++i)
             arguments.unchecked_append(Value(local.type()));
     }
+    for (u32 i = 0; i < inlined_locals; ++i)
+        arguments.unchecked_append(Value(ValueType { ValueType::I32 }));
 
     set_frame(
         is_tailcall ? IsTailcall::Yes : IsTailcall::No,
@@ -90,13 +93,13 @@ Result Configuration::execute(Interpreter& interpreter)
     if (interpreter.did_trap())
         return interpreter.trap();
 
-    Vector<Value> results { value_stack().span().slice_from_end(frame().arity()) };
+    Vector<Value, ResultsStaticSize> results { value_stack().span().slice_from_end(frame().arity()) };
     value_stack().shrink(value_stack().size() - results.size(), true);
     results.reverse();
 
     // If we reached here from a tailcall -> return, we might not have a label to pop (because the return already popped it)
-    if (!label_stack().is_empty())
-        label_stack().take_last();
+    if (label_stack().size() > frame().label_index())
+        label_stack().shrink(frame().label_index(), true);
 
     return Result { move(results) };
 }
@@ -118,6 +121,26 @@ ErrorOr<void, Trap> Configuration::execute_for_compiled_call(Interpreter& interp
         label_stack().take_last();
 
     return {};
+}
+
+void Configuration::reset_after_invoke(Badge<AbstractMachine>)
+{
+    m_value_stack.reset_and_clear();
+    m_call_record_stack.reset_and_clear();
+
+    m_label_stack.clear_with_capacity();
+    m_frame_stack.clear_with_capacity();
+    m_owned_locals_stack.clear_with_capacity();
+    m_call_argument_freelist.clear_with_capacity();
+    regs.fill(Value(0));
+
+    m_depth = 0;
+    m_ip = 0;
+    m_locals_base = nullptr;
+    m_call_record_base = nullptr;
+    m_memory_instances = nullptr;
+    m_global_instances = nullptr;
+    m_compiled_call_result_scratch = Value(0);
 }
 
 void Configuration::dump_stack()

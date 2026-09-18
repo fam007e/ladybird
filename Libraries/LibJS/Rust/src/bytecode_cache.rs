@@ -42,7 +42,7 @@ use crate::bytecode::validator::validate_bytecode;
 use crate::u32_from_usize;
 
 const MAGIC: &[u8; 8] = b"LBJSBC\0\0";
-const FORMAT_VERSION: u32 = 13;
+const FORMAT_VERSION: u32 = 17;
 const SOURCE_HASH_SIZE: usize = 32;
 const BYTECODE_ALIGNMENT: usize = 8;
 const COMPLETION_TYPE_VARIANT_COUNT: u32 = 6;
@@ -379,8 +379,8 @@ impl Decode for ast::Utf16String {
         let length: usize = u32::decode(decoder)?.try_into().ok()?;
         let bytes = decoder.bytes(length.checked_mul(size_of::<u16>())?)?;
         let mut code_units = Vec::with_capacity(length);
-        for chunk in bytes.chunks_exact(size_of::<u16>()) {
-            code_units.push(u16::from_le_bytes(chunk.try_into().ok()?));
+        for chunk in bytes.as_chunks::<{ size_of::<u16>() }>().0 {
+            code_units.push(u16::from_le_bytes(*chunk));
         }
         Some(code_units.into())
     }
@@ -409,8 +409,8 @@ impl Decode for DecodedUtf16String {
         }
 
         let mut code_units = Vec::with_capacity(length);
-        for chunk in bytes.chunks_exact(size_of::<u16>()) {
-            code_units.push(u16::from_le_bytes(chunk.try_into().ok()?));
+        for chunk in bytes.as_chunks::<{ size_of::<u16>() }>().0 {
+            code_units.push(u16::from_le_bytes(*chunk));
         }
         Some(Self::Owned(code_units.into()))
     }
@@ -488,34 +488,16 @@ impl PreparedUtf16Slice {
     }
 }
 
-fn utf16_slice_storage<'a>(
-    strings: impl ExactSizeIterator<Item = &'a DecodedUtf16String>,
-) -> (Vec<Vec<u16>>, Vec<FFIUtf16Slice>) {
-    #[cfg(target_endian = "little")]
-    let storage = Vec::new();
-    #[cfg(not(target_endian = "little"))]
-    let mut storage = Vec::new();
-    let mut slices = Vec::with_capacity(strings.len());
-    for string in strings {
-        match string {
-            DecodedUtf16String::Owned(value) => slices.push(FFIUtf16Slice::from(value.as_ref())),
-            DecodedUtf16String::Foreign { data, length } => {
-                #[cfg(target_endian = "little")]
-                {
-                    slices.push(FFIUtf16Slice {
-                        data: *data,
-                        length: *length,
-                    });
-                }
-                #[cfg(not(target_endian = "little"))]
-                {
-                    storage.push(string.to_vec());
-                    slices.push(FFIUtf16Slice::from(storage.last().unwrap().as_slice()));
-                }
-            }
-        }
-    }
-    (storage, slices)
+fn native_string_table<'a>(strings: impl Iterator<Item = &'a DecodedUtf16String>) -> Vec<ak::Utf16FlyString> {
+    strings
+        .map(|string| {
+            let prepared = PreparedUtf16Slice::new(string);
+            // SAFETY: The prepared slice borrows the decoded string or its own converted storage.
+            ak::Utf16FlyString::from_utf16(unsafe {
+                std::slice::from_raw_parts(prepared.slice.data, prepared.slice.length)
+            })
+        })
+        .collect()
 }
 
 struct Bytes<'a>(&'a [u8]);
@@ -1376,10 +1358,10 @@ unsafe fn materialize_function(
     validation: CachedBytecodeValidation,
 ) -> *mut c_void {
     unsafe {
-        let (_parameter_name_storage, parameter_names): (Vec<Vec<u16>>, Vec<FFIUtf16Slice>) = function
+        let parameter_names = function
             .parameter_names
             .as_ref()
-            .map(|names| utf16_slice_storage(names.iter()))
+            .map(|names| native_string_table(names.iter()))
             .unwrap_or_default();
         let name_storage = function.name.as_ref().map(PreparedUtf16Slice::new);
         let (name, name_len) = name_storage
@@ -1402,7 +1384,7 @@ unsafe fn materialize_function(
             strict: function.is_strict_mode || outer_strict,
             is_arrow: function.is_arrow_function,
             has_simple_parameter_list: function.parameter_names.is_some(),
-            parameter_names: parameter_names.as_ptr(),
+            parameter_names: parameter_names.as_ptr().cast(),
             parameter_name_count: parameter_names.len(),
             source_text_offset,
             source_text_length,
@@ -1458,10 +1440,10 @@ unsafe fn prepare_function_install(
     validation: CachedBytecodeValidation,
 ) -> *mut c_void {
     unsafe {
-        let (_parameter_name_storage, parameter_names): (Vec<Vec<u16>>, Vec<FFIUtf16Slice>) = function
+        let parameter_names = function
             .parameter_names
             .as_ref()
-            .map(|names| utf16_slice_storage(names.iter()))
+            .map(|names| native_string_table(names.iter()))
             .unwrap_or_default();
         let name_storage = function.name.as_ref().map(PreparedUtf16Slice::new);
         let (name, name_len) = name_storage
@@ -1484,7 +1466,7 @@ unsafe fn prepare_function_install(
             strict: function.is_strict_mode || outer_strict,
             is_arrow: function.is_arrow_function,
             has_simple_parameter_list: function.parameter_names.is_some(),
-            parameter_names: parameter_names.as_ptr(),
+            parameter_names: parameter_names.as_ptr().cast(),
             parameter_name_count: parameter_names.len(),
             source_text_offset,
             source_text_length,
@@ -1608,27 +1590,43 @@ unsafe fn materialize_executable_for_install(
         let Some(identifier_table) = executable.identifier_table.values() else {
             return std::ptr::null_mut();
         };
-        let (_identifier_table_storage, identifier_table_slices) = utf16_slice_storage(identifier_table.iter());
         let Some(property_key_table) = executable.property_key_table.values() else {
             return std::ptr::null_mut();
         };
-        let (_property_key_table_storage, property_key_table_slices) = utf16_slice_storage(property_key_table.iter());
+        let native_identifiers = native_string_table(identifier_table.iter());
+        let native_property_keys = native_string_table(property_key_table.iter());
         let Some(string_table) = executable.string_table.values() else {
             return std::ptr::null_mut();
         };
-        let (_string_table_storage, string_table_slices) = utf16_slice_storage(string_table.iter());
+        let native_strings = native_string_table(string_table.iter());
         let Some((constants_count, constants_bytes)) = executable.constants.ffi_data() else {
             return std::ptr::null_mut();
         };
         let Some(local_variables) = executable.local_variables.values() else {
             return std::ptr::null_mut();
         };
-        let (_local_variable_storage, local_variable_name_slices) =
-            utf16_slice_storage(local_variables.iter().map(|local_variable| {
-                let _ = local_variable.is_lexically_declared;
-                let _ = local_variable.is_initialized_during_declaration_instantiation;
-                &local_variable.name
-            }));
+        let local_variable_names = native_string_table(local_variables.iter().map(|local_variable| {
+            let _ = local_variable.is_lexically_declared;
+            let _ = local_variable.is_initialized_during_declaration_instantiation;
+            &local_variable.name
+        }));
+        let local_variable_metadata: Vec<crate::bytecode::ffi::FFILocalVariableMetadata> = local_variables
+            .iter()
+            .zip(&local_variable_names)
+            .map(|(variable, name)| crate::bytecode::ffi::FFILocalVariableMetadata {
+                name: name.raw_identity(),
+                is_mutable: variable.is_mutable,
+                has_scope_range: variable.scope_range.is_some(),
+                scope_start_line: variable.scope_range.map_or(0, |range| range.start.line),
+                scope_start_column: variable.scope_range.map_or(0, |range| range.start.column),
+                scope_end_line: variable.scope_range.map_or(0, |range| range.end.line),
+                scope_end_column: variable.scope_range.map_or(0, |range| range.end.column),
+            })
+            .collect();
+        let Some(argument_variable_names) = executable.argument_variable_names.values() else {
+            return std::ptr::null_mut();
+        };
+        let argument_variable_names = native_string_table(argument_variable_names.iter());
 
         let Some(shared_functions) = executable.shared_functions.values() else {
             return std::ptr::null_mut();
@@ -1701,12 +1699,13 @@ unsafe fn materialize_executable_for_install(
                 length_identifier: executable.length_identifier,
             },
             crate::bytecode::ffi::ExecutableSlices {
-                identifier_table: &identifier_table_slices,
-                property_key_table: &property_key_table_slices,
-                string_table: &string_table_slices,
+                identifier_table: &native_identifiers,
+                property_key_table: &native_property_keys,
+                string_table: &native_strings,
                 constants_data: constants_bytes.as_slice(),
                 constants_count,
-                local_variable_names: &local_variable_name_slices,
+                local_variable_metadata: &local_variable_metadata,
+                argument_variable_names: &argument_variable_names,
                 compiled_regexes: &[],
             },
             vm_ptr,
@@ -2769,13 +2768,22 @@ impl Encode for ExecutableRecord<'_> {
 
         encoder.align_bytes_payload_to(BYTECODE_ALIGNMENT);
         Bytes(&self.assembled.bytecode).encode(encoder);
-        Utf16Table(&self.generator.identifier_table).encode(encoder);
-        Utf16Table(&self.generator.property_key_table).encode(encoder);
-        Utf16Table(&self.generator.string_table).encode(encoder);
+        for table in [
+            &self.generator.identifier_table,
+            &self.generator.property_key_table,
+            &self.generator.string_table,
+        ] {
+            DecodedRecordSequence::encode(encoder, table, |value, encoder| {
+                Utf16(&value.to_utf16()).encode(encoder);
+            });
+        }
         ConstantTable(&self.generator.constants).encode(encoder);
         ExceptionHandlerTable(self.assembled).encode(encoder);
         SourceMapTable(self.assembled).encode(encoder);
         LocalVariableTable(self.generator).encode(encoder);
+        DecodedRecordSequence::encode(encoder, &self.generator.argument_variable_names, |value, encoder| {
+            Utf16(&value.to_utf16()).encode(encoder);
+        });
         SharedFunctionTable(self.generator).encode(encoder);
         ClassBlueprintTable(self.generator).encode(encoder);
     }
@@ -2801,6 +2809,7 @@ impl ExecutableRecord<'_> {
             exception_handlers: ExceptionHandlerTable::decode(decoder)?,
             source_map: SourceMapTable::decode(decoder)?,
             local_variables: LocalVariableTable::decode(decoder)?,
+            argument_variable_names: Utf16Table::decode(decoder)?,
             shared_functions: SharedFunctionTable::decode(decoder)?,
             class_blueprints: ClassBlueprintTable::decode(decoder)?,
         })
@@ -2822,6 +2831,7 @@ struct DecodedExecutableRecord {
     exception_handlers: DecodedExceptionHandlerTable,
     source_map: DecodedSourceMapTable,
     local_variables: DecodedLocalVariableTable,
+    argument_variable_names: DecodedUtf16Table,
     shared_functions: DecodedFunctionTable,
     class_blueprints: DecodedClassBlueprintTable,
 }
@@ -2841,6 +2851,7 @@ impl DecodedExecutableRecord {
             + self.exception_handlers.len()
             + self.source_map.len()
             + self.local_variables.len()
+            + self.argument_variable_names.len()
             + self.shared_functions.len()
             + self.class_blueprints.len();
         self.shared_functions.validate();
@@ -3197,6 +3208,7 @@ impl Encode for ExceptionHandlerTable<'_> {
             handler.start_offset.encode(encoder);
             handler.end_offset.encode(encoder);
             handler.handler_offset.encode(encoder);
+            handler.catches_exception.encode(encoder);
         });
     }
 }
@@ -3226,6 +3238,7 @@ impl DecodedExceptionHandlerTable {
                 start_offset: u32::decode(&mut decoder)?,
                 end_offset: u32::decode(&mut decoder)?,
                 handler_offset: u32::decode(&mut decoder)?,
+                catches_exception: bool::decode(&mut decoder)?,
             });
         }
         decoder.is_empty().then_some(values)
@@ -3280,11 +3293,19 @@ struct LocalVariableTable<'a>(&'a Generator);
 impl Encode for LocalVariableTable<'_> {
     fn encode(&self, encoder: &mut Encoder) {
         DecodedRecordSequence::encode(encoder, &self.0.local_variables, |local_variable, encoder| {
-            Utf16(&local_variable.name).encode(encoder);
+            Utf16(&local_variable.name.to_utf16()).encode(encoder);
             local_variable.is_lexically_declared.encode(encoder);
             local_variable
                 .is_initialized_during_declaration_instantiation
                 .encode(encoder);
+            local_variable.is_mutable.encode(encoder);
+            local_variable.scope_range.is_some().encode(encoder);
+            if let Some(range) = local_variable.scope_range {
+                range.start.line.encode(encoder);
+                range.start.column.encode(encoder);
+                range.end.line.encode(encoder);
+                range.end.column.encode(encoder);
+            }
         });
     }
 }
@@ -3314,6 +3335,23 @@ impl DecodedLocalVariableTable {
                 name: DecodedUtf16String::decode(&mut decoder)?,
                 is_lexically_declared: bool::decode(&mut decoder)?,
                 is_initialized_during_declaration_instantiation: bool::decode(&mut decoder)?,
+                is_mutable: bool::decode(&mut decoder)?,
+                scope_range: if bool::decode(&mut decoder)? {
+                    Some(crate::ast::SourceRange {
+                        start: crate::ast::Position {
+                            line: u32::decode(&mut decoder)?,
+                            column: u32::decode(&mut decoder)?,
+                            offset: 0,
+                        },
+                        end: crate::ast::Position {
+                            line: u32::decode(&mut decoder)?,
+                            column: u32::decode(&mut decoder)?,
+                            offset: 0,
+                        },
+                    })
+                } else {
+                    None
+                },
             });
         }
         decoder.is_empty().then_some(values)
@@ -3324,6 +3362,8 @@ struct DecodedLocalVariable {
     name: DecodedUtf16String,
     is_lexically_declared: bool,
     is_initialized_during_declaration_instantiation: bool,
+    is_mutable: bool,
+    scope_range: Option<crate::ast::SourceRange>,
 }
 
 struct SharedFunctionTable<'a>(&'a Generator);

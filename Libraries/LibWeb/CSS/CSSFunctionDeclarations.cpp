@@ -5,51 +5,58 @@
  */
 
 #include "CSSFunctionDeclarations.h"
-#include <LibWeb/Bindings/CSSFunctionDeclarations.h>
-#include <LibWeb/Bindings/Intrinsics.h>
-#include <LibWeb/CSS/Parser/Parser.h>
+#include <LibGC/Heap.h>
+#include <LibJS/Runtime/ExternalMemory.h>
 #include <LibWeb/Dump.h>
 
 namespace Web::CSS {
 
 GC_DEFINE_ALLOCATOR(CSSFunctionDeclarations);
 
-GC::Ref<CSSFunctionDeclarations> CSSFunctionDeclarations::create(JS::Realm& realm, Parser::Parser& parser, Vector<Parser::Declaration> const& declarations)
+GC::Ref<CSSFunctionDeclarations> CSSFunctionDeclarations::create(RustRule rule)
 {
-    return realm.create<CSSFunctionDeclarations>(realm, parser.convert_to_descriptors<CSSFunctionDescriptors>(AtRuleID::Function, declarations));
+    return GC::Heap::the().allocate<CSSFunctionDeclarations>(move(rule));
 }
 
-CSSFunctionDeclarations::CSSFunctionDeclarations(JS::Realm& realm, GC::Ref<CSSFunctionDescriptors> style)
-    : CSSRule(realm, Type::FunctionDeclarations)
-    , m_style(style)
+CSSFunctionDeclarations::CSSFunctionDeclarations(RustRule rule)
+    : CSSRule(move(rule))
+    , m_descriptors(Parser::ValueParserFFI::rust_descriptor_block_retain(native_rule().payload().descriptors))
 {
 }
 
-void CSSFunctionDeclarations::initialize(JS::Realm& realm)
+size_t CSSFunctionDeclarations::external_memory_size() const
 {
-    WEB_SET_PROTOTYPE_FOR_INTERFACE(CSSFunctionDeclarations);
-    Base::initialize(realm);
+    return JS::saturating_add_external_memory_size(Base::external_memory_size(), m_descriptors.external_memory_size());
 }
 
-void CSSFunctionDeclarations::visit_edges(Cell::Visitor& visitor)
+GC::Ref<CSSFunctionDescriptors> CSSFunctionDeclarations::style() const
+{
+    if (!m_style) {
+        m_style = CSSFunctionDescriptors::create(m_descriptors.retain());
+        m_style->set_parent_rule(const_cast<CSSFunctionDeclarations&>(*this));
+    }
+    return *m_style;
+}
+
+void CSSFunctionDeclarations::visit_edges(GC::Cell::Visitor& visitor)
 {
     Base::visit_edges(visitor);
     visitor.visit(m_style);
 }
 
-String CSSFunctionDeclarations::serialized() const
+Utf16String CSSFunctionDeclarations::serialized() const
 {
     // https://drafts.csswg.org/css-mixins-1/#the-function-declarations-interface
     // The CSSFunctionDeclarations rule, like CSSNestedDeclarations, serializes as if its declaration block had been
     // serialized directly.
-    return m_style->serialized();
+    return style()->serialized();
 }
 
 void CSSFunctionDeclarations::dump(StringBuilder& builder, int indent_levels) const
 {
     Base::dump(builder, indent_levels);
 
-    dump_descriptors(builder, m_style, indent_levels + 1);
+    dump_descriptors(builder, style(), indent_levels + 1);
 }
 
 }

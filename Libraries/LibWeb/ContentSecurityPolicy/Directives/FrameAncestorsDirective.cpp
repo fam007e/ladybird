@@ -19,7 +19,7 @@ namespace Web::ContentSecurityPolicy::Directives {
 
 GC_DEFINE_ALLOCATOR(FrameAncestorsDirective);
 
-FrameAncestorsDirective::FrameAncestorsDirective(String name, Vector<String> value)
+FrameAncestorsDirective::FrameAncestorsDirective(Utf16FlyString name, Vector<Utf16String> value)
     : Directive(move(name), move(value))
 {
 }
@@ -46,16 +46,15 @@ Directive::Result FrameAncestorsDirective::navigation_response_check(GC::Ref<Fet
         return Result::Allowed;
 
     // 5. Let current be target.
-    auto current = target;
-
     // 6. While current is a child navigable:
-    while (current->parent()) {
-        // 1. Let document be current’s container document.
-        auto document = current->container_document();
-        VERIFY(document);
-
+    //     1. Let document be current’s container document.
+    //     4. Set current to document’s node navigable.
+    // NB: Each container document is the next parent navigable's active document, and a parent navigable answers
+    //     for a document hosted in another process.
+    for (auto current = target->parent(); current; current = current->parent()) {
         // 2. Let origin be the result of executing the URL parser on the ASCII serialization of document’s origin.
-        auto origin = DOMURL::parse(document->origin().serialize());
+        auto serialized_origin = current->active_document_origin()->serialize();
+        auto origin = DOMURL::parse_from_byte_string(serialized_origin.bytes_as_string_view());
 
         // AD-HOC: If the origin is opaque, serialization produces "null" which fails URL parsing.
         //         All major engines block in this case, as an opaque origin can never match any source expression.
@@ -66,10 +65,6 @@ Directive::Result FrameAncestorsDirective::navigation_response_check(GC::Ref<Fet
         //    executed upon origin, this directive’s value, policy’s self-origin, and 0, return "Blocked".
         if (does_url_match_source_list_in_origin_with_redirect_count(origin.value(), value(), policy->self_origin(), 0) == MatchResult::DoesNotMatch)
             return Result::Blocked;
-
-        // 4. Set current to document’s node navigable.
-        VERIFY(document->navigable());
-        current = *document->navigable();
     }
 
     // 7. Return "Allowed".

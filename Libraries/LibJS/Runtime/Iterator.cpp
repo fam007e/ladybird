@@ -236,15 +236,18 @@ ThrowCompletionOr<Value> iterator_value(VM& vm, Object& iterator_result)
 // 7.4.9 IteratorStep ( iteratorRecord ), https://tc39.es/ecma262/#sec-iteratorstep
 ThrowCompletionOr<IterationResultOrDone> iterator_step(VM& vm, IteratorRecordImpl& iterator_record)
 {
-    if (auto* builtin_iterator = iterator_record.iterator->as_builtin_iterator_if_next_is_not_redefined(iterator_record.next_method)) {
-        Value value;
-        bool done = false;
-        TRY(builtin_iterator->next(vm, done, value));
-        if (done) {
-            iterator_record.done = true;
-            return ThrowCompletionOr<IterationResultOrDone> { IterationDone {} };
+    // OPTIMIZATION: Calling next can be skipped only if it would enter the current realm.
+    if (iterator_record.next_method.is_function() && iterator_record.next_method.as_function().realm() == vm.current_realm()) {
+        if (auto* builtin_iterator = iterator_record.iterator->as_builtin_iterator_if_next_is_not_redefined(iterator_record.next_method)) {
+            Value value;
+            bool done = false;
+            TRY(builtin_iterator->next(vm, done, value));
+            if (done) {
+                iterator_record.done = true;
+                return ThrowCompletionOr<IterationResultOrDone> { IterationDone {} };
+            }
+            return ThrowCompletionOr<IterationResultOrDone> { IterationResult { done, value } };
         }
-        return ThrowCompletionOr<IterationResultOrDone> { IterationResult { done, value } };
     }
 
     // 1. Let result be ? IteratorNext(iteratorRecord).
@@ -318,10 +321,6 @@ static Completion iterator_close_impl(VM& vm, IteratorRecordImpl const& iterator
     // 2. Let iterator be iteratorRecord.[[Iterator]].
     auto iterator = iterator_record.iterator;
 
-    // OPTIMIZATION: "return" method is not defined on any of iterators we treat as built-in.
-    if (iterator->as_builtin_iterator_if_next_is_not_redefined(iterator_record.next_method))
-        return completion;
-
     // 3. Let innerResult be Completion(GetMethod(iterator, "return")).
     auto inner_result = ThrowCompletionOr<Value> { js_undefined() };
     auto get_method_result = Value(iterator).get_method(vm, vm.names.return_);
@@ -379,10 +378,8 @@ Completion iterator_close_all(VM& vm, ReadonlySpan<GC::Ref<IteratorRecord>> iter
 }
 
 // 7.4.15 CreateIteratorResultObject ( value, done ), https://tc39.es/ecma262/#sec-createiterresultobject
-GC::Ref<Object> create_iterator_result_object(VM& vm, Value value, bool done)
+GC::Ref<Object> create_iterator_result_object(Realm& realm, Value value, bool done)
 {
-    auto& realm = *vm.current_realm();
-
     // 1. Let obj be OrdinaryObjectCreate(%Object.prototype%).
     auto object = Object::create_with_premade_shape(realm.intrinsics().iterator_result_object_shape());
 
@@ -394,6 +391,11 @@ GC::Ref<Object> create_iterator_result_object(VM& vm, Value value, bool done)
 
     // 4. Return obj.
     return object;
+}
+
+GC::Ref<Object> create_iterator_result_object(VM& vm, Value value, bool done)
+{
+    return create_iterator_result_object(*vm.current_realm(), value, done);
 }
 
 // 7.4.17 IteratorToList ( iteratorRecord ), https://tc39.es/ecma262/#sec-iteratortolist

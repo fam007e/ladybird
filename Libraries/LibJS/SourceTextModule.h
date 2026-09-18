@@ -40,8 +40,8 @@ class JS_API SourceTextModule final : public CyclicModule {
 public:
     virtual ~SourceTextModule() override;
 
-    static Result<GC::Ref<SourceTextModule>, Vector<ParserError>> parse(Utf16View source_text, Realm&, StringView filename = {}, Utf16View display_filename = {}, Script::HostDefined* host_defined = nullptr);
-    static Result<GC::Ref<SourceTextModule>, Vector<ParserError>> parse(NonnullRefPtr<SourceCode const>, Realm&, StringView filename = {}, Script::HostDefined* host_defined = nullptr);
+    static Result<GC::Ref<SourceTextModule>, Vector<ParserError>> parse(Utf16View source_text, Realm&, StringView filename = {}, Utf16View display_filename = {}, Script::HostDefined* host_defined = nullptr, size_t line_number_offset = 0);
+    static Result<GC::Ref<SourceTextModule>, Vector<ParserError>> parse(NonnullRefPtr<SourceCode const>, Realm&, StringView filename = {}, Script::HostDefined* host_defined = nullptr, size_t line_number_offset = 0);
     static Result<GC::Ref<SourceTextModule>, Vector<ParserError>> parse_from_pre_parsed(FFI::ParsedProgram* parsed, NonnullRefPtr<SourceCode const> source_code, Realm&, StringView filename, Script::HostDefined* host_defined = nullptr);
     static Result<GC::Ref<SourceTextModule>, Vector<ParserError>> parse_from_pre_compiled(FFI::CompiledProgram* compiled, NonnullRefPtr<SourceCode const> source_code, Realm&, StringView filename, Script::HostDefined* host_defined = nullptr);
     static Result<GC::Ref<SourceTextModule>, Vector<ParserError>> parse_from_bytecode_cache(NonnullRefPtr<RustIntegration::DecodedBytecodeCache>, NonnullRefPtr<SourceCode const> source_code, Realm&, StringView filename, Script::HostDefined* host_defined = nullptr);
@@ -49,7 +49,7 @@ public:
     virtual Vector<Utf16FlyString> get_exported_names(VM& vm, GC::RootHashTable<GC::Ref<Module const>>& export_star_set) override;
     virtual ResolvedBinding resolve_export(VM& vm, Utf16FlyString const& export_name, Vector<ResolvedBinding> resolve_set = {}) override;
 
-    Object* import_meta() { return m_import_meta; }
+    Object* import_meta() { return m_import_meta.ptr(); }
     void set_import_meta(Badge<VM>, Object* import_meta) { m_import_meta = import_meta; }
 
     // Pre-computed module declaration instantiation data.
@@ -65,8 +65,8 @@ public:
         i32 function_index { -1 }; // index into m_functions_to_initialize, -1 if not a function
     };
 
-    Bytecode::Executable* cached_executable() const { return m_executable; }
-    SharedFunctionInstanceData* top_level_await_shared_data() const { return m_tla_shared_data; }
+    Bytecode::Executable* cached_executable() const { return m_executable.ptr(); }
+    SharedFunctionInstanceData* top_level_await_shared_data() const { return m_tla_shared_data.ptr(); }
     ExecutableBacking const& executable_backing() const { return m_executable_backing; }
     [[nodiscard]] bool can_generate_bytecode_cache() const;
     [[nodiscard]] bool can_install_generated_bytecode_cache() const;

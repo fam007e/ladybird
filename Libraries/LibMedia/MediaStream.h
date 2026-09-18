@@ -8,11 +8,21 @@
 
 #include <AK/AtomicRefCounted.h>
 #include <AK/Endian.h>
+#include <AK/FixedArray.h>
+#include <AK/Function.h>
 #include <AK/NonnullRefPtr.h>
 #include <AK/Stream.h>
+#include <AK/Vector.h>
 #include <LibMedia/DecoderError.h>
 
 namespace Media {
+
+enum class ReadBlocked : u8 {
+    No,
+    Yes,
+};
+
+using ReadBlockedChangeHandler = Function<void(ReadBlocked)>;
 
 class MediaStreamCursor : public AtomicRefCounted<MediaStreamCursor> {
 public:
@@ -22,6 +32,7 @@ public:
 
     virtual DecoderErrorOr<void> seek(i64 offset, AK::SeekMode) = 0;
     virtual DecoderErrorOr<size_t> read_into(Bytes) = 0;
+    virtual DecoderErrorOr<FixedArray<u8>> read_bytes(size_t size) = 0;
     virtual size_t position() const = 0;
     virtual size_t size() const = 0;
 
@@ -34,7 +45,7 @@ public:
     }
 
     template<Integral T>
-    DecoderErrorOr<T> read_value(AK::Endianness endianness = AK::Endianness::Host)
+    DecoderErrorOr<T> read_value(AK::Endianness endianness = AK::Endianness::Big)
     {
         T value = 0;
         TRY(read_until_filled({ &value, sizeof(value) }));
@@ -64,7 +75,9 @@ public:
     virtual void abort() { }
     virtual void reset_abort() { }
     virtual bool is_aborted() const { return false; }
-    virtual bool is_blocked() const { return false; }
+
+    // The handler may be invoked while the stream's lock is held, so it must not call back into the stream.
+    virtual void set_blocked_change_handler(ReadBlockedChangeHandler) { }
 };
 
 class MediaStream : public AtomicRefCounted<MediaStream> {
@@ -81,6 +94,19 @@ public:
     virtual Vector<ByteRange> available_byte_ranges() const = 0;
 
     virtual Optional<u64> expected_size() const = 0;
+
+    virtual bool is_closed() const = 0;
+
+    bool closing_bytes_are_available() const
+    {
+        if (!is_closed())
+            return false;
+        auto ranges = available_byte_ranges();
+        return !ranges.is_empty() && ranges.last().end >= expected_size().value();
+    }
+
+    // The observer is invoked under the stream's lock, so it must be cheap and must not call back into the stream.
+    virtual void set_available_ranges_change_observer(Function<void()>) { }
 };
 
 }

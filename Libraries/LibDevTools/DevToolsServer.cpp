@@ -16,6 +16,7 @@
 #include <LibDevTools/Actors/ProcessActor.h>
 #include <LibDevTools/Actors/TabActor.h>
 #include <LibDevTools/Connection.h>
+#include <LibDevTools/DevToolsDelegate.h>
 #include <LibDevTools/DevToolsServer.h>
 
 namespace DevTools {
@@ -48,6 +49,7 @@ DevToolsServer::DevToolsServer(DevToolsDelegate& delegate, NonnullRefPtr<Core::T
 
 DevToolsServer::~DevToolsServer()
 {
+    notify_actors_connection_closed();
     m_is_shutting_down = true;
     m_server->on_ready_to_accept = {};
 
@@ -87,10 +89,15 @@ void DevToolsServer::unregister_actor(String const& name)
 
 ErrorOr<void> DevToolsServer::on_new_client()
 {
+    // The client must be accepted even when one is already active; a pending connection left in the listen backlog
+    // would cause the accept notifier to fire in a busy loop.
+    auto client = TRY(m_server->accept());
+
     if (m_connection)
         return Error::from_string_literal("Only one active DevTools connection is currently allowed");
 
-    auto client = TRY(m_server->accept());
+    m_did_notify_actors_connection_closed = false;
+    m_is_closing_connection = false;
     auto buffered_socket = TRY(Core::BufferedTCPSocket::create(move(client)));
 
     m_connection = Connection::create(move(buffered_socket));
@@ -142,17 +149,35 @@ void DevToolsServer::close_connection()
 {
     dbgln_if(DEVTOOLS_DEBUG, "Lost connection to the DevTools client");
 
-    if (m_is_shutting_down)
+    if (m_is_shutting_down || m_is_closing_connection)
         return;
+    m_is_closing_connection = true;
 
     Core::deferred_invoke([weak_self = make_weak_ptr<DevToolsServer>()] {
         if (!weak_self)
             return;
 
         weak_self->m_connection = nullptr;
+        weak_self->notify_actors_connection_closed();
+
         weak_self->m_actor_registry.clear();
         weak_self->m_root_actor = nullptr;
+
+        weak_self->m_delegate.did_close_devtools_connection();
     });
+}
+
+void DevToolsServer::notify_actors_connection_closed()
+{
+    if (exchange(m_did_notify_actors_connection_closed, true))
+        return;
+
+    Vector<NonnullRefPtr<Actor>> actors;
+    actors.ensure_capacity(m_actor_registry.size());
+    for (auto const& actor : m_actor_registry)
+        actors.unchecked_append(actor.value);
+    for (auto& actor : actors)
+        actor->connection_closed();
 }
 
 }

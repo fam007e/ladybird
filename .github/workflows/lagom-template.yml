@@ -32,7 +32,6 @@ env:
   # github.workspace = /home/runner/work/ladybird/ladybird
   LADYBIRD_SOURCE_DIR: ${{ github.workspace }}
   CCACHE_DIR: ${{ github.workspace }}/.ccache
-  VCPKG_ROOT: ${{ github.workspace }}/Build/vcpkg
 
   # Use the compiler version for the ccache compiler hash. Otherwise, if plugins are enabled, the plugin .so files
   # are included in the hash. This results in clean builds on every run as the .so files are rebuilt.
@@ -64,6 +63,7 @@ jobs:
           os: ${{ inputs.os_name }}
           arch: ${{ inputs.arch }}
           toolchain: ${{ inputs.toolchain }}
+          build_preset: ${{ inputs.build_preset }}
 
       # === PREPARE FOR BUILDING ===
 
@@ -90,10 +90,6 @@ jobs:
           elif ${{ inputs.os_name == 'macOS' }} ; then
             echo "host_cc=$(xcrun --find clang)" >> "$GITHUB_OUTPUT"
             echo "host_cxx=$(xcrun --find clang++)" >> "$GITHUB_OUTPUT"
-          fi
-
-          if ${{ inputs.os_name == 'Linux' && inputs.build_preset == 'Sanitizer' }} ; then
-            CMAKE_OPTIONS="$CMAKE_OPTIONS -DLADYBIRD_GUI_FRAMEWORK=Gtk"
           fi
 
           if ${{ inputs.clang_plugins }} ; then
@@ -176,7 +172,7 @@ jobs:
           cmake --install . --strip --prefix "${GITHUB_WORKSPACE}/Install"
 
       - name: Build with Qt
-        if: ${{ (inputs.os_name == 'macOS' || inputs.os_name == 'Linux') && inputs.build_preset == 'Sanitizer' }}
+        if: ${{ inputs.os_name == 'macOS' && inputs.build_preset == 'Sanitizer' }}
         working-directory: ${{ github.workspace }}
         run: |
           cmake --preset ${{ inputs.build_preset }} -B Build -DLADYBIRD_GUI_FRAMEWORK=Qt
@@ -201,16 +197,25 @@ jobs:
             --load="module-native-protocol-unix auth-anonymous=1 socket=/tmp/pulse-native" \
             --load="module-null-sink sink_name=virtual_sink"
 
+      - name: Verify StyleEngine invariants
+        if: ${{ inputs.os_name == 'Linux' && (inputs.build_preset == 'Release' || inputs.build_preset == 'Sanitizer') }}
+        timeout-minutes: 5
+        working-directory: ${{ github.workspace }}/Build/Tests/LibWeb/test-web
+        run: |
+          ../../../bin/test-web --verify-style -j10 \
+            -f Text/input/css/style-engine/ \
+            -f Text/input/css/style-invalidation/
+
       - name: Check new tests for flakiness
         if: ${{ github.event_name == 'pull_request' && inputs.build_preset == 'Sanitizer' && (inputs.os_name == 'Linux' || inputs.os_name == 'macOS') }}
         timeout-minutes: 30
         working-directory: ${{ github.workspace }}
         shell: bash
         run: |
-          git fetch --no-tags --depth=1 origin ${{ github.event.pull_request.base.sha }}
+          git fetch --no-tags --depth=2 origin "$(git rev-parse HEAD)"
           "${{ env.pythonLocation }}/bin/python" Meta/check-test-flakiness.py \
             --test-web-binary Build/bin/test-web \
-            --base-ref ${{ github.event.pull_request.base.sha }} \
+            --base-ref HEAD^1 \
             --deadline-seconds 1200 \
             --python-executable "${{ env.pythonLocation }}/bin/python" \
             | tee -a "$GITHUB_STEP_SUMMARY"
@@ -219,24 +224,27 @@ jobs:
         if: ${{ inputs.os_name == 'Linux' && (inputs.build_preset == 'Release' || inputs.build_preset == 'Sanitizer') }}
         timeout-minutes: 5
         working-directory: ${{ github.workspace }}
-        run: Meta/WPT.sh run --test-list Tests/LibWeb/WPT/ci-smoke-tests.txt
+        shell: bash
+        run: |
+          export ASAN_OPTIONS="log_path=\"${GITHUB_WORKSPACE}/Build/asan.log\""
+          export UBSAN_OPTIONS="log_path=\"${GITHUB_WORKSPACE}/Build/ubsan.log\""
+          Meta/WPT.sh run --test-list Tests/LibWeb/WPT/ci-smoke-tests.txt
         env:
           BUILD_LADYBIRD: 'false'
           LADYBIRD_BINARY: ${{ github.workspace }}/Build/bin/Ladybird
           WEBDRIVER_BINARY: ${{ github.workspace }}/Build/bin/WebDriver
           WPT_PROCESSES: '4'
-          ASAN_OPTIONS: 'log_path=${{ github.workspace }}/Build/asan.log'
-          UBSAN_OPTIONS: 'log_path=${{ github.workspace }}/Build/ubsan.log'
 
       - name: Test
         if: ${{ inputs.build_preset == 'Sanitizer' }}
         working-directory: ${{ github.workspace }}
-        run: ctest --preset ${{ inputs.build_preset }} --output-on-failure --test-dir Build --timeout 1800
+        shell: bash
+        run: |
+          export ASAN_OPTIONS="log_path=\"${GITHUB_WORKSPACE}/Build/asan.log\""
+          export UBSAN_OPTIONS="log_path=\"${GITHUB_WORKSPACE}/Build/ubsan.log\""
+          ctest --preset ${{ inputs.build_preset }} --output-on-failure --test-dir Build --timeout 1800
         env:
           TESTS_ONLY: 1
-          # NOTE: These are appended to the preset's options.
-          ASAN_OPTIONS: 'log_path=asan.log'
-          UBSAN_OPTIONS: 'log_path=ubsan.log'
 
       - name: Test
         if: ${{ inputs.build_preset != 'Fuzzers' && inputs.build_preset != 'All_Debug' && inputs.build_preset != 'Sanitizer' }}

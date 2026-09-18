@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 
-# Copyright (c) 2025, The Ladybird contributors
+# Copyright (c) 2026-present, the Ladybird developers.
 #
 # SPDX-License-Identifier: BSD-2-Clause
 
-import glob
+import argparse
 import json
 import os
 import re
@@ -13,12 +13,15 @@ import sys
 import urllib.request
 
 from enum import Enum
+from pathlib import Path
 
-VCPKG = "vcpkg.json"
-VCPKG_OVERLAYS_PORTS = "Meta/CMake/vcpkg/overlay-ports/*"
-VCPKG_REPO = "Build/vcpkg"
+LADYBIRD_SOURCE_DIR = Path(__file__).resolve().parent.parent.parent
+
+VCPKG = LADYBIRD_SOURCE_DIR / "vcpkg.json"
+VCPKG_OVERLAYS_PORTS = LADYBIRD_SOURCE_DIR / "Meta" / "CMake" / "vcpkg" / "overlay-ports"
+VCPKG_REPO = LADYBIRD_SOURCE_DIR / "Build" / "vcpkg-release"
 VCPKG_BASELINE_URL = "https://raw.githubusercontent.com/microsoft/vcpkg/{}/versions/baseline.json"
-FLATPAK_MANIFEST = "Meta/CMake/flatpak/org.ladybird.Ladybird.json"
+FLATPAK_MANIFEST = LADYBIRD_SOURCE_DIR / "Meta" / "CMake" / "flatpak" / "org.ladybird.Ladybird.json"
 SELF = "Ladybird"
 
 # List of build tools that are not provided by the Flatpak SDK and therefore in the manifest
@@ -43,9 +46,10 @@ flatpak_runtime_libs = [
     "harfbuzz",
     "libjpeg-turbo",
     "libproxy",
-    "nghttp2",  # FIXME: This can be removed when the vcpkg overlay is no longer needed.
+    "nghttp2",
     "qtbase",
-    "qtmultimedia",
+    "qtpositioning",
+    "qtserialport",
     "sqlite3",
     "tiff",
     "vulkan",
@@ -60,15 +64,6 @@ vcpkg_not_linux = [
     "pthread",
 ]
 
-# List of libraries that are behind vcpkg manifest features and only
-# installed for specific GUI frameworks (e.g. GTK), not the Qt flatpak.
-vcpkg_feature_only = [
-    "gtk",
-    "libadwaita",
-    "wayland",
-    "wayland-protocols",
-]
-
 
 class DepMatch(Enum):
     Match = (0,)
@@ -80,14 +75,14 @@ class DepMatch(Enum):
 baseline_versions = {}
 
 
-def get_baseline_version(baseline, name):
+def get_baseline_version(vcpkg_repo: Path, baseline, name):
     if baseline not in baseline_versions:
-        if os.path.isdir(VCPKG_REPO):
+        if vcpkg_repo.is_dir():
             # Clear GIT_DIR so git operates on the vcpkg repo, not the parent repo (pre-commit sets GIT_DIR)
             env = {k: v for k, v in os.environ.items() if k != "GIT_DIR"}
             try:
                 result = subprocess.run(
-                    ["git", "-C", VCPKG_REPO, "show", f"{baseline}:versions/baseline.json"],
+                    ["git", "-C", vcpkg_repo, "show", f"{baseline}:versions/baseline.json"],
                     stdout=subprocess.PIPE,
                     stderr=subprocess.DEVNULL,
                     check=True,
@@ -115,12 +110,12 @@ def get_baseline_version(baseline, name):
     print(f"{name} cannot be matched, vcpkg baseline revision: {baseline[:7]}")
 
 
-def check_for_match(vcpkg: dict, vcpkg_baseline, name: str, identifier: str) -> DepMatch:
+def check_for_match(vcpkg_repo: Path, vcpkg: dict, vcpkg_baseline, name: str, identifier: str) -> DepMatch:
     if name == SELF or name in flatpak_build_tools or name in flatpak_transitive_deps:
         return DepMatch.Excluded
 
     if name not in vcpkg:
-        version = get_baseline_version(vcpkg_baseline, name)
+        version = get_baseline_version(vcpkg_repo, vcpkg_baseline, name)
 
         if version:
             vcpkg[name] = version
@@ -137,9 +132,9 @@ def check_for_match(vcpkg: dict, vcpkg_baseline, name: str, identifier: str) -> 
         return DepMatch.NoMatch
 
 
-def check_vcpkg_vs_flatpak_versioning():
+def check_vcpkg_vs_flatpak_versioning(vcpkg_repo: Path):
     def match_and_update(name: str, identifier: str) -> bool:
-        dep_match = check_for_match(vcpkg, vcpkg_baseline, name, identifier)
+        dep_match = check_for_match(vcpkg_repo, vcpkg, vcpkg_baseline, name, identifier)
 
         if dep_match == DepMatch.Match or dep_match == DepMatch.Excluded:
             if name in vcpkg:
@@ -168,8 +163,11 @@ def check_vcpkg_vs_flatpak_versioning():
             vcpkg[package["name"]] = str(package["version"]).split("#")[0]
 
     # Check the vcpkg overlay ports for packages not listed in overrides
-    for path in glob.glob(VCPKG_OVERLAYS_PORTS):
-        with open(f"{path}/vcpkg.json") as input:
+    for entry in VCPKG_OVERLAYS_PORTS.iterdir():
+        if not entry.is_dir():
+            continue
+
+        with open(entry / "vcpkg.json") as input:
             overlay = json.load(input)
 
             if "name" in overlay and overlay["name"] not in vcpkg and "version" in overlay:
@@ -204,7 +202,7 @@ def check_vcpkg_vs_flatpak_versioning():
                     flatpak.append(name)
 
         # Remove excluded dependencies from the vcpkg list
-        for name in flatpak_runtime_libs + vcpkg_not_linux + vcpkg_feature_only:
+        for name in flatpak_runtime_libs + vcpkg_not_linux:
             if name in vcpkg:
                 del vcpkg[name]
 
@@ -226,11 +224,17 @@ def check_vcpkg_vs_flatpak_versioning():
 
 
 def main():
-    file_list = sys.argv[1:] if len(sys.argv) > 1 else [VCPKG]
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--vcpkg-repo", required=False, type=Path, default=VCPKG_REPO)
+    parser.add_argument("file_list", type=Path, nargs="*", default=[VCPKG])
+    args = parser.parse_args()
+
+    vcpkg_repo = args.vcpkg_repo.resolve()
+    file_list = [f.resolve() for f in args.file_list if f.exists()]
     did_fail = False
 
     if VCPKG in file_list or FLATPAK_MANIFEST in file_list:
-        did_fail = check_vcpkg_vs_flatpak_versioning()
+        did_fail = check_vcpkg_vs_flatpak_versioning(vcpkg_repo)
 
     # TODO: Add linting of Flatpak and AppStream manifest
     # See #5594, bullet point "Missing lint job in CI to ensure Flatpak and AppStream manifests are up to snuff"

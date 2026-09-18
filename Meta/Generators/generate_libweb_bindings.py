@@ -10,7 +10,6 @@ import sys
 
 from io import StringIO
 from pathlib import Path
-from typing import Dict
 from typing import List
 from typing import Set
 from typing import TextIO
@@ -19,12 +18,15 @@ sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 from Generators.libweb_bindings import interfaces
 from Generators.libweb_bindings.context import GenerationContext
+from Generators.libweb_bindings.global_mixins import write_global_mixin_header
 from Generators.libweb_bindings.includes import GeneratedIncludes
 from Generators.libweb_bindings.intrinsics import collect_interface_sets
 from Generators.libweb_bindings.intrinsics import write_exposed_interface_header
 from Generators.libweb_bindings.intrinsics import write_exposed_interface_implementation
 from Generators.libweb_bindings.intrinsics import write_intrinsic_definitions_header
 from Generators.libweb_bindings.intrinsics import write_intrinsic_definitions_implementation
+from Generators.libweb_bindings.intrinsics import write_wrapper_factory_implementation
+from Generators.libweb_bindings.structured_serialize import write_structured_serialize_bindings_implementation
 from Generators.libweb_bindings.to_idl_value import dictionaries_in_dependency_order
 from Generators.libweb_bindings.to_idl_value import write_dictionary_conversion
 from Generators.libweb_bindings.to_idl_value import write_dictionary_declaration
@@ -121,6 +123,27 @@ def write_idl_implementation(out: TextIO, module: Module, context: GenerationCon
     out.write("} // namespace Web::Bindings\n")
 
 
+def write_global_mixin_idl_header(out: TextIO, interface, context: GenerationContext) -> None:
+    includes = GeneratedIncludes()
+    body = StringIO()
+
+    write_global_mixin_header(body, context, includes, interface)
+
+    out.write("""/*
+ * Copyright (c) 2026-present, the Ladybird developers.
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#pragma once
+
+""")
+    includes.write(out)
+    out.write("namespace Web::Bindings {\n\n")
+    out.write(body.getvalue())
+    out.write("} // namespace Web::Bindings\n")
+
+
 def write_forward_header(out: TextIO, modules: List[Module]) -> None:
     out.write(
         """#pragma once
@@ -128,7 +151,7 @@ def write_forward_header(out: TextIO, modules: List[Module]) -> None:
 """
     )
 
-    interface_names_by_namespace: Dict[str, Set[str]] = {}
+    interface_names_by_namespace: dict[str, Set[str]] = {}
 
     for module in modules:
         interface = module.interface
@@ -236,7 +259,7 @@ def main() -> int:
     )
     output_files.extend([intrinsic_definitions_header_path, intrinsic_definitions_implementation_path])
 
-    for class_name in ("Window", "DedicatedWorker", "SharedWorker"):
+    for class_name in ("Window", "DedicatedWorker", "SharedWorker", "AudioWorklet"):
         exposed_interface_header_path = output_directory / f"{class_name}ExposedInterfaces.h"
         write_generated_file(exposed_interface_header_path, write_exposed_interface_header, class_name)
         output_files.append(exposed_interface_header_path)
@@ -245,6 +268,7 @@ def main() -> int:
         ("Window", interface_sets.window_exposed),
         ("DedicatedWorker", interface_sets.dedicated_worker_exposed),
         ("SharedWorker", interface_sets.shared_worker_exposed),
+        ("AudioWorklet", interface_sets.audio_worklet_exposed),
     ]
     for class_name, exposed_interfaces in exposed_interface_implementations:
         exposed_interface_implementation_path = output_directory / f"{class_name}ExposedInterfaces.cpp"
@@ -259,6 +283,35 @@ def main() -> int:
     forward_header_path = output_directory / "Forward.h"
     write_generated_file(forward_header_path, write_forward_header, modules)
     output_files.append(forward_header_path)
+
+    for global_mixin_interface_name in (
+        "AudioWorkletGlobalScope",
+        "DedicatedWorkerGlobalScope",
+        "SharedWorkerGlobalScope",
+        "Window",
+    ):
+        global_mixin_interface = context.interfaces.get(global_mixin_interface_name)
+        if global_mixin_interface is not None:
+            global_mixin_header_path = output_directory / f"{global_mixin_interface_name}GlobalMixin.h"
+            write_generated_file(
+                global_mixin_header_path,
+                write_global_mixin_idl_header,
+                global_mixin_interface,
+                context,
+            )
+            output_files.append(global_mixin_header_path)
+
+    wrapper_factory_implementation_path = output_directory / "WrapperFactory.cpp"
+    write_generated_file(wrapper_factory_implementation_path, write_wrapper_factory_implementation, interface_sets)
+    output_files.append(wrapper_factory_implementation_path)
+
+    structured_serialize_bindings_implementation_path = output_directory / "StructuredSerializeBindings.cpp"
+    write_generated_file(
+        structured_serialize_bindings_implementation_path,
+        write_structured_serialize_bindings_implementation,
+        interface_sets.intrinsics,
+    )
+    output_files.append(structured_serialize_bindings_implementation_path)
 
     if arguments.depfile is not None:
         generate_depfile(arguments.depfile, dependency_paths, output_files)

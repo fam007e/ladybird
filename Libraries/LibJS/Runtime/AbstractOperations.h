@@ -31,7 +31,7 @@
 namespace JS {
 
 GC::Ref<DeclarativeEnvironment> new_declarative_environment(Environment&);
-JS_API GC::Ref<ObjectEnvironment> new_object_environment(Object&, bool is_with_environment, Environment*);
+JS_API GC::Ref<ObjectEnvironment> new_object_environment(Object&, bool is_with_environment, GC::Ptr<Environment>);
 GC::Ref<FunctionEnvironment> new_function_environment(ECMAScriptFunctionObject&, Object* new_target);
 GC::Ref<FunctionEnvironment> new_function_environment(NativeJavaScriptBackedFunction&, Object* new_target);
 GC::Ref<PrivateEnvironment> new_private_environment(VM& vm, PrivateEnvironment* outer);
@@ -328,7 +328,7 @@ auto modulo(T x, U y)
 auto modulo(Crypto::BigInteger auto const& x, Crypto::BigInteger auto const& y)
 {
     VERIFY(!y.is_zero());
-    auto result = x.divided_by(y).remainder;
+    auto result = x.remainder(y);
     if (result.is_negative())
         result = result.plus(y);
     return result;
@@ -352,7 +352,7 @@ auto remainder(T x, U y)
 auto remainder(Crypto::BigInteger auto const& x, Crypto::BigInteger auto const& y)
 {
     VERIFY(!y.is_zero());
-    return x.divided_by(y).remainder;
+    return x.remainder(y);
 }
 
 // 14.5.1.1 ToIntegerIfIntegral ( argument ), https://tc39.es/proposal-temporal/#sec-tointegerifintegral

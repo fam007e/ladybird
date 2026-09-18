@@ -88,6 +88,9 @@ static constexpr u64 SHIFTED_INT32_TAG = INT32_TAG << GC::TAG_SHIFT;
 // this is not needed.
 
 class JS_API Value : public GC::NanBoxedValue {
+    template<typename T>
+    static constexpr bool HasForbiddenDirectJSValueConversion = requires { typename RemoveCV<T>::JSValueConversionIsForbidden; };
+
 public:
     enum class PreferredType {
         Default,
@@ -158,7 +161,7 @@ public:
     template<DerivedFrom<Object> T>
     [[nodiscard]] ALWAYS_INLINE bool is() const
     {
-        return as_if<T>() != nullptr;
+        return !!as_if<T>();
     }
 
     template<DerivedFrom<Object> T>
@@ -268,6 +271,9 @@ public:
     {
     }
 
+    template<typename T>
+    requires(HasForbiddenDirectJSValueConversion<T>) Value(T*) = delete;
+
     Value(Cell const* cell)
         : Value(GC::IS_CELL_BIT << GC::TAG_SHIFT, reinterpret_cast<void const*>(cell))
     {
@@ -299,32 +305,49 @@ public:
     }
 
     template<typename T>
-    Value(GC::Ptr<T> ptr)
+    requires(!HasForbiddenDirectJSValueConversion<T>) Value(GC::Ptr<T> ptr)
         : Value(ptr.ptr())
     {
     }
 
     template<typename T>
-    Value(GC::Ref<T> ptr)
+    requires(HasForbiddenDirectJSValueConversion<T>) Value(GC::Ptr<T>) = delete;
+
+    template<typename T>
+    requires(!HasForbiddenDirectJSValueConversion<T>) Value(GC::Ref<T> ptr)
         : Value(ptr.ptr())
     {
     }
 
     template<typename T>
-    Value(GC::Root<T> const& ptr)
+    requires(HasForbiddenDirectJSValueConversion<T>) Value(GC::Ref<T>) = delete;
+
+    template<typename T>
+    requires(!HasForbiddenDirectJSValueConversion<T>) Value(GC::Root<T> const& ptr)
         : Value(ptr.ptr())
     {
+    }
+
+    template<typename T>
+    requires(HasForbiddenDirectJSValueConversion<T>) Value(GC::Root<T> const&) = delete;
+
+    // Confirms the class of the cell this Value points at. The tag alone cannot do that: every
+    // cell-backed tag names a different C++ class, but a forged Value can carry an honest tag and
+    // a pointer to a cell of some other class.
+    ALWAYS_INLINE void verify_cell_kind(GC::CellKind kind) const
+    {
+        VERIFY(extract_pointer<GC::Cell>()->cell_kind() == kind);
     }
 
     Cell& as_cell()
     {
-        ASSERT(is_cell());
+        VERIFY(is_cell());
         return *extract_pointer<Cell>();
     }
 
     Cell& as_cell() const
     {
-        ASSERT(is_cell());
+        VERIFY(is_cell());
         return *extract_pointer<Cell>();
     }
 
@@ -338,61 +361,70 @@ public:
 
     bool as_bool() const
     {
-        ASSERT(is_boolean());
+        VERIFY(is_boolean());
         return static_cast<bool>(m_value.encoded & 0x1);
     }
 
     Object& as_object()
     {
-        ASSERT(is_object());
+        VERIFY(is_object());
+        verify_cell_kind(GC::CellKind::Object);
         return *extract_pointer<Object>();
     }
 
     Object const& as_object() const
     {
-        ASSERT(is_object());
+        VERIFY(is_object());
+        verify_cell_kind(GC::CellKind::Object);
         return *extract_pointer<Object>();
     }
 
     PrimitiveString& as_string()
     {
-        ASSERT(is_string());
+        VERIFY(is_string());
+        verify_cell_kind(GC::CellKind::PrimitiveString);
         return *extract_pointer<PrimitiveString>();
     }
 
     PrimitiveString const& as_string() const
     {
-        ASSERT(is_string());
+        VERIFY(is_string());
+        verify_cell_kind(GC::CellKind::PrimitiveString);
         return *extract_pointer<PrimitiveString>();
     }
 
     Symbol& as_symbol()
     {
-        ASSERT(is_symbol());
+        VERIFY(is_symbol());
+        verify_cell_kind(GC::CellKind::Symbol);
         return *extract_pointer<Symbol>();
     }
 
     Symbol const& as_symbol() const
     {
-        ASSERT(is_symbol());
+        VERIFY(is_symbol());
+        verify_cell_kind(GC::CellKind::Symbol);
         return *extract_pointer<Symbol>();
     }
 
     Accessor& as_accessor()
     {
-        ASSERT(is_accessor());
+        VERIFY(is_accessor());
+        verify_cell_kind(GC::CellKind::Accessor);
         return *extract_pointer<Accessor>();
     }
 
     BigInt const& as_bigint() const
     {
-        ASSERT(is_bigint());
+        VERIFY(is_bigint());
+        verify_cell_kind(GC::CellKind::BigInt);
         return *extract_pointer<BigInt>();
     }
 
     BigInt& as_bigint()
     {
-        ASSERT(is_bigint());
+        VERIFY(is_bigint());
+        verify_cell_kind(GC::CellKind::BigInt);
         return *extract_pointer<BigInt>();
     }
 
@@ -427,10 +459,10 @@ public:
     bool to_boolean() const;
 
     ThrowCompletionOr<Value> get(VM&, PropertyKey const&) const;
-    ThrowCompletionOr<Value> get(VM&, PropertyKey const&, Bytecode::PropertyLookupCache&) const;
+    ThrowCompletionOr<Value> get(VM&, PropertyKey const&, Bytecode::StaticPropertyLookupCache&) const;
 
     ThrowCompletionOr<GC::Ptr<FunctionObject>> get_method(VM&, PropertyKey const&) const;
-    ThrowCompletionOr<GC::Ptr<FunctionObject>> get_method(VM&, PropertyKey const&, Bytecode::PropertyLookupCache&) const;
+    ThrowCompletionOr<GC::Ptr<FunctionObject>> get_method(VM&, PropertyKey const&, Bytecode::StaticPropertyLookupCache&) const;
 
     [[nodiscard]] Utf16String to_utf16_string_without_side_effects() const;
 
@@ -490,24 +522,12 @@ private:
     Value(u64 tag, PointerType const* ptr)
     {
         if (!ptr) {
-            // Make sure all nullptrs are null
             m_value.tag = NULL_TAG;
             return;
         }
 
         ASSERT((tag & 0x8000000000000000ul) == 0x8000000000000000ul);
-
-        if constexpr (sizeof(PointerType*) < sizeof(u64)) {
-            m_value.encoded = tag | reinterpret_cast<u32>(ptr);
-        } else {
-            // NOTE: Pointers in x86-64 use just 48 bits however are supposed to be
-            //       sign extended up from the 47th bit.
-            //       This means that all bits above the 47th should be the same as
-            //       the 47th. When storing a pointer we thus drop the top 16 bits as
-            //       we can recover it when extracting the pointer again.
-            //       See also: NanBoxedValue::extract_pointer.
-            m_value.encoded = tag | (reinterpret_cast<u64>(ptr) & 0x0000ffffffffffffULL);
-        }
+        m_value.encoded = tag | GC::NanBoxedValue::encode_pointer_bits(ptr);
     }
 
     [[nodiscard]] ThrowCompletionOr<Value> invoke_internal(VM&, PropertyKey const&, Optional<GC::RootVector<Value>> arguments);
@@ -565,9 +585,6 @@ COLD ThrowCompletionOr<Value> bitwise_xor(VM&, Value lhs, Value rhs);
 COLD ThrowCompletionOr<Value> bitwise_not(VM&, Value);
 COLD ThrowCompletionOr<Value> unary_plus(VM&, Value);
 COLD ThrowCompletionOr<Value> unary_minus(VM&, Value);
-COLD ThrowCompletionOr<Value> left_shift(VM&, Value lhs, Value rhs);
-COLD ThrowCompletionOr<Value> right_shift(VM&, Value lhs, Value rhs);
-COLD ThrowCompletionOr<Value> unsigned_right_shift(VM&, Value lhs, Value rhs);
 COLD ThrowCompletionOr<Value> add(VM&, Value lhs, Value rhs);
 COLD ThrowCompletionOr<Value> sub(VM&, Value lhs, Value rhs);
 COLD ThrowCompletionOr<Value> mul(VM&, Value lhs, Value rhs);
@@ -578,6 +595,9 @@ ThrowCompletionOr<Value> in(VM&, Value lhs, Value rhs);
 ThrowCompletionOr<Value> instance_of(VM&, Value lhs, Value rhs);
 ThrowCompletionOr<Value> ordinary_has_instance(VM&, Value lhs, Value rhs);
 
+COLD ThrowCompletionOr<Value> left_shift(VM&, Value lhs, Value rhs);
+COLD ThrowCompletionOr<Value> right_shift(VM&, Value lhs, Value rhs);
+COLD ThrowCompletionOr<Value> unsigned_right_shift(VM&, Value lhs, Value rhs);
 ThrowCompletionOr<bool> is_loosely_equal(VM&, Value lhs, Value rhs);
 bool is_strictly_equal(Value lhs, Value rhs);
 JS_API bool same_value(Value lhs, Value rhs);

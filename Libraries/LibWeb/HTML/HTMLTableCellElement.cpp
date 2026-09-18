@@ -5,10 +5,9 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibWeb/Bindings/HTMLTableCellElement.h>
-#include <LibWeb/Bindings/Intrinsics.h>
-#include <LibWeb/CSS/ComputedProperties.h>
+#include <LibWeb/CSS/ComputedValues.h>
 #include <LibWeb/CSS/Parser/Parser.h>
+#include <LibWeb/CSS/PropertyID.h>
 #include <LibWeb/CSS/StyleValues/ColorStyleValue.h>
 #include <LibWeb/CSS/StyleValues/ImageStyleValue.h>
 #include <LibWeb/CSS/StyleValues/KeywordStyleValue.h>
@@ -32,13 +31,7 @@ HTMLTableCellElement::HTMLTableCellElement(DOM::Document& document, DOM::Qualifi
 
 HTMLTableCellElement::~HTMLTableCellElement() = default;
 
-void HTMLTableCellElement::initialize(JS::Realm& realm)
-{
-    WEB_SET_PROTOTYPE_FOR_INTERFACE(HTMLTableCellElement);
-    Base::initialize(realm);
-}
-
-bool HTMLTableCellElement::is_presentational_hint(FlyString const& name) const
+bool HTMLTableCellElement::is_presentational_hint(Utf16FlyString const& name) const
 {
     if (Base::is_presentational_hint(name))
         return true;
@@ -56,7 +49,7 @@ bool HTMLTableCellElement::is_presentational_hint(FlyString const& name) const
 void HTMLTableCellElement::apply_presentational_hints(Vector<CSS::StyleProperty>& properties) const
 {
     Base::apply_presentational_hints(properties);
-    for_each_attribute([&](auto& name, auto& value) {
+    for_each_attribute([&](Utf16FlyString const& name, Utf16View value) {
         if (name == HTML::AttributeNames::bgcolor) {
             // https://html.spec.whatwg.org/multipage/rendering.html#tables-2:rules-for-parsing-a-legacy-colour-value
             auto color = parse_legacy_color_value(value);
@@ -109,9 +102,25 @@ void HTMLTableCellElement::apply_presentational_hints(Vector<CSS::StyleProperty>
     if (!border)
         return;
     auto apply_border_style = [&](CSS::PropertyID style_property, CSS::PropertyID width_property, CSS::PropertyID color_property) {
+        auto const& border_values = *table_element->style_group<CSS::ComputedValues::BorderValues>();
+        auto const* color = [&] {
+            switch (color_property) {
+            case CSS::PropertyID::BorderLeftColor:
+                return static_cast<CSS::StyleValueFFI::StyleValueData const*>(border_values.border_left_color_style_value.pointer);
+            case CSS::PropertyID::BorderTopColor:
+                return static_cast<CSS::StyleValueFFI::StyleValueData const*>(border_values.border_top_color_style_value.pointer);
+            case CSS::PropertyID::BorderRightColor:
+                return static_cast<CSS::StyleValueFFI::StyleValueData const*>(border_values.border_right_color_style_value.pointer);
+            case CSS::PropertyID::BorderBottomColor:
+                return static_cast<CSS::StyleValueFFI::StyleValueData const*>(border_values.border_bottom_color_style_value.pointer);
+            default:
+                VERIFY_NOT_REACHED();
+            }
+        }();
+        VERIFY(color);
         properties.append({ .property_id = style_property, .value = CSS::KeywordStyleValue::create(CSS::Keyword::Inset) });
         properties.append({ .property_id = width_property, .value = CSS::LengthStyleValue::create(CSS::Length::make_px(1)) });
-        properties.append({ .property_id = color_property, .value = table_element->computed_properties()->property(color_property) });
+        properties.append({ .property_id = color_property, .value = CSS::StyleValue::adopt_rust_style_value_data(CSS::StyleValueFFI::rust_style_value_retain(color)) });
     };
     apply_border_style(CSS::PropertyID::BorderLeftStyle, CSS::PropertyID::BorderLeftWidth, CSS::PropertyID::BorderLeftColor);
     apply_border_style(CSS::PropertyID::BorderTopStyle, CSS::PropertyID::BorderTopWidth, CSS::PropertyID::BorderTopColor);
@@ -156,7 +165,7 @@ void HTMLTableCellElement::set_col_span(WebIDL::UnsignedLong value)
 {
     if (value > 2147483647)
         value = 1;
-    set_attribute_value(HTML::AttributeNames::colspan, String::number(value));
+    set_attribute_value(HTML::AttributeNames::colspan, Utf16String::number(value));
 }
 
 // This implements step 9 in the spec here:
@@ -187,7 +196,7 @@ void HTMLTableCellElement::set_row_span(WebIDL::UnsignedLong value)
 {
     if (value > 2147483647)
         value = 1;
-    set_attribute_value(HTML::AttributeNames::rowspan, String::number(value));
+    set_attribute_value(HTML::AttributeNames::rowspan, Utf16String::number(value));
 }
 
 // https://html.spec.whatwg.org/multipage/tables.html#dom-tdth-cellindex
@@ -202,7 +211,7 @@ WebIDL::Long HTMLTableCellElement::cell_index() const
 
     auto rows = parent->cells()->collect_matching_elements();
     for (size_t i = 0; i < rows.size(); ++i) {
-        if (rows[i] == this)
+        if (rows[i].ptr() == this)
             return i;
     }
     return -1;
@@ -217,10 +226,10 @@ Optional<ARIA::Role> HTMLTableCellElement::default_role() const
             // tests at https://wpt.fyi/results/html-aam/table-roles.html require doing these ancestor checks — and
             // implementing them causes the behavior to match that of other engines.
             // https://w3c.github.io/html-aam/#el-th-columnheader
-            if (get_attribute(HTML::AttributeNames::scope) == "columnheader" || ancestor->local_name() == TagNames::thead)
+            if (get_attribute(HTML::AttributeNames::scope) == u"columnheader"sv || ancestor->local_name() == TagNames::thead)
                 return ARIA::Role::columnheader;
             // https://w3c.github.io/html-aam/#el-th-rowheader
-            if (get_attribute(HTML::AttributeNames::scope) == "rowheader" || ancestor->local_name() == TagNames::tbody)
+            if (get_attribute(HTML::AttributeNames::scope) == u"rowheader"sv || ancestor->local_name() == TagNames::tbody)
                 return ARIA::Role::rowheader;
         }
     }

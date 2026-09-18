@@ -1,5 +1,3 @@
-#!/usr/bin/env python3
-
 # Copyright (c) 2024, Luke Wilde <luke@ladybird.org>
 # Copyright (c) 2026-present, the Ladybird developers.
 #
@@ -56,13 +54,13 @@ def write_implementation_file(out: TextIO, properties: dict) -> None:
 #include <LibJS/Runtime/PrimitiveString.h>
 #include <LibJS/Runtime/ValueInlines.h>
 #include <AK/Utf16String.h>
-#include <LibWeb/Bindings/ExceptionOrUtils.h>
-#include <LibWeb/Bindings/MainThreadVM.h>
+#include <LibWeb/Bindings/Wrappable.h>
 #include <LibWeb/CSS/GeneratedCSSStyleProperties.h>
 #include <LibWeb/CSS/CSSStyleProperties.h>
+#include <LibWeb/HTML/CustomElements/CustomElementReactions.h>
 #include <LibWeb/HTML/Scripting/SimilarOriginWindowAgent.h>
 #include <LibWeb/WebIDL/AbstractOperations.h>
-#include <LibWeb/WebIDL/ExceptionOr.h>
+#include <LibWeb/WebIDL/ExceptionOrUtils.h>
 
 namespace Web::Bindings {
 
@@ -70,8 +68,12 @@ namespace {
 
 JS::ThrowCompletionOr<CSS::CSSStyleProperties*> impl_from(JS::VM& vm, JS::Value value)
 {
-    if (auto impl = value.as_if<CSS::CSSStyleProperties>())
-        return impl.ptr();
+    if (auto object = value.as_if<JS::Object>()) {
+        if (auto* wrappable = wrappable_impl_from(object.ptr())) {
+            if (auto* impl = as_if<CSS::CSSStyleProperties>(wrappable))
+                return impl;
+        }
+    }
     return vm.throw_completion<JS::TypeError>(JS::ErrorType::NotAnObjectOfType, "CSSStyleProperties");
 }
 
@@ -87,11 +89,12 @@ GC::Ref<JS::NativeFunction> create_getter(JS::Realm& realm, Utf16FlyString const
 {
     auto getter = [property_name = move(property_name)](JS::VM& vm) -> JS::ThrowCompletionOr<JS::Value> {
         auto* idl_object = TRY(impl_from(vm));
+        auto& realm = *vm.current_realm();
 
-        auto result = TRY(throw_dom_exception_if_needed(vm, [&] {
+        auto result = TRY(WebIDL::throw_dom_exception_if_needed(vm, realm, [&] {
             return idl_object->get_property_value(property_name);
         }));
-        return JS::PrimitiveString::create(vm, Utf16String::from_utf8(result));
+        return JS::PrimitiveString::create(vm, result);
     };
 
     return JS::NativeFunction::create(realm, move(getter), 0, JS::PropertyKey { attribute_name }, &realm, "get"sv);
@@ -101,30 +104,41 @@ GC::Ref<JS::NativeFunction> create_setter(JS::Realm& realm, Utf16FlyString const
 {
     auto setter = [property_name = move(property_name)](JS::VM& vm) -> JS::ThrowCompletionOr<JS::Value> {
         auto* idl_object = TRY(impl_from(vm));
+        auto& realm = *vm.current_realm();
 
         auto value = vm.argument(0);
-        String idl_value;
+        Utf16String idl_value;
         if (!value.is_null())
-            idl_value = TRY(WebIDL::to_string(vm, value));
+            idl_value = TRY(WebIDL::to_utf16_string(vm, value));
 
         auto original_steps = [&]() -> JS::ThrowCompletionOr<JS::Value> {
-            TRY(throw_dom_exception_if_needed(vm, [&] {
+            TRY(WebIDL::throw_dom_exception_if_needed(vm, realm, [&] {
                 return idl_object->set_property(property_name, idl_value, ""sv);
             }));
             return JS::js_undefined();
         };
 
         // For [CEReactions]: https://html.spec.whatwg.org/multipage/custom-elements.html#cereactions
-        auto& reactions_stack = HTML::relevant_similar_origin_window_agent(*idl_object).custom_element_reactions_stack;
+
+        // 1. Push a new element queue onto this object's relevant agent's custom element reactions stack.
+        auto& reactions_stack = Bindings::main_thread_similar_origin_window_agent().custom_element_reactions_stack;
         reactions_stack.element_queue_stack.append({});
 
+        // 2. Run the originally-specified steps for this construct, catching any exceptions. If the steps return a value,
+        //    let value be the returned value. If they throw an exception, let exception be the thrown exception.
         auto value_or_exception = original_steps();
 
+        // 3. Let queue be the result of popping from this object's relevant agent's custom element reactions stack.
         auto queue = reactions_stack.element_queue_stack.take_last();
-        Bindings::invoke_custom_element_reactions(queue);
 
+        // 4. Invoke custom element reactions in queue.
+        HTML::invoke_custom_element_reactions(queue);
+
+        // 5. If an exception exception was thrown by the original steps, rethrow exception.
         if (value_or_exception.is_error())
             return value_or_exception.release_error();
+
+        // 6. If a value value was returned from the original steps, return value.
         return value_or_exception.release_value();
     };
 
@@ -135,7 +149,10 @@ GC::Ref<JS::NativeFunction> create_setter(JS::Realm& realm, Utf16FlyString const
 
 void GeneratedCSSStyleProperties::initialize(JS::Realm& realm, JS::Object& object)
 {
-    [[maybe_unused]] u8 default_attributes = JS::Attribute::Enumerable | JS::Attribute::Configurable | JS::Attribute::Writable;
+    // CSS property accessors are exposed on the prototype-like platform object but
+    // are not enumerable own properties (Object.values() must expose only indexed
+    // CSS declarations).
+    [[maybe_unused]] u8 default_attributes = JS::Attribute::Configurable | JS::Attribute::Writable;
 
     struct Property {
         StringView attribute_name;

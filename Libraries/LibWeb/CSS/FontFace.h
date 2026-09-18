@@ -6,157 +6,56 @@
 
 #pragma once
 
-#include <LibGfx/Font/Typeface.h>
-#include <LibGfx/FontCascadeList.h>
-#include <LibURL/URL.h>
-#include <LibWeb/Bindings/FontFace.h>
-#include <LibWeb/Bindings/PlatformObject.h>
-#include <LibWeb/CSS/ParsedFontFace.h>
-#include <LibWeb/CSS/StyleValues/ComputationContext.h>
-#include <LibWeb/WebIDL/Buffers.h>
+#include <LibWeb/Bindings/Wrappable.h>
+#include <LibWeb/CSS/FontFaceState.h>
 
 namespace Web::CSS {
 
-class FontLoader;
-
-class FontFace final : public Bindings::PlatformObject {
-    WEB_PLATFORM_OBJECT(FontFace, Bindings::PlatformObject);
+class FontFace final : public Bindings::GCAllocatedWrappable {
+    WEB_WRAPPABLE(FontFace, Bindings::GCAllocatedWrappable);
     GC_DECLARE_ALLOCATOR(FontFace);
 
 public:
-    using FontFaceSource = FlattenVariant<Variant<String>, WebIDL::BufferSourceVariant>;
+    using FontFaceSource = FontFaceState::FontFaceSource;
 
-    [[nodiscard]] static GC::Ref<FontFace> construct_impl(JS::Realm&, String family, FontFaceSource source, Bindings::FontFaceDescriptors const& descriptors);
-    [[nodiscard]] static GC::Ref<FontFace> create_css_connected(JS::Realm&, CSSFontFaceRule&);
-    virtual ~FontFace() override;
+    [[nodiscard]] static GC::Ref<FontFace> create_for_constructor(JS::Object&, Utf16String family, FontFaceSource source, Bindings::FontFaceDescriptors const&);
+    [[nodiscard]] static GC::Ref<FontFace> create(FontFaceState&);
 
-    String family() const { return m_family; }
-    WebIDL::ExceptionOr<void> set_family(String const&);
-    void set_family_impl(NonnullRefPtr<StyleValue const> const& value);
+    FontFaceState& state() const { return m_state; }
 
-    String style() const { return m_style; }
-    WebIDL::ExceptionOr<void> set_style(String const&);
-    void set_style_impl(NonnullRefPtr<StyleValue const> const& value);
+    Utf16String family() const { return m_state->family(); }
+    WebIDL::ExceptionOr<void> set_family(Utf16View value) { return m_state->set_family(value); }
+    Utf16String style() const { return m_state->style(); }
+    WebIDL::ExceptionOr<void> set_style(Utf16View value) { return m_state->set_style(value); }
+    Utf16String weight() const { return m_state->weight(); }
+    WebIDL::ExceptionOr<void> set_weight(Utf16View value) { return m_state->set_weight(value); }
+    Utf16String stretch() const { return m_state->stretch(); }
+    WebIDL::ExceptionOr<void> set_stretch(Utf16View value) { return m_state->set_stretch(value); }
+    Utf16String unicode_range() const { return m_state->unicode_range(); }
+    WebIDL::ExceptionOr<void> set_unicode_range(Utf16View value) { return m_state->set_unicode_range(value); }
+    Utf16String feature_settings() const { return m_state->feature_settings(); }
+    WebIDL::ExceptionOr<void> set_feature_settings(Utf16View value) { return m_state->set_feature_settings(value); }
+    Utf16String variation_settings() const { return m_state->variation_settings(); }
+    WebIDL::ExceptionOr<void> set_variation_settings(Utf16View value) { return m_state->set_variation_settings(value); }
+    Utf16String display() const { return m_state->display(); }
+    WebIDL::ExceptionOr<void> set_display(Utf16View value) { return m_state->set_display(value); }
+    Utf16String ascent_override() const { return m_state->ascent_override(); }
+    WebIDL::ExceptionOr<void> set_ascent_override(Utf16View value) { return m_state->set_ascent_override(value); }
+    Utf16String descent_override() const { return m_state->descent_override(); }
+    WebIDL::ExceptionOr<void> set_descent_override(Utf16View value) { return m_state->set_descent_override(value); }
+    Utf16String line_gap_override() const { return m_state->line_gap_override(); }
+    WebIDL::ExceptionOr<void> set_line_gap_override(Utf16View value) { return m_state->set_line_gap_override(value); }
 
-    String weight() const { return m_weight; }
-    WebIDL::ExceptionOr<void> set_weight(String const&);
-    void set_weight_impl(NonnullRefPtr<StyleValue const> const& value);
-
-    String stretch() const { return m_stretch; }
-    WebIDL::ExceptionOr<void> set_stretch(String const&);
-    void set_stretch_impl(NonnullRefPtr<StyleValue const> const& value);
-
-    String unicode_range() const { return m_unicode_range; }
-    WebIDL::ExceptionOr<void> set_unicode_range(String const&);
-    void set_unicode_range_impl(NonnullRefPtr<StyleValue const> const& value);
-
-    String feature_settings() const { return m_feature_settings; }
-    WebIDL::ExceptionOr<void> set_feature_settings(String const&);
-    void set_feature_settings_impl(NonnullRefPtr<StyleValue const> const& value);
-
-    String variation_settings() const { return m_variation_settings; }
-    WebIDL::ExceptionOr<void> set_variation_settings(String const&);
-    void set_variation_settings_impl(NonnullRefPtr<StyleValue const> const& value);
-
-    String display() const { return m_display; }
-    WebIDL::ExceptionOr<void> set_display(String const&);
-    void set_display_impl(NonnullRefPtr<StyleValue const> const& value);
-
-    String ascent_override() const { return m_ascent_override; }
-    WebIDL::ExceptionOr<void> set_ascent_override(String const&);
-    void set_ascent_override_impl(NonnullRefPtr<StyleValue const> const& value);
-
-    String descent_override() const { return m_descent_override; }
-    WebIDL::ExceptionOr<void> set_descent_override(String const&);
-    void set_descent_override_impl(NonnullRefPtr<StyleValue const> const& value);
-
-    String line_gap_override() const { return m_line_gap_override; }
-    WebIDL::ExceptionOr<void> set_line_gap_override(String const&);
-    void set_line_gap_override_impl(NonnullRefPtr<StyleValue const> const& value);
-
-    bool is_css_connected() const { return m_css_font_face_rule != nullptr; }
-    void disconnect_from_css_rule();
-    void reparse_connected_css_font_face_rule_descriptors();
-
-    ParsedFontFace parsed_font_face() const;
-
-    RefPtr<Gfx::Typeface const> typeface() const { return m_parsed_font; }
-
-    FontWeightRange declared_weight_range() const { return m_cached_weight_range; }
-    int declared_slope() const { return m_cached_slope; }
-    int declared_width() const { return m_cached_width; }
-    bool should_be_registered_with_font_computer() const { return is_css_connected() || status() == Bindings::FontFaceLoadStatus::Loaded; }
-
-    RefPtr<Gfx::FontCascadeList const> font_with_point_size(float point_size, Gfx::FontVariationSettings const&, Gfx::ShapeFeatures const&) const;
-
-    Vector<Gfx::UnicodeRange> const& unicode_ranges() const { return m_unicode_ranges; }
-    bool has_urls() const { return !m_urls.is_empty(); }
-
-    bool has_non_default_unicode_range() const
-    {
-        if (m_unicode_ranges.size() != 1)
-            return true;
-        auto const& range = m_unicode_ranges.first();
-        return range.min_code_point() != 0 || range.max_code_point() != 0x10FFFF;
-    }
-
-    Bindings::FontFaceLoadStatus status() const { return m_status; }
-
-    GC::Ref<WebIDL::Promise> load();
-    GC::Ref<WebIDL::Promise> loaded() const;
-
-    GC::Ref<WebIDL::Promise> font_status_promise() { return m_font_status_promise; }
-
-    void add_to_set(FontFaceSet&);
-    void remove_from_set(FontFaceSet&);
+    FontFaceLoadStatus status() const { return m_state->status(); }
+    GC::Ref<WebIDL::Promise> load() { return m_state->load(); }
+    GC::Ref<WebIDL::Promise> loaded() const { return m_state->loaded(); }
+    void set_font_display_time_for_testing(u32 milliseconds) { m_state->set_font_display_time_for_testing(milliseconds); }
 
 private:
-    FontFace(JS::Realm&, GC::Ref<WebIDL::Promise> font_status_promise);
+    explicit FontFace(FontFaceState&);
+    virtual void visit_edges(GC::Cell::Visitor&) override;
 
-    virtual void initialize(JS::Realm&) override;
-    virtual void visit_edges(Visitor&) override;
-    void reject_status_promise(JS::Value reason);
-
-    Optional<FontComputer&> font_computer() const;
-
-    [[nodiscard]] Optional<ComputationContext> computation_context() const;
-
-    // FIXME: Should we be storing StyleValues instead?
-    String m_family;
-    String m_style;
-    String m_weight;
-    String m_stretch;
-    String m_unicode_range;
-    Vector<Gfx::UnicodeRange> m_unicode_ranges;
-    String m_feature_settings;
-    String m_variation_settings;
-    String m_display;
-    String m_ascent_override;
-    String m_descent_override;
-    String m_line_gap_override;
-
-    FontWeightRange m_cached_weight_range { 400, 400 };
-    int m_cached_slope { 0 };
-    int m_cached_width { 100 };
-    GC::Ptr<FontLoader> m_font_loader;
-
-    // https://drafts.csswg.org/css-font-loading/#dom-fontface-status
-    Bindings::FontFaceLoadStatus m_status { Bindings::FontFaceLoadStatus::Unloaded };
-
-    GC::Ref<WebIDL::Promise> m_font_status_promise; // [[FontStatusPromise]]
-    Vector<ParsedFontFace::Source> m_urls;          // [[Urls]]
-    ByteBuffer m_binary_data {};                    // [[Data]]
-
-    RefPtr<Gfx::Typeface const> m_parsed_font;
-    RefPtr<Core::Promise<NonnullRefPtr<Gfx::Typeface const>>> m_font_load_promise;
-
-    GC::Ptr<CSSFontFaceRule> m_css_font_face_rule;
-    HashTable<GC::Ref<FontFaceSet>> m_containing_sets;
+    NonnullRefPtr<FontFaceState> m_state;
 };
-
-bool font_format_is_supported(FlyString const& name);
-
-bool font_tech_is_supported(FontTech);
-bool font_tech_is_supported(FlyString const& name);
 
 }

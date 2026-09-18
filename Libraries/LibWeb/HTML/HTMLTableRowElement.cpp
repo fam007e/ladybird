@@ -4,10 +4,8 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibWeb/Bindings/HTMLTableRowElement.h>
-#include <LibWeb/Bindings/Intrinsics.h>
-#include <LibWeb/CSS/ComputedProperties.h>
 #include <LibWeb/CSS/Parser/Parser.h>
+#include <LibWeb/CSS/PropertyID.h>
 #include <LibWeb/CSS/StyleValues/ColorStyleValue.h>
 #include <LibWeb/CSS/StyleValues/ImageStyleValue.h>
 #include <LibWeb/CSS/StyleValues/KeywordStyleValue.h>
@@ -33,13 +31,7 @@ HTMLTableRowElement::HTMLTableRowElement(DOM::Document& document, DOM::Qualified
 
 HTMLTableRowElement::~HTMLTableRowElement() = default;
 
-void HTMLTableRowElement::initialize(JS::Realm& realm)
-{
-    WEB_SET_PROTOTYPE_FOR_INTERFACE(HTMLTableRowElement);
-    Base::initialize(realm);
-}
-
-bool HTMLTableRowElement::is_presentational_hint(FlyString const& name) const
+bool HTMLTableRowElement::is_presentational_hint(Utf16FlyString const& name) const
 {
     if (Base::is_presentational_hint(name))
         return true;
@@ -55,7 +47,7 @@ bool HTMLTableRowElement::is_presentational_hint(FlyString const& name) const
 void HTMLTableRowElement::apply_presentational_hints(Vector<CSS::StyleProperty>& properties) const
 {
     Base::apply_presentational_hints(properties);
-    for_each_attribute([&](auto& name, auto& value) {
+    for_each_attribute([&](Utf16FlyString const& name, Utf16View value) {
         if (name == HTML::AttributeNames::align) {
             if (auto parsed_value = parse_table_child_element_align_value(value))
                 properties.append({ .property_id = CSS::PropertyID::TextAlign, .value = parsed_value.release_nonnull() });
@@ -90,9 +82,7 @@ GC::Ref<DOM::HTMLCollection> HTMLTableRowElement::cells() const
     // The cells attribute must return an HTMLCollection rooted at this tr element,
     // whose filter matches only td and th elements that are children of the tr element.
     if (!m_cells) {
-        m_cells = DOM::HTMLCollection::create(const_cast<HTMLTableRowElement&>(*this), DOM::HTMLCollection::Scope::Children, [](Element const& element) {
-            return is<HTMLTableCellElement>(element);
-        });
+        m_cells = DOM::HTMLCollection::create(const_cast<HTMLTableRowElement&>(*this), DOM::HTMLCollection::Scope::Children, [](Element const& element) { return is<HTMLTableCellElement>(element); }, DOM::HTMLCollection::AttributeInvalidationType::None);
     }
     return *m_cells;
 }
@@ -117,7 +107,7 @@ int HTMLTableRowElement::row_index() const
         return -1;
     auto rows = rows_collection->collect_matching_elements();
     for (size_t i = 0; i < rows.size(); ++i) {
-        if (rows[i] == this)
+        if (rows[i].ptr() == this)
             return i;
     }
     return -1;
@@ -142,7 +132,7 @@ int HTMLTableRowElement::section_row_index() const
         return -1;
     auto rows = rows_collection->collect_matching_elements();
     for (size_t i = 0; i < rows.size(); ++i) {
-        if (rows[i] == this)
+        if (rows[i].ptr() == this)
             return i;
     }
     return -1;
@@ -156,7 +146,7 @@ WebIDL::ExceptionOr<GC::Ref<HTMLTableCellElement>> HTMLTableRowElement::insert_c
 
     // 1. If index is less than −1 or greater than the number of elements in the cells collection, then throw an "IndexSizeError" DOMException.
     if (index < -1 || index > cells_collection_size)
-        return WebIDL::IndexSizeError::create(realm(), "Index is negative or greater than the number of cells"_utf16);
+        return WebIDL::IndexSizeError::create("Index is negative or greater than the number of cells"_utf16);
 
     // 2. Let table cell be the result of creating an element given this tr element's node document, "td", and the HTML namespace.
     auto& table_cell = static_cast<HTMLTableCellElement&>(*TRY(DOM::create_element(document(), HTML::TagNames::td, Namespace::HTML)));
@@ -181,7 +171,7 @@ WebIDL::ExceptionOr<void> HTMLTableRowElement::delete_cell(i32 index)
 
     // 1. If index is less than −1 or greater than or equal to the number of elements in the cells collection, then throw an "IndexSizeError" DOMException.
     if (index < -1 || index >= cells_collection_size)
-        return WebIDL::IndexSizeError::create(realm(), "Index is negative or greater than or equal to the number of cells"_utf16);
+        return WebIDL::IndexSizeError::create("Index is negative or greater than or equal to the number of cells"_utf16);
 
     // 2. If index is −1, then remove the last element in the cells collection from its parent, or do nothing if the cells collection is empty.
     if (index == -1) {

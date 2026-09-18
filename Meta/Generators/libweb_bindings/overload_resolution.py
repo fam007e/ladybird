@@ -14,6 +14,7 @@ from Generators.libweb_bindings.cpp_types import idl_identifier_cpp_name
 from Generators.libweb_bindings.cpp_types import is_numeric_type
 from Generators.libweb_bindings.cpp_types import is_string_type
 from Generators.libweb_bindings.includes import GeneratedIncludes
+from Generators.libweb_bindings.realms import member_realm_expr
 from Utils.webidl_parser import Constructor
 from Utils.webidl_parser import IDLParameterizedType
 from Utils.webidl_parser import IDLType
@@ -124,6 +125,7 @@ def write_overload_arbiter(
     interface: Interface,
     operations: list[Operation],
     receiver_class: Optional[str] = None,
+    emit_as_static: bool = False,
 ) -> None:
     if receiver_class is None:
         receiver_class = interface.prototype_class
@@ -132,27 +134,39 @@ def write_overload_arbiter(
     includes.add("AK/Vector.h")
     includes.add("LibWeb/WebIDL/OverloadTypes.h")
     includes.add("LibWeb/WebIDL/OverloadResolution.h")
-    includes.add("LibWeb/WebIDL/Tracing.h")
 
     operation = operations[0]
 
     # Web IDL overload sets cannot mix promise and non-promise return types.
     should_wrap_promise_rejections = operation.return_type_is_promise()
+    promise_realm_setup = ""
     if should_wrap_promise_rejections:
         includes.add("LibWeb/WebIDL/Promise.h")
+        realm_argument = member_realm_expr(
+            operation,
+            interface=interface,
+            is_static=emit_as_static or interface.is_namespace,
+        )
+        if realm_argument == "realm":
+            promise_realm_setup = "[[maybe_unused]] auto& promise_realm = realm;"
+        else:
+            promise_realm_setup = """auto promise_realm_this_value = vm.this_value();
+    if (promise_realm_this_value.is_nullish())
+        promise_realm_this_value = &realm.global_object();
+    [[maybe_unused]] auto& promise_realm = this_value_realm(realm, promise_realm_this_value);"""
 
     out.write(
         f"""JS_DEFINE_NATIVE_FUNCTION({receiver_class}::{idl_identifier_cpp_name(operation)})
 {{
-    WebIDL::log_trace(vm, "{receiver_class}::{idl_identifier_cpp_name(operation)}");
 
 """
     )
     if should_wrap_promise_rejections:
         out.write(
-            """    [[maybe_unused]] auto& realm = *vm.current_realm();
+            f"""    [[maybe_unused]] auto& realm = *vm.current_realm();
+    {promise_realm_setup}
 
-    auto steps = [&]() -> JS::ThrowCompletionOr<JS::Value> {
+    auto steps = [&]() -> JS::ThrowCompletionOr<JS::Value> {{
 """
         )
     write_overload_resolution_switch(out, context, interface, operations)
@@ -176,7 +190,7 @@ def write_overload_arbiter(
 
     auto maybe_result = steps();
     if (maybe_result.is_throw_completion())
-        return WebIDL::create_rejected_promise(realm, maybe_result.error_value())->promise();
+        return WebIDL::create_rejected_promise(promise_realm, maybe_result.error_value())->promise();
 
     return maybe_result.release_value();
 """)
@@ -304,12 +318,14 @@ def resolve_distinguishing_argument_index(
 
 def constructor_for_idl_type(idl_type: IDLType, context: GenerationContext) -> str:
     nullable = "true" if idl_type.nullable else "false"
+
     if isinstance(idl_type, IDLParameterizedType):
         parameters = ", ".join(constructor_for_idl_type(parameter, context) for parameter in idl_type.parameters)
         return (
             f'make_ref_counted<WebIDL::ParameterizedType>("{idl_type.name}", {nullable}, '
             f"Vector<NonnullRefPtr<WebIDL::Type const>> {{ {parameters} }})"
         )
+
     if isinstance(idl_type, IDLUnionType):
         member_types = ", ".join(
             constructor_for_idl_type(member_type, context) for member_type in idl_type.member_types
@@ -318,6 +334,10 @@ def constructor_for_idl_type(idl_type: IDLType, context: GenerationContext) -> s
             f'make_ref_counted<WebIDL::UnionType>("{idl_type.name}", {nullable}, '
             f"Vector<NonnullRefPtr<WebIDL::Type const>> {{ {member_types} }})"
         )
+
+    if context.enumeration(idl_type) is not None:
+        return f'make_ref_counted<WebIDL::Type>(WebIDL::Type::Kind::Enumeration, "{idl_type.name}", {nullable})'
+
     return f'make_ref_counted<WebIDL::Type>("{idl_type.name}", {nullable})'
 
 
@@ -503,7 +523,7 @@ def distinguishability_category(idl_type: IDLType, context: GenerationContext) -
         return "Numeric"
     if idl_type.name == "bigint":
         return "BigInt"
-    if is_string_type(idl_type.name):
+    if is_string_type(idl_type.name) or context.enumeration(idl_type) is not None:
         return "String"
     if idl_type.name == "object":
         return "Object"

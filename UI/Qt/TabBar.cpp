@@ -15,9 +15,9 @@
 #if defined(AK_OS_MACOS)
 #    include <UI/Qt/MacWindow.h>
 #endif
+#include <UI/Qt/HiddenPageSizing.h>
 #include <UI/Qt/Menu.h>
 #include <UI/Qt/StringUtils.h>
-#include <UI/Qt/Tab.h>
 #include <UI/Qt/TabBar.h>
 #include <UI/Qt/WindowControlButton.h>
 
@@ -47,6 +47,8 @@
 #include <QPixmap>
 #include <QScreen>
 #include <QStyle>
+#include <QStyleOptionButton>
+#include <QStylePainter>
 #include <QTimer>
 #include <QToolButton>
 #include <QToolTip>
@@ -59,10 +61,10 @@
 namespace Ladybird {
 
 static constexpr auto LADYBIRD_TAB_MIME_TYPE = "application/x-ladybird-tab";
-static constexpr int HORIZONTAL_TAB_STRIP_HEIGHT = 44;
-static constexpr int HORIZONTAL_TAB_HEIGHT = 38;
+static constexpr int HORIZONTAL_TAB_STRIP_HEIGHT = 42;
+static constexpr int HORIZONTAL_TAB_HEIGHT = 36;
 static constexpr int HORIZONTAL_TAB_MIN_WIDTH = 128;
-static constexpr int HORIZONTAL_TAB_MAX_WIDTH = 240;
+static constexpr int HORIZONTAL_TAB_MAX_WIDTH = 232;
 static constexpr int VERTICAL_TAB_HEIGHT = 38;
 static constexpr int VERTICAL_TABS_COLLAPSED_WIDTH = browser_chrome_layout_policy().collapsed_sidebar_width;
 static constexpr int VERTICAL_TABS_DEFAULT_EXPANDED_WIDTH = browser_chrome_layout_policy().expanded_sidebar_width;
@@ -111,10 +113,25 @@ static QPointer<Tab> s_active_tab_dragged_tab;
 static QPointer<TabWidget> s_pending_tab_drop_target;
 static int s_pending_tab_drop_index { -1 };
 
-static bool window_uses_client_side_decorations(QWidget& widget)
+static bool window_has_chrome_in_titlebar(QWidget& widget)
 {
     auto* top_level_window = qobject_cast<BrowserWindow*>(widget.window());
-    return !top_level_window || top_level_window->uses_client_side_decorations();
+    return !top_level_window || top_level_window->has_chrome_in_titlebar();
+}
+
+static bool target_can_accept_tab_drop(QWidget& target, QDropEvent& event)
+{
+    if (!s_active_tab_drag_source)
+        return false;
+    if (!event.mimeData()->hasFormat(LADYBIRD_TAB_MIME_TYPE))
+        return false;
+
+    auto* source_window = qobject_cast<BrowserWindow*>(s_active_tab_drag_source->window());
+    auto* target_window = qobject_cast<BrowserWindow*>(target.window());
+    if (!source_window || !target_window)
+        return false;
+
+    return source_window->is_private() == target_window->is_private();
 }
 
 static QPainterPath tab_shape_path(QRectF const& rect, qreal top_radius, qreal bottom_radius)
@@ -244,11 +261,6 @@ public:
     }
 
 private:
-    bool is_hovered() const
-    {
-        return rect().contains(mapFromGlobal(QCursor::pos()));
-    }
-
     virtual void enterEvent(QEnterEvent* event) override
     {
         QToolButton::enterEvent(event);
@@ -281,7 +293,7 @@ private:
                       ? horizontal_new_tab_button_shape_rect(QRectF(rect()))
                       : QRectF(rect()).adjusted(4.0, 3.0, -4.0, -3.0));
         auto tab_path = tab_shape_path(shape_rect, 9.0, 9.0);
-        auto hovered = is_hovered();
+        auto hovered = underMouse();
 
         if (isDown()) {
             painter.setBrush(ChromeStyle::chrome_surface_pressed(palette()));
@@ -624,10 +636,24 @@ void TabBar::resizeEvent(QResizeEvent* event)
 
 void TabBar::tabLayoutChange()
 {
-    hide_tab_preview();
     QTabBar::tabLayoutChange();
     set_vertical_scroll_offset(m_vertical_scroll_offset);
     update_tab_button_geometry();
+
+    if (m_tab_preview_index < 0)
+        return;
+
+    // NB: Title and favicon updates also change the tab layout. Keep the preview open if it still belongs
+    //     to the tab under the pointer, but dismiss it if tabs moved or were removed.
+    auto hovered_tab = tab_index_at(mapFromGlobal(QCursor::pos()));
+    if (hovered_tab != m_tab_preview_index || !m_tab_widget
+        || (m_previewed_tab && m_tab_widget->tab(hovered_tab) != m_previewed_tab)) {
+        hide_tab_preview();
+        return;
+    }
+
+    if (m_previewed_tab)
+        show_tab_preview();
 }
 
 bool TabBar::event(QEvent* event)
@@ -794,13 +820,14 @@ void TabBar::contextMenuEvent(QContextMenuEvent* event)
     if (tab_index < 0)
         return;
 
+    m_pressed_tab = nullptr;
     if (auto* tab = m_tab_widget->tab(tab_index))
         tab->context_menu()->exec(event->globalPos());
 }
 
 void TabBar::dragEnterEvent(QDragEnterEvent* event)
 {
-    if (!m_tab_widget || !s_active_tab_drag_source || !event->mimeData()->hasFormat(LADYBIRD_TAB_MIME_TYPE)) {
+    if (!m_tab_widget || !target_can_accept_tab_drop(*m_tab_widget, *event)) {
         event->ignore();
         return;
     }
@@ -819,7 +846,11 @@ void TabBar::dragLeaveEvent(QDragLeaveEvent* event)
 
 void TabBar::dragMoveEvent(QDragMoveEvent* event)
 {
-    if (!m_tab_widget || !s_active_tab_drag_source || !event->mimeData()->hasFormat(LADYBIRD_TAB_MIME_TYPE)) {
+    if (!m_tab_widget || !target_can_accept_tab_drop(*m_tab_widget, *event)) {
+        if (m_drop_indicator_index != -1) {
+            m_drop_indicator_index = -1;
+            update();
+        }
         event->ignore();
         return;
     }
@@ -837,7 +868,11 @@ void TabBar::dragMoveEvent(QDragMoveEvent* event)
 void TabBar::dropEvent(QDropEvent* event)
 {
     hide_tab_preview();
-    if (!m_tab_widget || !s_active_tab_drag_source || !event->mimeData()->hasFormat(LADYBIRD_TAB_MIME_TYPE)) {
+    if (!m_tab_widget || !target_can_accept_tab_drop(*m_tab_widget, *event)) {
+        if (m_drop_indicator_index != -1) {
+            m_drop_indicator_index = -1;
+            update();
+        }
         event->ignore();
         return;
     }
@@ -885,7 +920,7 @@ void TabBar::mousePressEvent(QMouseEvent* event)
     }
 
     if (tab_layout() != TabLayout::Horizontal) {
-        if (pressed_tab >= 0) {
+        if (pressed_tab >= 0 && event->button() == Qt::LeftButton) {
             setCurrentIndex(pressed_tab);
         } else if (event->button() == Qt::LeftButton && start_window_move()) {
             event->accept();
@@ -961,7 +996,7 @@ void TabBar::mouseReleaseEvent(QMouseEvent* event)
 
 void TabBar::mouseDoubleClickEvent(QMouseEvent* event)
 {
-    if (window_uses_client_side_decorations(*this) && tab_index_at(event->pos()) < 0 && event->button() == Qt::LeftButton) {
+    if (window_has_chrome_in_titlebar(*this) && tab_index_at(event->pos()) < 0 && event->button() == Qt::LeftButton) {
         toggle_window_maximized();
         event->accept();
         return;
@@ -1128,8 +1163,8 @@ void TabBar::schedule_tab_preview(int index)
     if (m_tab_preview_index == index && m_tab_preview_popup->isVisible())
         return;
 
+    hide_tab_preview();
     m_tab_preview_index = index;
-    m_tab_preview_popup->hide();
     QToolTip::hideText();
     m_tab_preview_timer->start();
 }
@@ -1151,11 +1186,17 @@ void TabBar::show_tab_preview()
         return;
     }
 
-    auto thumbnail = tab->view().tab_preview_pixmap({ TAB_PREVIEW_THUMBNAIL_WIDTH, TAB_PREVIEW_THUMBNAIL_HEIGHT });
-    if (!thumbnail.has_value()) {
-        hide_tab_preview();
-        return;
+    if (m_previewed_tab != tab) {
+        m_previewed_tab = tab;
+        m_tab_preview_paint_connection = connect(&tab->view(), &WebContentView::ready_to_paint, this, &TabBar::show_tab_preview);
+        // NB: Background tabs may never have painted. Allow rendering while their preview is requested,
+        //     without selecting the tab or showing its widget.
+        tab->view().set_system_visibility_state(Web::HTML::VisibilityState::Visible);
     }
+
+    auto thumbnail = tab->view().tab_preview_pixmap({ TAB_PREVIEW_THUMBNAIL_WIDTH, TAB_PREVIEW_THUMBNAIL_HEIGHT });
+    if (!thumbnail.has_value())
+        return;
 
     m_tab_preview_popup->set_preview(palette(), tab->title(), qstring_from_ak_string(tab->view().url().serialize()), *thumbnail);
     m_tab_preview_popup->move(tab_preview_position_for(index, m_tab_preview_popup->sizeHint()));
@@ -1165,6 +1206,12 @@ void TabBar::show_tab_preview()
 
 void TabBar::hide_tab_preview()
 {
+    disconnect(m_tab_preview_paint_connection);
+    if (m_previewed_tab) {
+        m_previewed_tab->view().set_system_visibility_state(m_previewed_tab->view().isVisible() ? Web::HTML::VisibilityState::Visible : Web::HTML::VisibilityState::Hidden);
+        m_previewed_tab = nullptr;
+    }
+
     if (m_tab_preview_timer)
         m_tab_preview_timer->stop();
 
@@ -1482,11 +1529,15 @@ TabWidget::TabWidget(QWidget* parent)
     m_new_tab_button->setToolTip("New Tab");
     m_new_tab_button->installEventFilter(this);
 
-    auto window_control_buttons = create_window_control_buttons(*this, "LadybirdTabStripWindowControls", { 18, 18 }, { 40, 40 });
-    m_window_controls = window_control_buttons.container;
-    m_minimize_window_button = window_control_buttons.minimize;
-    m_maximize_window_button = window_control_buttons.maximize;
-    m_close_window_button = window_control_buttons.close;
+    if constexpr (use_native_macos_window_controls()) {
+        m_window_controls = create_window_controls_spacer(*this, "LadybirdTabStripWindowControls", { NATIVE_MACOS_WINDOW_CONTROLS_WIDTH + NATIVE_MACOS_WINDOW_CONTROLS_GAP, HORIZONTAL_TAB_HEIGHT });
+    } else {
+        auto window_control_buttons = create_window_control_buttons(*this, "LadybirdTabStripWindowControls", { 18, 18 }, { 40, 40 });
+        m_window_controls = window_control_buttons.container;
+        m_minimize_window_button = window_control_buttons.minimize;
+        m_maximize_window_button = window_control_buttons.maximize;
+        m_close_window_button = window_control_buttons.close;
+    }
 
     recreate_icons();
 
@@ -1504,6 +1555,7 @@ TabWidget::TabWidget(QWidget* parent)
     m_vertical_tab_bar_column = new QWidget(this);
     m_vertical_tab_bar_column->setObjectName("LadybirdVerticalTabBar");
 #if defined(AK_OS_MACOS)
+    m_vertical_tab_bar_column->setAttribute(Qt::WA_DontCreateNativeAncestors);
     m_vertical_tab_bar_column->setAttribute(Qt::WA_NativeWindow);
 #endif
     m_vertical_tab_bar_column_layout = new QVBoxLayout(m_vertical_tab_bar_column);
@@ -1522,6 +1574,7 @@ TabWidget::TabWidget(QWidget* parent)
     m_vertical_tabs_resize_handle = new QWidget(this);
     m_vertical_tabs_resize_handle->setObjectName("LadybirdVerticalTabsResizeHandle");
 #if defined(AK_OS_MACOS)
+    m_vertical_tabs_resize_handle->setAttribute(Qt::WA_DontCreateNativeAncestors);
     m_vertical_tabs_resize_handle->setAttribute(Qt::WA_NativeWindow);
 #endif
     m_vertical_tabs_resize_handle->setCursor(Qt::SizeHorCursor);
@@ -1548,6 +1601,7 @@ TabWidget::TabWidget(QWidget* parent)
         m_toolbar_container->setCurrentIndex(index);
         update_vertical_tabs_overlay_geometry();
         update_vertical_tabs_resize_handle();
+        update_vertical_tabs_content_overlay();
     });
 
     connect(m_tab_bar, &QTabBar::tabCloseRequested, this, &TabWidget::tab_close_requested);
@@ -1568,15 +1622,17 @@ TabWidget::TabWidget(QWidget* parent)
         m_stacked_widget->setCurrentIndex(m_tab_bar->currentIndex());
     });
 
-    connect(m_minimize_window_button, &QToolButton::clicked, this, [this] {
-        window()->showMinimized();
-    });
-    connect(m_maximize_window_button, &QToolButton::clicked, this, [this] {
-        toggle_window_maximized();
-    });
-    connect(m_close_window_button, &QToolButton::clicked, this, [this] {
-        window()->close();
-    });
+    if constexpr (!use_native_macos_window_controls()) {
+        connect(m_minimize_window_button, &QToolButton::clicked, this, [this] {
+            window()->showMinimized();
+        });
+        connect(m_maximize_window_button, &QToolButton::clicked, this, [this] {
+            toggle_window_maximized();
+        });
+        connect(m_close_window_button, &QToolButton::clicked, this, [this] {
+            window()->close();
+        });
+    }
 }
 
 void TabWidget::add_tab(Tab* widget, QString const& label)
@@ -1584,8 +1640,24 @@ void TabWidget::add_tab(Tab* widget, QString const& label)
     insert_tab(m_tab_bar->count(), widget, label);
 }
 
+// Sizing the hidden page's view alone doesn't hold: The page itself still has its placeholder geometry, and the next
+// pass of the page's own layout pulls the view back to it. So, give the whole page the current page's geometry, laid
+// out now — and only then push the view's viewport.
+static void size_page_like(Tab& page, Tab const& current)
+{
+    size_hidden_page_like(page, current);
+    page.view().push_viewport_size();
+}
+
 void TabWidget::insert_tab(int index, Tab* widget, QString const& label)
 {
+    // A page inserted behind the current one stays at Qt's default geometry until it's selected, and a load can start
+    // into it long before that. Size its view like the current page's view first — as Chrome does for a new background
+    // tab (TabStripModel::AddWebContents) — so the page's first layout sees the real viewport.
+    if (auto* current = as_if<Tab>(m_stacked_widget->currentWidget()); current && current != widget)
+        size_page_like(*widget, *current);
+    widget->view().installEventFilter(this);
+
     m_stacked_widget->insertWidget(index, widget);
     m_tab_bar->insertTab(index, label);
     widget->set_toolbar_container_in_tab_layout(false);
@@ -1611,6 +1683,7 @@ Tab* TabWidget::take_tab(int index)
         return nullptr;
 
     m_stacked_widget->removeWidget(widget);
+    as<Tab>(widget)->view().removeEventFilter(this);
     auto* toolbar = as<Tab>(widget)->toolbar_container();
     if (m_toolbar_container->indexOf(toolbar) != -1)
         m_toolbar_container->removeWidget(toolbar);
@@ -1653,6 +1726,10 @@ void TabWidget::set_tab_bar_visible(bool visible)
         return;
 
     m_tab_bar_visible = visible;
+
+    if (!m_tab_bar_visible)
+        set_vertical_tabs_hover_expanded(false);
+
     update_tab_chrome_visibility();
     update_tab_layout();
 }
@@ -1746,6 +1823,11 @@ bool TabWidget::eventFilter(QObject* watched, QEvent* event)
     if (watched == window() && event->type() == QEvent::Leave)
         defer_update_vertical_tabs_hover_expanded();
 
+    if (event->type() == QEvent::Resize) {
+        if (auto* current = as_if<Tab>(m_stacked_widget->currentWidget()); current && watched == &current->view())
+            size_hidden_pages_like_the_current_one();
+    }
+
     if (watched == m_vertical_tabs_resize_handle) {
         auto reset_resize_handle = [this] {
             m_is_resizing_vertical_tabs = false;
@@ -1821,7 +1903,7 @@ bool TabWidget::eventFilter(QObject* watched, QEvent* event)
         }
     }
 
-    if ((watched == m_tab_bar_row || watched == m_vertical_tab_bar_column) && window_uses_client_side_decorations(*this)) {
+    if ((watched == m_tab_bar_row || watched == m_vertical_tab_bar_column) && window_has_chrome_in_titlebar(*this)) {
         auto is_empty_chrome_area = [this, watched](QMouseEvent const& mouse_event) {
             if (watched == m_vertical_tab_bar_column) {
                 auto* child = m_vertical_tab_bar_column->childAt(mouse_event.pos());
@@ -1855,9 +1937,26 @@ void TabWidget::resizeEvent(QResizeEvent* event)
     update_tab_layout();
 }
 
+// The stacked layout sizes only the current page, so the tabs behind it keep stale geometry: Qt's default 100x30 for
+// a tab that was created before the window was first shown — which is every tab but the first on a command line, and
+// every restored one. Their pages may already be loading. So, whenever the current page's view gets its size, then size
+// every hidden page's view the same (Chrome keeps its background tabs at the window's size the same way).
+// NB: This hangs off the view's own resize event, not this widget's: At the window's first show, this widget is laid
+// out before the current page's child layout has run. So at that point the current view still has its placeholder size.
+void TabWidget::size_hidden_pages_like_the_current_one()
+{
+    auto* current = as_if<Tab>(m_stacked_widget->currentWidget());
+    if (!current)
+        return;
+    for (int i = 0; i < m_stacked_widget->count(); ++i) {
+        if (auto* page = as_if<Tab>(m_stacked_widget->widget(i)); page && page != current)
+            size_page_like(*page, *current);
+    }
+}
+
 void TabWidget::accept_tab_drag(QDragMoveEvent* event)
 {
-    if (!s_active_tab_drag_source || !event->mimeData()->hasFormat(LADYBIRD_TAB_MIME_TYPE)) {
+    if (!target_can_accept_tab_drop(*this, *event)) {
         event->ignore();
         return;
     }
@@ -1875,7 +1974,7 @@ void TabWidget::accept_tab_drag(QDragMoveEvent* event)
 
 void TabWidget::accept_tab_drop(QDropEvent* event, int index)
 {
-    if (!s_active_tab_drag_source || !event->mimeData()->hasFormat(LADYBIRD_TAB_MIME_TYPE)) {
+    if (!target_can_accept_tab_drop(*this, *event)) {
         event->ignore();
         return;
     }
@@ -2023,19 +2122,17 @@ void TabWidget::rebuild_layout_for_horizontal_tabs()
     m_new_tab_button->setFixedSize(HORIZONTAL_TAB_HEIGHT, HORIZONTAL_TAB_HEIGHT);
     m_new_tab_button->setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Fixed);
 
-    if (use_left_traffic_light_window_controls()) {
+    if constexpr (use_native_macos_window_controls()) {
         m_tab_bar_row_layout->addWidget(m_window_controls, 0, Qt::AlignVCenter);
-        m_tab_bar_row_layout->addSpacing(16);
         m_tab_bar_row_layout->addWidget(m_tab_bar);
         m_tab_bar_row_layout->addWidget(m_new_tab_button, 0, Qt::AlignVCenter);
         m_tab_bar_row_layout->addStretch(1);
-        return;
+    } else {
+        m_tab_bar_row_layout->addWidget(m_tab_bar);
+        m_tab_bar_row_layout->addWidget(m_new_tab_button, 0, Qt::AlignVCenter);
+        m_tab_bar_row_layout->addStretch(1);
+        m_tab_bar_row_layout->addWidget(m_window_controls);
     }
-
-    m_tab_bar_row_layout->addWidget(m_tab_bar);
-    m_tab_bar_row_layout->addWidget(m_new_tab_button, 0, Qt::AlignVCenter);
-    m_tab_bar_row_layout->addStretch(1);
-    m_tab_bar_row_layout->addWidget(m_window_controls);
 }
 
 void TabWidget::rebuild_layout_for_vertical_tabs()
@@ -2049,7 +2146,8 @@ void TabWidget::rebuild_layout_for_vertical_tabs()
     m_vertical_tab_bar_column_layout->setSpacing(0);
     auto tab_layout = m_tab_bar->tab_layout();
     auto side_margin = vertical_tabs_side_margin(tab_layout != TabLayout::VerticalCollapsed);
-    m_window_controls->layout()->setContentsMargins(0, 0, 0, 0);
+    if (auto* window_controls_layout = m_window_controls->layout())
+        window_controls_layout->setContentsMargins(0, 0, 0, 0);
     m_vertical_tab_bar_column_layout->setContentsMargins(side_margin, VERTICAL_TABS_TOP_MARGIN, side_margin, 8);
 
     update_vertical_tabs_button_layout();
@@ -2306,7 +2404,26 @@ void TabWidget::set_vertical_tabs_hover_expanded(bool expanded)
         m_vertical_tabs_hover_collapse_timer->start();
     else
         m_vertical_tabs_hover_collapse_timer->stop();
+
     update_vertical_tabs_hover_layout();
+    update_vertical_tabs_content_overlay();
+}
+
+void TabWidget::update_vertical_tabs_content_overlay()
+{
+    auto index = current_index();
+    if (index < 0)
+        return;
+
+    int overlap = 0;
+    if (m_tab_bar_visible && m_vertical_tabs_hover_expanded && m_tab_bar->tab_layout() != TabLayout::Horizontal)
+        overlap = max(0, current_vertical_tabs_width() - vertical_tabs_layout_width());
+
+    auto left = vertical_tabs_are_on_right() ? 0 : overlap;
+    auto right = vertical_tabs_are_on_right() ? overlap : 0;
+
+    if (auto* current = tab(index))
+        current->view().set_vertical_tab_overlay_insets(left, right);
 }
 
 void TabWidget::defer_update_vertical_tabs_hover_expanded()
@@ -2327,11 +2444,13 @@ void TabWidget::update_vertical_tabs_hover_expanded()
 
 void TabWidget::update_window_button_icons()
 {
-    auto is_maximized = window()->isMaximized();
-    m_minimize_window_button->setIcon(create_chrome_icon(ChromeIcon::WindowMinimize, palette()));
-    m_maximize_window_button->setIcon(create_chrome_icon(is_maximized ? ChromeIcon::WindowRestore : ChromeIcon::WindowMaximize, palette()));
-    m_maximize_window_button->setToolTip(is_maximized ? "Restore" : "Maximize");
-    m_close_window_button->setIcon(create_chrome_icon(ChromeIcon::WindowClose, palette()));
+    if (m_minimize_window_button && m_maximize_window_button && m_close_window_button) {
+        auto is_maximized = window()->isMaximized();
+        m_minimize_window_button->setIcon(create_chrome_icon(ChromeIcon::WindowMinimize, palette()));
+        m_maximize_window_button->setIcon(create_chrome_icon(is_maximized ? ChromeIcon::WindowRestore : ChromeIcon::WindowMaximize, palette()));
+        m_maximize_window_button->setToolTip(is_maximized ? "Restore" : "Maximize");
+        m_close_window_button->setIcon(create_chrome_icon(ChromeIcon::WindowClose, palette()));
+    }
 
     for (int index = 0; index < m_stacked_widget->count(); ++index)
         tab(index)->update_window_control_icons();
@@ -2399,6 +2518,24 @@ bool TabBarButton::event(QEvent* event)
         setFlat(true);
 
     return QPushButton::event(event);
+}
+
+void TabBarButton::paintEvent(QPaintEvent*)
+{
+    QStyleOptionButton option;
+    initStyleOption(&option);
+
+    QStylePainter painter(this);
+
+    if (objectName() == "LadybirdTabButton") {
+        auto collapsed = property(COLLAPSED_VERTICAL_TAB_BUTTON_PROPERTY).toBool();
+        auto frame_style = collapsed
+            ? ChromeStyle::CircularControlFrameStyle::ActiveTabOverlay
+            : ChromeStyle::CircularControlFrameStyle::InteractionOnly;
+        ChromeStyle::paint_circular_control_frame(painter, *this, frame_style);
+    }
+
+    painter.drawControl(QStyle::CE_PushButton, option);
 }
 
 }

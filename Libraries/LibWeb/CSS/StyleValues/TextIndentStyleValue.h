@@ -24,22 +24,21 @@ public:
     static ValueComparingNonnullRefPtr<TextIndentStyleValue const> create(NonnullRefPtr<StyleValue const> length_percentage, Hanging hanging, EachLine each_line);
     virtual ~TextIndentStyleValue() override;
 
-    StyleValue const& length_percentage() const { return m_length_percentage; }
-    bool hanging() const { return m_hanging; }
-    bool each_line() const { return m_each_line; }
+    ValueComparingNonnullRefPtr<StyleValue const> length_percentage() const { return wrap_rust_child(m_value->text_indent.length_percentage); }
+    bool hanging() const { return m_value->text_indent.hanging; }
+    bool each_line() const { return m_value->text_indent.each_line; }
 
-    virtual void serialize(StringBuilder&, SerializationMode) const override;
-    virtual ValueComparingNonnullRefPtr<StyleValue const> absolutized(ComputationContext const&) const override;
-    bool properties_equal(TextIndentStyleValue const&) const;
-
-    virtual bool is_computationally_independent() const override { return m_length_percentage->is_computationally_independent(); }
+    ValueComparingNonnullRefPtr<StyleValue const> absolutized(ComputationContext const&) const;
 
 private:
-    TextIndentStyleValue(NonnullRefPtr<StyleValue const> length_percentage, Hanging hanging, EachLine each_line);
+    friend class StyleValue;
 
-    ValueComparingNonnullRefPtr<StyleValue const> m_length_percentage;
-    bool m_hanging;
-    bool m_each_line;
+    explicit TextIndentStyleValue(StyleValueFFI::StyleValueData const* data)
+        : StyleValueWithDefaultOperators(Type::TextIndent, data)
+    {
+    }
+
+    TextIndentStyleValue(NonnullRefPtr<StyleValue const> length_percentage, Hanging hanging, EachLine each_line);
 };
 
 }

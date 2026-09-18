@@ -4,21 +4,20 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibWeb/CSS/CSSStyleSheet.h>
 #include <LibWeb/CSS/Fetch.h>
+#include <LibWeb/CSS/StyleSheetState.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOMURL/DOMURL.h>
 #include <LibWeb/Fetch/Fetching/Fetching.h>
 #include <LibWeb/HTML/SharedResourceRequest.h>
 #include <LibWeb/Loader/ResourceLoader.h>
-#include <LibWeb/Painting/ViewportPaintable.h>
 
 namespace Web::CSS {
 
 // https://drafts.csswg.org/css-values-4/#style-resource-base-url
 
 struct StyleResourceContext {
-    GC::Ptr<CSSStyleSheet> sheet;
+    RefPtr<StyleSheetState> sheet;
     Optional<bool> parent_style_sheet_origin_clean;
     ::URL::URL url;
 };
@@ -33,7 +32,7 @@ static StyleResourceContext style_resource_context(RuleOrDeclaration css_rule_or
     }
 
     // 1. Let sheet be null.
-    GC::Ptr<CSSStyleSheet> sheet;
+    RefPtr<StyleSheetState> sheet;
 
     // 2. If cssRuleOrDeclaration is a CSS declaration block whose parent CSS rule is not null, set cssRuleOrDeclaration to cssRuleOrDeclaration’s parent CSS rule.
     if (auto* block = css_rule_or_declaration.value.get_pointer<RuleOrDeclaration::StyleDeclaration>()) {
@@ -73,17 +72,14 @@ static Optional<::URL::URL> resolve_a_style_resource_url(StyleResourceURL const&
     auto base_url = style_resource_context(css_rule_or_declaration).url;
 
     // 2. Return the result of the URL parser steps with urlValue’s url and base.
-    auto url_string = url_value.visit(
-        [](::URL::URL const& url) { return url.to_string(); },
-        [](CSS::URL const& url) { return url.url(); });
-    return DOMURL::parse(url_string, base_url);
+    return url_value.visit(
+        [&](::URL::URL const& url) { return DOMURL::parse_from_byte_string(url.to_string(), base_url); },
+        [&](CSS::URL const& url) { return DOMURL::parse(url.url(), base_url); });
 }
 
 // https://drafts.csswg.org/css-values-4/#fetch-a-style-resource
 static GC::Ptr<Fetch::Infrastructure::Request> fetch_a_style_resource_impl(StyleResourceURL const& url_value, RuleOrDeclaration css_rule_or_declaration, Fetch::Infrastructure::Request::Destination destination, CorsMode cors_mode)
 {
-    auto& vm = css_rule_or_declaration.environment_settings_object->vm();
-
     // 1. Let parsedUrl be the result of resolving urlValue given cssRuleOrDeclaration. If that failed, return.
     auto parsed_url = resolve_a_style_resource_url(url_value, css_rule_or_declaration);
     if (!parsed_url.has_value())
@@ -95,7 +91,7 @@ static GC::Ptr<Fetch::Infrastructure::Request> fetch_a_style_resource_impl(Style
     // 3. Let req be a new request whose url is parsedUrl, whose destination is destination, mode is corsMode,
     //    origin is environmentSettings’s origin, credentials mode is "same-origin", use-url-credentials flag is set,
     //    client is environmentSettings, and whose referrer is environmentSettings’s API base URL.
-    auto request = Fetch::Infrastructure::Request::create(vm);
+    auto request = Fetch::Infrastructure::Request::create();
     request->set_url(parsed_url.release_value());
     request->set_destination(destination);
     request->set_mode(cors_mode == CorsMode::Cors ? Fetch::Infrastructure::Request::Mode::CORS : Fetch::Infrastructure::Request::Mode::NoCORS);
@@ -143,12 +139,11 @@ GC::Ptr<Fetch::Infrastructure::FetchController> fetch_a_style_resource(StyleReso
         return {};
 
     auto& environment_settings = *css_rule_or_declaration.environment_settings_object;
-    auto& vm = environment_settings.vm();
 
     Fetch::Infrastructure::FetchAlgorithms::Input fetch_algorithms_input {};
     fetch_algorithms_input.process_response_consume_body = move(process_response);
 
-    return Fetch::Fetching::fetch(environment_settings.realm(), *request, Fetch::Infrastructure::FetchAlgorithms::create(vm, move(fetch_algorithms_input)));
+    return Fetch::Fetching::fetch(environment_settings.realm(), *request, Fetch::Infrastructure::FetchAlgorithms::create(move(fetch_algorithms_input)));
 }
 
 // https://drafts.csswg.org/css-images-4/#fetch-an-external-image-for-a-stylesheet
@@ -169,12 +164,10 @@ GC::Ptr<HTML::SharedResourceRequest> fetch_an_external_image_for_a_stylesheet(St
     if (!request)
         return {};
 
-    auto& realm = document.realm();
-
-    auto shared_resource_request = HTML::SharedResourceRequest::get_or_create(realm, document.page(), request->url());
+    auto shared_resource_request = HTML::SharedResourceRequest::get_or_create(document, request->url());
 
     if (shared_resource_request->needs_fetching())
-        shared_resource_request->fetch_resource(realm, *request);
+        shared_resource_request->fetch_resource(*request);
 
     return shared_resource_request;
 }

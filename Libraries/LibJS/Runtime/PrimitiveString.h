@@ -25,13 +25,15 @@ class JS_API PrimitiveString : public Cell {
     GC_DECLARE_ALLOCATOR(PrimitiveString);
 
 public:
+    static constexpr GC::CellKind cell_kind_for_class = GC::CellKind::PrimitiveString;
+
     static constexpr bool OVERRIDES_FINALIZE = true;
 
     [[nodiscard]] static GC::Ref<PrimitiveString> create(VM&, Utf16String const&);
     [[nodiscard]] static GC::Ref<PrimitiveString> create(VM&, Utf16View const&);
     [[nodiscard]] static GC::Ref<PrimitiveString> create(VM&, Utf16FlyString const&);
 
-    [[nodiscard]] static GC::Ref<PrimitiveString> create(VM&, PrimitiveString&, PrimitiveString&);
+    [[nodiscard]] static ThrowCompletionOr<GC::Ref<PrimitiveString>> create(VM&, PrimitiveString&, PrimitiveString&);
     [[nodiscard]] static GC::Ref<PrimitiveString> create(VM&, PrimitiveString const&, size_t code_unit_offset, size_t code_unit_length);
 
     [[nodiscard]] static GC::Ref<PrimitiveString> create_from_unsigned_integer(VM&, u64);
@@ -41,13 +43,14 @@ public:
     PrimitiveString(PrimitiveString const&) = delete;
     PrimitiveString& operator=(PrimitiveString const&) = delete;
 
-    bool is_empty() const;
+    bool is_empty() const { return m_length_in_utf16_code_units == 0; }
 
     [[nodiscard]] Utf16String utf16_string() const;
     [[nodiscard]] Utf16View utf16_string_view() const;
+    [[nodiscard]] PropertyKey property_key(VM&) const;
     bool has_utf16_string() const { return m_utf16_string.has_value(); }
 
-    size_t length_in_utf16_code_units() const;
+    size_t length_in_utf16_code_units() const { return m_length_in_utf16_code_units; }
 
     ThrowCompletionOr<Optional<Value>> get(VM&, PropertyKey const&) const;
 
@@ -60,16 +63,12 @@ protected:
         Substring,
     };
 
-    explicit PrimitiveString(DeferredKind deferred_kind)
-        : m_deferred_kind(deferred_kind)
-    {
-    }
+    PrimitiveString(DeferredKind, size_t length_in_utf16_code_units);
 
     mutable DeferredKind m_deferred_kind { DeferredKind::None };
+    u32 m_length_in_utf16_code_units { 0 };
 
     mutable Optional<Utf16String> m_utf16_string;
-
-    bool m_utf16_string_is_in_cache { false };
 
 private:
     friend class RopeString;
@@ -81,6 +80,7 @@ private:
     explicit PrimitiveString(Utf16String);
 
     void resolve_if_needed() const;
+    static size_t fly_string_cache_hash(Utf16FlyString const&);
     Optional<StringView> short_flat_string_storage_view() const;
     static GC::Ptr<PrimitiveString> try_create_short_flat_concatenated_string(VM&, PrimitiveString const& lhs, PrimitiveString const& rhs);
 };
@@ -123,7 +123,6 @@ private:
 
     mutable GC::Ptr<PrimitiveString> m_source_string;
     size_t m_code_unit_offset { 0 };
-    size_t m_code_unit_length { 0 };
 };
 
 }

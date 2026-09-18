@@ -1,38 +1,18 @@
 AccumulatedVisualContext Tree:
-  [0] transform=[1,0,0,1,0,0] origin=(0,0) (ViewportPaintable(Viewport<#document>))
-    [1] scroll_frame_id=1 (PaintableWithLines(BlockContainer<PRE>#out))
-      [2] clip=[8,8 100x100] (SVGForeignObjectPaintable(SVGForeignObjectBox<foreignObject>#fo))
-        [3] clip=[9,8 100x100] (PaintableWithLines(BlockContainer(anonymous)))
+  spatial:
+    [s0] transform=[1,0,0,1,0,0] origin=(0,0) (Viewport<#document>)
+      [s1] scroll (Viewport<#document>)
+        [s2] svg-viewport-transform=[1,0,0,1,8,8] origin=(0,0) (SVGSVGBox<svg>)
+          [s3] transform=[1,0,0,1,1,0] origin=(0,0) (SVGForeignObjectBox<foreignObject>#fo)
+  clips:
+    [c0 in s1] clip=[8,8 100x100] (SVGSVGBox<svg>)
+      [c1 in s3] clip=[0,0 100x100] (SVGForeignObjectBox<foreignObject>#fo)
+  effects:
+    [e0 in s0] effects=[]
+      [e1 in s3 out=c0] mask=[-10,-10 120x120] kind=luminance origin=svg-mask (SVGForeignObjectBox<foreignObject>#fo)
 
 DisplayList:
-SaveLayer@0
-  CompositorWheelHitTestTarget@0 target_scroll_frame_index=0 rect=[0,0 800x600]
-  CompositorWheelHitTestTarget@1 target_scroll_frame_index=0 rect=[0,0 800x121]
-  CompositorWheelHitTestTarget@1 target_scroll_frame_index=0 rect=[8,8 784x100]
-  CompositorWheelHitTestTarget@1 target_scroll_frame_index=0 rect=[8,8 784x100]
-  CompositorWheelHitTestTarget@1 target_scroll_frame_index=0 rect=[8,8 100x100]
-  Save@2
-    AddClipRect@2 rect=[-2,-2 119x119]
-    SaveLayer@2
-      ApplyEffects@3 opacity=1 has_filter=false
-        PaintNestedDisplayList@3 rect=[-2,-2 119x119]
-          Translate@0 delta=[2,2]
-          FillPath@0 path_bounding_rect=[8,8 100x100]
-      Restore@3
-    Restore@3
-  Restore@3
-  Save@2
-    AddClipRect@2 rect=[-2,-2 119x119]
-    SaveLayer@2
-      CompositorWheelHitTestTarget@2 target_scroll_frame_index=0 rect=[9,8 100x100]
-      CompositorWheelHitTestTarget@3 target_scroll_frame_index=0 rect=[9,8 100x100]
-      FillRect@3 rect=[9,8 100x100] color=rgb(0, 0, 0)
-      ApplyEffects@2 opacity=1 has_filter=false
-        PaintNestedDisplayList@2 rect=[-2,-2 119x119]
-          Translate@0 delta=[2,2]
-          FillPath@0 path_bounding_rect=[8,8 100x100]
-      Restore@2
-    Restore@2
-  Restore@2
-Restore@0
+DeclareMaskContent@s3/c0/e1 rect=[-10,-10 120x120] effect=e1
+  FillPath@s3/c0/e1 path_bounding_rect=[0,0 100x100]
+FillRect@s3/c1/e1 rect=[0,0 100x100] color=rgb(0, 0, 0)
 

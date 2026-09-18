@@ -5,9 +5,11 @@
  */
 
 #include <LibWeb/Animations/KeyframeEffect.h>
-#include <LibWeb/CSS/ComputedProperties.h>
+#include <LibWeb/CSS/ComputedValues.h>
 #include <LibWeb/CSS/CustomPropertyData.h>
+#include <LibWeb/CSS/StyleComputer.h>
 #include <LibWeb/DOM/AbstractElement.h>
+#include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/Element.h>
 #include <LibWeb/DOM/PseudoElement.h>
 #include <LibWeb/Layout/Node.h>
@@ -24,36 +26,77 @@ struct SyntheticPseudoElement::CustomPropertyDataStorage {
 };
 
 SyntheticPseudoElement::SyntheticPseudoElement() = default;
+SyntheticPseudoElement::SyntheticPseudoElement(GC::Ref<Element> originating_element)
+    : m_originating_element(originating_element)
+{
+}
 SyntheticPseudoElement::~SyntheticPseudoElement() = default;
 
 void SyntheticPseudoElement::visit_edges(JS::Cell::Visitor& visitor)
 {
     Base::visit_edges(visitor);
 
+    visitor.visit(m_originating_element);
     if (m_counters_set)
         m_counters_set->visit_edges(visitor);
 }
 
 void SyntheticPseudoElement::set_layout_node(Layout::NodeWithStyle* value)
 {
+    if (m_layout_node && m_layout_node.ptr() != value) {
+        m_layout_node->pin_style_record_for_detachment();
+        Layout::RustFFI::layout_arena_set_node_flag(m_layout_node->arena_handle(), Layout::Node::slot_id(m_layout_node), Layout::RustFFI::NodeFlag::IsPseudoElementPrincipalBox, false);
+    }
     m_layout_node = value;
-}
-
-RefPtr<CSS::ComputedProperties const> SyntheticPseudoElement::computed_properties() const
-{
-    return m_computed_properties;
+    // The box becomes the pseudo-element's box here, which is when it starts holding its scroll offset.
+    if (value) {
+        Layout::RustFFI::layout_arena_set_node_flag(value->arena_handle(), Layout::Node::slot_id(value), Layout::RustFFI::NodeFlag::IsPseudoElementPrincipalBox, true);
+        value->update_has_scroll_offset_flag();
+    }
 }
 
 void SyntheticPseudoElement::update_animated_properties(Badge<Web::Animations::KeyframeEffect> const&, DOM::AbstractElement abstract_element, Web::Animations::KeyframeEffect& effect, Web::Animations::AnimationUpdateContext& context)
 {
-    if (!m_computed_properties)
+    if (!m_style_record_identity)
         return;
-    effect.update_computed_properties_for_style(context, abstract_element, *m_computed_properties);
+    effect.update_computed_properties_for_style(context, abstract_element);
 }
 
-void SyntheticPseudoElement::set_computed_properties(RefPtr<CSS::ComputedProperties> value)
+void SyntheticPseudoElement::replace_style_record(CSS::StyleRecordID style_record_identity)
 {
-    m_computed_properties = value;
+    VERIFY(m_originating_element);
+    auto old_style_record_identity = m_style_record_identity;
+    if (old_style_record_identity == style_record_identity)
+        return;
+    m_style_record_identity = style_record_identity;
+    if (m_layout_node)
+        m_layout_node->set_style_record_identity(style_record_identity);
+}
+
+void SyntheticPseudoElement::set_computed_style(CSS::StyleRecordID style_record_identity)
+{
+    if (!style_record_identity) {
+        clear_computed_style();
+        return;
+    }
+    replace_style_record(style_record_identity);
+}
+
+void SyntheticPseudoElement::clear_computed_style(RefPtr<CSS::ComputedValues const> style_to_preserve_for_detachment)
+{
+    if (m_layout_node) {
+        if (style_to_preserve_for_detachment)
+            m_layout_node->set_computed_values(style_to_preserve_for_detachment.release_nonnull());
+        else
+            m_layout_node->pin_style_record_for_detachment();
+    }
+    m_style_record_identity = 0;
+}
+
+void SyntheticPseudoElement::refresh_computed_style(CSS::StyleRecordID style_record_identity)
+{
+    replace_style_record(style_record_identity);
+    VERIFY(m_style_record_identity);
 }
 
 RefPtr<CSS::CustomPropertyData const> SyntheticPseudoElement::custom_property_data() const
@@ -95,6 +138,10 @@ void SyntheticPseudoElement::set_counters_set(OwnPtr<CSS::CountersSet>&& counter
 }
 
 SyntheticPseudoElementTreeNode::SyntheticPseudoElementTreeNode() = default;
+SyntheticPseudoElementTreeNode::SyntheticPseudoElementTreeNode(GC::Ref<Element> originating_element)
+    : SyntheticPseudoElement(originating_element)
+{
+}
 SyntheticPseudoElementTreeNode::~SyntheticPseudoElementTreeNode() = default;
 
 void SyntheticPseudoElementTreeNode::visit_edges(JS::Cell::Visitor& visitor)
@@ -113,9 +160,9 @@ Layout::NodeWithStyle* ElementReferencePseudoElement::unsafe_layout_node() const
     return m_referenced_element->unsafe_layout_node();
 }
 
-RefPtr<CSS::ComputedProperties const> ElementReferencePseudoElement::computed_properties() const
+CSS::StyleRecordID ElementReferencePseudoElement::style_record_identity() const
 {
-    return m_referenced_element->computed_properties({});
+    return m_referenced_element->style_record_identity({});
 }
 
 void ElementReferencePseudoElement::update_animated_properties(Badge<Web::Animations::KeyframeEffect> const& badge, DOM::AbstractElement abstract_element, Web::Animations::KeyframeEffect& effect, Web::Animations::AnimationUpdateContext& context)

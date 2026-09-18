@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/Array.h>
 #include <AK/Atomic.h>
 #include <AK/Function.h>
 #include <LibCore/File.h>
@@ -11,6 +12,38 @@
 #include <LibMedia/IncrementallyPopulatedStream.h>
 #include <LibTest/TestCase.h>
 #include <LibThreading/Thread.h>
+
+TEST_CASE(accepts_adts_aac)
+{
+    // Nine ADTS AAC-LC frames containing 48 kHz stereo silence.
+    // clang-format off
+    static constexpr auto raw_aac_data = to_array<u8>({
+        0xff, 0xf1, 0x4c, 0x80, 0x03, 0xdf, 0xfc, 0xde, 0x02, 0x00, 0x4c, 0x61,
+        0x76, 0x63, 0x36, 0x31, 0x2e, 0x31, 0x39, 0x2e, 0x31, 0x30, 0x31, 0x00,
+        0x42, 0x20, 0x08, 0xc1, 0x18, 0x38, 0xff, 0xf1, 0x4c, 0x80, 0x01, 0xbf,
+        0xfc, 0x21, 0x10, 0x04, 0x60, 0x8c, 0x1c, 0xff, 0xf1, 0x4c, 0x80, 0x01,
+        0xbf, 0xfc, 0x21, 0x10, 0x04, 0x60, 0x8c, 0x1c, 0xff, 0xf1, 0x4c, 0x80,
+        0x01, 0xbf, 0xfc, 0x21, 0x10, 0x04, 0x60, 0x8c, 0x1c, 0xff, 0xf1, 0x4c,
+        0x80, 0x01, 0xbf, 0xfc, 0x21, 0x10, 0x04, 0x60, 0x8c, 0x1c, 0xff, 0xf1,
+        0x4c, 0x80, 0x01, 0xbf, 0xfc, 0x21, 0x10, 0x04, 0x60, 0x8c, 0x1c, 0xff,
+        0xf1, 0x4c, 0x80, 0x01, 0xbf, 0xfc, 0x21, 0x10, 0x04, 0x60, 0x8c, 0x1c,
+        0xff, 0xf1, 0x4c, 0x80, 0x01, 0xbf, 0xfc, 0x21, 0x10, 0x04, 0x60, 0x8c,
+        0x1c, 0xff, 0xf1, 0x4c, 0x80, 0x01, 0xbf, 0xfc, 0x21, 0x10, 0x04, 0x60,
+        0x8c, 0x1c,
+    });
+    // clang-format on
+
+    auto stream = Media::IncrementallyPopulatedStream::create_from_data(raw_aac_data);
+    EXPECT(!Media::FFmpeg::FFmpegDemuxer::from_stream(stream).is_error());
+}
+
+TEST_CASE(rejects_formats_handled_by_other_demuxers)
+{
+    auto file = MUST(Core::File::open("./vfr.mkv"sv, Core::File::OpenMode::Read));
+    auto stream = Media::IncrementallyPopulatedStream::create_from_buffer(MUST(file->read_until_eof()));
+
+    EXPECT(Media::FFmpeg::FFmpegDemuxer::from_stream(stream).is_error());
+}
 
 TEST_CASE(read_after_aborted_blocking_read)
 {
@@ -41,6 +74,11 @@ TEST_CASE(read_after_aborted_blocking_read)
 
     // Start a thread to read the frames in parallel and check the errors returned.
     IGNORE_USE_IN_ESCAPING_LAMBDA Atomic<bool> got_aborted { false };
+    IGNORE_USE_IN_ESCAPING_LAMBDA Atomic<bool> read_blocked { false };
+
+    demuxer->set_read_blocked_change_handler_for_track(track, [&](Media::ReadBlocked blocked) {
+        read_blocked = blocked == Media::ReadBlocked::Yes;
+    });
 
     auto reader_thread = Threading::Thread::construct("TestReader"sv, [&]() -> intptr_t {
         // Read frames until a read blocks and is aborted.
@@ -75,7 +113,7 @@ TEST_CASE(read_after_aborted_blocking_read)
     reader_thread->start();
 
     // Wait for the reader thread to block on a read.
-    while (!demuxer->is_read_blocked_for_track(track)) { }
+    while (!read_blocked.load()) { }
 
     // Abort the blocked read from the main thread.
     demuxer->set_blocking_reads_aborted_for_track(track);

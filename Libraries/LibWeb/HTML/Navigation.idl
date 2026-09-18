@@ -4,17 +4,18 @@ interface Navigation : EventTarget {
     sequence<NavigationHistoryEntry> entries();
     readonly attribute NavigationHistoryEntry? currentEntry;
     undefined updateCurrentEntry(NavigationUpdateCurrentEntryOptions options);
-    readonly attribute NavigationTransition? transition;
+    [DirectGetter] readonly attribute NavigationTransition? transition;
+    [DirectGetter] readonly attribute NavigationActivation? activation;
 
     readonly attribute boolean canGoBack;
     readonly attribute boolean canGoForward;
 
-    NavigationResult navigate(USVString url, optional NavigationNavigateOptions options = {});
-    NavigationResult reload(optional NavigationReloadOptions options = {});
+    [NeedsCallerRealm] NavigationResult navigate(USVString url, optional NavigationNavigateOptions options = {});
+    [NeedsCallerRealm] NavigationResult reload(optional NavigationReloadOptions options = {});
 
-    NavigationResult traverseTo(DOMString key, optional NavigationOptions options = {});
-    NavigationResult back(optional NavigationOptions options = {});
-    NavigationResult forward(optional NavigationOptions options = {});
+    [NeedsCallerRealm] NavigationResult traverseTo(DOMString key, optional NavigationOptions options = {});
+    [NeedsCallerRealm] NavigationResult back(optional NavigationOptions options = {});
+    [NeedsCallerRealm] NavigationResult forward(optional NavigationOptions options = {});
 
     attribute EventHandler onnavigate;
     attribute EventHandler onnavigatesuccess;

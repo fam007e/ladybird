@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2026, the Ladybird developers.
+ * Copyright (c) 2026-present, the Ladybird developers.
  *
  * SPDX-License-Identifier: BSD-2-Clause
  */
@@ -18,8 +18,10 @@
 
 namespace URL::RustIntegration {
 
-Optional<URL> parse_basic_url(StringView input, Optional<URL const&> base_url = {}, URL* url = nullptr, Optional<Parser::State> state_override = {}, Optional<StringView> encoding = {});
 Optional<Host> parse_host(StringView input, bool is_opaque = false);
+Optional<Host> parse_host(Utf16View input, bool is_opaque = false);
+Optional<Host> host_from_ffi(FFI::FfiUrlHost const&);
+FFI::RustUrlInput rust_url_input(Utf16View);
 
 class URLPattern {
 public:

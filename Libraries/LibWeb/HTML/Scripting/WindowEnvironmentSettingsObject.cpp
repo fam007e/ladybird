@@ -4,10 +4,16 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <LibGC/Heap.h>
 #include <LibWeb/Bindings/Intrinsics.h>
 #include <LibWeb/Bindings/PrincipalHostDefined.h>
+#include <LibWeb/Bindings/Wrappable.h>
 #include <LibWeb/DOM/Document.h>
+#include <LibWeb/HTML/BrowsingContext.h>
+#include <LibWeb/HTML/BrowsingContextGroup.h>
+#include <LibWeb/HTML/CrossOrigin/OpenerPolicy.h>
 #include <LibWeb/HTML/LocalNavigable.h>
+#include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/Scripting/WindowEnvironmentSettingsObject.h>
 #include <LibWeb/HTML/Window.h>
 
@@ -19,6 +25,7 @@ WindowEnvironmentSettingsObject::WindowEnvironmentSettingsObject(Window& window,
     : EnvironmentSettingsObject(move(execution_context))
     , m_window(window)
 {
+    m_window->set_environment_settings_object({}, *this);
 }
 
 WindowEnvironmentSettingsObject::~WindowEnvironmentSettingsObject() = default;
@@ -37,11 +44,12 @@ void WindowEnvironmentSettingsObject::setup(Page& page, URL::URL const& creation
     VERIFY(realm);
 
     // 2. Let window be realm's global object.
-    auto& window = as<HTML::Window>(realm->global_object());
+    auto* window = window_from_global_object(realm->global_object());
+    VERIFY(window);
 
     // 3. Let settings object be a new environment settings object whose algorithms are defined as follows:
     // NOTE: See the functions defined for this class.
-    auto settings_object = realm->create<WindowEnvironmentSettingsObject>(window, move(execution_context));
+    auto settings_object = realm->create<WindowEnvironmentSettingsObject>(*window, move(execution_context));
 
     // 4. If reservedEnvironment is non-null, then:
     if (reserved_environment) {
@@ -52,7 +60,7 @@ void WindowEnvironmentSettingsObject::setup(Page& page, URL::URL const& creation
         settings_object->target_browsing_context = reserved_environment->target_browsing_context;
 
         // 2. Set reservedEnvironment's id to the empty string.
-        reserved_environment->id = String {};
+        reserved_environment->id = Utf16String {};
     }
 
     // 5. Otherwise, ...
@@ -61,7 +69,7 @@ void WindowEnvironmentSettingsObject::setup(Page& page, URL::URL const& creation
         //        settings object's target browsing context to null,
         //        and settings object's active service worker to null.
         static i64 next_id = 1;
-        settings_object->id = String::number(next_id++);
+        settings_object->id = Utf16String::number(next_id++);
         settings_object->target_browsing_context = nullptr;
     }
 
@@ -75,12 +83,12 @@ void WindowEnvironmentSettingsObject::setup(Page& page, URL::URL const& creation
     // 7. Set realm's [[HostDefined]] field to settings object.
     // Non-Standard: We store the ESO next to the web intrinsics in a custom HostDefined object
     auto intrinsics = realm->create<Bindings::Intrinsics>(*realm);
-    auto host_defined = make<Bindings::PrincipalHostDefined>(settings_object, intrinsics, page);
-    realm->set_host_defined(move(host_defined));
+    realm->set_host_defined(Bindings::create_principal_host_defined(settings_object, intrinsics, page));
+    Bindings::cache_global_object_wrapper(*realm);
 
     // Non-Standard: We cannot fully initialize window object until *after* the we set up
     //    the realm's [[HostDefined]] internal slot as the internal slot contains the web platform intrinsics
-    MUST(window.initialize_web_interfaces({}));
+    MUST(Bindings::initialize_window_web_interfaces(*window));
 }
 
 // https://html.spec.whatwg.org/multipage/window-object.html#script-settings-for-window-objects:responsible-document
@@ -108,18 +116,17 @@ URL::Origin WindowEnvironmentSettingsObject::origin() const
 bool WindowEnvironmentSettingsObject::has_cross_site_ancestor() const
 {
     // 1. If window's navigable's parent is null, then return false.
-    if (m_window->navigable()->parent() == nullptr)
+    auto parent = m_window->navigable()->parent();
+    if (!parent)
         return false;
 
     // 2. Let parentDocument be window's navigable's parent's active document.
-    auto parent_document = as<LocalNavigable>(*m_window->navigable()->parent()).active_document();
-
     // 3. If parentDocument's relevant settings object's has cross-site ancestor is true, then return true.
-    if (parent_document->relevant_settings_object().has_cross_site_ancestor())
+    if (parent->active_document_has_cross_site_ancestor())
         return true;
 
     // 4. If parentDocument's origin is not same site with window's associated Document's origin, then return true.
-    if (!parent_document->origin().is_same_site(m_window->associated_document().origin()))
+    if (!parent->active_document_origin()->is_same_site(m_window->associated_document().origin()))
         return true;
 
     // 5. Return false.
@@ -146,7 +153,26 @@ CanUseCrossOriginIsolatedAPIs WindowEnvironmentSettingsObject::cross_origin_isol
     // FIXME: Return true if both of the following hold, and false otherwise:
     //          1. realm's agent cluster's cross-origin-isolation mode is "concrete", and
     //          2. window's associated Document is allowed to use the "cross-origin-isolated" feature.
+    // AD-HOC: Until we track an agent cluster's cross-origin-isolation mode (point 1) or the "cross-origin-isolated"
+    //         feature (point 2), we approximate this from the associated Document's cross-origin opener policy: It is
+    //         "same-origin-plus-COEP" exactly when the document was served (in a secure context) with COOP:same-origin
+    //         and COEP:require-corp — the condition for cross-origin isolation.
+    // NB: This can be called before the window's document is associated (e.g., via time coarsening during setup) — so,
+    //     we guard against a null document here.
+    auto document = m_window ? m_window->associated_document_if_any() : nullptr;
+    if (document && document->opener_policy().value == OpenerPolicyValue::SameOriginPlusCOEP)
+        return CanUseCrossOriginIsolatedAPIs::Yes;
     return CanUseCrossOriginIsolatedAPIs::No;
+}
+
+Optional<u64> WindowEnvironmentSettingsObject::agent_cluster_id() const
+{
+    // The document names its cluster through its browsing context's group. A window whose document has no browsing
+    // context anymore is in no cluster anything can reach.
+    auto document = m_window ? m_window->associated_document_if_any() : nullptr;
+    if (!document || !document->browsing_context() || !document->browsing_context()->group())
+        return {};
+    return document->browsing_context()->group()->agent_cluster_id(document->origin(), cross_origin_isolated_capability());
 }
 
 }

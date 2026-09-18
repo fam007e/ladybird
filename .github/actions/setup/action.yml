@@ -18,6 +18,10 @@ inputs:
     description: 'Whether the setup is for building or linting'
     required: false
     default: 'build'
+  build_preset:
+    description: 'When the setup is for building, set the build preset (e.g. Release)'
+    required: false
+    default: 'Release'
 outputs:
   ccache_path:
     description: 'Path to the ccache directory'
@@ -35,7 +39,6 @@ runs:
       run: |
         echo "LADYBIRD_SOURCE_DIR=${GITHUB_WORKSPACE}" >> "$GITHUB_ENV"
         echo "CCACHE_DIR=${GITHUB_WORKSPACE}/.ccache" >> "$GITHUB_ENV"
-        echo "VCPKG_ROOT=${GITHUB_WORKSPACE}/Build/vcpkg" >> "$GITHUB_ENV"
         echo "ccache_path=${GITHUB_WORKSPACE}/.ccache" >> "$GITHUB_OUTPUT"
         echo "vcpkg_cache_path=${GITHUB_WORKSPACE}/Build/caches/vcpkg-binary-cache" >> "$GITHUB_OUTPUT"
         echo "GIT_CONFIG_GLOBAL=${RUNNER_TEMP}/gitconfig" >> "$GITHUB_ENV"
@@ -43,7 +46,7 @@ runs:
         mkdir -p "${RUNNER_TEMP}/pip-cache"
         echo "PIP_CACHE_DIR=${RUNNER_TEMP}/pip-cache" >> "$GITHUB_ENV"
 
-    - uses: actions/setup-python@v6
+    - uses: actions/setup-python@v7
       if: ${{ inputs.os != 'Linux' }}
       with:
         python-version: 3.12
@@ -64,9 +67,9 @@ runs:
         python3 -m pip install --upgrade pip
 
         if ${{ inputs.type == 'build' }} ; then
-          pip3 install pyyaml requests six
+          pip3 install pyyaml requests six cryptography
         else
-          pip3 install pyright ruff
+          python3 "${GITHUB_WORKSPACE}/Meta/Linters/run.py"
         fi
 
     - name: Ensure clang-cl is available
@@ -87,7 +90,7 @@ runs:
       if: ${{ inputs.os == 'macOS' || inputs.os == 'Android' }}
       uses: maxim-lobanov/setup-xcode@v1
       with:
-        xcode-version: 26.2
+        xcode-version: '26.6'
 
     - name: 'Install Dependencies'
       if: ${{ inputs.os == 'macOS' || inputs.os == 'Android' }}
@@ -117,7 +120,23 @@ runs:
     - name: 'Warm up the Rust toolchain'
       if: ${{ inputs.os == 'macOS' || inputs.os == 'Android' }}
       shell: bash
-      run: rustup toolchain install
+      run: |
+        if rustup toolchain install ; then
+          exit 0
+        fi
+
+        # Some Blacksmith runner images boot with a partially installed toolchain whose files rustup does not know
+        # about. It cannot repair that on its own and fails with a "detected conflict" error, so wipe the toolchain and
+        # retry.
+        CHANNEL=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' "${{ github.workspace }}/rust-toolchain.toml")
+        if [ -z "${CHANNEL}" ]; then
+          echo "Could not determine the pinned Rust channel" >&2
+          exit 1
+        fi
+
+        echo "Reinstalling Rust toolchain ${CHANNEL} from scratch"
+        rustup toolchain uninstall "${CHANNEL}" || rm -rf "$(rustup show home)/toolchains/${CHANNEL}"-*
+        rustup toolchain install
 
     - name: 'Resolve wasm-tools release'
       id: 'wasm-tools'
@@ -189,4 +208,4 @@ runs:
     - name: 'Install vcpkg'
       if: ${{ inputs.type == 'build' }}
       shell: bash
-      run: ./Meta/Utils/build_vcpkg.py
+      run: ./Meta/ladybird.py vcpkg --preset "${{ inputs.build_preset }}"

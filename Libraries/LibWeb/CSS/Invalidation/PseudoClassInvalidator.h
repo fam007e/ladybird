@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2026-present, the Ladybird developers
+ * Copyright (c) 2026-present, the Ladybird developers.
  *
  * SPDX-License-Identifier: BSD-2-Clause
  */
@@ -13,5 +13,7 @@
 namespace Web::CSS::Invalidation {
 
 void invalidate_style_after_pseudo_class_state_change(CSS::PseudoClass, GC::Ptr<DOM::Node> old_state, GC::Ptr<DOM::Node> new_state);
+void invalidate_style_after_subtree_place_changed(DOM::Node& subtree, GC::Ptr<DOM::Node> old_parent);
+bool descendants_hold_a_propagating_state_source(DOM::Node&);
 
 }

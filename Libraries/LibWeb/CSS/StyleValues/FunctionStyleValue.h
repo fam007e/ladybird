@@ -6,39 +6,37 @@
 
 #pragma once
 
+#include <AK/Utf16FlyString.h>
 #include <LibWeb/CSS/StyleValues/StyleValue.h>
 
 namespace Web::CSS {
 
 class FunctionStyleValue : public StyleValueWithDefaultOperators<FunctionStyleValue> {
 public:
-    static NonnullRefPtr<FunctionStyleValue> create(FlyString name, NonnullRefPtr<StyleValue const> value)
+    static NonnullRefPtr<FunctionStyleValue> create(Utf16FlyString name, NonnullRefPtr<StyleValue const> value)
     {
         return adopt_ref(*new FunctionStyleValue(move(name), move(value)));
     }
 
-    FlyString const& name() const { return m_name; }
-    NonnullRefPtr<StyleValue const> const& value() const { return m_value; }
+    Utf16FlyString name() const { return css_string_from_rust(&m_value->function.name); }
+    ValueComparingNonnullRefPtr<StyleValue const> value() const { return wrap_rust_child(m_value->function.value); }
 
-    virtual ValueComparingNonnullRefPtr<StyleValue const> absolutized(ComputationContext const&) const override;
-    virtual void serialize(StringBuilder&, SerializationMode) const override;
-
-    bool properties_equal(FunctionStyleValue const& other) const { return m_name == other.m_name && m_value == other.m_value; }
-
-    virtual bool is_computationally_independent() const override { return m_value->is_computationally_independent(); }
+    ValueComparingNonnullRefPtr<StyleValue const> absolutized(ComputationContext const&) const;
 
 private:
-    FunctionStyleValue(FlyString name, NonnullRefPtr<StyleValue const> value)
-        : StyleValueWithDefaultOperators(Type::Function)
-        , m_name(move(name))
-        , m_value(move(value))
+    friend class StyleValue;
+
+    explicit FunctionStyleValue(StyleValueFFI::StyleValueData const* data)
+        : StyleValueWithDefaultOperators(Type::Function, data)
+    {
+    }
+
+    FunctionStyleValue(Utf16FlyString name, NonnullRefPtr<StyleValue const> value)
+        : StyleValueWithDefaultOperators(Type::Function, StyleValueFFI::rust_style_value_create_function(name.to_raw_leaked(), StyleValueFFI::rust_style_value_retain(value->rust_style_value_data())))
     {
     }
 
     virtual ~FunctionStyleValue() override = default;
-
-    FlyString m_name;
-    ValueComparingNonnullRefPtr<StyleValue const> m_value;
 };
 
 }

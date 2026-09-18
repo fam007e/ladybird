@@ -27,6 +27,7 @@ public:
     ~DevToolsServer();
 
     RefPtr<Connection>& connection() { return m_connection; }
+    bool has_active_connection() const { return m_connection; }
     DevToolsDelegate const& delegate() const { return m_delegate; }
     ActorRegistry const& actor_registry() const { return m_actor_registry; }
     Optional<u16> local_port() const;
@@ -59,6 +60,7 @@ private:
     void on_message_received(JsonObject);
 
     void close_connection();
+    void notify_actors_connection_closed();
 
     NonnullRefPtr<Core::TCPServer> m_server;
     RefPtr<Connection> m_connection;
@@ -70,6 +72,8 @@ private:
 
     u64 m_server_id { 0 };
     u64 m_actor_count { 0 };
+    bool m_did_notify_actors_connection_closed { false };
+    bool m_is_closing_connection { false };
     bool m_is_shutting_down { false };
 };
 

@@ -6,36 +6,38 @@
 
 #pragma once
 
+#include <AK/Utf16FlyString.h>
 #include <LibJS/Runtime/MapIterator.h>
 #include <LibWeb/Bindings/CSSFontFeatureValuesMap.h>
-#include <LibWeb/Bindings/PlatformObject.h>
+#include <LibWeb/Bindings/Wrappable.h>
+#include <LibWeb/CSS/RustFontFeatureValues.h>
 #include <LibWeb/Forward.h>
 
 namespace Web::CSS {
 
-class CSSFontFeatureValuesMap final : public Bindings::PlatformObject {
-    WEB_PLATFORM_OBJECT(CSSFontFeatureValuesMap, Bindings::PlatformObject);
+class CSSFontFeatureValuesMap final : public Bindings::GCAllocatedWrappable {
+    WEB_WRAPPABLE(CSSFontFeatureValuesMap, Bindings::GCAllocatedWrappable);
     GC_DECLARE_ALLOCATOR(CSSFontFeatureValuesMap);
 
 public:
-    static GC::Ref<CSSFontFeatureValuesMap> create(JS::Realm&, size_t max_value_count, GC::Ref<CSSFontFeatureValuesRule> parent_rule);
+    static GC::Ref<CSSFontFeatureValuesMap> create(FontFeatureValuesRuleKind, GC::Ref<CSSFontFeatureValuesRule> parent_rule);
 
-    GC::Ref<JS::Map> map_entries() { return m_map_entries; }
+    size_t map_size() const;
+    OrderedHashMap<Utf16String, Vector<u32>> entries() const;
+    Optional<Vector<u32>> map_get(Utf16View key) const;
+    bool map_has(Utf16View key) const;
+    void map_set(Utf16View key, Vector<u32> const& values);
+    bool map_remove(Utf16View key);
+    void map_clear();
 
-    WebIDL::ExceptionOr<void> set(String const& feature_value_name, Variant<u32, Vector<u32>> const& values);
-
-    void on_map_modified_from_js(Badge<Bindings::CSSFontFeatureValuesMapPrototype>);
-
-    OrderedHashMap<FlyString, Vector<u32>> to_ordered_hash_map() const;
+    size_t max_value_count() const;
 
 private:
-    CSSFontFeatureValuesMap(JS::Realm&, size_t max_value_count, GC::Ref<CSSFontFeatureValuesRule> parent_rule);
+    CSSFontFeatureValuesMap(FontFeatureValuesRuleKind, GC::Ref<CSSFontFeatureValuesRule> parent_rule);
 
-    virtual void initialize(JS::Realm&) override;
-    virtual void visit_edges(Cell::Visitor&) override;
+    virtual void visit_edges(GC::Cell::Visitor&) override;
 
-    GC::Ref<JS::Map> m_map_entries;
-    size_t m_max_value_count { 0 };
+    FontFeatureValuesRuleKind m_kind;
     GC::Ref<CSSFontFeatureValuesRule> m_parent_rule;
 };
 

@@ -6,12 +6,13 @@
 
 #include <AK/Assertions.h>
 #include <AK/ByteString.h>
+#include <AK/Mutex.h>
 #include <AK/Optional.h>
 #include <LibCore/MachPort.h>
 #include <LibCore/System.h>
 #include <LibIPC/MachBootstrapMessages.h>
 #include <LibIPC/TransportBootstrapMach.h>
-#include <LibSync/Mutex.h>
+#include <LibIPC/TransportMachPort.h>
 
 #include <mach/mach.h>
 
@@ -92,6 +93,10 @@ ErrorOr<TransportBootstrapMachPorts> TransportBootstrapMachServer::create_on_dem
     auto remote_receive_right = TRY(Core::MachPort::create_with_right(Core::MachPort::PortRight::Receive));
     auto remote_send_right = TRY(remote_receive_right.insert_right(Core::MachPort::MessageRight::MakeSend));
 
+    // Either peer may send messages before the other has constructed its transport.
+    TransportMachPort::raise_receive_queue_limit(local_receive_right);
+    TransportMachPort::raise_receive_queue_limit(remote_receive_right);
+
     send_transport_ports_to_child(move(reply_port), TransportBootstrapMachPorts {
                                                         .receive_right = move(remote_receive_right),
                                                         .send_right = move(local_send_right),
@@ -113,7 +118,7 @@ ErrorOr<TransportBootstrapMachServer::BootstrapRequestResult> TransportBootstrap
 {
     Optional<TransportBootstrapMachPorts> child_transport;
     {
-        Sync::MutexLocker locker(m_child_registration_mutex);
+        MutexLocker locker(m_child_registration_mutex);
         child_transport = m_child_transports.take(pid);
     }
 

@@ -8,15 +8,17 @@
 
 #include "ColorFunctionStyleValue.h"
 #include <AK/Math.h>
-#include <AK/TypeCasts.h>
 #include <LibGfx/ColorConversion.h>
-#include <LibWeb/CSS/Serialize.h>
-#include <LibWeb/CSS/StyleValues/CalculatedStyleValue.h>
 #include <LibWeb/CSS/StyleValues/KeywordStyleValue.h>
 #include <LibWeb/CSS/StyleValues/NumberStyleValue.h>
 #include <LibWeb/CSS/StyleValues/PercentageStyleValue.h>
 
 namespace Web::CSS {
+
+ColorFunctionStyleValue::ColorFunctionStyleValue(StyleValueFFI::StyleValueData const* data)
+    : ColorStyleValue(data)
+{
+}
 
 ValueComparingNonnullRefPtr<ColorFunctionStyleValue const> ColorFunctionStyleValue::create(
     ColorType color_type,
@@ -25,7 +27,7 @@ ValueComparingNonnullRefPtr<ColorFunctionStyleValue const> ColorFunctionStyleVal
     ValueComparingNonnullRefPtr<StyleValue const> c3,
     ValueComparingRefPtr<StyleValue const> alpha,
     ColorSyntax color_syntax,
-    Optional<FlyString> name,
+    Optional<Utf16FlyString> name,
     ValueComparingRefPtr<StyleValue const> origin_color)
 {
     auto const& descriptor = color_function_descriptor_for(color_type);
@@ -33,128 +35,6 @@ ValueComparingNonnullRefPtr<ColorFunctionStyleValue const> ColorFunctionStyleVal
 
     return adopt_ref(*new (nothrow) ColorFunctionStyleValue(
         color_type, move(c1), move(c2), move(c3), move(alpha), color_syntax, move(name), move(origin_color)));
-}
-
-namespace {
-
-struct ResolvedChannels {
-    double c1 { 0 };
-    double c2 { 0 };
-    double c3 { 0 };
-    double alpha { 0 };
-};
-
-Optional<ResolvedChannels> resolve_channels_for(ColorFunctionDescriptor const& descriptor, Array<ValueComparingNonnullRefPtr<StyleValue const>, 3> const& channels, StyleValue const* alpha_style_value, CalculationResolutionContext const& calculation_resolution_context)
-{
-    Array<Optional<double>, 3> resolved_channels;
-    for (size_t i = 0; i < 3; ++i) {
-        auto const& channel_descriptor = descriptor.channels[i];
-        if (channel_descriptor.kind == ChannelKind::Hue)
-            resolved_channels[i] = ColorStyleValue::resolve_hue(*channels[i], calculation_resolution_context);
-        else
-            resolved_channels[i] = ColorStyleValue::resolve_with_reference_value(*channels[i], channel_descriptor.percent_reference, calculation_resolution_context);
-    }
-    auto resolved_alpha = alpha_style_value ? ColorStyleValue::resolve_alpha(*alpha_style_value, calculation_resolution_context) : Optional<double>(1.0);
-
-    if (!resolved_channels[0].has_value() || !resolved_channels[1].has_value() || !resolved_channels[2].has_value() || !resolved_alpha.has_value())
-        return {};
-
-    return ResolvedChannels { *resolved_channels[0], *resolved_channels[1], *resolved_channels[2], *resolved_alpha };
-}
-
-u8 clamp_to_byte(double value)
-{
-    if (isnan(value))
-        value = 0;
-    return static_cast<u8>(llround(clamp(value, 0.0, 255.0)));
-}
-
-u8 fraction_to_byte(double fraction_0_1)
-{
-    // Match CSS Color 4 "resolve to sRGB" rounding: round half away from zero,
-    // not the default round-half-to-even that cvtsd2si uses.
-    return static_cast<u8>(llround(clamp(fraction_0_1 * 255.0, 0.0, 255.0)));
-}
-
-}
-
-Optional<Color> ColorFunctionStyleValue::to_color(ColorResolutionContext color_resolution_context) const
-{
-    Optional<CalculationResolutionContext> relative_resolution_context;
-    RefPtr<StyleValue const> default_relative_alpha;
-    if (m_origin_color) {
-        auto relative_color = extract_channels_in_color_space(*m_origin_color, *color_type(), color_resolution_context);
-        if (!relative_color.has_value())
-            return {};
-        relative_resolution_context = color_resolution_context.calculation_resolution_context;
-        relative_resolution_context->relative_color = move(relative_color);
-        // https://drafts.csswg.org/css-color-5/#rcs-intro
-        // If the alpha value of the relative color is omitted, it defaults to that of the origin color (rather than
-        // defaulting to 100%, as it does in the absolute syntax).
-        if (!m_alpha)
-            default_relative_alpha = KeywordStyleValue::create(Keyword::Alpha);
-    }
-    auto const& calculation_resolution_context = relative_resolution_context.has_value() ? *relative_resolution_context : color_resolution_context.calculation_resolution_context;
-
-    auto resolved = resolve_channels_for(descriptor(), m_channels, m_alpha ? m_alpha.ptr() : default_relative_alpha.ptr(), calculation_resolution_context);
-    if (!resolved.has_value())
-        return {};
-
-    auto [c1, c2, c3, alpha] = *resolved;
-
-    switch (*color_type()) {
-    case ColorType::RGB:
-        return Color(clamp_to_byte(c1), clamp_to_byte(c2), clamp_to_byte(c3), fraction_to_byte(alpha));
-    case ColorType::HSL:
-        return Color::from_hsla(c1, c2 / 100.0f, c3 / 100.0f, alpha);
-    case ColorType::HWB: {
-        auto whiteness = static_cast<float>(clamp(c2, 0.0, 100.0) / 100.0);
-        auto blackness = static_cast<float>(clamp(c3, 0.0, 100.0) / 100.0);
-        if (whiteness + blackness >= 1.0f) {
-            u8 gray = fraction_to_byte(whiteness / (whiteness + blackness));
-            return Color(gray, gray, gray, fraction_to_byte(alpha));
-        }
-        auto value = 1.0f - blackness;
-        auto saturation = 1.0f - (whiteness / value);
-        return Color::from_hsv(c1, saturation, value).with_opacity(alpha);
-    }
-    case ColorType::Lab:
-        return Color::from_lab(clamp(c1, 0.0, 100.0), c2, c3, alpha);
-    case ColorType::OKLab:
-        return Color::from_oklab(clamp(c1, 0.0, 1.0), c2, c3, alpha);
-    case ColorType::LCH: {
-        auto l = clamp(c1, 0.0, 100.0);
-        auto hue_radians = AK::to_radians(c3);
-        return Color::from_lab(l, c2 * cos(hue_radians), c2 * sin(hue_radians), alpha);
-    }
-    case ColorType::OKLCH: {
-        auto l = clamp(c1, 0.0, 1.0);
-        auto chroma = max(c2, 0.0);
-        auto hue_radians = AK::to_radians(c3);
-        return Color::from_oklab(l, chroma * cos(hue_radians), chroma * sin(hue_radians), alpha);
-    }
-    case ColorType::A98RGB:
-        return Color::from_a98rgb(c1, c2, c3, alpha);
-    case ColorType::DisplayP3:
-        return Color::from_display_p3(c1, c2, c3, alpha);
-    case ColorType::DisplayP3Linear:
-        return Color::from_linear_display_p3(c1, c2, c3, alpha);
-    case ColorType::sRGB: {
-        auto to_u8 = [](double v) -> u8 { return round_to<u8>(clamp(255.0 * v, 0.0, 255.0)); };
-        return Color(to_u8(c1), to_u8(c2), to_u8(c3), to_u8(alpha));
-    }
-    case ColorType::sRGBLinear:
-        return Color::from_linear_srgb(c1, c2, c3, alpha);
-    case ColorType::ProPhotoRGB:
-        return Color::from_pro_photo_rgb(c1, c2, c3, alpha);
-    case ColorType::Rec2020:
-        return Color::from_rec2020(c1, c2, c3, alpha);
-    case ColorType::XYZD50:
-        return Color::from_xyz50(c1, c2, c3, alpha);
-    case ColorType::XYZD65:
-        return Color::from_xyz65(c1, c2, c3, alpha);
-    }
-    VERIFY_NOT_REACHED();
 }
 
 namespace {
@@ -230,11 +110,11 @@ ValueComparingNonnullRefPtr<StyleValue const> hwb_to_absolutized_rgb(double hue_
 // https://drafts.csswg.org/css-color-5/#resolving-rcs
 ValueComparingRefPtr<StyleValue const> ColorFunctionStyleValue::resolve_relative_form(ColorResolutionContext const& color_resolution_context) const
 {
-    VERIFY(m_origin_color);
+    VERIFY(origin_color());
     VERIFY(color_type().has_value());
 
     auto target_color_type = *color_type();
-    auto relative_color = extract_channels_in_color_space(*m_origin_color, target_color_type, color_resolution_context);
+    auto relative_color = extract_channels_in_color_space(*origin_color(), target_color_type, color_resolution_context);
     if (!relative_color.has_value())
         return nullptr;
 
@@ -244,8 +124,8 @@ ValueComparingRefPtr<StyleValue const> ColorFunctionStyleValue::resolve_relative
     auto const& descriptor = this->descriptor();
 
     auto resolve_channel = [&](size_t index) -> ValueComparingNonnullRefPtr<StyleValue const> {
-        auto const& value = *m_channels[index];
-        if (value.to_keyword() == Keyword::None)
+        auto value = channel(index);
+        if (value->to_keyword() == Keyword::None)
             return KeywordStyleValue::create(Keyword::None);
         auto const& channel_descriptor = descriptor.channels[index];
         auto resolved = channel_descriptor.kind == ChannelKind::Hue
@@ -258,7 +138,7 @@ ValueComparingRefPtr<StyleValue const> ColorFunctionStyleValue::resolve_relative
         // https://drafts.csswg.org/css-color-5/#rcs-intro
         // If the alpha value of the relative color is omitted, it defaults to that of the origin color (rather than
         // defaulting to 100%, as it does in the absolute syntax).
-        NonnullRefPtr<StyleValue const> effective_alpha = m_alpha ? *m_alpha : KeywordStyleValue::create(Keyword::Alpha);
+        NonnullRefPtr<StyleValue const> effective_alpha = alpha() ? *alpha() : KeywordStyleValue::create(Keyword::Alpha);
         if (effective_alpha->to_keyword() == Keyword::None)
             return KeywordStyleValue::create(Keyword::None);
         auto resolved = resolve_alpha(*effective_alpha, calculation_resolution_context);
@@ -277,7 +157,7 @@ ValueComparingRefPtr<StyleValue const> ColorFunctionStyleValue::resolve_relative
 // https://drafts.csswg.org/css-color-4/#resolving-sRGB-values
 ValueComparingNonnullRefPtr<StyleValue const> ColorFunctionStyleValue::computed_value_form() const
 {
-    VERIFY(!m_origin_color);
+    VERIFY(!origin_color());
     auto color_type = *this->color_type();
     if (color_type != ColorType::RGB && color_type != ColorType::HSL && color_type != ColorType::HWB)
         return *this;
@@ -287,11 +167,11 @@ ValueComparingNonnullRefPtr<StyleValue const> ColorFunctionStyleValue::computed_
     };
 
     ValueComparingNonnullRefPtr<StyleValue const> alpha_value = [&]() -> ValueComparingNonnullRefPtr<StyleValue const> {
-        if (!m_alpha)
+        if (!alpha())
             return NumberStyleValue::create(1);
-        if (m_alpha->to_keyword() == Keyword::None)
+        if (alpha()->to_keyword() == Keyword::None)
             return KeywordStyleValue::create(Keyword::None);
-        return NumberStyleValue::create(number_or_zero(*m_alpha));
+        return NumberStyleValue::create(number_or_zero(*alpha()));
     }();
 
     if (color_type == ColorType::RGB) {
@@ -301,14 +181,14 @@ ValueComparingNonnullRefPtr<StyleValue const> ColorFunctionStyleValue::computed_
             return NumberStyleValue::create(value.as_number().number() / 255.0);
         };
         return create(ColorType::sRGB,
-            to_fraction(m_channels[0]), to_fraction(m_channels[1]), to_fraction(m_channels[2]),
+            to_fraction(channels()[0]), to_fraction(channels()[1]), to_fraction(channels()[2]),
             move(alpha_value), ColorSyntax::Modern);
     }
 
     Gfx::ColorComponents const native_channels {
-        static_cast<float>(number_or_zero(m_channels[0])),
-        static_cast<float>(number_or_zero(m_channels[1]) / 100.0),
-        static_cast<float>(number_or_zero(m_channels[2]) / 100.0),
+        static_cast<float>(number_or_zero(channels()[0])),
+        static_cast<float>(number_or_zero(channels()[1]) / 100.0),
+        static_cast<float>(number_or_zero(channels()[2]) / 100.0),
         1.0f
     };
     auto srgb = color_type == ColorType::HSL ? Gfx::hsl_to_srgb(native_channels) : Gfx::hwb_to_srgb(native_channels);
@@ -321,20 +201,20 @@ ValueComparingNonnullRefPtr<StyleValue const> ColorFunctionStyleValue::computed_
 
 ValueComparingNonnullRefPtr<StyleValue const> ColorFunctionStyleValue::absolutized(ComputationContext const& context) const
 {
-    auto absolutized_c1 = m_channels[0]->absolutized(context);
-    auto absolutized_c2 = m_channels[1]->absolutized(context);
-    auto absolutized_c3 = m_channels[2]->absolutized(context);
-    ValueComparingRefPtr<StyleValue const> absolutized_alpha = m_alpha ? ValueComparingRefPtr<StyleValue const>(m_alpha->absolutized(context)) : nullptr;
+    auto absolutized_c1 = channels()[0]->absolutized(context);
+    auto absolutized_c2 = channels()[1]->absolutized(context);
+    auto absolutized_c3 = channels()[2]->absolutized(context);
+    ValueComparingRefPtr<StyleValue const> absolutized_alpha = alpha() ? ValueComparingRefPtr<StyleValue const>(alpha()->absolutized(context)) : nullptr;
 
     auto const& descriptor = this->descriptor();
 
     // https://drafts.csswg.org/css-color-5/#relative-color
-    if (m_origin_color) {
-        auto absolutized_origin = m_origin_color->absolutized(context);
-        if (absolutized_c1 == m_channels[0] && absolutized_c2 == m_channels[1] && absolutized_c3 == m_channels[2]
-            && absolutized_alpha == m_alpha && absolutized_origin == m_origin_color)
+    if (origin_color()) {
+        auto absolutized_origin = origin_color()->absolutized(context);
+        if (absolutized_c1 == channels()[0] && absolutized_c2 == channels()[1] && absolutized_c3 == channels()[2]
+            && absolutized_alpha == alpha() && absolutized_origin == origin_color())
             return *this;
-        return create(*color_type(), move(absolutized_c1), move(absolutized_c2), move(absolutized_c3), move(absolutized_alpha), color_syntax(), m_name, move(absolutized_origin));
+        return create(*color_type(), move(absolutized_c1), move(absolutized_c2), move(absolutized_c3), move(absolutized_alpha), color_syntax(), name(), move(absolutized_origin));
     }
 
     if (descriptor.absolutizes_to_rgb == AbsolutizesToRgb::Yes) {
@@ -354,152 +234,9 @@ ValueComparingNonnullRefPtr<StyleValue const> ColorFunctionStyleValue::absolutiz
         return hwb_to_absolutized_rgb(*c1, *c2, *c3, *alpha);
     }
 
-    if (absolutized_c1 == m_channels[0] && absolutized_c2 == m_channels[1] && absolutized_c3 == m_channels[2] && absolutized_alpha == m_alpha)
+    if (absolutized_c1 == channels()[0] && absolutized_c2 == channels()[1] && absolutized_c3 == channels()[2] && absolutized_alpha == alpha())
         return *this;
-    return create(*color_type(), move(absolutized_c1), move(absolutized_c2), move(absolutized_c3), move(absolutized_alpha), color_syntax(), m_name);
-}
-
-bool ColorFunctionStyleValue::equals(StyleValue const& other) const
-{
-    if (type() != other.type())
-        return false;
-    auto const& other_color = other.as_color();
-    if (color_type() != other_color.color_type())
-        return false;
-    auto const& other_color_function = as<ColorFunctionStyleValue>(other_color);
-    if (m_channels[0] != other_color_function.m_channels[0]
-        || m_channels[1] != other_color_function.m_channels[1]
-        || m_channels[2] != other_color_function.m_channels[2])
-        return false;
-    if (m_alpha != other_color_function.m_alpha)
-        return false;
-    if (m_origin_color != other_color_function.m_origin_color)
-        return false;
-    return m_name == other_color_function.m_name;
-}
-
-namespace {
-
-bool alpha_should_be_serialized(StyleValue const& alpha)
-{
-    if (alpha.is_number() && alpha.as_number().number() >= 1)
-        return false;
-    if (alpha.is_percentage() && alpha.as_percentage().percentage().as_fraction() >= 1)
-        return false;
-    return true;
-}
-
-}
-
-void ColorFunctionStyleValue::serialize(StringBuilder& builder, SerializationMode mode) const
-{
-    auto const& descriptor = this->descriptor();
-
-    // https://drafts.csswg.org/css-color-5/#serial-relative-color
-    if (m_origin_color) {
-        if (descriptor.serialization_behavior == SerializationBehavior::ColorFunction) {
-            builder.append("color(from "sv);
-            m_origin_color->serialize(builder, mode);
-            builder.appendff(" {} ", descriptor.function_name);
-        } else {
-            builder.appendff("{}(from ", descriptor.function_name);
-            m_origin_color->serialize(builder, mode);
-            builder.append(' ');
-        }
-        m_channels[0]->serialize(builder, mode);
-        builder.append(' ');
-        m_channels[1]->serialize(builder, mode);
-        builder.append(' ');
-        m_channels[2]->serialize(builder, mode);
-        if (m_alpha) {
-            builder.append(" / "sv);
-            m_alpha->serialize(builder, mode);
-        }
-        builder.append(')');
-        return;
-    }
-
-    if (descriptor.serialization_behavior == SerializationBehavior::SrgbLegacy || descriptor.serialization_behavior == SerializationBehavior::SrgbModern) {
-        if (mode != SerializationMode::ResolvedValue && m_name.has_value()) {
-            for (auto c : m_name->bytes_as_string_view())
-                builder.append(AK::to_ascii_lowercase(c));
-            return;
-        }
-        // sRGB-equivalent shortcut: serialize via Color::serialize_a_srgb_value when the color resolves cleanly.
-        if (auto color = to_color({}); color.has_value()) {
-            builder.append(color->serialize_a_srgb_value());
-            return;
-        }
-    }
-
-    // https://drafts.csswg.org/css-color-4/#serializing-color-function-values
-    if (descriptor.serialization_behavior == SerializationBehavior::ColorFunction) {
-        auto convert_percentage = [&](StyleValue const& value) -> ValueComparingNonnullRefPtr<StyleValue const> {
-            if (value.is_percentage())
-                return NumberStyleValue::create(value.as_percentage().raw_value() / 100);
-            if (mode == SerializationMode::ResolvedValue && value.is_calculated()) {
-                // FIXME: Figure out how to get the proper calculation resolution context here.
-                CalculationResolutionContext calculation_resolution_context {};
-                auto const& calculated = value.as_calculated();
-                if (calculated.resolves_to_percentage()) {
-                    if (auto resolved_percentage = calculated.resolve_percentage(calculation_resolution_context); resolved_percentage.has_value()) {
-                        auto resolved_number = resolved_percentage->value() / 100;
-                        if (!isfinite(resolved_number))
-                            resolved_number = 0;
-                        return NumberStyleValue::create(resolved_number);
-                    }
-                } else if (calculated.resolves_to_number()) {
-                    if (auto resolved_number = calculated.resolve_number(calculation_resolution_context); resolved_number.has_value())
-                        return NumberStyleValue::create(*resolved_number);
-                }
-            }
-            return value;
-        };
-
-        // An omitted alpha is treated as 1 and not serialized.
-        ValueComparingNonnullRefPtr<StyleValue const> alpha = m_alpha
-            ? convert_percentage(*m_alpha)
-            : NumberStyleValue::create(1);
-
-        bool const is_alpha_required = m_alpha && [&]() {
-            if (alpha->is_number())
-                return alpha->as_number().number() < 1;
-            return true;
-        }();
-
-        if (alpha->is_number() && alpha->as_number().number() < 0)
-            alpha = NumberStyleValue::create(0);
-
-        builder.appendff("color({} ", descriptor.function_name);
-        convert_percentage(*m_channels[0])->serialize(builder, mode);
-        builder.append(' ');
-        convert_percentage(*m_channels[1])->serialize(builder, mode);
-        builder.append(' ');
-        convert_percentage(*m_channels[2])->serialize(builder, mode);
-        if (is_alpha_required) {
-            builder.append(" / "sv);
-            alpha->serialize(builder, mode);
-        }
-        builder.append(')');
-        return;
-    }
-
-    builder.append(descriptor.function_name);
-    builder.append('(');
-    for (size_t i = 0; i < 3; ++i) {
-        if (i > 0)
-            builder.append(' ');
-        auto const& channel_descriptor = descriptor.channels[i];
-        if (channel_descriptor.kind == ChannelKind::Hue)
-            serialize_hue_component(builder, mode, m_channels[i]);
-        else
-            serialize_color_component(builder, mode, m_channels[i], channel_descriptor.percent_reference, channel_descriptor.serialize_clamp_min, channel_descriptor.serialize_clamp_max);
-    }
-    if (m_alpha && alpha_should_be_serialized(*m_alpha)) {
-        builder.append(" / "sv);
-        serialize_alpha_component(builder, mode, *m_alpha);
-    }
-    builder.append(')');
+    return create(*color_type(), move(absolutized_c1), move(absolutized_c2), move(absolutized_c3), move(absolutized_alpha), color_syntax(), name());
 }
 
 }

@@ -4,19 +4,19 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibJS/Runtime/VM.h>
-#include <LibWeb/Bindings/MainThreadVM.h>
+#include <LibGC/Heap.h>
 #include <LibWeb/HTML/WorkerAgentTypes.h>
 #include <WebWorker/ConnectionFromClient.h>
 #include <WebWorker/PageHost.h>
+#include <WebWorker/WebWorkerCompositorHost.h>
 
 namespace WebWorker {
 
 GC_DEFINE_ALLOCATOR(PageHost);
 
-GC::Ref<PageHost> PageHost::create(JS::VM& vm, ConnectionFromClient& client)
+GC::Ref<PageHost> PageHost::create(ConnectionFromClient& client)
 {
-    return vm.heap().allocate<PageHost>(client);
+    return GC::Heap::the().allocate<PageHost>(client);
 }
 
 PageHost::~PageHost() = default;
@@ -103,7 +103,7 @@ bool PageHost::page_did_is_known_hsts_host(String const& domain)
     return m_client.did_is_known_hsts_host(domain);
 }
 
-void PageHost::page_did_report_worker_exception(String const& message, String const& filename, u32 lineno, u32 colno)
+void PageHost::page_did_report_worker_exception(Utf16String const& message, Utf16String const& filename, u32 lineno, u32 colno)
 {
     m_client.async_did_report_worker_exception(message, filename, lineno, colno);
 }
@@ -118,6 +118,21 @@ void PageHost::request_file(Web::FileRequest request)
     m_client.request_file(move(request));
 }
 
+URL::BlobURLEntry::Token PageHost::page_did_add_blob_url_entry(Utf16String const& url, Web::FileAPI::SerializedBlobURLEntry const& entry)
+{
+    return m_client.did_add_blob_url_entry(url, entry);
+}
+
+void PageHost::page_did_remove_blob_url_entries(Vector<Utf16String> const& urls, URL::Origin const& origin)
+{
+    m_client.did_remove_blob_url_entries(urls, origin);
+}
+
+Optional<Web::FileAPI::SerializedBlobURLEntry> PageHost::page_did_request_blob_url_entry(Utf16String const& url, Optional<URL::BlobURLEntry::Token> token)
+{
+    return m_client.did_request_blob_url_entry(url, token);
+}
+
 Web::HTML::WorkerAgentId PageHost::start_worker_agent(Web::HTML::WorkerAgentStartRequest&& request)
 {
     return m_client.start_worker_agent(move(request));
@@ -126,6 +141,18 @@ Web::HTML::WorkerAgentId PageHost::start_worker_agent(Web::HTML::WorkerAgentStar
 void PageHost::close_worker_agent(Web::HTML::WorkerAgentId agent_id, Web::HTML::WorkerAgentOwnerToken owner_token)
 {
     m_client.async_close_worker_agent(agent_id, owner_token);
+}
+
+void PageHost::ensure_compositor_host()
+{
+    if (m_compositor_host)
+        return;
+    m_compositor_host = create_web_worker_compositor_host(m_client);
+}
+
+void PageHost::compositor_process_lost()
+{
+    page().notify_all_webgl_contexts_lost();
 }
 
 void PageHost::did_finish_loading_worker_script(bool worker_is_secure_context)
@@ -140,7 +167,7 @@ void PageHost::did_fail_loading_worker_script()
 
 PageHost::PageHost(ConnectionFromClient& client)
     : m_client(client)
-    , m_page(Web::Page::create(Web::Bindings::main_thread_vm(), *this))
+    , m_page(Web::Page::create(*this))
 {
     setup_palette();
 }

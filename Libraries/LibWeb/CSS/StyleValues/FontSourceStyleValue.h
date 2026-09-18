@@ -6,7 +6,7 @@
 
 #pragma once
 
-#include <AK/FlyString.h>
+#include <AK/Utf16FlyString.h>
 #include <LibWeb/CSS/StyleValues/StyleValue.h>
 #include <LibWeb/CSS/URL.h>
 
@@ -19,28 +19,29 @@ public:
     };
     using Source = Variant<Local, URL>;
 
-    static ValueComparingNonnullRefPtr<FontSourceStyleValue const> create(Source source, Optional<FlyString> format, Vector<FontTech> tech)
-    {
-        return adopt_ref(*new (nothrow) FontSourceStyleValue(move(source), move(format), move(tech)));
-    }
     virtual ~FontSourceStyleValue() override;
 
-    Source const& source() const { return m_source; }
-    Optional<FlyString> const& format() const { return m_format; }
-    Vector<FontTech> const& tech() const { return m_tech; }
-
-    virtual void serialize(StringBuilder&, SerializationMode) const override;
-
-    bool properties_equal(FontSourceStyleValue const&) const;
-
-    virtual bool is_computationally_independent() const override { return true; }
+    Source source() const;
+    Optional<Utf16FlyString> format() const
+    {
+        if (!m_value->font_source.has_format)
+            return {};
+        return css_string_from_rust(&m_value->font_source.format);
+    }
+    Vector<FontTech> tech() const
+    {
+        auto const& list = m_value->font_source.tech;
+        Vector<FontTech> tech;
+        tech.ensure_capacity(list.length);
+        for (size_t i = 0; i < list.length; ++i)
+            tech.unchecked_append(static_cast<FontTech>(list.pointer[i]));
+        return tech;
+    }
 
 private:
-    FontSourceStyleValue(Source source, Optional<FlyString> format, Vector<FontTech> tech);
+    friend class StyleValue;
 
-    Source m_source;
-    Optional<FlyString> m_format;
-    Vector<FontTech> m_tech;
+    explicit FontSourceStyleValue(StyleValueFFI::StyleValueData const*);
 };
 
 }

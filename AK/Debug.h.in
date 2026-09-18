@@ -62,6 +62,10 @@
 #    cmakedefine01 DEVTOOLS_DEBUG
 #endif
 
+#ifndef DISPLAY_LIST_RUNS_DEBUG
+#    cmakedefine01 DISPLAY_LIST_RUNS_DEBUG
+#endif
+
 #ifndef DNS_DEBUG
 #    cmakedefine01 DNS_DEBUG
 #endif
@@ -134,6 +138,14 @@
 #    cmakedefine01 IMAGE_LOADER_DEBUG
 #endif
 
+#ifndef ISOBMFF_DEBUG
+#    cmakedefine01 ISOBMFF_DEBUG
+#endif
+
+#ifndef ISOBMFF_TRACE_DEBUG
+#    cmakedefine01 ISOBMFF_TRACE_DEBUG
+#endif
+
 #ifndef JS_MODULE_DEBUG
 #    cmakedefine01 JS_MODULE_DEBUG
 #endif
@@ -202,6 +214,10 @@
 #    cmakedefine01 REGEX_DEBUG
 #endif
 
+#ifndef RENDERING_SCHEDULER_DEBUG
+#    cmakedefine01 RENDERING_SCHEDULER_DEBUG
+#endif
+
 #ifndef REQUESTSERVER_DEBUG
 #    cmakedefine01 REQUESTSERVER_DEBUG
 #endif
@@ -214,16 +230,20 @@
 #    cmakedefine01 RESOURCE_DEBUG
 #endif
 
+#ifndef SHARED_QUEUE_DEBUG
+#    cmakedefine01 SHARED_QUEUE_DEBUG
+#endif
+
 #ifndef SPAM_DEBUG
 #    cmakedefine01 SPAM_DEBUG
 #endif
 
-#ifndef SYNTAX_HIGHLIGHTING_DEBUG
-#    cmakedefine01 SYNTAX_HIGHLIGHTING_DEBUG
+#ifndef STRUCTURED_SERIALIZE_DEBUG
+#    cmakedefine01 STRUCTURED_SERIALIZE_DEBUG
 #endif
 
-#ifndef STYLE_INVALIDATION_DEBUG
-#    cmakedefine01 STYLE_INVALIDATION_DEBUG
+#ifndef SYNTAX_HIGHLIGHTING_DEBUG
+#    cmakedefine01 SYNTAX_HIGHLIGHTING_DEBUG
 #endif
 
 #ifndef TEXTEDITOR_DEBUG
@@ -256,6 +276,10 @@
 
 #ifndef UTF8_DEBUG
 #    cmakedefine01 UTF8_DEBUG
+#endif
+
+#ifndef VIDEO_FRAME_POOL_DEBUG
+#    cmakedefine01 VIDEO_FRAME_POOL_DEBUG
 #endif
 
 #ifndef VULKAN_VALIDATION_LAYERS_DEBUG
@@ -292,6 +316,10 @@
 
 #ifndef WEBDRIVER_ROUTE_DEBUG
 #    cmakedefine01 WEBDRIVER_ROUTE_DEBUG
+#endif
+
+#ifndef VIDEO_PRESENTATION_CHANNEL_DEBUG
+#    cmakedefine01 VIDEO_PRESENTATION_CHANNEL_DEBUG
 #endif
 
 #ifndef WEBGL_CONTEXT_DEBUG

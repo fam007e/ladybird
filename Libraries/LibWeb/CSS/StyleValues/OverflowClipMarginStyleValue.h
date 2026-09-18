@@ -12,25 +12,30 @@
 
 namespace Web::CSS {
 
-class OverflowClipMarginStyleValue final : public StyleValueWithDefaultOperators<OverflowClipMarginStyleValue> {
+class WEB_API OverflowClipMarginStyleValue final : public StyleValueWithDefaultOperators<OverflowClipMarginStyleValue> {
 public:
     static ValueComparingNonnullRefPtr<OverflowClipMarginStyleValue const> create(Optional<BackgroundBox> visual_box, NonnullRefPtr<StyleValue const> offset);
     virtual ~OverflowClipMarginStyleValue() override;
 
-    Optional<BackgroundBox> visual_box() const { return m_visual_box; }
-    StyleValue const& offset() const { return m_offset; }
+    Optional<BackgroundBox> visual_box() const
+    {
+        if (!m_value->overflow_clip_margin.has_visual_box)
+            return {};
+        return static_cast<BackgroundBox>(m_value->overflow_clip_margin.visual_box);
+    }
+    ValueComparingNonnullRefPtr<StyleValue const> offset() const { return wrap_rust_child(m_value->overflow_clip_margin.offset); }
 
-    virtual void serialize(StringBuilder&, SerializationMode) const override;
-    virtual ValueComparingNonnullRefPtr<StyleValue const> absolutized(ComputationContext const&) const override;
-    bool properties_equal(OverflowClipMarginStyleValue const&) const;
-
-    virtual bool is_computationally_independent() const override { return m_offset->is_computationally_independent(); }
+    ValueComparingNonnullRefPtr<StyleValue const> absolutized(ComputationContext const&) const;
 
 private:
-    OverflowClipMarginStyleValue(Optional<BackgroundBox> visual_box, NonnullRefPtr<StyleValue const> offset);
+    friend class StyleValue;
 
-    Optional<BackgroundBox> m_visual_box;
-    ValueComparingNonnullRefPtr<StyleValue const> m_offset;
+    explicit OverflowClipMarginStyleValue(StyleValueFFI::StyleValueData const* data)
+        : StyleValueWithDefaultOperators(Type::OverflowClipMargin, data)
+    {
+    }
+
+    OverflowClipMarginStyleValue(Optional<BackgroundBox> visual_box, NonnullRefPtr<StyleValue const> offset);
 };
 
 }

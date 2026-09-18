@@ -6,9 +6,10 @@
  */
 
 #include "CanvasTextDrawingStyles.h"
-#include <LibWeb/CSS/ComputedProperties.h>
+#include <LibWeb/CSS/ComputedValues.h>
 #include <LibWeb/CSS/FontComputer.h>
 #include <LibWeb/CSS/Parser/Parser.h>
+#include <LibWeb/CSS/PropertyID.h>
 #include <LibWeb/CSS/StyleComputer.h>
 #include <LibWeb/CSS/StyleValues/FontStyleStyleValue.h>
 #include <LibWeb/CSS/StyleValues/LengthStyleValue.h>
@@ -19,21 +20,22 @@
 #include <LibWeb/HTML/CanvasRenderingContext2D.h>
 #include <LibWeb/HTML/OffscreenCanvas.h>
 #include <LibWeb/HTML/OffscreenCanvasRenderingContext2D.h>
+#include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/Window.h>
 #include <LibWeb/HTML/WorkerGlobalScope.h>
 
 namespace Web::HTML {
 
 template<typename CanvasType>
-ByteString CanvasTextDrawingStyles<CanvasType>::font() const
+Utf16String CanvasTextDrawingStyles<CanvasType>::font() const
 {
     // When font style value is empty return default string
     if (!drawing_state().font_style_value) {
-        return "10px sans-serif";
+        return "10px sans-serif"_utf16;
     }
 
     // On getting, the font attribute must return the serialized form of the current font of the context (with no 'line-height' component).
-    return drawing_state().font_style_value->to_string(CSS::SerializationMode::ResolvedValue).to_byte_string();
+    return drawing_state().font_style_value->to_utf16_string(CSS::SerializationMode::ResolvedValue);
 }
 
 // https://html.spec.whatwg.org/multipage/canvas.html#font-style-source-object
@@ -49,23 +51,22 @@ Variant<DOM::Document*, HTML::WorkerGlobalScope*> CanvasTextDrawingStyles<Canvas
         // 2. Otherwise, object's font style source object is an OffscreenCanvas object:
 
         // 1. Let global be object's relevant global object.
-        auto& global_object = HTML::relevant_global_object(font_style_source_object);
+        auto& global_object = font_style_source_object.relevant_global_object();
 
         // 2. If global is a Window object, then return global's associated Document.
-        if (is<HTML::Window>(global_object)) {
-            auto& window = as<HTML::Window>(global_object);
-            return &(window.associated_document());
-        }
+        if (auto* window = window_from_global_object(global_object))
+            return &(window->associated_document());
 
         // 3. Assert: global implements WorkerGlobalScope.
-        VERIFY(is<HTML::WorkerGlobalScope>(global_object));
+        auto* worker_global_scope = Bindings::worker_global_scope_from_global_object(global_object);
+        VERIFY(worker_global_scope);
 
         // 4. Return global.
-        return &(as<HTML::WorkerGlobalScope>(global_object));
+        return worker_global_scope;
     };
 }
 template<typename CanvasType>
-void CanvasTextDrawingStyles<CanvasType>::set_font(StringView font)
+void CanvasTextDrawingStyles<CanvasType>::set_font(Utf16View font)
 {
     // The font IDL attribute, on setting, must be parsed as a CSS <'font'> value (but without supporting property-independent style sheet syntax like 'inherit'),
     // and the resulting font must be assigned to the context, with the 'line-height' component forced to 'normal', with the 'font-size' component converted to CSS pixels,
@@ -92,18 +93,16 @@ void CanvasTextDrawingStyles<CanvasType>::set_font(StringView font)
     auto computed_math_depth = CSS::InitialValues::math_depth();
 
     // FIXME: We will need to absolutize this once we support ident() functions
-    auto& font_family = *font_style_value.longhand(CSS::PropertyID::FontFamily);
+    auto font_family = font_style_value.longhand(CSS::PropertyID::FontFamily);
 
     Optional<DOM::AbstractElement> inheritance_parent;
 
     if constexpr (SameAs<CanvasType, HTML::HTMLCanvasElement>) {
-        canvas_element.document().update_style_if_needed_for_element(DOM::AbstractElement { canvas_element });
+        canvas_element.document().update_style_for_element(DOM::AbstractElement { canvas_element });
 
         if (canvas_element.navigable() && canvas_element.is_connected()) {
-            VERIFY(canvas_element.computed_properties());
-
             // NOTE: Since we can't set a math depth directly here we always use the inherited value for the computed value
-            computed_math_depth = canvas_element.computed_properties()->math_depth();
+            computed_math_depth = canvas_element.template style_group<CSS::ComputedValues::FontValues>()->math_depth;
 
             // NOTE: The canvas itself is considered the inheritance parent
             inheritance_parent = canvas_element;
@@ -142,7 +141,7 @@ void CanvasTextDrawingStyles<CanvasType>::set_font(StringView font)
         },
         {
             // Set explicitly
-            font_family,
+            *font_family,
             computed_font_size,
             computed_font_width,
             computed_font_style,
@@ -169,8 +168,9 @@ void CanvasTextDrawingStyles<CanvasType>::set_font(StringView font)
 
     auto font_list = font_source.visit(
         [&](DOM::Document* document) -> RefPtr<Gfx::FontCascadeList const> {
+            drawing_state().font_environment_generation = document->font_computer().environment_generation();
             return document->font_computer().compute_font_for_style_values(
-                font_family,
+                *font_family,
                 computed_font_size->as_length().length().absolute_length_to_px(),
                 computed_font_style->as_font_style().to_font_slope(),
                 computed_font_weight->as_number().number(),
@@ -192,17 +192,17 @@ void CanvasTextDrawingStyles<CanvasType>::set_font(StringView font)
 
 // https://html.spec.whatwg.org/multipage/canvas.html#dom-context-2d-letterspacing
 template<typename CanvasType>
-String CanvasTextDrawingStyles<CanvasType>::letter_spacing() const
+Utf16String CanvasTextDrawingStyles<CanvasType>::letter_spacing() const
 {
     // The letterSpacing getter steps are to return the serialized form of this's letter spacing.
-    StringBuilder builder;
+    Utf16StringBuilder builder;
     drawing_state().letter_spacing->serialize(builder, CSS::SerializationMode::Normal);
-    return MUST(builder.to_string());
+    return builder.to_string();
 }
 
 // https://html.spec.whatwg.org/multipage/canvas.html#dom-context-2d-letterspacing
 template<typename CanvasType>
-void CanvasTextDrawingStyles<CanvasType>::set_letter_spacing(StringView letter_spacing)
+void CanvasTextDrawingStyles<CanvasType>::set_letter_spacing(Utf16View letter_spacing)
 {
     // 1. Let parsed be the result of parsing the given value as a CSS <length>.
     auto parsed = parse_css_type(CSS::Parser::ParsingParams { CSS::Parser::SpecialContext::CanvasContextGenericValue }, letter_spacing, CSS::ValueType::Length);

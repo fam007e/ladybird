@@ -10,11 +10,15 @@
 #include <AK/HashMap.h>
 #include <AK/JsonValue.h>
 #include <AK/NonnullRefPtr.h>
+#include <AK/Optional.h>
 #include <AK/RefPtr.h>
+#include <AK/Span.h>
 #include <AK/String.h>
+#include <AK/StringView.h>
 #include <AK/Types.h>
 #include <LibIPC/ConnectionToServer.h>
 #include <LibIPC/Transport.h>
+#include <LibWeb/Page/PageId.h>
 #include <LibWebView/Forward.h>
 #include <WebContent/WebUIClientEndpoint.h>
 #include <WebContent/WebUIServerEndpoint.h>
@@ -25,13 +29,28 @@ class WEBVIEW_API WebUI
     : public IPC::ConnectionToServer<WebUIClientEndpoint, WebUIServerEndpoint>
     , public WebUIClientEndpoint {
 public:
-    static ErrorOr<RefPtr<WebUI>> create(WebContentClient&, u64 page_id, String host);
+    enum class PageType {
+        Static,
+        Dynamic,
+    };
+
+    struct Page {
+        StringView host;
+        StringView title;
+        PageType type;
+    };
+
+    static ReadonlySpan<Page> pages();
+    static Optional<Page const&> page_for_host(StringView);
+    static ErrorOr<RefPtr<WebUI>> create(WebContentClient&, Web::PageId page_id, String host);
     virtual ~WebUI();
 
     String const& host() const { return m_host; }
 
 protected:
     WebUI(WebContentClient&, NonnullOwnPtr<IPC::Transport>, String host);
+
+    WebContentClient& client() const { return m_client; }
 
     using Interface = Function<void(JsonValue)>;
 

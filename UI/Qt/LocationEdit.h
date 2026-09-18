@@ -7,6 +7,8 @@
 
 #pragma once
 
+#include <AK/Function.h>
+#include <LibWebView/BrowsingSession.h>
 #include <LibWebView/Omnibox.h>
 #include <LibWebView/Settings.h>
 
@@ -31,7 +33,7 @@ class LocationEdit final
     Q_OBJECT
 
 public:
-    explicit LocationEdit(QWidget*);
+    LocationEdit(QWidget*, WebView::IsPrivate);
 
     void set_trailing_action(QAction*);
     QAction* trailing_action() const;
@@ -43,8 +45,14 @@ public:
     void set_url_is_hidden(bool);
     void show_autocomplete();
 
+    Function<void(String, Optional<URL::URL>, WebView::OmniboxDestinationKind)> on_navigation;
+
+signals:
+    void focus_return_requested();
+
 private:
     virtual void changeEvent(QEvent* event) override;
+    virtual void contextMenuEvent(QContextMenuEvent* event) override;
     virtual void focusInEvent(QFocusEvent* event) override;
     virtual void focusOutEvent(QFocusEvent* event) override;
     virtual void keyPressEvent(QKeyEvent* event) override;

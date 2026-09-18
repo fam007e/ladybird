@@ -8,29 +8,30 @@ $b6d86a12 destructuring-no-base-identifier.js:1:1
     [3] = Int32(2)
 
 block0:
-  [   0] GetLexicalEnvironment dst:reg4
-  [   8] NewObject dst:reg5
-  [  18] SetGlobal `x`, src:reg5
-  [  28] NewPrimitiveArray dst:reg5, elements:[42]
-  [  40] Mov dst:reg6, src:Bool(false)
-  [  50] GetIterator dst_iterator_object:reg7, dst_iterator_next:reg8, dst_iterator_done:reg9, iterable:reg5
-  [  68] Jump target:block3
+  [   0] Enter
+  [   8] GetLexicalEnvironment dst:reg4
+  [  10] NewObject dst:reg5
+  [  20] SetGlobal `x`, src:reg5
+  [  30] NewPrimitiveArray dst:reg5, elements:[42]
+  [  48] Mov dst:reg6, src:Bool(false)
+  [  58] GetIterator dst_iterator_object:reg7, dst_iterator_next:reg8, dst_iterator_done:reg9, iterable:reg5
+  [  70] Jump target:block3
 
 block1:
-  [  70] Catch dst:reg11
-  [  78] SetLexicalEnvironment environment:reg4
-  [  80] Mov dst:reg10, src:Int32(1)
-  [  90] JumpIf condition:reg9, true_target:block11, false_target:block10
+  [  78] Catch dst:reg11
+  [  80] SetLexicalEnvironment environment:reg4
+  [  88] Mov dst:reg10, src:Int32(1)
+  [  98] JumpIf condition:reg9, true_target:block11, false_target:block10
 
 block2:
-  [  a0] End value:reg5
+  [  a8] End value:reg5
 
 block3:
-  [  a8] GetGlobal dst:reg12, `x`
-  [  b8] Jump target:block5
+  [  b0] GetGlobal dst:reg12, `x`
+  [  c0] Jump target:block5
 
 block4:
-  [  c0] Mov dst:reg13, src:Undefined
+  [  c8] MovSrcUndefined dst:reg13
   [  d0] Jump target:block6
 
 block5:
@@ -51,10 +52,10 @@ block9:
   [ 150] Jump target:block8
 
 block10:
-  [ 158] JumpStrictlyEquals lhs:reg10, rhs:Int32(1), true_target:block12, false_target:block13
+  [ 158] JumpStrictlyEqualsRhsInt32 lhs:reg10, rhs:1, true_target:block12, false_target:block13
 
 block11:
-  [ 170] JumpStrictlyEquals lhs:reg10, rhs:Int32(2), true_target:block14, false_target:block15
+  [ 170] JumpStrictlyEqualsRhsInt32 lhs:reg10, rhs:2, true_target:block14, false_target:block15
 
 block12:
   [ 188] IteratorClose iterator_object:reg7, iterator_next:reg8, iterator_done:reg9, completion_value:reg11
@@ -71,5 +72,5 @@ block15:
   [ 1d0] Throw src:reg11
 
 Exception handlers:
-  [  a8 ..   d8] => handler block1
+  [  b0 ..   d8] => handler block1
   [ 100 ..  120] => handler block1

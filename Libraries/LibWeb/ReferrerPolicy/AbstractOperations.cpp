@@ -11,6 +11,7 @@
 #include <LibWeb/Fetch/Infrastructure/HTTP/Requests.h>
 #include <LibWeb/Fetch/Infrastructure/HTTP/Responses.h>
 #include <LibWeb/Fetch/Infrastructure/URL.h>
+#include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/Window.h>
 #include <LibWeb/ReferrerPolicy/AbstractOperations.h>
 #include <LibWeb/ReferrerPolicy/ReferrerPolicy.h>
@@ -72,9 +73,9 @@ Optional<URL::URL> determine_requests_referrer(Fetch::Infrastructure::Request co
             auto& global_object = const_cast<HTML::EnvironmentSettingsObject&>(*environment).global_object();
 
             // 1. If environment’s global object is a Window object, then
-            if (is<HTML::Window>(global_object)) {
+            if (auto const* window = HTML::window_from_global_object(global_object)) {
                 // 1. Let document be the associated Document of environment’s global object.
-                auto const& document = static_cast<HTML::Window const&>(global_object).associated_document();
+                auto const& document = window->associated_document();
 
                 // 2. If document’s origin is an opaque origin, return no referrer.
                 if (document.origin().is_opaque())
@@ -226,7 +227,7 @@ Optional<URL::URL> strip_url_for_use_as_referrer(Optional<URL::URL> url, OriginO
     // 6. If the origin-only flag is true, then:
     if (origin_only == OriginOnly::Yes) {
         // 1. Set url’s path to « the empty string ».
-        url->set_paths({ ""sv });
+        url->set_path(Array { ""sv });
 
         // 2. Set url’s query to null.
         url->set_query({});

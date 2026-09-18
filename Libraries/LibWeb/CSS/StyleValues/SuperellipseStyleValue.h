@@ -6,8 +6,6 @@
 
 #pragma once
 
-#include <LibWeb/CSS/StyleValues/CalculatedStyleValue.h>
-#include <LibWeb/CSS/StyleValues/NumberStyleValue.h>
 #include <LibWeb/CSS/StyleValues/StyleValue.h>
 
 namespace Web::CSS {
@@ -23,25 +21,25 @@ public:
     // NOTE: This function can only be called after absolutization
     double parameter() const
     {
-        return number_from_style_value(*m_parameter, {});
+        return number_from_style_value(parameter_style_value(), {});
     }
 
-    virtual void serialize(StringBuilder&, SerializationMode) const override;
-
-    virtual ValueComparingNonnullRefPtr<StyleValue const> absolutized(ComputationContext const&) const override;
-
-    bool properties_equal(SuperellipseStyleValue const& other) const { return m_parameter == other.m_parameter; }
-
-    virtual bool is_computationally_independent() const override { return m_parameter->is_computationally_independent(); }
+    ValueComparingNonnullRefPtr<StyleValue const> absolutized(ComputationContext const&) const;
 
 private:
-    explicit SuperellipseStyleValue(ValueComparingNonnullRefPtr<StyleValue const> const& parameter)
-        : StyleValueWithDefaultOperators(Type::Superellipse)
-        , m_parameter(parameter)
+    friend class StyleValue;
+
+    explicit SuperellipseStyleValue(StyleValueFFI::StyleValueData const* data)
+        : StyleValueWithDefaultOperators(Type::Superellipse, data)
     {
     }
 
-    ValueComparingNonnullRefPtr<StyleValue const> m_parameter;
+    explicit SuperellipseStyleValue(ValueComparingNonnullRefPtr<StyleValue const> const& parameter)
+        : StyleValueWithDefaultOperators(Type::Superellipse, StyleValueFFI::rust_style_value_create_superellipse(StyleValueFFI::rust_style_value_retain(parameter->rust_style_value_data())))
+    {
+    }
+
+    ValueComparingNonnullRefPtr<StyleValue const> parameter_style_value() const { return wrap_rust_child(m_value->superellipse.parameter); }
 };
 
 }

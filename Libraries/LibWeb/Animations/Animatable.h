@@ -10,6 +10,7 @@
 
 #include <AK/FlyString.h>
 #include <AK/HashMap.h>
+#include <AK/Utf16FlyString.h>
 #include <LibWeb/Animations/KeyframeEffect.h>
 #include <LibWeb/Bindings/Animatable.h>
 #include <LibWeb/Export.h>
@@ -39,20 +40,36 @@ public:
         Yes
     };
 
-    WebIDL::ExceptionOr<GC::Ref<Animation>> animate(GC::Ptr<JS::Object> keyframes, Variant<Empty, double, Bindings::KeyframeAnimationOptions> const& options = {});
-    WebIDL::ExceptionOr<Vector<GC::Ref<Animation>>> get_animations(Optional<Bindings::GetAnimationsOptions> const& options = {});
-    WebIDL::ExceptionOr<Vector<GC::Ref<Animation>>> get_animations_internal(GetAnimationsSorted sorted, Optional<Bindings::GetAnimationsOptions> const& options = {});
+    struct GetAnimationsOptions {
+        bool subtree { false };
+        Optional<CSS::Selector::PseudoElementSelector> pseudo_element;
+    };
+
+    struct KeyframeAnimationOptions : public KeyframeEffect::Options {
+        Utf16FlyString id;
+        Optional<GC::Ptr<AnimationTimeline>> timeline;
+    };
+
+    WebIDL::ExceptionOr<GC::Ref<Animation>> animate(Vector<BaseKeyframe> keyframes, Variant<double, KeyframeAnimationOptions> const& options);
+    WebIDL::ExceptionOr<GC::Ref<Animation>> animate(JS::Realm&, GC::Ptr<JS::Object> keyframes, Variant<double, Bindings::KeyframeAnimationOptions> const& options);
+    WebIDL::ExceptionOr<Vector<GC::Ref<Animation>>> get_animations(GetAnimationsOptions const& options);
+    WebIDL::ExceptionOr<Vector<GC::Ref<Animation>>> get_animations(Bindings::GetAnimationsOptions const& options);
+    WebIDL::ExceptionOr<Vector<GC::Ref<Animation>>> get_animations_internal(GetAnimationsSorted sorted, GetAnimationsOptions const& options);
+    ReadonlySpan<GC::Ref<Animation>> associated_animations_in_composite_order();
+    void invalidate_associated_animation_composite_order();
     bool has_relevant_animations() const;
+    bool has_associated_animations() const;
+    bool has_relevant_animations_other_than_transitions() const;
 
     void associate_with_animation(GC::Ref<Animation>);
     void disassociate_with_animation(GC::Ref<Animation>);
     void on_document_changed(DOM::Document& old_document, DOM::Document& new_document);
+    void cancel_css_animations_and_transitions();
 
-    void set_has_css_defined_animations();
     bool has_css_defined_animations() const;
-    HashMap<FlyString, GC::Ref<CSS::CSSAnimation>>* css_defined_animations(Optional<CSS::PseudoElement>);
-    void add_css_animation(FlyString name, Optional<CSS::PseudoElement>, GC::Ref<CSS::CSSAnimation>);
-    void remove_css_animation(FlyString name, Optional<CSS::PseudoElement>);
+    bool has_css_animations_or_transitions() const;
+    Vector<GC::Ref<CSS::CSSAnimation>> const* css_defined_animations(Optional<CSS::PseudoElement>);
+    void set_css_defined_animations(Optional<CSS::PseudoElement>, Vector<GC::Ref<CSS::CSSAnimation>>&&);
 
     void add_transitioned_properties(Optional<CSS::PseudoElement>, Vector<CSS::TransitionProperties> const& transitions);
     Vector<CSS::PropertyID> property_ids_with_matching_transition_property_entry(Optional<CSS::PseudoElement>) const;
@@ -74,7 +91,7 @@ private:
         bool is_sorted_by_composite_order { true };
         bool has_css_defined_animations { false };
 
-        mutable Array<OwnPtr<HashMap<FlyString, GC::Ref<CSS::CSSAnimation>>>, to_underlying(CSS::PseudoElement::KnownPseudoElementCount) + 1> css_defined_animations;
+        mutable Array<OwnPtr<Vector<GC::Ref<CSS::CSSAnimation>>>, to_underlying(CSS::PseudoElement::KnownPseudoElementCount) + 1> css_defined_animations;
         mutable Array<OwnPtr<Transition>, to_underlying(CSS::PseudoElement::KnownPseudoElementCount) + 1> transitions;
 
         ~Impl();

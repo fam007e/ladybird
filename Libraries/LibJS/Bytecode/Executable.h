@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <AK/HashMap.h>
 #include <AK/NonnullOwnPtr.h>
 #include <AK/Optional.h>
 #include <AK/OwnPtr.h>
@@ -13,12 +14,12 @@
 #include <AK/String.h>
 #include <AK/Types.h>
 #include <AK/Utf16FlyString.h>
-#include <AK/Variant.h>
 #include <AK/Vector.h>
 #include <LibCore/ImmutableBytes.h>
 #include <LibGC/CellAllocator.h>
 #include <LibGC/Ptr.h>
 #include <LibGC/WeakContainer.h>
+#include <LibJS/Breakpoint.h>
 #include <LibJS/Bytecode/ClassBlueprint.h>
 #include <LibJS/Bytecode/IdentifierTable.h>
 #include <LibJS/Bytecode/Label.h>
@@ -33,7 +34,7 @@
 
 namespace JS::Bytecode {
 
-class InstructionStream {
+class JS_API InstructionStream {
 public:
     explicit InstructionStream(Vector<u8>);
     InstructionStream(Core::ImmutableBytes, size_t offset, size_t size);
@@ -42,6 +43,7 @@ public:
     [[nodiscard]] u8 const* data() const LIFETIME_BOUND { return m_data; }
     [[nodiscard]] size_t size() const { return m_size; }
     [[nodiscard]] size_t external_memory_size() const;
+    [[nodiscard]] bool is_readonly_mapped() const { return m_storage.is_readonly_mapped(); }
     [[nodiscard]] u8 operator[](size_t index) const { return m_data[index]; }
 
     operator ReadonlyBytes() const LIFETIME_BOUND { return span(); }
@@ -51,7 +53,7 @@ public:
 private:
     void update_view_from_storage(size_t offset = 0, Optional<size_t> size = {});
 
-    Variant<Vector<u8>, Core::ImmutableBytes> m_storage;
+    Core::ImmutableBytes m_storage;
     u8 const* m_data { nullptr };
     size_t m_size { 0 };
 };
@@ -59,6 +61,8 @@ private:
 // Represents one tiered inline cache used for property lookups.
 struct PropertyLookupCache {
     static constexpr size_t max_number_of_shapes_to_remember = 4;
+    static constexpr size_t megamorphic_primary_cache_size = 64;
+    static constexpr size_t megamorphic_secondary_cache_size = 64;
     struct Entry {
         enum class Type {
             Empty,
@@ -67,10 +71,12 @@ struct PropertyLookupCache {
             GetOwnProperty,
             ChangePropertyInPrototypeChain,
             GetPropertyInPrototypeChain,
+            GetMissingProperty,
         };
         Type type { Type::Empty };
         u32 property_offset { 0 };
         u32 shape_dictionary_generation { 0 };
+        bool direct_getter_validated { false };
         GC::RawPtr<Shape> from_shape;
         GC::RawPtr<Shape> shape;
         GC::RawPtr<Object> prototype;
@@ -85,6 +91,14 @@ struct PropertyLookupCache {
         AK::Array<Entry, max_number_of_shapes_to_remember> entries;
     };
 
+    struct MegamorphicData {
+        // Keep the most recently used entry first so generated interpreter code can use the
+        // same fast path for every cache tier. Other shapes use the bounded two-level cache.
+        Entry entry;
+        AK::Array<Entry, megamorphic_primary_cache_size> primary_entries;
+        AK::Array<Entry, megamorphic_secondary_cache_size> secondary_entries;
+    };
+
     PropertyLookupCache() = default;
     PropertyLookupCache(PropertyLookupCache const&) = delete;
     PropertyLookupCache& operator=(PropertyLookupCache const&) = delete;
@@ -96,6 +110,7 @@ struct PropertyLookupCache {
     [[nodiscard]] Entry const* first_entry() const;
     [[nodiscard]] Span<Entry> entries();
     [[nodiscard]] ReadonlySpan<Entry> entries() const;
+    [[nodiscard]] Span<Entry> entries_for_shape(Shape const&);
     [[nodiscard]] size_t external_memory_size() const;
     void copy_from(PropertyLookupCache const&);
 
@@ -104,6 +119,12 @@ struct PropertyLookupCache {
         Entry new_entry;
         new_entry.type = type;
         callback(new_entry);
+
+        if (auto* data = megamorphic_data()) {
+            insert_megamorphic_entry(*data, new_entry);
+            data->entry = new_entry;
+            return;
+        }
 
         if (!m_data) {
             auto data = make<MonomorphicData>();
@@ -128,7 +149,7 @@ struct PropertyLookupCache {
         }
 
         auto& entries = polymorphic_data()->entries;
-        size_t insertion_index = entries.size() - 1;
+        size_t insertion_index = entries.size();
         for (size_t i = 0; i < entries.size(); ++i) {
             if (entries_have_same_cache_key(entries[i], new_entry)) {
                 insertion_index = i;
@@ -136,14 +157,34 @@ struct PropertyLookupCache {
             }
         }
 
+        if (insertion_index == entries.size() && entries.last().type != Entry::Type::Empty) {
+            auto new_data = make<MegamorphicData>();
+            for (size_t i = entries.size(); i > 0; --i) {
+                auto const& entry = entries[i - 1];
+                if (auto lookup_shape = entry_lookup_shape(entry))
+                    insert_megamorphic_entry(*new_data, entry);
+            }
+            insert_megamorphic_entry(*new_data, new_entry);
+            new_data->entry = new_entry;
+            clear();
+            set_megamorphic_data(new_data.leak_ptr());
+            return;
+        }
+
+        if (insertion_index == entries.size())
+            insertion_index = entries.size() - 1;
+
         for (size_t i = insertion_index; i > 0; --i)
             entries[i] = entries[i - 1];
         entries[0] = new_entry;
     }
 
     void clear();
+    void remove_dead_entries();
 
+    static constexpr FlatPtr cache_data_tag_mask = 3;
     static constexpr FlatPtr polymorphic_data_tag = 1;
+    static constexpr FlatPtr megamorphic_data_tag = 2;
     FlatPtr m_data { 0 };
 
 private:
@@ -151,9 +192,38 @@ private:
     [[nodiscard]] MonomorphicData const* monomorphic_data() const;
     [[nodiscard]] PolymorphicData* polymorphic_data();
     [[nodiscard]] PolymorphicData const* polymorphic_data() const;
+    [[nodiscard]] MegamorphicData* megamorphic_data();
+    [[nodiscard]] MegamorphicData const* megamorphic_data() const;
     void set_monomorphic_data(MonomorphicData*);
     void set_polymorphic_data(PolymorphicData*);
+    void set_megamorphic_data(MegamorphicData*);
     static bool entries_have_same_cache_key(Entry const&, Entry const&);
+    static GC::RawPtr<Shape> entry_lookup_shape(Entry const& entry)
+    {
+        if (entry.type == Entry::Type::AddOwnProperty)
+            return entry.from_shape;
+        return entry.shape;
+    }
+    static size_t megamorphic_primary_index(Shape const& shape)
+    {
+        auto hash = AK::Traits<GC::RawPtr<Shape>>::hash(const_cast<Shape*>(&shape));
+        return hash & (megamorphic_primary_cache_size - 1);
+    }
+    static size_t megamorphic_secondary_index(Shape const& shape)
+    {
+        auto hash = AK::Traits<GC::RawPtr<Shape>>::hash(const_cast<Shape*>(&shape));
+        return (hash >> 8) & (megamorphic_secondary_cache_size - 1);
+    }
+    static void insert_megamorphic_entry(MegamorphicData& data, Entry const& entry)
+    {
+        auto lookup_shape = entry_lookup_shape(entry);
+        VERIFY(lookup_shape);
+
+        auto& primary_entry = data.primary_entries[megamorphic_primary_index(*lookup_shape)];
+        if (auto displaced_shape = entry_lookup_shape(primary_entry); displaced_shape && displaced_shape != lookup_shape)
+            data.secondary_entries[megamorphic_secondary_index(*displaced_shape)] = primary_entry;
+        primary_entry = entry;
+    }
 };
 
 // A PropertyLookupCache for use as a static local variable.
@@ -161,6 +231,26 @@ private:
 struct StaticPropertyLookupCache : public PropertyLookupCache {
     StaticPropertyLookupCache();
     static void sweep_all();
+};
+
+struct KeyedPropertyLookupCache {
+    static constexpr size_t number_of_entries = 2048;
+
+    struct Entry {
+        PropertyLookupCache::Entry::Type type { PropertyLookupCache::Entry::Type::Empty };
+        u32 property_offset { 0 };
+        u32 shape_dictionary_generation { 0 };
+        GC::RawPtr<Shape> shape;
+        GC::RawPtr<Object> prototype;
+        GC::RawPtr<PrototypeChainValidity> prototype_chain_validity;
+        Utf16FlyString property_name;
+    };
+
+    [[nodiscard]] Entry& entry_for(Shape const&, Utf16FlyString const& property_name);
+    void remove_dead_entries();
+
+private:
+    AK::Array<Entry, number_of_entries> m_entries;
 };
 
 struct GlobalVariableCache {
@@ -323,6 +413,7 @@ public:
         size_t start_offset;
         size_t end_offset;
         size_t handler_offset;
+        bool catches_exception { false };
     };
 
     Vector<ExceptionHandlers> exception_handlers;
@@ -330,6 +421,16 @@ public:
     Vector<SourceMapEntry> source_map;
 
     Vector<Utf16FlyString> local_variable_names;
+    Vector<Utf16FlyString> argument_variable_names;
+    struct LocalVariableScopeRange {
+        Position start;
+        Position end;
+    };
+    struct LocalVariableMetadata {
+        bool is_mutable { true };
+        Optional<LocalVariableScopeRange> scope_range;
+    };
+    Vector<LocalVariableMetadata> local_variable_metadata;
     u32 local_index_base { 0 };
     u32 argument_index_base { 0 };
 
@@ -353,6 +454,13 @@ public:
 
     [[nodiscard]] SourceRange const& get_source_range(u32 program_counter);
 
+    void add_debugger_breakpoint(u32 bytecode_offset, BreakpointID breakpoint_id);
+    void remove_debugger_breakpoint(BreakpointID breakpoint_id);
+    void clear_debugger_breakpoints();
+    [[nodiscard]] bool has_debugger_breakpoint_at(u32 bytecode_offset) const;
+    [[nodiscard]] ReadonlySpan<BreakpointID> debugger_breakpoints_at(u32 bytecode_offset) const;
+    [[nodiscard]] bool has_debugger_breakpoint(BreakpointID breakpoint_id) const;
+
     void dump() const;
 
     virtual Cell const& owner_cell(Badge<GC::Heap>) const override { return *this; }
@@ -362,6 +470,10 @@ private:
     virtual void visit_edges(Visitor&) override;
     virtual size_t external_memory_size() const override;
 
+    struct DebuggerBreakpointSite {
+        Vector<BreakpointID> breakpoint_ids;
+    };
+    OwnPtr<HashMap<u32, DebuggerBreakpointSite>> m_debugger_breakpoint_sites;
     HashMap<u32, SourceRange> m_source_range_cache;
 };
 

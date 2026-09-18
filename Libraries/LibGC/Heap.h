@@ -67,6 +67,7 @@ public:
         defer_gc();
         new (memory) T(forward<Args>(args)...);
         auto* cell = static_cast<T*>(memory);
+        cell->set_cell_kind(T::cell_kind_for_class);
         // Cells allocated during incremental sweep must be marked so they
         // survive until the next GC cycle clears and re-establishes marks.
         if (m_incremental_sweep_active) {
@@ -82,10 +83,15 @@ public:
         CollectEverything,
     };
 
-    void collect_garbage(CollectionType = CollectionType::CollectGarbage, bool print_report = false);
-    AK::JsonObject dump_graph();
+    // NB: NEVER_INLINE so that each entry point keeps a frame of its own: setjmp() only captures the registers as
+    //     they are in the frame it runs in, and the frames below become the scan's floor. The definitions are
+    //     NO_SANITIZE_ADDRESS so that the capture buffer stays on the real stack rather than ASan's fake one.
+    NEVER_INLINE void collect_garbage(CollectionType = CollectionType::CollectGarbage, bool print_report = false);
+    NEVER_INLINE AK::JsonObject dump_graph();
 
     bool should_collect_on_every_allocation() const { return m_should_collect_on_every_allocation; }
+    // This is true for any CollectEverything cycle, not only heap teardown.
+    bool is_collecting_everything() const { return m_collecting_garbage && m_current_collection_type == CollectionType::CollectEverything; }
 
     void set_incremental_sweep_enabled(bool enabled) { m_incremental_sweep_enabled = enabled; }
     void set_should_collect_on_every_allocation(bool b) { m_should_collect_on_every_allocation = b; }
@@ -162,16 +168,29 @@ private:
     void will_allocate(size_t);
     void update_gc_bytes_threshold(size_t live_cell_bytes, size_t live_external_bytes);
 
-    void find_min_and_max_block_addresses(FlatPtr& min_address, FlatPtr& max_address);
     enum class IncludeIncomingCrossHeapMembers {
         No,
         Yes,
     };
-    void gather_roots(HashMap<Cell*, HeapRoot>&, Vector<StackFrameInfo>* out_stack_frames = nullptr, IncludeIncomingCrossHeapMembers = IncludeIncomingCrossHeapMembers::Yes);
+    // Where the conservative scan starts: every frame from stack_floor up, plus the callee-saved registers as captured
+    // at the entry point. The floor lands just below the entry point's frame, so the caller's registers that its
+    // prologue spilled are covered by the stack scan and the ones it left alone by the capture.
+    struct ConservativeScanOrigin {
+        FlatPtr stack_floor { 0 };
+        ReadonlySpan<FlatPtr> callee_saved_registers;
+    };
+
+    // NB: NEVER_INLINE so that these stay below their entry point's frame, and so that __builtin_frame_address(0)
+    //     yields a floor that leaves out their own frames -- which is what keeps the collection's large locals from
+    //     being scanned.
+    NEVER_INLINE void run_collection(ReadonlySpan<FlatPtr> callee_saved_registers, CollectionType, bool print_report);
+    NEVER_INLINE AK::JsonObject build_graph(ReadonlySpan<FlatPtr> callee_saved_registers);
+
+    void gather_roots(ConservativeScanOrigin const&, HashMap<Cell*, HeapRoot>&, Vector<StackFrameInfo>* out_stack_frames = nullptr, IncludeIncomingCrossHeapMembers = IncludeIncomingCrossHeapMembers::Yes);
     static void mark_live_cells_across(ReadonlySpan<Heap* const>, HashMap<Cell*, HeapRoot> const& roots);
     void run_post_mark_phases(bool report);
-    void gather_conservative_roots(HashMap<Cell*, HeapRoot>&, Vector<StackFrameInfo>* out_stack_frames = nullptr);
-    void gather_asan_fake_stack_roots(HashMap<FlatPtr, HeapRoot>&, FlatPtr, FlatPtr min_block_address, FlatPtr max_block_address, FlatPtr stack_reference, FlatPtr stack_top);
+    void gather_conservative_roots(ConservativeScanOrigin const&, HashMap<Cell*, HeapRoot>&, Vector<StackFrameInfo>* out_stack_frames = nullptr);
+    void gather_asan_fake_stack_roots(HashMap<FlatPtr, HeapRoot>&, FlatPtr, FlatPtr heap_region_start, FlatPtr heap_region_end, FlatPtr stack_reference, FlatPtr stack_top);
     void mark_live_cells(HashMap<Cell*, HeapRoot> const& live_cells);
     void finalize_unmarked_cells();
     void sweep_dead_cells(bool print_report, Core::ElapsedTimer const&);
@@ -225,6 +244,7 @@ private:
     bool m_should_gc_when_deferral_ends { false };
 
     bool m_collecting_garbage { false };
+    CollectionType m_current_collection_type { CollectionType::CollectGarbage };
     StackInfo m_stack_info;
     AK::Function<void(HashMap<Cell*, GC::HeapRoot>&)> m_gather_embedder_roots;
 

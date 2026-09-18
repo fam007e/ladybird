@@ -13,7 +13,7 @@ namespace Web::HTML {
 
 GC_DEFINE_ALLOCATOR(Script);
 
-void register_javascript_source(Script& script, NonnullRefPtr<JS::SourceCode const> source_code, ScriptRegistry::IsInlineSource is_inline_source, size_t source_line_number)
+void register_javascript_source(Script& script, NonnullRefPtr<JS::SourceCode const> source_code, ScriptRegistry::JavaScriptSource::Type type, ScriptRegistry::IsInlineSource is_inline_source, size_t source_line_number)
 {
     auto document = script.settings_object().responsible_document();
     if (!document) {
@@ -22,13 +22,15 @@ void register_javascript_source(Script& script, NonnullRefPtr<JS::SourceCode con
     }
 
     auto source_length = is_inline_source == ScriptRegistry::IsInlineSource::Yes
-        ? document->source().byte_count()
+        ? document->source().length_in_code_units()
         : source_code->length_in_code_units();
 
     auto const& registered_script = document->script_registry().register_javascript_source(
         move(source_code),
+        type,
         script.filename(),
-        "scriptElement"_string,
+        script.display_filename(),
+        "scriptElement"_utf16,
         is_inline_source,
         source_line_number,
         source_length);
@@ -41,6 +43,14 @@ Script::Script(Optional<URL::URL> base_url, ByteString filename, EnvironmentSett
     : m_base_url(move(base_url))
     , m_filename(filename)
     , m_display_filename(Utf16String::from_utf8(filename))
+    , m_settings(settings)
+{
+}
+
+Script::Script(Optional<URL::URL> base_url, ByteString filename, Utf16String display_filename, EnvironmentSettingsObject& settings)
+    : m_base_url(move(base_url))
+    , m_filename(filename)
+    , m_display_filename(move(display_filename))
     , m_settings(settings)
 {
 }

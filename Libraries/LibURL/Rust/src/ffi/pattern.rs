@@ -4,11 +4,10 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+use crate::rust_panic::abort_on_panic;
 use std::ffi::c_void;
-use std::panic::AssertUnwindSafe;
-use std::panic::catch_unwind;
 
-use crate::ffi::url::RustFfiUrl;
+use crate::ffi::url::RustUrl;
 use crate::ffi::url::RustUrlByteSlice;
 use crate::pattern::ComponentResult;
 use crate::pattern::GroupMatch;
@@ -101,13 +100,6 @@ pub struct RustUrlPatternExecResult {
 
 pub type FfiUrlPatternResultFn = unsafe extern "C" fn(*mut c_void, *const RustUrlPatternExecResult);
 
-fn abort_on_panic<F: FnOnce() -> R, R>(f: F) -> R {
-    match catch_unwind(AssertUnwindSafe(f)) {
-        Ok(result) => result,
-        Err(_) => std::process::abort(),
-    }
-}
-
 fn decode_utf8(slice: RustUrlByteSlice) -> String {
     if slice.data.is_null() {
         return String::new();
@@ -198,10 +190,6 @@ fn init_to_ffi(init: &Init) -> RustUrlPatternInit {
         has_base_url,
         base_url,
     }
-}
-
-fn url_from_ffi(ffi: &RustFfiUrl) -> Url {
-    super::url::url_from_ffi(ffi)
 }
 
 fn component_pattern_string(pattern: &Pattern, component: RustUrlPatternComponent) -> &str {
@@ -625,7 +613,7 @@ pub unsafe extern "C" fn rust_url_pattern_test_init(
 /// # Safety
 /// `pattern` and `input` must be valid pointers.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_url_pattern_test_url(pattern: *const RustUrlPattern, input: *const RustFfiUrl) -> bool {
+pub unsafe extern "C" fn rust_url_pattern_test_url(pattern: *const RustUrlPattern, input: *const RustUrl) -> bool {
     abort_on_panic(|| {
         if pattern.is_null() || input.is_null() {
             return false;
@@ -633,7 +621,7 @@ pub unsafe extern "C" fn rust_url_pattern_test_url(pattern: *const RustUrlPatter
 
         // SAFETY: caller guarantees pointers are valid.
         let pattern = unsafe { &*pattern };
-        let input = url_from_ffi(unsafe { &*input });
+        let input = Url::from(unsafe { (*input).borrow() });
 
         matches!(pattern.0.r#match(&MatchInput::Url(input), &None), Ok(Some(_)))
     })

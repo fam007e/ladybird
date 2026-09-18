@@ -26,14 +26,19 @@ set(SOURCES
     Bindings/OptionConstructor.cpp
     Bindings/PlatformObject.cpp
     Bindings/PrincipalHostDefined.cpp
+    Bindings/Wrappable.cpp
+    Bindings/WrapperWorld.cpp
     Clipboard/Clipboard.cpp
     Clipboard/ClipboardEvent.cpp
     Clipboard/ClipboardItem.cpp
     Clipboard/SystemClipboard.cpp
     Compositor/AsyncScrollTree.cpp
     Compositor/AsyncScrollingState.cpp
+    Compositor/ScrollSnapSelection.cpp
     Compositor/CompositorHost.cpp
+    Compositor/SmoothScrollAnimation.cpp
     Compositor/Types.cpp
+    Compositor/VisualAnimation.cpp
     Compression/CompressionStream.cpp
     Compression/DecompressionStream.cpp
     ContentSecurityPolicy/BlockingAlgorithms.cpp
@@ -85,19 +90,21 @@ set(SOURCES
     Crypto/CryptoAlgorithms.cpp
     Crypto/CryptoBindings.cpp
     Crypto/CryptoKey.cpp
-    Crypto/KeyAlgorithms.cpp
     Crypto/SubtleCrypto.cpp
     CSS/Angle.cpp
     CSS/AnimationEvent.cpp
-    CSS/BooleanExpression.cpp
     CSS/CascadedProperties.cpp
     CSS/Clip.cpp
-    CSS/ComputedProperties.cpp
+    CSS/ComputedStyleWorkingSet.cpp
+    CSS/ComputedValues.cpp
+    CSS/RustDeclarationBlock.cpp
+    CSS/RustDescriptorBlock.cpp
     CSS/ContainerQuery.cpp
     CSS/CountersSet.cpp
     CSS/CounterStyle.cpp
     CSS/CounterStyleDefinition.cpp
     CSS/CustomPropertyRegistration.cpp
+    CSS/GeneratedContent.cpp
     CSS/CSS.cpp
     CSS/CSSAnimation.cpp
     CSS/CSSConditionRule.cpp
@@ -160,15 +167,12 @@ set(SOURCES
     CSS/CSSUnparsedValue.cpp
     CSS/CSSVariableReferenceValue.cpp
     CSS/ColorFunctionDescriptor.cpp
-    CSS/ColorInterpolation.cpp
     CSS/CustomPropertyData.cpp
     CSS/Descriptor.cpp
     CSS/Display.cpp
     CSS/EasingFunction.cpp
     CSS/EdgeRect.cpp
-    CSS/FeatureQuery.cpp
     CSS/Fetch.cpp
-    CSS/Filter.cpp
     CSS/Flex.cpp
     CSS/FontComputer.cpp
     CSS/FontFace.cpp
@@ -177,28 +181,20 @@ set(SOURCES
     CSS/FontFaceSetLoadEvent.cpp
     CSS/FontFeatureData.cpp
     CSS/Frequency.cpp
-    CSS/GridTrackPlacement.cpp
-    CSS/GridTrackSize.cpp
+    CSS/HypotheticalElement.cpp
     CSS/Invalidation/AdoptedStyleSheetInvalidator.cpp
     CSS/Invalidation/AttributeInvalidator.cpp
+    CSS/Invalidation/ContainerQueryInvalidator.cpp
     CSS/Invalidation/CustomElementInvalidator.cpp
     CSS/Invalidation/EmbeddedContentInvalidator.cpp
     CSS/Invalidation/ElementStateInvalidator.cpp
     CSS/Invalidation/FormControlInvalidator.cpp
-    CSS/Invalidation/HasMutationFeatureCollector.cpp
-    CSS/Invalidation/HasMutationInvalidator.cpp
-    CSS/Invalidation/InvalidationSetMatcher.cpp
     CSS/Invalidation/LanguageInvalidator.cpp
     CSS/Invalidation/LinkInvalidator.cpp
     CSS/Invalidation/MediaQueryInvalidator.cpp
-    CSS/Invalidation/NodeInvalidator.cpp
     CSS/Invalidation/PartInvalidator.cpp
     CSS/Invalidation/PseudoClassInvalidator.cpp
     CSS/Invalidation/SlotInvalidator.cpp
-    CSS/Invalidation/StyleInvalidator.cpp
-    CSS/Invalidation/StructuralMutationInvalidator.cpp
-    CSS/Interpolation.cpp
-    CSS/InvalidationSet.cpp
     CSS/Length.cpp
     CSS/LengthBox.cpp
     CSS/MediaList.cpp
@@ -207,69 +203,52 @@ set(SOURCES
     CSS/MediaQueryListEvent.cpp
     CSS/Number.cpp
     CSS/NumericType.cpp
-    CSS/PageSelector.cpp
     CSS/ParsedFontFace.cpp
-    CSS/Parser/ArbitrarySubstitutionFunctions.cpp
-    CSS/Parser/ComponentValue.cpp
-    CSS/Parser/DescriptorParsing.cpp
     CSS/Parser/ErrorReporter.cpp
-    CSS/Parser/GradientParsing.cpp
     CSS/Parser/Helpers.cpp
-    CSS/Parser/MediaParsing.cpp
     CSS/Parser/Parser.cpp
-    CSS/Parser/RustTokenizer.cpp
-    CSS/Parser/PropertyParsing.cpp
+    CSS/Parser/RustQueryParsing.cpp
+    CSS/Parser/RustValueParsing.cpp
+    CSS/Parser/RustSyntaxParsing.cpp
     CSS/Parser/RuleContext.cpp
-    CSS/Parser/RuleParsing.cpp
     CSS/Parser/SelectorParsing.cpp
-    CSS/Parser/Syntax.cpp
-    CSS/Parser/SyntaxParsing.cpp
-    CSS/Parser/Token.cpp
-    CSS/Parser/Tokenizer.cpp
-    CSS/Parser/Types.cpp
-    CSS/Parser/ValueParsing.cpp
     CSS/Percentage.cpp
     CSS/PreferredColorScheme.cpp
-    CSS/PreferredContrast.cpp
-    CSS/PreferredMotion.cpp
     CSS/Ratio.cpp
     CSS/Resolution.cpp
+    CSS/ResolvedTransform.cpp
     CSS/Screen.cpp
     CSS/ScreenOrientation.cpp
+    CSS/ScrollStateContainerQuery.cpp
     CSS/Selector.cpp
-    CSS/SelectorEngine.cpp
+    CSS/SelectorMatching.cpp
     CSS/Serialize.cpp
-    CSS/Size.cpp
     CSS/Sizing.cpp
     CSS/StyleComputer.cpp
+    CSS/StyleEngineBridge.cpp
+    CSS/StyleEngineInput.cpp
     CSS/StyleInvalidation.cpp
-    CSS/StyleInvalidationData.cpp
     CSS/StyleProperty.cpp
     CSS/StylePropertyMapReadOnly.cpp
     CSS/StylePropertyMap.cpp
     CSS/StyleScope.cpp
     CSS/StyleSheet.cpp
     CSS/StyleSheetIdentifier.cpp
+    CSS/StyleSheetImport.cpp
     CSS/StyleSheetInvalidation.cpp
     CSS/StyleSheetList.cpp
+    CSS/StyleSheetState.cpp
     CSS/StyleValues/AbstractImageStyleValue.cpp
     CSS/StyleValues/AnchorStyleValue.cpp
-    CSS/StyleValues/AnchorSizeStyleValue.cpp
     CSS/StyleValues/AngleStyleValue.cpp
     CSS/StyleValues/BackgroundSizeStyleValue.cpp
-    CSS/StyleValues/BasicShapeStyleValue.cpp
-    CSS/StyleValues/BorderImageSliceStyleValue.cpp
     CSS/StyleValues/BorderRadiusStyleValue.cpp
     CSS/StyleValues/BorderRadiusRectStyleValue.cpp
     CSS/StyleValues/CalculatedStyleValue.cpp
     CSS/StyleValues/ColorFunctionStyleValue.cpp
-    CSS/StyleValues/ColorInterpolationMethodStyleValue.cpp
-    CSS/StyleValues/ColorMixStyleValue.cpp
-    CSS/StyleValues/ColorSchemeStyleValue.cpp
     CSS/StyleValues/ColorStyleValue.cpp
     CSS/StyleValues/ConicGradientStyleValue.cpp
     CSS/StyleValues/ContentStyleValue.cpp
-    CSS/StyleValues/ContrastColorStyleValue.cpp
     CSS/StyleValues/CounterDefinitionsStyleValue.cpp
     CSS/StyleValues/CounterStyleSystemStyleValue.cpp
     CSS/StyleValues/CounterStyleValue.cpp
@@ -278,23 +257,16 @@ set(SOURCES
     CSS/StyleValues/CustomIdentStyleValue.cpp
     CSS/StyleValues/DimensionStyleValue.cpp
     CSS/StyleValues/DisplayStyleValue.cpp
-    CSS/StyleValues/EasingStyleValue.cpp
     CSS/StyleValues/EdgeStyleValue.cpp
-    CSS/StyleValues/FilterValueListStyleValue.cpp
+    CSS/StyleValues/FilterStyleValue.cpp
     CSS/StyleValues/FunctionStyleValue.cpp
     CSS/StyleValues/FontSourceStyleValue.cpp
     CSS/StyleValues/FontStyleStyleValue.cpp
-    CSS/StyleValues/FrequencyStyleValue.cpp
-    CSS/StyleValues/GridAutoFlowStyleValue.cpp
-    CSS/StyleValues/GridTemplateAreaStyleValue.cpp
-    CSS/StyleValues/GridTrackPlacementStyleValue.cpp
-    CSS/StyleValues/GridTrackSizeListStyleValue.cpp
     CSS/StyleValues/ImageSetStyleValue.cpp
     CSS/StyleValues/ImageStyleValue.cpp
     CSS/StyleValues/IntegerStyleValue.cpp
     CSS/StyleValues/KeywordStyleValue.cpp
     CSS/StyleValues/LengthStyleValue.cpp
-    CSS/StyleValues/LightDarkStyleValue.cpp
     CSS/StyleValues/LinearGradientStyleValue.cpp
     CSS/StyleValues/NumberStyleValue.cpp
     CSS/StyleValues/OpacityValueStyleValue.cpp
@@ -306,8 +278,6 @@ set(SOURCES
     CSS/StyleValues/RandomValueSharingStyleValue.cpp
     CSS/StyleValues/RatioStyleValue.cpp
     CSS/StyleValues/RectStyleValue.cpp
-    CSS/StyleValues/RepeatStyleStyleValue.cpp
-    CSS/StyleValues/ResolutionStyleValue.cpp
     CSS/StyleValues/ScrollbarColorStyleValue.cpp
     CSS/StyleValues/ShadowStyleValue.cpp
     CSS/StyleValues/ShorthandStyleValue.cpp
@@ -315,12 +285,8 @@ set(SOURCES
     CSS/StyleValues/StyleValueList.cpp
     CSS/StyleValues/SuperellipseStyleValue.cpp
     CSS/StyleValues/TextIndentStyleValue.cpp
-    CSS/StyleValues/TextUnderlinePositionStyleValue.cpp
-    CSS/StyleValues/TimeStyleValue.cpp
     CSS/StyleValues/TransformationStyleValue.cpp
     CSS/StyleValues/TreeCountingFunctionStyleValue.cpp
-    CSS/StyleValues/TupleStyleValue.cpp
-    CSS/StyleValues/UnicodeRangeStyleValue.cpp
     CSS/StyleValues/UnresolvedStyleValue.cpp
     CSS/Supports.cpp
     CSS/SyntaxHighlighter/SyntaxHighlighter.cpp
@@ -385,6 +351,7 @@ set(SOURCES
     DOM/Slottable.cpp
     DOM/StaticNodeList.cpp
     DOM/StaticRange.cpp
+    DOM/SubtreeInsertionScope.cpp
     DOM/StyleElementBase.cpp
     DOM/Text.cpp
     DOM/TreeWalker.cpp
@@ -397,8 +364,30 @@ set(SOURCES
     Dump.cpp
     Editing/CommandNames.cpp
     Editing/Commands.cpp
+    Editing/ClipboardSanitizer.cpp
+    Editing/ClipboardSerializer.cpp
+    Editing/EditCommand.cpp
+    Editing/EditingHistory.cpp
     Editing/ExecCommand.cpp
+    Editing/InlineInsertion.cpp
+    Editing/InsertedContent.cpp
+    Editing/InsertedNodes.cpp
+    Editing/ReplacementEndpoints.cpp
+    Editing/InterchangeWhitespace.cpp
+    Editing/LegacyFontStyle.cpp
     Editing/Internal/Algorithms.cpp
+    Editing/MutationTrackedRange.cpp
+    Editing/ParagraphIntegration.cpp
+    Editing/ParagraphOperations.cpp
+    Editing/ParagraphTransfer.cpp
+    Editing/ReplacementFragment.cpp
+    Editing/ReplacementRangeCleanup.cpp
+    Editing/ReplacementStyleCleanup.cpp
+    Editing/StyledMarkupAccumulator.cpp
+    Editing/StyledMarkupSelection.cpp
+    Editing/StyledMarkupSerializer.cpp
+    Editing/VisiblePosition.cpp
+    Editing/ReplaceSelection.cpp
     Encoding/TextDecoder.cpp
     Encoding/TextDecoderCommon.cpp
     Encoding/TextDecoderStream.cpp
@@ -407,12 +396,10 @@ set(SOURCES
     Encoding/TextEncoderStream.cpp
     EncryptedMediaExtensions/Algorithms.cpp
     EncryptedMediaExtensions/MediaKeySystemAccess.cpp
-    EncryptedMediaExtensions/NavigatorEncryptedMediaExtensionsPartial.cpp
     EntriesAPI/FileSystemEntry.cpp
     EventTiming/PerformanceEventTiming.cpp
     Fetch/Body.cpp
     Fetch/BodyInit.cpp
-    Fetch/Enums.cpp
     Fetch/Fetching/Checks.cpp
     Fetch/Fetching/FetchedDataReceiver.cpp
     Fetch/Fetching/Fetching.cpp
@@ -449,6 +436,7 @@ set(SOURCES
     FileAPI/FileList.cpp
     FileAPI/FileReader.cpp
     FileAPI/FileReaderSync.cpp
+    FileAPI/SerializedBlobURLEntry.cpp
     Gamepad/EventNames.cpp
     Gamepad/Gamepad.cpp
     Gamepad/GamepadButton.cpp
@@ -488,6 +476,7 @@ set(SOURCES
     HTML/BrowsingContext.cpp
     HTML/BrowsingContextGroup.cpp
     HTML/Canvas/AbstractCanvasMixin.cpp
+    HTML/Canvas/Canvas2DContextBase.cpp
     HTML/Canvas/CanvasDrawImage.cpp
     HTML/Canvas/CanvasFillStrokeStyles.cpp
     HTML/Canvas/CanvasPath.cpp
@@ -506,8 +495,10 @@ set(SOURCES
     HTML/CrossOrigin/AbstractOperations.cpp
     HTML/CrossOrigin/Reporting.cpp
     HTML/CustomElements/CustomElementDefinition.cpp
+    HTML/CustomElements/CustomElementAlgorithms.cpp
     HTML/CustomElements/CustomElementName.cpp
     HTML/CustomElements/CustomElementReactionNames.cpp
+    HTML/CustomElements/CustomElementReactions.cpp
     HTML/CustomElements/CustomElementRegistry.cpp
     HTML/CustomElements/CustomStateSet.cpp
     HTML/DataTransfer.cpp
@@ -541,6 +532,8 @@ set(SOURCES
     HTML/GlobalEventHandlers.cpp
     HTML/HashChangeEvent.cpp
     HTML/History.cpp
+    HTML/HistoryExecutor.cpp
+    HTML/HistoryOperation.cpp
     HTML/HTMLAllCollection.cpp
     HTML/HTMLAnchorElement.cpp
     HTML/HTMLAreaElement.cpp
@@ -637,14 +630,20 @@ set(SOURCES
     HTML/MimeType.cpp
     HTML/MimeTypeArray.cpp
     HTML/Navigable.cpp
+    HTML/CrossProcessId.cpp
     HTML/NavigableContainer.cpp
+    HTML/NavigateParams.cpp
     HTML/NavigateEvent.cpp
     HTML/Navigation.cpp
+    HTML/NavigationActivation.cpp
     HTML/NavigationCurrentEntryChangeEvent.cpp
     HTML/NavigationDestination.cpp
     HTML/NavigationHistoryEntry.cpp
+    HTML/NavigationPopulationRequest.cpp
+    HTML/NavigationSourceSnapshot.cpp
     HTML/NavigationObserver.cpp
     HTML/NavigationParams.cpp
+    HTML/NavigationParamsDescriptor.cpp
     HTML/NavigationTransition.cpp
     HTML/Navigator.cpp
     HTML/NavigatorBeacon.cpp
@@ -654,6 +653,7 @@ set(SOURCES
     HTML/Numbers.cpp
     HTML/OffscreenCanvas.cpp
     HTML/OffscreenCanvasRenderingContext2D.cpp
+    HTML/PageSwapEvent.cpp
     HTML/PageTransitionEvent.cpp
     HTML/Parser/Entities.cpp
     HTML/Parser/HTMLEncodingDetection.cpp
@@ -666,13 +666,19 @@ set(SOURCES
     HTML/Plugin.cpp
     HTML/PluginArray.cpp
     HTML/PolicyContainers.cpp
+    HTML/PostedMessageDescriptor.cpp
+    HTML/PreparedNavigationDescriptor.cpp
     HTML/POSTResource.cpp
     HTML/PopoverTargetAttributes.cpp
     HTML/PopStateEvent.cpp
     HTML/PotentialCORSRequest.cpp
     HTML/PreloadEntry.cpp
     HTML/PromiseRejectionEvent.cpp
+    HTML/RadioButtonGroupRegistry.cpp
     HTML/RadioNodeList.cpp
+    HTML/RemoteNavigable.cpp
+    HTML/RemoteWindow.cpp
+    HTML/ReplicatedNavigableState.cpp
     HTML/SandboxingFlagSet.cpp
     HTML/Scripting/Agent.cpp
     HTML/Scripting/ClassicScript.cpp
@@ -690,13 +696,14 @@ set(SOURCES
     HTML/Scripting/SimilarOriginWindowAgent.cpp
     HTML/Scripting/TemporaryExecutionContext.cpp
     HTML/Scripting/WindowEnvironmentSettingsObject.cpp
+    HTML/Scripting/WindowRealm.cpp
     HTML/Scripting/WorkerAgent.cpp
     HTML/Scripting/WorkerEnvironmentSettingsObject.cpp
+    HTML/Scripting/WorkletEnvironmentSettingsObject.cpp
     HTML/SelectedFile.cpp
     HTML/SelectItem.cpp
     HTML/SerializedPolicyContainer.cpp
     HTML/SessionHistoryEntry.cpp
-    HTML/SessionHistoryTraversalQueue.cpp
     HTML/SharedResourceRequest.cpp
     HTML/AnimatedBitmapDecodedImageData.cpp
     HTML/AnimatedDecodedImageData.cpp
@@ -704,6 +711,7 @@ set(SOURCES
     HTML/SharedWorkerGlobalScope.cpp
     HTML/SourceSet.cpp
     HTML/SourceSnapshotParams.cpp
+    HTML/TargetSnapshotParams.cpp
     HTML/Storage.cpp
     HTML/StorageEvent.cpp
     HTML/StructuredSerialize.cpp
@@ -722,9 +730,9 @@ set(SOURCES
     HTML/ToggleEvent.cpp
     HTML/TokenizedFeatures.cpp
     HTML/TrackEvent.cpp
-    HTML/UniversalGlobalScope.cpp
     HTML/UserActivation.cpp
     HTML/UserNavigationInvolvement.cpp
+    HTML/UniversalGlobalScope.cpp
     HTML/ValidityState.cpp
     HTML/VideoTrack.cpp
     HTML/VideoTrackList.cpp
@@ -740,6 +748,7 @@ set(SOURCES
     HTML/WorkerLocation.cpp
     HTML/WorkerAgentTypes.cpp
     HTML/WorkerNavigator.cpp
+    HTML/Worklet.cpp
     HTML/WorkletGlobalScope.cpp
     HTML/XMLSerializer.cpp
     IndexedDB/Inspection.cpp
@@ -773,63 +782,21 @@ set(SOURCES
     Internals/XRTest.cpp
     IntersectionObserver/IntersectionObserver.cpp
     IntersectionObserver/IntersectionObserverEntry.cpp
-    Layout/AudioBox.cpp
-    Layout/AvailableSpace.cpp
-    Layout/BlockContainer.cpp
-    Layout/BlockFormattingContext.cpp
     Layout/Box.cpp
-    Layout/BreakNode.cpp
-    Layout/CanvasBox.cpp
-    Layout/CheckBox.cpp
-    Layout/FieldSetBox.cpp
-    Layout/FlexFormattingContext.cpp
-    Layout/FormattingContext.cpp
-    Layout/GridFormattingContext.cpp
-    Layout/ImageBox.cpp
     Layout/ImageProvider.cpp
-    Layout/InlineFormattingContext.cpp
-    Layout/InlineLevelIterator.cpp
-    Layout/InlineNode.cpp
-    Layout/LayoutState.cpp
-    Layout/LegendBox.cpp
-    Layout/LineBox.cpp
-    Layout/LineBoxFragment.cpp
-    Layout/LineBuilder.cpp
-    Layout/ListItemBox.cpp
-    Layout/ListItemMarkerBox.cpp
-    Layout/NavigableContainerViewport.cpp
+    Layout/LayoutRustBridge.cpp
     Layout/Node.cpp
-    Layout/RadioButton.cpp
-    Layout/RangeInputBox.cpp
-    Layout/ReplacedBox.cpp
-    Layout/ReplacedWithChildrenFormattingContext.cpp
-    Layout/SVGBox.cpp
-    Layout/SVGClipBox.cpp
-    Layout/SVGForeignObjectBox.cpp
-    Layout/SVGFormattingContext.cpp
-    Layout/SVGGeometryBox.cpp
-    Layout/SVGGraphicsBox.cpp
-    Layout/SVGImageBox.cpp
-    Layout/SVGMaskBox.cpp
-    Layout/SVGPatternBox.cpp
-    Layout/SVGSVGBox.cpp
-    Layout/SVGTextBox.cpp
-    Layout/SVGTextPathBox.cpp
-    Layout/TableFormattingContext.cpp
-    Layout/TableGrid.cpp
-    Layout/TableWrapper.cpp
-    Layout/TextAreaBox.cpp
-    Layout/TextInputBox.cpp
+    Layout/NodeArena.cpp
     Layout/TextNode.cpp
-    Layout/TextOffsetMapping.cpp
     Layout/TreeBuilder.cpp
-    Layout/VideoBox.cpp
+    Layout/UpdateLayout.cpp
     Layout/Viewport.cpp
     Loader/ContentBlocker.cpp
+    Loader/DownloadFilename.cpp
     Loader/FileRequest.cpp
     Loader/GeneratedPagesLoader.cpp
-    Loader/ProxyMappings.cpp
     Loader/ResourceLoader.cpp
+    Loader/SiteCompatibility.cpp
     MathML/AttributeNames.cpp
     MathML/MathMLAnchorElement.cpp
     MathML/MathMLElement.cpp
@@ -844,6 +811,7 @@ set(SOURCES
     MediaCapture/MediaStreamTrackEvent.cpp
     MediaSourceExtensions/BufferedChangeEvent.cpp
     MediaSourceExtensions/EventNames.cpp
+    MediaSourceExtensions/ISOBMFFByteStreamParser.cpp
     MediaSourceExtensions/ManagedMediaSource.cpp
     MediaSourceExtensions/ManagedSourceBuffer.cpp
     MediaSourceExtensions/MediaSource.cpp
@@ -860,6 +828,7 @@ set(SOURCES
     Namespace.cpp
     NavigationTiming/EntryNames.cpp
     NavigationTiming/PerformanceNavigation.cpp
+    NavigationTiming/PerformanceNavigationTiming.cpp
     NavigationTiming/PerformanceTiming.cpp
     NotificationsAPI/Notification.cpp
     Page/AutoScrollHandler.cpp
@@ -869,55 +838,29 @@ set(SOURCES
     Page/InputEvent.cpp
     Page/MiddleButtonScrollHandler.cpp
     Page/Page.cpp
+    Page/ScreenWakeLockHandle.cpp
     Painting/AccumulatedVisualContext.cpp
-    Painting/BackgroundPainting.cpp
     Painting/Blending.cpp
-    Painting/BorderPainting.cpp
-    Painting/BorderRadiiData.cpp
-    Painting/BorderRadiusCornerClipper.cpp
-    Painting/BordersData.cpp
     Painting/BoxModelMetrics.cpp
-    Painting/CanvasPaintable.cpp
-    Painting/CheckBoxPaintable.cpp
+    Painting/BoxViews.cpp
+    Painting/PaintFacts.cpp
+    Painting/Canvas2DCommandStream.cpp
+    Painting/ChromeWidget.cpp
     Painting/DisplayList.cpp
-    Painting/DisplayListCommand.cpp
+    Painting/DisplayListDamage.cpp
     Painting/DisplayListPlayerSkia.cpp
-    Painting/DisplayListRecorder.cpp
-    Painting/DisplayListRecordingContext.cpp
     Painting/DisplayListResourceTransaction.cpp
     Painting/DisplayListResourceStorage.cpp
-    Painting/FieldSetPaintable.cpp
-    Painting/GradientPainting.cpp
+    Painting/DocumentPaintState.cpp
     Painting/HitTestDisplayList.cpp
-    Painting/ImagePaintable.cpp
-    Painting/MarkerPaintable.cpp
-    Painting/NavigableContainerViewportPaintable.cpp
-    Painting/Paintable.cpp
-    Painting/PaintableBox.cpp
-    Painting/PaintStyle.cpp
-    Painting/PaintableFragment.cpp
-    Painting/PaintableWithLines.cpp
-    Painting/RadioButtonPaintable.cpp
-    Painting/ReplacedElementCommon.cpp
-    Painting/ResolvedCSSFilter.cpp
+    Painting/PaintingRustBridge.cpp
     Painting/ResizeHandle.cpp
     Painting/Scrollbar.cpp
-    Painting/ScrollFrame.cpp
+    Painting/Scrolling.cpp
+    Painting/ScrollSnap.cpp
     Painting/ScrollState.cpp
-    Painting/ShadowPainting.cpp
-    Painting/StackingContext.cpp
-    Painting/SVGClipPaintable.cpp
-    Painting/SVGForeignObjectPaintable.cpp
-    Painting/SVGGraphicsPaintable.cpp
-    Painting/SVGMaskable.cpp
-    Painting/SVGMaskPaintable.cpp
-    Painting/SVGPaintable.cpp
-    Painting/SVGPatternPaintable.cpp
-    Painting/SVGPathPaintable.cpp
-    Painting/SVGSVGPaintable.cpp
-    Painting/TableBordersPainting.cpp
-    Painting/VideoPaintable.cpp
-    Painting/ViewportPaintable.cpp
+    Painting/SvgPaintResources.cpp
+    Painting/VisualContextTreeTestBuilder.cpp
     PerformanceTimeline/EntryTypes.cpp
     PerformanceTimeline/EventNames.cpp
     PerformanceTimeline/PerformanceEntry.cpp
@@ -941,6 +884,8 @@ set(SOURCES
     ResourceTiming/PerformanceResourceTiming.cpp
     SecureContexts/AbstractOperations.cpp
     Selection/Selection.cpp
+    Selection/CaretNavigation.cpp
+    Selection/SelectionModifier.cpp
     ServiceWorker/Cache.cpp
     ServiceWorker/CacheStorage.cpp
     ServiceWorker/EventNames.cpp
@@ -969,7 +914,6 @@ set(SOURCES
     StorageAPI/StorageEndpoint.cpp
     StorageAPI/StorageKey.cpp
     StorageAPI/StorageManager.cpp
-    StorageAPI/StorageShed.cpp
     StorageAPI/StorageShelf.cpp
     Streams/AbstractOperations.cpp
     Streams/ByteLengthQueuingStrategy.cpp
@@ -994,7 +938,7 @@ set(SOURCES
     Streams/WritableStreamDefaultWriter.cpp
     Streams/WritableStreamOperations.cpp
     SVG/AttributeNames.cpp
-    SVG/AttributeParser.cpp
+    SVG/AttributeParsing.cpp
     SVG/Path.cpp
     SVG/SVGAElement.cpp
     SVG/SVGAnimatedEnumeration.cpp
@@ -1044,6 +988,7 @@ set(SOURCES
     SVG/SVGImageElement.cpp
     SVG/SVGLength.cpp
     SVG/SVGLengthList.cpp
+    SVG/SVGLengthValue.cpp
     SVG/SVGLinearGradientElement.cpp
     SVG/SVGLineElement.cpp
     SVG/SVGList.cpp
@@ -1097,6 +1042,7 @@ set(SOURCES
     UserTiming/PerformanceMark.cpp
     UserTiming/PerformanceMeasure.cpp
     ViewTransition/ViewTransition.cpp
+    VisualLines.cpp
     WebLocks/AbstractOperations.cpp
     WebLocks/Lock.cpp
     WebLocks/LockManager.cpp
@@ -1110,6 +1056,12 @@ set(SOURCES
     WebAssembly/WebAssembly.cpp
     WebAssembly/WebAssemblyModule.cpp
     WebAudio/AnalyserNode.cpp
+    WebAudio/AudioParamMap.cpp
+    WebAudio/AudioWorklet.cpp
+    WebAudio/AudioWorkletGlobalScope.cpp
+    WebAudio/AudioWorkletNode.cpp
+    WebAudio/AudioWorkletProcessor.cpp
+    WebAudio/AudioArray.cpp
     WebAudio/AudioBuffer.cpp
     WebAudio/AudioBufferSourceNode.cpp
     WebAudio/AudioContext.cpp
@@ -1117,6 +1069,7 @@ set(SOURCES
     WebAudio/AudioListener.cpp
     WebAudio/AudioNode.cpp
     WebAudio/AudioParam.cpp
+    WebAudio/AudioParamTimeline.cpp
     WebAudio/AudioScheduledSourceNode.cpp
     WebAudio/BaseAudioContext.cpp
     WebAudio/BiquadFilterNode.cpp
@@ -1124,15 +1077,32 @@ set(SOURCES
     WebAudio/ChannelSplitterNode.cpp
     WebAudio/ConstantSourceNode.cpp
     WebAudio/ControlMessageQueue.cpp
+    WebAudio/ConvolverNode.cpp
     WebAudio/DelayNode.cpp
     WebAudio/DynamicsCompressorNode.cpp
     WebAudio/GainNode.cpp
     WebAudio/MediaElementAudioSourceNode.cpp
+    WebAudio/MediaStreamAudioDestinationNode.cpp
+    WebAudio/MediaStreamAudioSourceNode.cpp
     WebAudio/OfflineAudioCompletionEvent.cpp
     WebAudio/OfflineAudioContext.cpp
     WebAudio/OscillatorNode.cpp
     WebAudio/PannerNode.cpp
     WebAudio/PeriodicWave.cpp
+    WebAudio/Rendering/AnalyserRenderNode.cpp
+    WebAudio/Rendering/AudioBus.cpp
+    WebAudio/Rendering/AudioWorkletPipe.cpp
+    WebAudio/Rendering/AudioWorkletRenderNode.cpp
+    WebAudio/Rendering/BiquadCoefficients.cpp
+    WebAudio/Rendering/ConvolverKernel.cpp
+    WebAudio/Rendering/FFT.cpp
+    WebAudio/Rendering/MediaStreamDestinationRenderNode.cpp
+    WebAudio/Rendering/MediaStreamSourceRenderNode.cpp
+    WebAudio/Rendering/OfflineAudioRenderer.cpp
+    WebAudio/Rendering/RealtimeAudioRenderer.cpp
+    WebAudio/Rendering/RenderGraph.cpp
+    WebAudio/Rendering/RenderNode.cpp
+    WebAudio/Rendering/RenderNodes.cpp
     WebAudio/ScriptProcessorNode.cpp
     WebAudio/StereoPannerNode.cpp
     WebDriver/Actions.cpp
@@ -1174,8 +1144,8 @@ set(SOURCES
     WebGL/WebGLBuffer.cpp
     WebGL/WebGLCommandList.cpp
     WebGL/WebGLContextAttributes.cpp
-    WebGL/WebGLContextProxyBase.cpp
     WebGL/WebGLContextEvent.cpp
+    WebGL/WebGLContextProxyBase.cpp
     WebGL/WebGLFramebuffer.cpp
     WebGL/WebGLObject.cpp
     WebGL/WebGLProgram.cpp
@@ -1203,7 +1173,6 @@ set(SOURCES
     WebIDL/OverloadTypes.cpp
     WebIDL/Promise.cpp
     WebIDL/QuotaExceededError.cpp
-    WebIDL/Tracing.cpp
     WebSockets/WebSocket.cpp
     WebVTT/VTTCue.cpp
     WebVTT/VTTRegion.cpp
@@ -1253,17 +1222,14 @@ set(GENERATED_SOURCES
     CSS/DefaultStyleSheetSource.cpp
     CSS/DescriptorID.cpp
     CSS/Enums.cpp
-    CSS/EnvironmentVariable.cpp
     CSS/GeneratedCSSNumericFactoryMethods.cpp
     CSS/GeneratedCSSNumericFactoryMethods.idl
     CSS/GeneratedCSSStyleProperties.cpp
     CSS/GeneratedCSSStyleProperties.idl
     CSS/Keyword.cpp
-    CSS/MathFunctions.cpp
-    CSS/MediaFeatureID.cpp
-    CSS/Parser/GeneratedValueTypesParsing.cpp
+    CSS/MediaFeatureID.h
     CSS/PropertyID.cpp
-    CSS/PseudoClass.cpp
+    CSS/PseudoClass.h
     CSS/PseudoElement.cpp
     CSS/QuirksModeStyleSheetSource.cpp
     CSS/TransformFunctions.cpp
@@ -1281,7 +1247,7 @@ set(GENERATED_SOURCES
 ladybird_lib(LibWeb web EXPLICIT_SYMBOL_EXPORT)
 add_dependencies(LibWeb generate_GLFunctions.cpp)
 
-target_link_libraries(LibWeb PRIVATE LibCore LibCompress LibCrypto LibJS LibHTTP LibGfx LibIPC LibRegex LibSyntax LibTextCodec LibUnicode LibMedia LibWasm LibXML LibURL LibTLS LibRequests LibGC LibSync LibThreading skia SDL3::SDL3 LibXml2::LibXml2)
+target_link_libraries(LibWeb PRIVATE LibCore LibCompress LibCrypto LibJS LibHTTP LibGfx LibIPC LibRegex LibSyntax LibTextCodec LibUnicode LibMedia LibWasm LibXML LibURL LibTLS LibRequests LibGC LibThreading skia SDL3::SDL3 LibXml2::LibXml2)
 
 # LibWeb still includes ANGLE's GLES headers for WebGL constants and types, but
 # the actual GL entry points live in the Compositor. Copy only ANGLE's compile
@@ -1294,7 +1260,40 @@ foreach(angle_target IN LISTS ANGLE_TARGETS)
     target_compile_options(LibWeb PRIVATE $<TARGET_PROPERTY:${angle_target},INTERFACE_COMPILE_OPTIONS>)
 endforeach()
 
-import_rust_crate(MANIFEST_PATH Rust/Cargo.toml CRATE_NAME libweb_rust FFI_HEADER RustFFI.h)
+import_rust_crate(
+    MANIFEST_PATH Rust/Cargo.toml
+    CRATE_NAME libweb_rust
+    FEATURES style-recording
+    FFI_HEADERS
+        HTML/Parser/RustFFI.h
+        RustFFI.h
+        SVG/ParserRustFFI.h
+        SelectorRustFFI.h
+        StyleValueRustFFI.h
+        ValueParserRustFFI.h
+        ComputedValuesRustFFI.h
+        StyleEngineRustFFI.h
+        StyleEngineBridgeGenerated.h
+        StyleEngineBridgeGenerated.inc
+        StyleEngineStateFactsGenerated.inc
+        Layout/TreeBuilderRustFFI.h
+        Layout/LayoutRustFFI.h
+        Painting/PaintingRustFFI.h
+        Painting/DisplayListCommandsGenerated.h
+)
+build_rust_binary(
+    MANIFEST_PATH Rust/Cargo.toml
+    CRATE_NAME libweb_rust
+    BINARY_NAME style-replay
+    FEATURES style-replay
+)
+# The replay tool currently requires POSIX memory mapping.
+if (UNIX)
+    add_custom_target(style-replay ALL)
+    add_dependencies(style-replay style-replay-build)
+endif()
+target_link_libraries(libweb_rust INTERFACE LibGfx)
+test_rust_crate(MANIFEST_PATH Rust/Cargo.toml CRATE_NAME libweb_rust)
 
 set(content_blocker_rust_features "")
 if (NOT BUILD_SHARED_LIBS)
@@ -1328,8 +1327,14 @@ if(NOT BUILD_SHARED_LIBS)
     # stale Rust objects. Force the C++ FFI bridge files to depend on the
     # Rust archives: when they change, LibWeb re-archives, and POST_BUILD
     # re-merges the fresh Rust objects.
-    set_property(SOURCE CSS/Parser/RustTokenizer.cpp APPEND PROPERTY OBJECT_DEPENDS ${_libweb_rust_lib})
+    set_property(SOURCE CSS/Parser/RustSyntaxParsing.cpp APPEND PROPERTY OBJECT_DEPENDS ${_libweb_rust_lib})
     set_property(SOURCE HTML/Parser/HTMLEncodingDetection.cpp APPEND PROPERTY OBJECT_DEPENDS ${_libweb_rust_lib})
+    set_property(SOURCE Layout/LayoutRustBridge.cpp APPEND PROPERTY OBJECT_DEPENDS ${_libweb_rust_lib})
+    set_property(SOURCE Layout/TreeBuilder.cpp APPEND PROPERTY OBJECT_DEPENDS ${_libweb_rust_lib})
+    set_property(SOURCE Layout/UpdateLayout.cpp APPEND PROPERTY OBJECT_DEPENDS ${_libweb_rust_lib})
+    set_property(SOURCE Painting/PaintingRustBridge.cpp APPEND PROPERTY OBJECT_DEPENDS ${_libweb_rust_lib})
+    set_property(SOURCE SVG/AttributeParsing.cpp APPEND PROPERTY OBJECT_DEPENDS ${_libweb_rust_lib})
+    set_property(SOURCE SVG/Path.cpp APPEND PROPERTY OBJECT_DEPENDS ${_libweb_rust_lib})
     set_property(SOURCE Loader/ContentBlocker.cpp APPEND PROPERTY OBJECT_DEPENDS ${_libweb_content_blocker_rust_lib})
 endif()
 

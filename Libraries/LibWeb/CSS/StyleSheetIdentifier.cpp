@@ -6,9 +6,10 @@
 
 #include "StyleSheetIdentifier.h"
 #include <AK/Debug.h>
+#include <AK/Utf16String.h>
 #include <LibIPC/Decoder.h>
 #include <LibIPC/Encoder.h>
-#include <LibWeb/CSS/CSSStyleSheet.h>
+#include <LibWeb/CSS/StyleSheetState.h>
 #include <LibWeb/DOM/Element.h>
 
 namespace Web::CSS {
@@ -45,11 +46,11 @@ Optional<StyleSheetIdentifier::Type> style_sheet_identifier_type_from_string(Str
     return {};
 }
 
-Optional<StyleSheetIdentifier> style_sheet_identifier_for(CSSStyleSheet const& sheet)
+Optional<StyleSheetIdentifier> style_sheet_identifier_for(StyleSheetState const& sheet)
 {
     StyleSheetIdentifier identifier {};
 
-    if (sheet.owner_rule()) {
+    if (sheet.owner_import()) {
         identifier.type = StyleSheetIdentifier::Type::ImportRule;
     } else if (auto* node = sheet.owner_node()) {
         if (node->is_html_style_element() || node->is_svg_style_element()) {
@@ -66,10 +67,10 @@ Optional<StyleSheetIdentifier> style_sheet_identifier_for(CSSStyleSheet const& s
         return {};
     }
 
-    if (auto sheet_url = sheet.href(); sheet_url.has_value())
+    if (auto sheet_url = sheet.href_for_bindings(); sheet_url.has_value())
         identifier.url = sheet_url.release_value();
 
-    identifier.rule_count = sheet.rules().length();
+    identifier.rule_count = sheet.native_rules().size();
     return identifier;
 }
 
@@ -93,7 +94,7 @@ ErrorOr<Web::CSS::StyleSheetIdentifier> decode(Decoder& decoder)
 {
     auto type = TRY(decoder.decode<Web::CSS::StyleSheetIdentifier::Type>());
     auto dom_element_unique_id = TRY(decoder.decode<Optional<Web::UniqueNodeID::Type>>());
-    auto url = TRY(decoder.decode<Optional<String>>());
+    auto url = TRY(decoder.decode<Optional<Utf16String>>());
     auto rule_count = TRY(decoder.decode<size_t>());
 
     return Web::CSS::StyleSheetIdentifier {

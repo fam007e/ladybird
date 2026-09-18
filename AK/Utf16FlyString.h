@@ -19,14 +19,69 @@ class [[nodiscard]] Utf16FlyString {
 
 public:
     constexpr Utf16FlyString() = default;
+    ALWAYS_INLINE ~Utf16FlyString() = default;
 
     static Utf16FlyString from_utf8(StringView);
     static Utf16FlyString from_utf8(String const& string) { return from_utf8_without_validation(string); }
     static Utf16FlyString from_utf8(FlyString const& string) { return from_utf8_without_validation(string); }
+    static Utf16FlyString from_fly_string(FlyString const& string) { return from_utf8_without_validation(string); }
+    static Utf16FlyString from_ascii_without_validation(StringView);
     static Utf16FlyString from_utf8_without_validation(StringView);
     static Utf16FlyString from_utf8_but_should_be_ported_to_utf16(StringView string) { return from_utf8_without_validation(string); }
 
     static Utf16FlyString from_utf16(Utf16View const&);
+
+    // NB: These round-trip the one-word raw representation through FFI bridges (e.g. the LibWeb
+    //     Rust style value data), which retain the raw value and manage its reference manually.
+    //     to_raw_leaked() leaks one reference to the bridge, from_raw() reconstructs a fly string
+    //     without consuming the bridge's reference, and unref_raw() releases it.
+    [[nodiscard]] FlatPtr to_raw_leaked() const
+    {
+        if (m_data.has_long_storage())
+            m_data.data({})->ref();
+        return m_data.raw({});
+    }
+
+    // Transfer this string's existing ownership reference to an FFI caller. The caller must
+    // eventually pass the raw value to adopt_raw() or unref_raw().
+    [[nodiscard]] FlatPtr into_raw() &&
+    {
+        return m_data.leak_raw(Badge<Utf16FlyString> {});
+    }
+
+    [[nodiscard]] FlatPtr raw_identity() const { return m_data.raw({}); }
+    [[nodiscard]] bool has_short_ascii_storage() const { return m_data.has_short_ascii_storage(); }
+
+    [[nodiscard]] static Utf16FlyString from_raw(FlatPtr raw)
+    {
+        auto base = Detail::Utf16StringBase::adopt_raw(Badge<Utf16FlyString> {}, raw);
+        if (base.has_long_storage())
+            base.data({})->ref();
+
+        Utf16FlyString string;
+        string.m_data = move(base);
+        return string;
+    }
+
+    // Adopt a raw value produced by into_raw() without changing its reference count.
+    [[nodiscard]] static Utf16FlyString adopt_raw(FlatPtr raw)
+    {
+        return Utf16FlyString { Detail::Utf16StringBase::adopt_raw(Badge<Utf16FlyString> {}, raw) };
+    }
+
+    static void ref_raw(FlatPtr raw)
+    {
+        auto string = adopt_raw(raw);
+        if (string.m_data.has_long_storage())
+            string.m_data.data({})->ref();
+        (void)move(string).into_raw();
+    }
+
+    static void unref_raw(FlatPtr raw)
+    {
+        // Adopt the bridge's reference and let it drop.
+        auto string = adopt_raw(raw);
+    }
 
     template<typename T>
     requires(IsOneOf<RemoveCVReference<T>, Utf16String, Utf16FlyString>)
@@ -110,6 +165,10 @@ public:
     }
 
     [[nodiscard]] ALWAYS_INLINE bool equals_ignoring_ascii_case(Utf16View const& other) const { return m_data.equals_ignoring_ascii_case(other); }
+    [[nodiscard]] ALWAYS_INLINE bool equals_ignoring_ascii_case(StringView other) const { return view().equals_ignoring_ascii_case(other); }
+
+    [[nodiscard]] ALWAYS_INLINE bool starts_with(StringView string) const { return view().starts_with(string); }
+    [[nodiscard]] ALWAYS_INLINE bool starts_with_ignoring_ascii_case(StringView string) const { return view().starts_with_ignoring_ascii_case(string); }
 
     template<typename... Ts>
     [[nodiscard]] ALWAYS_INLINE bool is_one_of(Ts&&... strings) const
@@ -124,6 +183,7 @@ public:
     }
 
     [[nodiscard]] ALWAYS_INLINE u32 hash() const { return m_data.hash(); }
+    [[nodiscard]] ALWAYS_INLINE u32 ascii_case_insensitive_hash() const { return view().ascii_case_insensitive_hash(); }
     [[nodiscard]] ALWAYS_INLINE bool is_empty() const { return m_data.is_empty(); }
     [[nodiscard]] ALWAYS_INLINE bool is_ascii() const { return m_data.is_ascii(); }
 
@@ -184,8 +244,12 @@ struct SentinelOptionalTraits<Utf16FlyString> {
 
 template<>
 class Optional<Utf16FlyString> : public SentinelOptional<Utf16FlyString> {
+    AK_MAKE_DEFAULT_MOVABLE(Optional);
+    AK_MAKE_DEFAULT_COPYABLE(Optional);
+
 public:
     using SentinelOptional::SentinelOptional;
+    ALWAYS_INLINE ~Optional() = default;
 };
 
 template<>

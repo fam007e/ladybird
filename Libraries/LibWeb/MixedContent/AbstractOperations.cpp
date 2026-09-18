@@ -7,7 +7,8 @@
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/Fetch/Response.h>
 #include <LibWeb/HTML/BrowsingContext.h>
-#include <LibWeb/HTML/LocalNavigable.h>
+#include <LibWeb/HTML/Navigable.h>
+#include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/Window.h>
 #include <LibWeb/MixedContent/AbstractOperations.h>
 #include <LibWeb/SecureContexts/AbstractOperations.h>
@@ -41,20 +42,25 @@ void upgrade_a_mixed_content_request_to_a_potentially_trustworthy_url_if_appropr
 
     // 2. If request’s URL’s scheme is http, set request’s URL’s scheme to https, and return.
     if (request.url().scheme() == "http")
-        request.url().set_scheme("https"_string);
+        request.url().set_scheme("https"sv);
 }
 
 // https://w3c.github.io/webappsec-mixed-content/#categorize-settings-object
 ProhibitsMixedSecurityContexts does_settings_prohibit_mixed_security_contexts(GC::Ptr<HTML::EnvironmentSettingsObject> settings)
 {
+    // AD-HOC: Fetch requests initiated by the browser UI have no client. Treat that as not restricting mixed content;
+    //         callers also rely on this result before inspecting the client's browsing context.
+    if (!settings)
+        return ProhibitsMixedSecurityContexts::DoesNotRestrictMixedSecurityContexts;
+
     // 1. If settings’ origin is a potentially trustworthy origin, then return "Prohibits Mixed Security Contexts".
     if (SecureContexts::is_origin_potentially_trustworthy(settings->origin()) == SecureContexts::Trustworthiness::PotentiallyTrustworthy)
         return ProhibitsMixedSecurityContexts::ProhibitsMixedSecurityContexts;
 
     // 2. If settings’ global object is a window, then:
-    if (is<HTML::Window>(settings->global_object())) {
+    if (auto* window = HTML::window_from_global_object(settings->global_object())) {
         // 1. Set document to settings’ global object's associated Document.
-        auto document = as<HTML::Window>(settings->global_object()).document();
+        auto document = window->document();
 
         // 2. For each navigable navigable in document’s ancestor navigables:
         for (auto const& navigable : document->ancestor_navigables()) {

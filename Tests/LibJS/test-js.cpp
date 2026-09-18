@@ -12,6 +12,8 @@
 #include <LibJS/Runtime/ArrayBuffer.h>
 #include <LibJS/Runtime/Date.h>
 #include <LibJS/Runtime/FinalizationRegistry.h>
+#include <LibJS/Runtime/Object.h>
+#include <LibJS/Runtime/Symbol.h>
 #include <LibJS/Runtime/TypedArray.h>
 #include <LibJS/Runtime/ValueInlines.h>
 #include <LibTest/JavaScriptTestRunner.h>
@@ -31,6 +33,14 @@ TESTJS_GLOBAL_FUNCTION(can_parse_source, canParseSource)
 TESTJS_GLOBAL_FUNCTION(collect_garbage, gc)
 {
     vm.heap().collect_garbage();
+    return JS::js_undefined();
+}
+
+TESTJS_GLOBAL_FUNCTION(add_engine_private_property, addEnginePrivateProperty)
+{
+    auto object = TRY(vm.argument(0).to_object(vm));
+    auto key = JS::Symbol::create_private(vm);
+    object->set_engine_private_property(key, vm.argument(1));
     return JS::js_undefined();
 }
 
@@ -156,10 +166,10 @@ TESTJS_GLOBAL_FUNCTION(detach_array_buffer, detachArrayBuffer)
 TESTJS_GLOBAL_FUNCTION(set_time_zone, setTimeZone)
 {
     auto current_time_zone = Core::TimeZone::current_time_zone();
-    auto current_time_zone_string = JS::PrimitiveString::create(vm, Utf16String::from_ascii_without_validation(current_time_zone.bytes_as_string_view().bytes()));
-    auto time_zone = TRY(vm.argument(0).to_utf16_string(vm)).to_utf8_but_should_be_ported_to_utf16();
+    auto current_time_zone_string = JS::PrimitiveString::create(vm, move(current_time_zone));
+    auto time_zone = TRY(vm.argument(0).to_utf16_string(vm));
 
-    if (auto result = Core::TimeZone::set_current_time_zone(time_zone); result.is_error())
+    if (auto result = Core::TimeZone::set_current_time_zone(time_zone.utf16_view()); result.is_error())
         return vm.throw_completion<JS::InternalError>(Utf16String::formatted("Could not set time zone: {}", result.error()));
 
     JS::clear_system_time_zone_cache();

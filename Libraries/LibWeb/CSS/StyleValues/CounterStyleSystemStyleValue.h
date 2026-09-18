@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <AK/Utf16FlyString.h>
 #include <LibWeb/CSS/StyleValues/StyleValue.h>
 
 namespace Web::CSS {
@@ -22,15 +23,14 @@ public:
         return adopt_ref(*new CounterStyleSystemStyleValue(Fixed { move(first_symbol) }));
     }
 
-    NonnullRefPtr<StyleValue const> static create_extends(FlyString name)
+    NonnullRefPtr<StyleValue const> static create_extends(Utf16FlyString name)
     {
         return adopt_ref(*new CounterStyleSystemStyleValue(Extends { move(name) }));
     }
 
     virtual ~CounterStyleSystemStyleValue() override = default;
 
-    virtual void serialize(StringBuilder& builder, SerializationMode mode) const override;
-    virtual ValueComparingNonnullRefPtr<StyleValue const> absolutized(ComputationContext const& context) const override;
+    ValueComparingNonnullRefPtr<StyleValue const> absolutized(ComputationContext const& context) const;
     bool algorithm_differs_from(CounterStyleSystemStyleValue const& other) const;
     bool is_valid_symbol_count(size_t count) const;
     bool is_valid_additive_symbol_count(size_t count) const;
@@ -41,26 +41,54 @@ public:
     };
 
     struct Extends {
-        FlyString name;
+        Utf16FlyString name;
         bool operator==(Extends const&) const = default;
     };
 
     using Value = Variant<CounterStyleSystem, Fixed, Extends>;
-    Value const& value() const { return m_value; }
-
-    bool properties_equal(CounterStyleSystemStyleValue const& other) const { return m_value == other.m_value; }
+    Value value() const
+    {
+        auto const& data = m_value->counter_style_system;
+        switch (data.kind) {
+        case 0:
+            return static_cast<CounterStyleSystem>(data.system);
+        case 1:
+            return Fixed { wrap_rust_child_or_null(data.first_symbol) };
+        default:
+            return Extends { css_string_from_rust(&data.name) };
+        }
+    }
 
     // NB: We only use this style value within the @counter-style at-rule so will never call this
-    virtual bool is_computationally_independent() const override { VERIFY_NOT_REACHED(); }
-
 private:
+    friend class StyleValue;
+
     explicit CounterStyleSystemStyleValue(Variant<CounterStyleSystem, Fixed, Extends> value)
-        : StyleValueWithDefaultOperators(Type::CounterStyleSystem)
-        , m_value(move(value))
+        : StyleValueWithDefaultOperators(Type::CounterStyleSystem, make_counter_style_system_data(value))
     {
     }
 
-    Value m_value;
+    explicit CounterStyleSystemStyleValue(StyleValueFFI::StyleValueData const* data)
+        : StyleValueWithDefaultOperators(Type::CounterStyleSystem, data)
+    {
+    }
+
+    static StyleValueFFI::StyleValueData const* make_counter_style_system_data(Value const& value)
+    {
+        // The Rust allocation takes ownership of one strong reference to the first symbol and
+        // one leaked reference to the name when they are present.
+        return value.visit(
+            [](CounterStyleSystem system) {
+                return StyleValueFFI::rust_style_value_create_counter_style_system(0, to_underlying(system), nullptr, 0);
+            },
+            [](Fixed const& fixed) {
+                auto const* first_symbol_data = fixed.first_symbol ? StyleValueFFI::rust_style_value_retain(fixed.first_symbol->rust_style_value_data()) : nullptr;
+                return StyleValueFFI::rust_style_value_create_counter_style_system(1, 0, first_symbol_data, 0);
+            },
+            [](Extends const& extends) {
+                return StyleValueFFI::rust_style_value_create_counter_style_system(2, 0, nullptr, extends.name.to_raw_leaked());
+            });
+    }
 };
 
 }

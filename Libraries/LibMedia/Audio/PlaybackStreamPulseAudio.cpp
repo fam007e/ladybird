@@ -26,7 +26,7 @@ namespace Audio {
         __temporary_result.release_value();                                                                                        \
     })
 
-NonnullRefPtr<PlaybackStream::CreatePromise> PlaybackStream::create(OutputState initial_output_state, u32 target_latency_ms, AudioDataRequestCallback&& data_request_callback)
+NonnullRefPtr<PlaybackStream::CreatePromise> PlaybackStream::create_platform_playback_stream(OutputState initial_output_state, u32 target_latency_ms, AudioDataRequestCallback&& data_request_callback)
 {
     return PlaybackStreamPulseAudio::create(initial_output_state, target_latency_ms, move(data_request_callback));
 }
@@ -92,13 +92,6 @@ PlaybackStreamPulseAudio::~PlaybackStreamPulseAudio()
         }                                                        \
         __temporary_result.release_value();                      \
     })
-
-void PlaybackStreamPulseAudio::set_underrun_callback(Function<void()> callback)
-{
-    m_state->enqueue([&state = *m_state, callback = move(callback)]() mutable {
-        state.stream()->set_underrun_callback(move(callback));
-    });
-}
 
 NonnullRefPtr<Core::ThreadedPromise<AK::Duration>> PlaybackStreamPulseAudio::resume()
 {
@@ -176,7 +169,7 @@ RefPtr<PulseAudioStream> const& PlaybackStreamPulseAudio::InternalState::stream(
 
 void PlaybackStreamPulseAudio::InternalState::enqueue(Function<void()>&& task)
 {
-    Sync::MutexLocker locker { m_mutex };
+    MutexLocker locker { m_mutex };
     m_tasks.enqueue(forward<Function<void()>>(task));
     m_wake_condition.signal();
 }
@@ -185,7 +178,7 @@ void PlaybackStreamPulseAudio::InternalState::thread_loop()
 {
     while (true) {
         auto task = [this]() -> Function<void()> {
-            Sync::MutexLocker locker { m_mutex };
+            MutexLocker locker { m_mutex };
 
             while (m_tasks.is_empty() && !m_exit)
                 m_wake_condition.wait();

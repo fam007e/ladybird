@@ -4,8 +4,6 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibWeb/Bindings/Intrinsics.h>
-#include <LibWeb/Bindings/Lock.h>
 #include <LibWeb/Bindings/LockManager.h>
 #include <LibWeb/WebLocks/Lock.h>
 #include <LibWeb/WebLocks/LockManager.h>
@@ -17,19 +15,13 @@ GC_DEFINE_ALLOCATOR(LockData);
 
 GC::Ref<Lock> Lock::create(JS::Realm& realm, GC::Ref<LockData> lock)
 {
-    return realm.create<Lock>(realm, lock);
+    auto result = realm.create<Lock>(lock);
+    return result;
 }
 
-Lock::Lock(JS::Realm& realm, GC::Ref<LockData> lock)
-    : PlatformObject(realm)
-    , m_lock(lock)
+Lock::Lock(GC::Ref<LockData> lock)
+    : m_lock(lock)
 {
-}
-
-void Lock::initialize(JS::Realm& realm)
-{
-    WEB_SET_PROTOTYPE_FOR_INTERFACE(Lock);
-    Base::initialize(realm);
 }
 
 void Lock::visit_edges(Cell::Visitor& visitor)
@@ -39,7 +31,7 @@ void Lock::visit_edges(Cell::Visitor& visitor)
 }
 
 // https://w3c.github.io/web-locks/#dom-lock-name
-String const& Lock::name() const
+Utf16String const& Lock::name() const
 {
     // The name getter’s steps are to return the associated lock’s name.
     return m_lock->name();
@@ -52,7 +44,7 @@ Bindings::LockMode Lock::mode() const
     return m_lock->mode();
 }
 
-LockData::LockData(String client_id, GC::Ref<LockManager> manager, Bindings::LockMode mode, String name, GC::Ref<WebIDL::Promise> released_promise, GC::Ref<WebIDL::Promise> waiting_promise)
+LockData::LockData(Utf16String client_id, GC::Ref<LockManager> manager, Bindings::LockMode mode, Utf16String name, GC::Ref<WebIDL::Promise> released_promise, GC::Ref<WebIDL::Promise> waiting_promise)
     : m_client_id(move(client_id))
     , m_manager(manager)
     , m_name(move(name))
@@ -85,7 +77,7 @@ void LockData::release_lock() const
 
     // 6. Remove lock from the manager’s held lock set.
     m_manager->held_lock_set().remove_first_matching([&](GC::Ref<LockData> held_lock) {
-        return held_lock == this;
+        return held_lock == GC::Ref { *this };
     });
 
     // 7. Process the lock request queue queue.

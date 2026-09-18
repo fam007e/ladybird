@@ -4,39 +4,26 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+// The browser transfers HTML buffers to C++, so both sides must use the same allocator.
+// The standalone replay program has no C++ runtime or cross-language buffer transfers.
+#[cfg(not(feature = "style-replay"))]
+/// cbindgen:ignore
 #[path = "../../../RustAllocator.rs"]
 mod rust_allocator;
 
-mod css_tokenizer;
+#[path = "../../../RustPanic.rs"]
+mod rust_panic;
+
 mod encoding_detection;
+
+pub mod css;
+pub mod layout;
+pub mod painting;
+pub mod svg;
 
 pub use libweb_html_tokenizer as html_tokenizer;
 
-use std::ffi::c_void;
-use std::panic::AssertUnwindSafe;
-use std::panic::catch_unwind;
-
-pub use css_tokenizer::CssHashType;
-pub use css_tokenizer::CssNumberType;
-pub use css_tokenizer::CssToken;
-pub use css_tokenizer::CssTokenType;
-
-fn abort_on_panic<F: FnOnce() -> R, R>(f: F) -> R {
-    match catch_unwind(AssertUnwindSafe(f)) {
-        Ok(result) => result,
-        Err(payload) => {
-            let message = if let Some(message) = payload.downcast_ref::<&str>() {
-                (*message).to_string()
-            } else if let Some(message) = payload.downcast_ref::<String>() {
-                message.clone()
-            } else {
-                "unknown panic".to_string()
-            };
-            eprintln!("Rust panic at FFI boundary: {message}");
-            std::process::abort();
-        }
-    }
-}
+use crate::rust_panic::abort_on_panic;
 
 unsafe fn bytes_from_raw<'a>(bytes: *const u8, len: usize) -> Option<&'a [u8]> {
     unsafe {
@@ -48,30 +35,5 @@ unsafe fn bytes_from_raw<'a>(bytes: *const u8, len: usize) -> Option<&'a [u8]> {
             return None;
         }
         Some(std::slice::from_raw_parts(bytes, len))
-    }
-}
-
-/// # Safety
-/// - `input` and `input_len` must point to a valid string
-/// - `ctx` must be a valid pointer to a CallbackContext
-/// - Parameters provided to `callback` must be valid pointers
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_css_tokenize(
-    input: *const u8,
-    input_len: usize,
-    ctx: *mut c_void,
-    callback: unsafe extern "C" fn(ctx: *mut c_void, token: *const CssToken),
-) {
-    unsafe {
-        abort_on_panic(|| {
-            let Some(input) = bytes_from_raw(input, input_len) else {
-                return;
-            };
-
-            css_tokenizer::tokenize(input, |token, filtered_input| {
-                let ffi_token = token.as_ffi(filtered_input);
-                callback(ctx, &raw const ffi_token);
-            });
-        });
     }
 }

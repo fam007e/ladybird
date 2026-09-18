@@ -4,8 +4,8 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibWeb/Bindings/SVGTextElement.h>
-#include <LibWeb/Layout/SVGTextBox.h>
+#include <LibGC/Heap.h>
+#include <LibWeb/Layout/Box.h>
 #include <LibWeb/SVG/SVGTextElement.h>
 
 namespace Web::SVG {
@@ -17,15 +17,9 @@ SVGTextElement::SVGTextElement(DOM::Document& document, DOM::QualifiedName quali
 {
 }
 
-void SVGTextElement::initialize(JS::Realm& realm)
+Layout::Node* SVGTextElement::create_layout_node(CSS::LayoutStyle style)
 {
-    WEB_SET_PROTOTYPE_FOR_INTERFACE(SVGTextElement);
-    Base::initialize(realm);
-}
-
-RefPtr<Layout::Node> SVGTextElement::create_layout_node(CSS::ComputedProperties const& style)
-{
-    return make_ref_counted<Layout::SVGTextBox>(document(), *this, style);
+    return &Layout::allocate_layout_node<Layout::Box>(document(), *this, style, Layout::RustFFI::NodeKind::SVGTextBox);
 }
 
 }

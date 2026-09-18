@@ -323,7 +323,7 @@ public:
         Vector<StackEntry> result_types;
         bool is_constant { false };
     };
-    ErrorOr<ExpressionTypeResult, ValidationError> validate(Expression const&, Vector<ValueType> const&);
+    ErrorOr<ExpressionTypeResult, ValidationError> validate(Expression const&, Vector<ValueType> const&, Span<CodeSection::Func const* const> callee_bodies = {}, size_t current_function_index = 0);
     ErrorOr<void, ValidationError> validate(Instruction const& instruction, Stack& stack, bool& is_constant);
     template<u64 opcode>
     ErrorOr<void, ValidationError> validate_instruction(Instruction const&, Stack& stack, bool& is_constant);
@@ -360,6 +360,7 @@ private:
     {
     }
 
+    ErrorOr<void, ValidationError> validate_atomic_memory_argument(Instruction::MemoryArgument const&, size_t access_size);
     ErrorOr<void, ValidationError> validate_struct_get(Stack&, Instruction const&, bool requires_packed);
     ErrorOr<FieldType, ValidationError> array_field_type(TypeIndex, StringView instruction_name, bool requires_mutable);
     ErrorOr<void, ValidationError> validate_array_get(Stack&, Instruction const&, bool requires_packed);
@@ -438,7 +439,6 @@ private:
     {
         frame.local_init_log_height = m_local_init_log.size();
         m_frames.append(move(frame));
-        m_max_frame_size = max(m_max_frame_size, m_frames.size());
     }
     void mark_local_initialized(u32 local_index)
     {
@@ -457,7 +457,6 @@ private:
     Vector<Frame, 16> m_frames;
     Vector<bool> m_local_initialized;
     Vector<u32> m_local_init_log;
-    size_t m_max_frame_size { 0 };
     COWVector<GlobalType> m_globals_without_internal_globals;
 };
 

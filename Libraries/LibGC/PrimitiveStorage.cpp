@@ -19,6 +19,7 @@ namespace GC {
 static constexpr size_t small_slab_size = 64 * KiB;
 static constexpr size_t minimum_small_slot_size = 16;
 static constexpr size_t maximum_small_slot_size = 64 * KiB;
+static constexpr auto primitive_storage_tag = balanced_external_entity_table_tag(0);
 
 static size_t round_up_to_page(size_t value)
 {
@@ -78,7 +79,7 @@ ErrorOr<void> PrimitiveStorage::Allocator::ensure_cage()
 
     // Leave an inaccessible page after the logical cage so a masked fixed-width
     // access at the top edge cannot cross into an unrelated mapping.
-    auto mapping = TRY(Core::System::reserve_address_space(reservation_size.value()));
+    auto mapping = TRY(Core::System::reserve_address_space(reservation_size.value(), Core::System::MemoryTag::GarbageCollector));
     m_cage_base = static_cast<u8*>(mapping);
     js_primitive_storage_cage_base = bit_cast<FlatPtr>(m_cage_base);
     return {};
@@ -131,7 +132,7 @@ ErrorOr<PrimitiveStorage::Allocator::Allocation> PrimitiveStorage::Allocator::al
         return Error::from_errno(ENOMEM);
 
     auto slab_offset = TRY(allocate_cage_range(small_slab_size));
-    auto commit_result = Core::System::commit_memory(m_cage_base + slab_offset, small_slab_size);
+    auto commit_result = Core::System::commit_memory(m_cage_base + slab_offset, small_slab_size, Core::System::MemoryTag::GarbageCollector);
     if (commit_result.is_error()) {
         release_cage_range(slab_offset, small_slab_size);
         return commit_result.release_error();
@@ -179,7 +180,7 @@ ErrorOr<PrimitiveStorage::Allocator::Allocation> PrimitiveStorage::Allocator::al
     auto offset = TRY(allocate_cage_range(reservation_size.value()));
     auto committed_size = round_up_to_page(size);
     if (committed_size > 0) {
-        auto commit_result = Core::System::commit_memory(m_cage_base + offset, committed_size);
+        auto commit_result = Core::System::commit_memory(m_cage_base + offset, committed_size, Core::System::MemoryTag::GarbageCollector);
         if (commit_result.is_error()) {
             release_cage_range(offset, reservation_size.value());
             return commit_result.release_error();
@@ -193,6 +194,31 @@ ErrorOr<PrimitiveStorage::Allocator::Allocation> PrimitiveStorage::Allocator::al
         .capacity = capacity,
         .reservation_size = reservation_size.value(),
         .committed_size = committed_size,
+        .small_allocation = {},
+    };
+}
+
+ErrorOr<PrimitiveStorage::Allocator::Allocation> PrimitiveStorage::Allocator::adopt_shared_fd(int fd, size_t size)
+{
+    VERIFY(size > 0);
+    TRY(ensure_cage());
+
+    auto reservation_size = round_up_to_page(size);
+    auto offset = TRY(allocate_cage_range(reservation_size));
+
+    // Replace the reserved PROT_NONE pages at this offset with a shared mapping of fd. On teardown, deallocate() runs
+    // the same decommit path as any large allocation — which re-establishes the PROT_NONE reservation and drops this.
+    auto map_result = Core::System::map_shared_memory_fixed(m_cage_base + offset, reservation_size, fd);
+    if (map_result.is_error()) {
+        release_cage_range(offset, reservation_size);
+        return map_result.release_error();
+    }
+
+    return Allocation {
+        .offset = offset,
+        .capacity = size,
+        .reservation_size = reservation_size,
+        .committed_size = reservation_size,
         .small_allocation = {},
     };
 }
@@ -247,7 +273,7 @@ ErrorOr<void> PrimitiveStorage::Allocator::commit_large_storage(Allocation& allo
 
     auto new_committed_size = round_up_to_page(new_size);
     if (new_committed_size > allocation.committed_size) {
-        TRY(Core::System::commit_memory(m_cage_base + allocation.offset + allocation.committed_size, new_committed_size - allocation.committed_size));
+        TRY(Core::System::commit_memory(m_cage_base + allocation.offset + allocation.committed_size, new_committed_size - allocation.committed_size, Core::System::MemoryTag::GarbageCollector));
         allocation.committed_size = new_committed_size;
     }
 
@@ -259,7 +285,7 @@ void PrimitiveStorage::Allocator::decommit_large_storage(Allocation const& alloc
     VERIFY(!allocation.small_allocation.has_value());
     if (allocation.committed_size == 0)
         return;
-    MUST(Core::System::decommit_memory(m_cage_base + allocation.offset, allocation.committed_size));
+    MUST(Core::System::decommit_memory(m_cage_base + allocation.offset, allocation.committed_size, Core::System::MemoryTag::GarbageCollector));
 }
 
 ErrorOr<PrimitiveStorage::Allocator::Allocation> PrimitiveStorage::Allocator::reallocate(Allocation const& old_allocation, size_t old_size, size_t new_size, size_t new_capacity, ZeroFillNewBytes zero_fill_new_bytes, bool force_large)
@@ -407,29 +433,31 @@ ErrorOr<PrimitiveStorageHandle> PrimitiveStorage::try_reserve(size_t size, size_
     return install_allocation(move(allocation), size);
 }
 
+ErrorOr<PrimitiveStorageHandle> PrimitiveStorage::try_adopt_shared_fd(int fd, size_t size)
+{
+    if (size == 0)
+        return Error::from_errno(EINVAL);
+
+    auto allocation = TRY(m_allocator.adopt_shared_fd(fd, size));
+    return install_allocation(move(allocation), size);
+}
+
 PrimitiveStorageHandle PrimitiveStorage::install_allocation(Allocator::Allocation allocation, size_t size)
 {
-    u32 index;
-    if (m_free_entry_indices.is_empty()) {
-        VERIFY(m_entries.size() < PrimitiveStorageHandle::invalid_index);
-        index = static_cast<u32>(m_entries.size());
+    auto handle = allocate_entry(primitive_storage_tag);
+    if (handle.index == m_entries.size())
         m_entries.append({});
-    } else {
-        index = m_free_entry_indices.take_last();
-    }
 
-    auto& entry = m_entries[index];
-    VERIFY(!entry.allocated);
-    entry.allocated = true;
+    auto& entry = m_entries[handle.index];
     entry.size = size;
     entry.allocation = move(allocation);
 
-    return PrimitiveStorageHandle { index, entry.generation };
+    return handle;
 }
 
 bool PrimitiveStorage::is_valid(PrimitiveStorageHandle handle) const
 {
-    return entry_for(handle) != nullptr;
+    return ExternalEntityTable::is_valid(handle, primitive_storage_tag);
 }
 
 bool PrimitiveStorage::contains(void const* address, size_t size) const
@@ -550,22 +578,16 @@ void PrimitiveStorage::free(PrimitiveStorageHandle handle)
         return;
 
     m_allocator.deallocate(entry->allocation);
-    entry->allocated = false;
     entry->size = 0;
-    ++entry->generation;
-    if (entry->generation == 0)
-        ++entry->generation;
-    m_free_entry_indices.append(handle.index);
+    free_entry(handle, primitive_storage_tag);
 }
 
 PrimitiveStorage::Entry* PrimitiveStorage::entry_for(PrimitiveStorageHandle handle)
 {
-    if (!handle.is_valid() || handle.index >= m_entries.size())
+    if (!ExternalEntityTable::is_valid(handle, primitive_storage_tag))
         return nullptr;
-    auto& entry = m_entries[handle.index];
-    if (!entry.allocated || entry.generation != handle.generation)
-        return nullptr;
-    return &entry;
+    VERIFY(handle.index < m_entries.size());
+    return &m_entries[handle.index];
 }
 
 PrimitiveStorage::Entry const* PrimitiveStorage::entry_for(PrimitiveStorageHandle handle) const

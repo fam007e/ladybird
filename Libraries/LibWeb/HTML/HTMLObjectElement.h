@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <AK/Utf16View.h>
 #include <LibCore/Forward.h>
 #include <LibGfx/Forward.h>
 #include <LibWeb/HTML/NavigableContainer.h>
@@ -16,7 +17,7 @@ namespace Web::HTML {
 class HTMLObjectElement final
     : public NavigableContainer
     , public Layout::ImageProvider {
-    WEB_PLATFORM_OBJECT(HTMLObjectElement, NavigableContainer)
+    WEB_WRAPPABLE(HTMLObjectElement, NavigableContainer)
     GC_DECLARE_ALLOCATOR(HTMLObjectElement);
 
     enum class Representation {
@@ -29,13 +30,10 @@ class HTMLObjectElement final
 public:
     virtual ~HTMLObjectElement() override;
 
-    virtual void form_associated_element_attribute_changed(FlyString const& name, Optional<String> const& old_value, Optional<String> const& value, Optional<FlyString> const& namespace_) override;
+    virtual void form_associated_element_attribute_changed(Utf16FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_) override;
     virtual void form_associated_element_was_removed(DOM::Node*) override;
 
-    String data() const;
-    void set_data(String const& data);
-
-    String type() const { return get_attribute_value(HTML::AttributeNames::type); }
+    Utf16String type() const { return get_attribute_value(HTML::AttributeNames::type); }
 
     // ^FormAssociatedElement
     virtual bool is_form_associated_element() const override { return true; }
@@ -58,13 +56,12 @@ private:
 
     virtual bool is_html_object_element() const override { return true; }
 
-    virtual void initialize(JS::Realm&) override;
+    virtual void initialize_element() override;
 
-    virtual bool is_presentational_hint(FlyString const&) const override;
+    virtual bool is_presentational_hint(Utf16FlyString const&) const override;
     virtual void apply_presentational_hints(Vector<CSS::StyleProperty>&) const override;
 
-    virtual RefPtr<Layout::Node> create_layout_node(CSS::ComputedProperties const&) override;
-    virtual void adjust_computed_style(CSS::ComputedProperties::Builder&) override;
+    virtual Layout::Node* create_layout_node(CSS::LayoutStyle) override;
 
     bool has_ancestor_media_element_or_object_element_not_showing_fallback_content() const;
 
@@ -84,6 +81,7 @@ private:
 
     // ^Layout::ImageProvider
     virtual GC::Ptr<DecodedImageData> decoded_image_data() const override { return image_data(); }
+    virtual Layout::Node const* image_provider_layout_node() const override;
 
     GC::Ptr<DecodedImageData> image_data() const;
 

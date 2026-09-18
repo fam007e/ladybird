@@ -10,14 +10,16 @@
 #include <AK/Optional.h>
 #include <AK/RefCounted.h>
 #include <AK/RefPtr.h>
-#include <AK/String.h>
 #include <AK/Types.h>
+#include <AK/Utf16String.h>
 #include <AK/Vector.h>
 #include <LibURL/URL.h>
 #include <LibWeb/Export.h>
 #include <LibWeb/Fetch/Infrastructure/HTTP/Requests.h>
 #include <LibWeb/Forward.h>
+#include <LibWeb/HTML/CrossProcessId.h>
 #include <LibWeb/HTML/DocumentState.h>
+#include <LibWeb/HTML/SessionHistoryEntryIdentity.h>
 #include <LibWeb/HTML/StructuredSerializeTypes.h>
 #include <LibWeb/PixelUnits.h>
 #include <LibWeb/ReferrerPolicy/ReferrerPolicy.h>
@@ -45,17 +47,17 @@ struct SessionHistoryNestedHistoryDescriptor;
 struct SessionHistoryDocumentStateDescriptor {
     // AD-HOC: The spec models shared document state by object identity. The UI-process mirror uses a stable
     //         descriptor ID so entries that share a document state can be reconstructed after IPC.
-    u64 id { 0 };
+    CrossProcessId id;
     Variant<SerializedPolicyContainer, DocumentState::Client> history_policy_container { DocumentState::Client::Tag };
     Fetch::Infrastructure::Request::ReferrerType request_referrer { Fetch::Infrastructure::Request::Referrer::Client };
     ReferrerPolicy::ReferrerPolicy request_referrer_policy { ReferrerPolicy::DEFAULT_REFERRER_POLICY };
     Optional<URL::Origin> initiator_origin;
     Optional<URL::Origin> origin;
     Optional<URL::URL> about_base_url;
-    Variant<Empty, String, POSTResource> resource;
+    DocumentResource resource;
     bool reload_pending { false };
     bool ever_populated { false };
-    String navigable_target_name;
+    Utf16String navigable_target_name;
     Vector<SessionHistoryNestedHistoryDescriptor> nested_histories;
 };
 
@@ -63,8 +65,13 @@ struct SessionHistoryDocumentStateDescriptor {
 struct SessionHistoryEntryScrollPositionData {
     // FIXME: Track all restorable scrollable regions. Currently only the viewport is persisted.
     Optional<CSSPixelPoint> viewport_scroll_position;
+};
 
-    bool operator==(SessionHistoryEntryScrollPositionData const&) const = default;
+struct SessionHistoryEntryPersistedState {
+    // AD-HOC: Persisted state crosses the process boundary separately from its entry, so retain the entry's full
+    // identity instead of relying on its Navigation API key, which replaceState() can share with another entry.
+    SessionHistoryEntryIdentity entry_identity;
+    SessionHistoryEntryScrollPositionData scroll_position_data;
 };
 
 // https://html.spec.whatwg.org/multipage/browsing-the-web.html#session-history-entry
@@ -72,17 +79,28 @@ struct SessionHistoryEntryDescriptor {
     i32 step { 0 };
     URL::URL url;
     SessionHistoryDocumentStateDescriptor document_state;
-    SerializationRecord classic_history_api_state;
-    SerializationRecord navigation_api_state;
-    String navigation_api_key;
-    String navigation_api_id;
+    StorageSerializationRecord classic_history_api_state;
+    StorageSerializationRecord navigation_api_state;
+    Utf16String navigation_api_key;
+    Utf16String navigation_api_id;
+    ScrollRestorationMode scroll_restoration_mode { ScrollRestorationMode::Auto };
+    SessionHistoryEntryScrollPositionData scroll_position_data;
+};
+
+struct PendingSessionHistoryEntryDescriptor {
+    URL::URL url;
+    SessionHistoryDocumentStateDescriptor document_state;
+    StorageSerializationRecord classic_history_api_state;
+    StorageSerializationRecord navigation_api_state;
+    Utf16String navigation_api_key;
+    Utf16String navigation_api_id;
     ScrollRestorationMode scroll_restoration_mode { ScrollRestorationMode::Auto };
     SessionHistoryEntryScrollPositionData scroll_position_data;
 };
 
 // https://html.spec.whatwg.org/multipage/browsing-the-web.html#nested-history
 struct SessionHistoryNestedHistoryDescriptor {
-    String id;
+    CrossProcessId id;
     Vector<SessionHistoryEntryDescriptor> entries;
 };
 
@@ -113,17 +131,19 @@ public:
     [[nodiscard]] RefPtr<HTML::DocumentState> document_state() const;
     void set_document_state(RefPtr<HTML::DocumentState>);
 
-    [[nodiscard]] SerializationRecord const& classic_history_api_state() const { return m_classic_history_api_state; }
-    void set_classic_history_api_state(SerializationRecord classic_history_api_state) { m_classic_history_api_state = move(classic_history_api_state); }
+    [[nodiscard]] UniqueNodeID document_id() const;
 
-    [[nodiscard]] SerializationRecord const& navigation_api_state() const { return m_navigation_api_state; }
-    void set_navigation_api_state(SerializationRecord navigation_api_state) { m_navigation_api_state = move(navigation_api_state); }
+    [[nodiscard]] StorageSerializationRecord const& classic_history_api_state() const { return m_classic_history_api_state; }
+    void set_classic_history_api_state(StorageSerializationRecord classic_history_api_state) { m_classic_history_api_state = move(classic_history_api_state); }
 
-    [[nodiscard]] String const& navigation_api_key() const { return m_navigation_api_key; }
-    void set_navigation_api_key(String navigation_api_key) { m_navigation_api_key = move(navigation_api_key); }
+    [[nodiscard]] StorageSerializationRecord const& navigation_api_state() const { return m_navigation_api_state; }
+    void set_navigation_api_state(StorageSerializationRecord navigation_api_state) { m_navigation_api_state = move(navigation_api_state); }
 
-    [[nodiscard]] String const& navigation_api_id() const { return m_navigation_api_id; }
-    void set_navigation_api_id(String navigation_api_id) { m_navigation_api_id = move(navigation_api_id); }
+    [[nodiscard]] Utf16String const& navigation_api_key() const { return m_navigation_api_key; }
+    void set_navigation_api_key(Utf16String navigation_api_key) { m_navigation_api_key = move(navigation_api_key); }
+
+    [[nodiscard]] Utf16String const& navigation_api_id() const { return m_navigation_api_id; }
+    void set_navigation_api_id(Utf16String navigation_api_id) { m_navigation_api_id = move(navigation_api_id); }
 
     [[nodiscard]] ScrollRestorationMode scroll_restoration_mode() const { return m_scroll_restoration_mode; }
     void set_scroll_restoration_mode(ScrollRestorationMode scroll_restoration_mode) { m_scroll_restoration_mode = scroll_restoration_mode; }
@@ -145,19 +165,19 @@ private:
 
     // https://html.spec.whatwg.org/multipage/browsing-the-web.html#she-classic-history-api-state
     // classic history API state, which is serialized state, initially StructuredSerializeForStorage(null).
-    SerializationRecord m_classic_history_api_state;
+    StorageSerializationRecord m_classic_history_api_state;
 
     // https://html.spec.whatwg.org/multipage/browsing-the-web.html#she-navigation-api-state
     // navigation API state, which is a serialized state, initially StructuredSerializeForStorage(undefined).
-    SerializationRecord m_navigation_api_state;
+    StorageSerializationRecord m_navigation_api_state;
 
     // https://html.spec.whatwg.org/multipage/browsing-the-web.html#she-navigation-api-key
     // navigation API key, which is a string, initially set to the result of generating a random UUID.
-    String m_navigation_api_key;
+    Utf16String m_navigation_api_key;
 
     // https://html.spec.whatwg.org/multipage/browsing-the-web.html#she-navigation-api-id
     // navigation API ID, which is a string, initially set to the result of generating a random UUID.
-    String m_navigation_api_id;
+    Utf16String m_navigation_api_id;
 
     // https://html.spec.whatwg.org/multipage/browsing-the-web.html#she-scroll-restoration-mode
     // scroll restoration mode, a scroll restoration mode, initially "auto"
@@ -172,19 +192,27 @@ private:
     // NOTE: This is where we could remember the state of form controls, for example.
 };
 
-struct SessionHistoryEntryDescriptorCreationState {
-    HashMap<DocumentState const*, u64> document_state_ids;
-    u64 next_document_state_id { 1 };
+WEB_API SessionHistoryEntryDescriptor create_session_history_entry_descriptor(SessionHistoryEntry const&);
+
+WEB_API SessionHistoryEntryDescriptor create_initial_session_history_entry_descriptor(CrossProcessId document_state_id, Optional<URL::Origin> opener_origin, Optional<URL::URL> opener_base_url, Utf16String navigable_target_name);
+WEB_API SessionHistoryDocumentStateDescriptor create_session_history_document_state_descriptor(DocumentState const&);
+WEB_API PendingSessionHistoryEntryDescriptor create_pending_session_history_entry_descriptor(SessionHistoryEntry const&);
+WEB_API PendingSessionHistoryEntryDescriptor create_pending_session_history_entry_descriptor(SessionHistoryEntryDescriptor);
+WEB_API SessionHistoryEntryDescriptor create_session_history_entry_descriptor(PendingSessionHistoryEntryDescriptor, i32 step);
+WEB_API Optional<SessionHistoryEntryPersistedState> create_session_history_entry_persisted_state(SessionHistoryEntry const&);
+WEB_API SessionHistoryEntryIdentity session_history_entry_identity(SessionHistoryEntry const&);
+WEB_API SessionHistoryEntryIdentity session_history_entry_identity(SessionHistoryEntryDescriptor const&);
+
+// Document states already reconstructed from the UI process's descriptors, so entries that share a document state
+// there share one here too.
+struct SessionHistoryEntryReconstructionState {
+    HashMap<CrossProcessId, RefPtr<DocumentState>> document_states;
 };
 
-WEB_API SessionHistoryEntryDescriptor create_session_history_entry_descriptor(SessionHistoryEntry const&, SessionHistoryEntryDescriptorCreationState&);
-WEB_API bool session_history_entry_descriptors_match(SessionHistoryEntryDescriptor const&, SessionHistoryEntryDescriptor const&);
-enum class MatchNestedHistories {
-    Yes,
-    No,
-};
-WEB_API bool session_history_entry_descriptors_match_ignoring_document_state_id(SessionHistoryEntryDescriptor const&, SessionHistoryEntryDescriptor const&, MatchNestedHistories = MatchNestedHistories::Yes);
-WEB_API bool session_history_entry_matches_descriptor_ignoring_document_state_id(SessionHistoryEntry const&, SessionHistoryEntryDescriptor const&, MatchNestedHistories = MatchNestedHistories::Yes);
+WEB_API void apply_session_history_entry_descriptor_from_ui_process(SessionHistoryEntry&, SessionHistoryEntryDescriptor&);
+WEB_API void apply_session_history_document_state_descriptor_from_ui_process(DocumentState&, SessionHistoryDocumentStateDescriptor const&);
+WEB_API RefPtr<DocumentState> get_or_create_document_state_from_ui_process(SessionHistoryDocumentStateDescriptor const&, SessionHistoryEntryReconstructionState&);
+WEB_API NonnullRefPtr<SessionHistoryEntry> create_session_history_entry_from_ui_process(SessionHistoryEntryDescriptor, SessionHistoryEntryReconstructionState&);
 
 }
 
@@ -197,10 +225,22 @@ template<>
 WEB_API ErrorOr<Web::HTML::SessionHistoryEntryDescriptor> decode(Decoder&);
 
 template<>
+WEB_API ErrorOr<void> encode(Encoder&, Web::HTML::PendingSessionHistoryEntryDescriptor const&);
+
+template<>
+WEB_API ErrorOr<Web::HTML::PendingSessionHistoryEntryDescriptor> decode(Decoder&);
+
+template<>
 WEB_API ErrorOr<void> encode(Encoder&, Web::HTML::SessionHistoryEntryScrollPositionData const&);
 
 template<>
 WEB_API ErrorOr<Web::HTML::SessionHistoryEntryScrollPositionData> decode(Decoder&);
+
+template<>
+WEB_API ErrorOr<void> encode(Encoder&, Web::HTML::SessionHistoryEntryPersistedState const&);
+
+template<>
+WEB_API ErrorOr<Web::HTML::SessionHistoryEntryPersistedState> decode(Decoder&);
 
 template<>
 WEB_API ErrorOr<void> encode(Encoder&, Web::HTML::SessionHistoryDocumentStateDescriptor const&);

@@ -191,7 +191,7 @@ bool SourceTextModule::try_install_bytecode_cache(NonnullRefPtr<RustIntegration:
         return false;
 
     auto shared_function_data = collect_shared_function_data();
-    auto result = RustIntegration::try_install_bytecode_cache_module(bytecode_cache, move(source_code), realm(), m_executable, shared_function_data, m_tla_shared_data);
+    auto result = RustIntegration::try_install_bytecode_cache_module(bytecode_cache, move(source_code), realm(), m_executable.ptr(), shared_function_data, m_tla_shared_data.ptr());
     if (!result.has_value())
         return false;
 
@@ -204,7 +204,7 @@ void SourceTextModule::install_generated_bytecode_cache(NonnullRefPtr<RustIntegr
     VERIFY(can_install_generated_bytecode_cache());
 
     auto shared_function_data = collect_shared_function_data();
-    auto result = RustIntegration::install_generated_bytecode_cache_module(bytecode_cache, move(source_code), realm(), m_executable, shared_function_data, m_tla_shared_data);
+    auto result = RustIntegration::install_generated_bytecode_cache_module(bytecode_cache, move(source_code), realm(), m_executable.ptr(), shared_function_data, m_tla_shared_data.ptr());
     complete_bytecode_cache_install(result.executable.ptr(), result.top_level_await_executable.ptr(), move(bytecode_cache));
 }
 
@@ -284,18 +284,18 @@ Result<GC::Ref<SourceTextModule>, Vector<ParserError>> SourceTextModule::from_ru
 }
 
 // 16.2.1.7.1 ParseModule ( sourceText, realm, hostDefined ), https://tc39.es/ecma262/#sec-parsemodule
-Result<GC::Ref<SourceTextModule>, Vector<ParserError>> SourceTextModule::parse(Utf16View source_text, Realm& realm, StringView filename, Utf16View display_filename, Script::HostDefined* host_defined)
+Result<GC::Ref<SourceTextModule>, Vector<ParserError>> SourceTextModule::parse(Utf16View source_text, Realm& realm, StringView filename, Utf16View display_filename, Script::HostDefined* host_defined, size_t line_number_offset)
 {
     auto fallback_display_filename = display_filename.is_empty() ? Utf16String::from_utf8(filename) : Utf16String {};
     if (display_filename.is_empty())
         display_filename = fallback_display_filename.utf16_view();
 
-    return from_rust_result(RustIntegration::compile_module(source_text, realm, display_filename), realm, filename, host_defined);
+    return from_rust_result(RustIntegration::compile_module(source_text, realm, display_filename, line_number_offset), realm, filename, host_defined);
 }
 
-Result<GC::Ref<SourceTextModule>, Vector<ParserError>> SourceTextModule::parse(NonnullRefPtr<SourceCode const> source_code, Realm& realm, StringView filename, Script::HostDefined* host_defined)
+Result<GC::Ref<SourceTextModule>, Vector<ParserError>> SourceTextModule::parse(NonnullRefPtr<SourceCode const> source_code, Realm& realm, StringView filename, Script::HostDefined* host_defined, size_t line_number_offset)
 {
-    return from_rust_result(RustIntegration::compile_module(move(source_code), realm), realm, filename, host_defined);
+    return from_rust_result(RustIntegration::compile_module(move(source_code), realm, line_number_offset), realm, filename, host_defined);
 }
 
 void SourceTextModule::verify_executable_backing_invariants()
@@ -572,7 +572,7 @@ ResolvedBinding SourceTextModule::resolve_export(VM& vm, Utf16FlyString const& e
     // 3. For each Record { [[Module]], [[ExportName]] } r of resolveSet, do
     for (auto const& [type, module, exported_name] : resolve_set) {
         // a. If module and r.[[Module]] are the same Module Record and exportName is r.[[ExportName]], then
-        if (module == this && exported_name == export_name) {
+        if (module == GC::Ptr<Module> { *this } && exported_name == export_name) {
             // i. Assert: This is a circular import request.
 
             // ii. Return null.

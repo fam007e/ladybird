@@ -14,16 +14,6 @@
 
 namespace AK {
 
-bool validate_utf16_le(ReadonlyBytes bytes)
-{
-    return simdutf::validate_utf16le(reinterpret_cast<char16_t const*>(bytes.data()), bytes.size() / 2);
-}
-
-bool validate_utf16_be(ReadonlyBytes bytes)
-{
-    return simdutf::validate_utf16be(reinterpret_cast<char16_t const*>(bytes.data()), bytes.size() / 2);
-}
-
 ErrorOr<String> Utf16View::to_utf8(AllowLonelySurrogates allow_lonely_surrogates) const
 {
     if (is_empty())
@@ -57,8 +47,37 @@ ErrorOr<ByteString> Utf16View::to_byte_string(AllowLonelySurrogates allow_lonely
     return TRY(to_utf8(allow_lonely_surrogates)).to_byte_string();
 }
 
+Optional<size_t> Utf16View::to_utf8_with_replacement_into(Bytes output) const
+{
+    if (has_ascii_storage()) {
+        if (output.size() < bytes().size())
+            return {};
+        return bytes().copy_to(output);
+    }
+
+    auto utf16 = utf16_span();
+    auto utf8_length = simdutf::utf8_length_from_utf16_with_replacement(utf16.data(), utf16.size()).count;
+    if (output.size() < utf8_length)
+        return {};
+
+    auto bytes_written = simdutf::convert_utf16_to_utf8_with_replacement(utf16.data(), utf16.size(), reinterpret_cast<char*>(output.data()));
+    VERIFY(bytes_written == utf8_length);
+    return bytes_written;
+}
+
 Utf16String Utf16View::to_ascii_lowercase() const
 {
+    // OPTIMIZATION: Write ASCII results directly into the new string's storage instead of appending one code unit at a
+    //               time to a builder.
+    if (has_ascii_storage()) {
+        return Utf16String::create_uninitialized_ascii(length_in_code_units(), [&](Bytes buffer) {
+            auto const* input = bytes().data();
+            auto* output = buffer.data();
+            for (size_t i = 0; i < buffer.size(); ++i)
+                output[i] = static_cast<u8>(AK::to_ascii_lowercase(input[i]));
+        });
+    }
+
     Utf16StringBuilder builder(length_in_code_units());
 
     for (size_t i = 0; i < length_in_code_units(); ++i)
@@ -69,6 +88,16 @@ Utf16String Utf16View::to_ascii_lowercase() const
 
 Utf16String Utf16View::to_ascii_uppercase() const
 {
+    // OPTIMIZATION: See to_ascii_lowercase().
+    if (has_ascii_storage()) {
+        return Utf16String::create_uninitialized_ascii(length_in_code_units(), [&](Bytes buffer) {
+            auto const* input = bytes().data();
+            auto* output = buffer.data();
+            for (size_t i = 0; i < buffer.size(); ++i)
+                output[i] = static_cast<u8>(AK::to_ascii_uppercase(input[i]));
+        });
+    }
+
     Utf16StringBuilder builder(length_in_code_units());
 
     for (size_t i = 0; i < length_in_code_units(); ++i)

@@ -12,7 +12,7 @@
 namespace Web::HTML {
 
 class HTMLTableColElement final : public HTMLElement {
-    WEB_PLATFORM_OBJECT(HTMLTableColElement, HTMLElement);
+    WEB_WRAPPABLE(HTMLTableColElement, HTMLElement);
     GC_DECLARE_ALLOCATOR(HTMLTableColElement);
 
 public:
@@ -24,10 +24,16 @@ public:
 private:
     HTMLTableColElement(DOM::Document&, DOM::QualifiedName);
 
-    virtual void initialize(JS::Realm&) override;
-
-    virtual bool is_presentational_hint(FlyString const&) const override;
+    virtual bool is_html_table_col_element() const override { return true; }
+    virtual bool is_presentational_hint(Utf16FlyString const&) const override;
     virtual void apply_presentational_hints(Vector<CSS::StyleProperty>&) const override;
 };
+
+}
+
+namespace Web::DOM {
+
+template<>
+inline bool Node::fast_is<HTML::HTMLTableColElement>() const { return is_html_table_col_element(); }
 
 }

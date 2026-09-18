@@ -20,7 +20,7 @@ namespace Web::WebGL {
 using namespace Web::HTML;
 
 class WebGL2RenderingContextOverloads : public WebGL2RenderingContextImpl {
-    WEB_NON_IDL_PLATFORM_OBJECT(WebGL2RenderingContextOverloads, WebGL2RenderingContextImpl);
+    WEB_NON_IDL_WRAPPABLE(WebGL2RenderingContextOverloads, WebGL2RenderingContextImpl);
 
 public:
     WebGL2RenderingContextOverloads(JS::Realm&, NonnullOwnPtr<WebGLContextProxy>);
@@ -52,6 +52,7 @@ public:
     void uniform_matrix3fv(GC::Ptr<WebGLUniformLocation> location, bool transpose, Float32List data, WebIDL::UnsignedLongLong src_offset, WebIDL::UnsignedLong src_length);
     void uniform_matrix4fv(GC::Ptr<WebGLUniformLocation> location, bool transpose, Float32List data, WebIDL::UnsignedLongLong src_offset, WebIDL::UnsignedLong src_length);
     void read_pixels(WebIDL::Long x, WebIDL::Long y, WebIDL::Long width, WebIDL::Long height, WebIDL::UnsignedLong format, WebIDL::UnsignedLong type, WebIDL::NullableArrayBufferViewVariant pixels);
+    void read_pixels(WebIDL::Long x, WebIDL::Long y, WebIDL::Long width, WebIDL::Long height, WebIDL::UnsignedLong format, WebIDL::UnsignedLong type, WebIDL::ArrayBufferView dst_data, WebIDL::UnsignedLongLong dst_offset);
     void read_pixels(WebIDL::Long x, WebIDL::Long y, WebIDL::Long width, WebIDL::Long height, WebIDL::UnsignedLong format, WebIDL::UnsignedLong type, WebIDL::LongLong offset);
 };
 

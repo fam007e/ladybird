@@ -44,6 +44,7 @@
 #include <LibURL/Parser.h>
 #include <LibURL/URL.h>
 #include <LibWeb/HTML/SelectedFile.h>
+#include <LibWeb/HTML/VisibilityState.h>
 #include <LibWebView/Process.h>
 #include <LibWebView/Utilities.h>
 
@@ -163,17 +164,32 @@ static ErrorOr<void> skip_ui_process_session_history_tests_unless_enabled(Applic
     if (app.run_ui_process_session_history_tests)
         return {};
 
-    static constexpr Array ui_process_session_history_tests {
-        "Text/input/navigation/ui-process-session-history-dump.html"sv,
-        "Text/input/navigation/ui-process-session-history-same-document-back.html"sv,
-        "Text/input/navigation/ui-process-session-history-same-document.html"sv,
-    };
+    auto directory = LexicalPath::join(app.test_root_path, "Text/input/navigation/"sv).string();
+    if (!FileSystem::exists(directory))
+        return {};
 
-    for (auto const& test : ui_process_session_history_tests) {
-        auto path = LexicalPath::join(app.test_root_path, test).string();
+    Core::DirIterator it(directory, Core::DirIterator::Flags::SkipDots);
+    while (it.has_next()) {
+        auto path = it.next_full_path();
+        if (!LexicalPath::basename(path).starts_with("ui-process-session-history-"sv))
+            continue;
+        if (!is_valid_test_name(path))
+            continue;
         s_skipped_tests.append(TRY(real_path_for_test_input(path)));
     }
 
+    return {};
+}
+
+static ErrorOr<void> skip_aia_tests_on_apple(Application const& app)
+{
+#ifdef AK_OS_MACOS
+    auto path = LexicalPath::join(app.test_root_path, "Text/input/aia-cert-fetching.html"sv).string();
+    if (FileSystem::exists(path))
+        s_skipped_tests.append(TRY(real_path_for_test_input(path)));
+#else
+    (void)app;
+#endif
     return {};
 }
 
@@ -459,6 +475,18 @@ static void run_dump_test(TestWebView& view, TestRunContext& context, Test& test
 {
     auto test_index = test.index;
 
+    if (test.mode == TestMode::Text && !test.expectation_path.is_empty()) {
+        auto expectation_file = Core::File::open(test.expectation_path, Core::File::OpenMode::Read);
+        if (!expectation_file.is_error()) {
+            auto expectation = expectation_file.value()->read_until_eof();
+            if (!expectation.is_error()) {
+                auto expectation_view = StringView { expectation.value() };
+                if (expectation_view == web_content_termination_marker || expectation_view == "WebContent helper process terminated after rejected IPC.\n"sv)
+                    test.expected_outcome = ExpectedOutcome::WebContentTermination;
+            }
+        }
+    }
+
     auto handle_completed_test = [&context, test_index, url]() -> ErrorOr<TestResult> {
         auto& test = context.tests[test_index];
         if (test.expectation_path.is_empty()) {
@@ -525,7 +553,7 @@ static void run_dump_test(TestWebView& view, TestRunContext& context, Test& test
             // NOTE: We take a screenshot here to force the lazy layout of SVG-as-image documents to happen.
             //       It also causes a lot more code to run, which is good for finding bugs. :^)
             view.take_screenshot()->when_resolved([&view, &context, test_index, on_test_complete = move(on_test_complete)](auto const&) {
-                auto promise = view.request_internal_page_info(WebView::PageInfoType::LayoutTree | WebView::PageInfoType::PaintTree | WebView::PageInfoType::StackingContextTree);
+                auto promise = view.request_internal_page_info(WebView::PageInfoType::LayoutTree | WebView::PageInfoType::StackingContextTree);
 
                 promise->when_resolved([&context, test_index, on_test_complete = move(on_test_complete)](auto const& text) {
                     context.tests[test_index].text = text;
@@ -544,6 +572,9 @@ static void run_dump_test(TestWebView& view, TestRunContext& context, Test& test
             auto& test = context.tests[test_index];
             test.did_finish_loading = true;
 
+            if (test.expected_outcome == ExpectedOutcome::WebContentTermination)
+                return;
+
             if (test.expectation_path.is_empty()) {
                 auto promise = view.request_internal_page_info(WebView::PageInfoType::Text);
 
@@ -559,6 +590,9 @@ static void run_dump_test(TestWebView& view, TestRunContext& context, Test& test
 
         view.on_test_finish = [&context, test_index, on_test_complete](auto const& text) {
             auto& test = context.tests[test_index];
+            if (test.expected_outcome == ExpectedOutcome::WebContentTermination)
+                return;
+
             test.text = text;
             test.did_finish_test = true;
 
@@ -888,10 +922,11 @@ static void run_test(TestWebView& view, TestRunContext& context, size_t test_ind
     });
     test.timeout_timer->start();
 
-    view.on_set_test_timeout = [&context, test_index, timeout_in_milliseconds](double milliseconds) {
+    view.on_set_test_timeout = [&context, test_index](double milliseconds) {
         auto& test = context.tests[test_index];
-        if (milliseconds > timeout_in_milliseconds)
-            test.timeout_timer->restart(AK::clamp_to<int>(milliseconds));
+        if (milliseconds <= 0)
+            return;
+        test.timeout_timer->restart(AK::clamp_to<int>(milliseconds));
     };
 
     // Clear the current document.
@@ -932,7 +967,7 @@ static void run_test(TestWebView& view, TestRunContext& context, size_t test_ind
 
             // Append variant query string if present (variant is "?foo=bar", set_query expects "foo=bar")
             if (test.variant.has_value())
-                url->set_query(MUST(test.variant->substring_from_byte_offset_with_shared_superstring(1)));
+                url->set_query(test.variant->bytes_as_string_view().substring_view(1));
 
             switch (test.mode) {
             case TestMode::Crash:
@@ -955,7 +990,7 @@ static void run_test(TestWebView& view, TestRunContext& context, size_t test_ind
     view.load(URL::about_blank());
 }
 
-static void set_ui_callbacks_for_tests(TestWebView& view, TestRunCapture& test_run_capture)
+static void set_ui_callbacks_for_tests(TestWebView& view, TestRunContext& context, TestRunCapture& test_run_capture)
 {
     view.on_request_file_picker = [&](auto const& accepted_file_types, auto allow_multiple_files) {
         // Create some dummy files for tests.
@@ -978,20 +1013,20 @@ static void set_ui_callbacks_for_tests(TestWebView& view, TestRunCapture& test_r
         }
 
         if (add_txt_files) {
-            selected_files.empend("file1"sv, MUST(ByteBuffer::copy("Contents for file1"sv.bytes())));
+            selected_files.empend("file1"_utf16, MUST(ByteBuffer::copy("Contents for file1"sv.bytes())));
 
             if (allow_multiple_files == Web::HTML::AllowMultipleFiles::Yes) {
-                selected_files.empend("file2"sv, MUST(ByteBuffer::copy("Contents for file2"sv.bytes())));
-                selected_files.empend("file3"sv, MUST(ByteBuffer::copy("Contents for file3"sv.bytes())));
-                selected_files.empend("file4"sv, MUST(ByteBuffer::copy("Contents for file4"sv.bytes())));
+                selected_files.empend("file2"_utf16, MUST(ByteBuffer::copy("Contents for file2"sv.bytes())));
+                selected_files.empend("file3"_utf16, MUST(ByteBuffer::copy("Contents for file3"sv.bytes())));
+                selected_files.empend("file4"_utf16, MUST(ByteBuffer::copy("Contents for file4"sv.bytes())));
             }
         }
 
         if (add_cpp_files) {
-            selected_files.empend("file1.cpp"sv, MUST(ByteBuffer::copy("int main() {{ return 1; }}"sv.bytes())));
+            selected_files.empend("file1.cpp"_utf16, MUST(ByteBuffer::copy("int main() {{ return 1; }}"sv.bytes())));
 
             if (allow_multiple_files == Web::HTML::AllowMultipleFiles::Yes) {
-                selected_files.empend("file2.cpp"sv, MUST(ByteBuffer::copy("int main() {{ return 2; }}"sv.bytes())));
+                selected_files.empend("file2.cpp"_utf16, MUST(ByteBuffer::copy("int main() {{ return 2; }}"sv.bytes())));
             }
         }
 
@@ -1003,11 +1038,14 @@ static void set_ui_callbacks_for_tests(TestWebView& view, TestRunCapture& test_r
         view.alert_closed();
     };
 
-    view.on_web_content_crashed = [&view, &test_run_capture]() {
+    view.on_web_content_crashed = [&view, &context, &test_run_capture](auto crash_reason) {
         test_run_capture.write_test_output(view);
 
         if (auto index = s_current_test_index_by_view.get(&view); index.has_value()) {
-            view.on_test_complete({ *index, TestResult::Crashed });
+            auto result = context.tests[*index].expected_outcome == ExpectedOutcome::WebContentTermination && crash_reason == WebView::ViewImplementation::WebContentCrashReason::RejectedIPC
+                ? TestResult::Pass
+                : TestResult::Crashed;
+            view.on_test_complete({ *index, result });
         }
     };
 
@@ -1024,6 +1062,7 @@ static ErrorOr<int> run_tests(Core::AnonymousBuffer const& theme, Web::DevicePix
     TRY(load_test_config(app.test_root_path));
     TRY(skip_async_scrolling_tests_unless_enabled(app));
     TRY(skip_ui_process_session_history_tests_unless_enabled(app));
+    TRY(skip_aia_tests_on_apple(app));
 
     Vector<Test> tests;
 
@@ -1120,8 +1159,6 @@ static ErrorOr<int> run_tests(Core::AnonymousBuffer const& theme, Web::DevicePix
     for (size_t i = 0; i < concurrency; ++i) {
         auto view = TestWebView::create(theme, window_size);
         view->on_load_finish = [&](auto const&) { ++loaded_web_views; };
-        // FIXME: Figure out a better way to ensure that tests use default browser settings.
-        view->reset_zoom();
 
         views.unchecked_append(move(view));
     }
@@ -1140,6 +1177,11 @@ static ErrorOr<int> run_tests(Core::AnonymousBuffer const& theme, Web::DevicePix
         s_view_index_by_view.set(view.ptr(), i);
     }
 
+    auto tests_remaining = tests.size();
+    TestRunContext context { tests, tests_remaining, total_tests };
+    s_run_context = &context;
+    ScopeGuard clear_run_context = [&] { s_run_context = nullptr; };
+
     display.begin_run();
     ScopeGuard clear_live_display = [&] { display.clear_live_display(); };
 
@@ -1147,18 +1189,26 @@ static ErrorOr<int> run_tests(Core::AnonymousBuffer const& theme, Web::DevicePix
     s_view_run_next_test.resize_and_keep_capacity(concurrency);
 
     s_all_tests_complete = Core::Promise<Empty>::construct();
-    auto tests_remaining = tests.size();
     auto current_test = 0uz;
-
-    TestRunContext context { tests, tests_remaining, total_tests };
-    s_run_context = &context;
-    ScopeGuard clear_run_context = [&] { s_run_context = nullptr; };
 
     Vector<TestCompletion> non_passing_tests;
     bool fail_fast_triggered = false;
 
+    // If the Compositor dies, it takes the rendering pipeline of every in-flight test with it. So, fail all those as
+    // Crashed, not Pass. WebView::Application restarts the Compositor afterwards, so subsequent tests still run.
+    app.on_compositor_process_death = [&]() {
+        warnln("test-web: Compositor process died; failing all in-flight tests as crashed");
+        for (auto& view : views) {
+            if (auto index = s_current_test_index_by_view.get(view.ptr()); index.has_value()) {
+                test_run_capture.write_test_output(*view);
+                view->on_test_complete({ *index, TestResult::Crashed });
+            }
+        }
+    };
+    ScopeGuard clear_compositor_death_hook = [&] { app.on_compositor_process_death = {}; };
+
     for (auto [view_id, view] : enumerate(views)) {
-        set_ui_callbacks_for_tests(*view, test_run_capture);
+        set_ui_callbacks_for_tests(*view, context, test_run_capture);
         view->clear_content_blockers();
 
         auto cleanup_test = [&, view = view.ptr()](size_t test_index, TestResult test_result) {
@@ -1169,13 +1219,21 @@ static ErrorOr<int> run_tests(Core::AnonymousBuffer const& theme, Web::DevicePix
 
             // Disconnect child crash handlers so old child crashes don't affect the next test
             view->disconnect_child_crash_handlers();
+            view->close_child_web_views();
 
             // Don't try to reset state if WebContent crashed - it's gone
             if (test_result != TestResult::Crashed) {
                 view->clear_content_blockers();
                 view->reset_zoom();
+                view->reset_force_dark();
+                view->reset_line_box_borders();
                 view->reset_viewport_size(window_size);
             }
+
+            // The system visibility state lives in this view's traversable, and a test that hid the page only puts it
+            // back from signalTestIsDone(). A test that times out or crashes while hidden would otherwise hand the
+            // hidden state to every test that follows in this view, a respawned WebContent included.
+            view->set_system_visibility_state(Web::HTML::VisibilityState::Visible);
 
             auto& test = tests[test_index];
             if (test.timeout_timer) {
@@ -1226,7 +1284,7 @@ static ErrorOr<int> run_tests(Core::AnonymousBuffer const& theme, Web::DevicePix
 
                 // Write captured std logs to results directory.
                 // NOTE: On crashes, we already flushed it in on_web_content_crashed.
-                if (result.result != TestResult::Crashed)
+                if (result.result != TestResult::Crashed && test.expected_outcome != ExpectedOutcome::WebContentTermination)
                     test_run_capture.write_test_output(*view);
 
                 bool const is_non_passing_result = result.result != TestResult::Pass;

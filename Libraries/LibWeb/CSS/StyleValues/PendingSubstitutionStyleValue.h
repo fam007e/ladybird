@@ -13,35 +13,18 @@ namespace Web::CSS {
 // https://drafts.csswg.org/css-values-5/#pending-substitution-value
 class PendingSubstitutionStyleValue final : public StyleValueWithDefaultOperators<PendingSubstitutionStyleValue> {
 public:
-    static ValueComparingNonnullRefPtr<PendingSubstitutionStyleValue> create(StyleValue const& original_shorthand_value)
-    {
-        return adopt_ref(*new (nothrow) PendingSubstitutionStyleValue(original_shorthand_value));
-    }
     virtual ~PendingSubstitutionStyleValue() override = default;
-    virtual void serialize(StringBuilder&, SerializationMode) const override { }
-    virtual Vector<Parser::ComponentValue> tokenize() const override
-    {
-        // Not sure what to do here, but this isn't valid so returning GIV seems the most correct.
-        return { Parser::ComponentValue { Parser::GuaranteedInvalidValue {} } };
-    }
+    ValueComparingNonnullRefPtr<StyleValue const> original_shorthand_value() const { return wrap_rust_child(m_value->pending_substitution.original_shorthand_value); }
 
-    StyleValue const& original_shorthand_value() const { return *m_original_shorthand_value; }
-
-    // We shouldn't need to compare these, but in case we do: The nature of them is that their value is unknown, so
-    // consider them all to be unique.
-    bool properties_equal(PendingSubstitutionStyleValue const&) const { return false; }
-
-    // NB: We should never be in a position where we need to check this
-    virtual bool is_computationally_independent() const override { VERIFY_NOT_REACHED(); }
-
+    // NB: Pending-substitution values never compare equal (their value is unknown);
+    //     StyleValue::equals special-cases them.
 private:
-    explicit PendingSubstitutionStyleValue(StyleValue const& original_shorthand_value)
-        : StyleValueWithDefaultOperators(Type::PendingSubstitution)
-        , m_original_shorthand_value(original_shorthand_value)
+    friend class StyleValue;
+
+    explicit PendingSubstitutionStyleValue(StyleValueFFI::StyleValueData const* data)
+        : StyleValueWithDefaultOperators(Type::PendingSubstitution, data)
     {
     }
-
-    NonnullRefPtr<StyleValue const> m_original_shorthand_value;
 };
 
 }

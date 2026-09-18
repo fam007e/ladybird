@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/ByteString.h>
 #include <AK/Function.h>
 #include <AK/OwnPtr.h>
 #include <AK/String.h>
@@ -31,6 +32,16 @@ static constexpr CGFloat const WINDOW_HEIGHT = 800;
 static constexpr CGFloat const TAB_ICON_SIZE = 16;
 static constexpr NSUInteger const TAB_LOADING_SPINNER_SEGMENT_COUNT = 12;
 
+static NSString* window_frame_autosave_name()
+{
+    auto const& profile = WebView::Application::profile();
+    if (profile.is_temporary())
+        return nil;
+
+    auto name = ByteString::formatted("window-{}", WebView::Profile::routing_identifier(profile.paths().identity));
+    return Ladybird::string_to_ns_string(name);
+}
+
 class TabSettingsObserver final : public WebView::SettingsObserver {
 public:
     explicit TabSettingsObserver(Tab* tab)
@@ -40,7 +51,7 @@ public:
 
 private:
     // These are forward-declared so that they may access non-public Tab methods.
-    virtual void show_bookmarks_bar_changed() override;
+    virtual void appearance_changed() override;
     virtual void config_variable_changed(WebView::ConfigVariableID variable) override;
 
     __weak Tab* m_tab { nil };
@@ -88,6 +99,7 @@ static NSImage* tab_loading_spinner_icon(NSUInteger frame)
 }
 
 @property (nonatomic, strong) NSString* title;
+@property (nonatomic, strong) NSString* page_title;
 @property (nonatomic, strong) NSImage* favicon;
 
 @property (nonatomic, strong) NSTitlebarAccessoryViewController* bookmarks_bar_controller;
@@ -114,14 +126,14 @@ static NSImage* tab_loading_spinner_icon(NSUInteger frame)
     return default_favicon;
 }
 
-- (instancetype)init
+- (instancetype)init:(WebView::IsPrivate)is_private
 {
-    auto* web_view = [[LadybirdWebView alloc] init:self];
+    auto* web_view = [[LadybirdWebView alloc] init:self isPrivate:is_private];
     return [self initWithWebView:web_view];
 }
 
 - (instancetype)initAsChild:(Tab*)parent
-                  pageIndex:(u64)page_index
+                  pageIndex:(Web::PageId)page_index
 {
     auto* web_view = [[LadybirdWebView alloc] initAsChild:self parent:[parent web_view] pageIndex:page_index];
     return [self initWithWebView:web_view];
@@ -135,11 +147,24 @@ static NSImage* tab_loading_spinner_icon(NSUInteger frame)
     auto window_rect = NSMakeRect(position_x, position_y, WINDOW_WIDTH, WINDOW_HEIGHT);
 
     if (self = [super initWithWebView:web_view windowRect:window_rect]) {
-        // Remember last window position
-        self.frameAutosaveName = @"window";
+        [self setTabbingIdentifier:[self isPrivate] == WebView::IsPrivate::Yes
+                ? @"LadybirdPrivateBrowsing"
+                : @"LadybirdBrowsing"];
+
+        auto* frame_autosave_name = window_frame_autosave_name();
+        if ([self isPrivate] == WebView::IsPrivate::No && frame_autosave_name != nil) {
+            // Remember last window position.
+            self.frameAutosaveName = frame_autosave_name;
+        } else {
+            // Adopt the last saved frame without persisting changes to it, and keep private and temporary-profile
+            // windows out of window state restoration entirely.
+            if (frame_autosave_name != nil)
+                [self setFrameUsingName:frame_autosave_name];
+            [self setRestorable:NO];
+        }
 
         self.favicon = [Tab defaultFavicon];
-        self.title = @"New Tab";
+        [self setPageTitle:@"New Tab"];
         [self updateTabTitleAndFavicon];
 
         [self setTitleVisibility:NSWindowTitleHidden];
@@ -147,11 +172,11 @@ static NSImage* tab_loading_spinner_icon(NSUInteger frame)
 
         m_settings_observer = make<TabSettingsObserver>(self);
 
-        auto* bookmarks_bar = [[BookmarksBar alloc] init];
+        auto* bookmarks_bar = [[BookmarksBar alloc] init:self];
         self.bookmarks_bar_controller = [[NSTitlebarAccessoryViewController alloc] init];
         [self.bookmarks_bar_controller setView:bookmarks_bar];
         [self.bookmarks_bar_controller setLayoutAttribute:NSLayoutAttributeBottom];
-        [self updateBookmarksBarDisplay:WebView::Application::settings().show_bookmarks_bar()];
+        [self updateBookmarksBarDisplay:WebView::Application::settings().appearance().show_bookmarks_bar];
         [self addTitlebarAccessoryViewController:self.bookmarks_bar_controller];
 
         self.search_panel = [[SearchPanel alloc] init];
@@ -179,6 +204,11 @@ static NSImage* tab_loading_spinner_icon(NSUInteger frame)
 }
 
 #pragma mark - Public methods
+
+- (WebView::IsPrivate)isPrivate
+{
+    return [[self web_view] view].is_private();
+}
 
 - (void)find:(id)sender
 {
@@ -214,12 +244,22 @@ static NSImage* tab_loading_spinner_icon(NSUInteger frame)
     return self.favicon;
 }
 
+- (void)setPageTitle:(NSString*)page_title
+{
+    self.page_title = page_title;
+
+    if ([self isPrivate] == WebView::IsPrivate::Yes)
+        [self setTitle:[NSString stringWithFormat:@"%@ (Private Browsing)", page_title]];
+    else
+        [self setTitle:page_title];
+}
+
 - (NSString*)displayTitle
 {
     if (!WebView::Application::settings().config_variable_as_bool(WebView::ConfigVariableID::ShowWebContentProcessIDInTabTitle))
-        return self.title;
+        return self.page_title;
 
-    auto title = MUST(String::formatted("{} [{}]", Ladybird::ns_string_to_string(self.title), [[self web_view] view].client().pid()));
+    auto title = MUST(String::formatted("{} [{}]", Ladybird::ns_string_to_string(self.page_title), [[self web_view] view].client().pid()));
     return Ladybird::string_to_ns_string(title);
 }
 
@@ -356,7 +396,9 @@ static NSImage* tab_loading_spinner_icon(NSUInteger frame)
 
     auto* controller = [delegate createNewTab:url
                                       fromTab:self
-                                  activateTab:activate_tab];
+                                    isPrivate:[self isPrivate]
+                                  activateTab:activate_tab
+                                  tabLocation:TabLocation::end()];
 
     auto* tab = (Tab*)[controller window];
     return [[tab web_view] handle];
@@ -364,7 +406,7 @@ static NSImage* tab_loading_spinner_icon(NSUInteger frame)
 
 - (String const&)onCreateChildTab:(Optional<URL::URL> const&)url
                       activateTab:(Web::HTML::ActivateTab)activate_tab
-                        pageIndex:(u64)page_index
+                        pageIndex:(Web::PageId)page_index
 {
     auto* delegate = (ApplicationDelegate*)[NSApp delegate];
 
@@ -377,21 +419,16 @@ static NSImage* tab_loading_spinner_icon(NSUInteger frame)
     return [[tab web_view] handle];
 }
 
-- (void)onLoadStart:(URL::URL const&)url isRedirect:(BOOL)is_redirect
+- (void)onLoadStart
 {
-    self.title = Ladybird::string_to_ns_string(url.serialize());
-    self.favicon = [Tab defaultFavicon];
     [self setTabLoading:YES];
-    [self updateTabTitleAndFavicon];
-
-    [[self tabController] onFaviconChange:nil];
-    [[self tabController] onLoadStart:url isRedirect:is_redirect];
+    [[self tabController] onLoadStart];
 }
 
-- (void)onLoadFinish:(URL::URL const&)url
+- (void)onLoadFinish
 {
     [self setTabLoading:NO];
-    [[self tabController] onLoadFinish:url];
+    [[self tabController] onLoadFinish];
 }
 
 - (void)onURLChange:(URL::URL const&)url
@@ -401,15 +438,22 @@ static NSImage* tab_loading_spinner_icon(NSUInteger frame)
 
 - (void)onTitleChange:(Utf16String const&)title
 {
-    self.title = Ladybird::utf16_string_to_ns_string(title);
+    [self setPageTitle:Ladybird::utf16_string_to_ns_string(title)];
     [self updateTabTitleAndFavicon];
 }
 
-- (void)onFaviconChange:(Gfx::Bitmap const&)bitmap
+- (void)onFaviconChange:(Optional<Gfx::Bitmap const&>)bitmap
 {
-    auto* favicon = Ladybird::gfx_bitmap_to_ns_image(bitmap);
-    [favicon setResizingMode:NSImageResizingModeStretch];
-    self.favicon = favicon;
+    NSImage* favicon = nil;
+
+    if (bitmap.has_value()) {
+        favicon = Ladybird::gfx_bitmap_to_ns_image(*bitmap);
+        [favicon setResizingMode:NSImageResizingModeStretch];
+        self.favicon = favicon;
+    } else {
+        self.favicon = [Tab defaultFavicon];
+    }
+
     [self updateTabTitleAndFavicon];
     [[self tabController] onFaviconChange:favicon];
 }
@@ -470,9 +514,9 @@ static NSImage* tab_loading_spinner_icon(NSUInteger frame)
 
 @end
 
-void TabSettingsObserver::show_bookmarks_bar_changed()
+void TabSettingsObserver::appearance_changed()
 {
-    [m_tab updateBookmarksBarDisplay:WebView::Application::settings().show_bookmarks_bar()];
+    [m_tab updateBookmarksBarDisplay:WebView::Application::settings().appearance().show_bookmarks_bar];
 }
 
 void TabSettingsObserver::config_variable_changed(WebView::ConfigVariableID variable)

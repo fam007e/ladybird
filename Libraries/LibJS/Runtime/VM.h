@@ -14,6 +14,7 @@
 #include <AK/HashMap.h>
 #include <AK/RefCounted.h>
 #include <AK/StackInfo.h>
+#include <AK/Utf16FlyString.h>
 #include <AK/Variant.h>
 #include <LibCrypto/Forward.h>
 #include <LibGC/Function.h>
@@ -21,7 +22,6 @@
 #include <LibGC/RootVector.h>
 #include <LibJS/Bytecode/Executable.h>
 #include <LibJS/Bytecode/Label.h>
-#include <LibJS/Bytecode/Operand.h>
 #include <LibJS/Bytecode/Register.h>
 #include <LibJS/CyclicModule.h>
 #include <LibJS/Export.h>
@@ -56,6 +56,17 @@ enum class CompilationType {
     IndirectEval,
     Function,
     Timer,
+};
+
+enum class NativeFunctionType : u32 {
+    RawNativeFunction,
+};
+
+struct NativeFunctionTableEntry {
+    NativeFunctionPointer function { nullptr };
+    NativeFunctionType type { NativeFunctionType::RawNativeFunction };
+
+    bool operator==(NativeFunctionTableEntry const&) const = default;
 };
 
 class JS_API VM : public RefCounted<VM> {
@@ -103,15 +114,6 @@ public:
         return m_running_execution_context->registers_and_constants_and_locals_and_arguments()[r.index()];
     }
 
-    ALWAYS_INLINE Value get(Bytecode::Operand op) const
-    {
-        return m_running_execution_context->registers_and_constants_and_locals_and_arguments()[op.raw()];
-    }
-    ALWAYS_INLINE void set(Bytecode::Operand op, Value value)
-    {
-        m_running_execution_context->registers_and_constants_and_locals_and_arguments_span().data()[op.raw()] = value;
-    }
-
     void do_return(Value value)
     {
         if (value.is_special_empty_value())
@@ -133,18 +135,26 @@ public:
 
     [[nodiscard]] PropertyKey const& get_property_key(Bytecode::PropertyKeyTableIndex) const;
 
+    // NB: The interpreter picks its dispatch table when it starts running an outermost executable.
+    //     Enabling debugging therefore only takes effect for later interpreter invocations, not
+    //     code that is already running.
+    void enable_debugging();
+    void disable_debugging();
+    [[nodiscard]] bool debugging_enabled() const { return m_debugger; }
+    [[nodiscard]] Debugger* debugger() { return m_debugger; }
+    [[nodiscard]] Debugger const* debugger() const { return m_debugger; }
+
     enum class HandleExceptionResponse {
         ExitFromExecutable,
         ContinueInThisExecutable,
     };
     [[nodiscard]] COLD HandleExceptionResponse handle_exception(u32 program_counter, Value exception);
-
     NEVER_INLINE void unwind_inline_frame_for_exception();
 
     ExecutionContext* push_inline_frame(
         ECMAScriptFunctionObject& callee_function,
         Bytecode::Executable& callee_executable,
-        ReadonlySpan<Bytecode::Operand> arguments,
+        ReadonlySpan<Value> arguments,
         u32 return_pc,
         u32 dst_raw,
         Value this_value,
@@ -163,12 +173,23 @@ public:
     JS_ENUMERATE_WELL_KNOWN_SYMBOLS
 #undef __JS_ENUMERATE
 
-    HashMap<Utf16String, GC::Ptr<PrimitiveString>>& utf16_string_cache()
-    {
-        return m_utf16_string_cache;
-    }
+    Bytecode::KeyedPropertyLookupCache& keyed_property_lookup_cache() { return *m_keyed_property_lookup_cache; }
 
+    struct StringToAtomCacheEntry {
+        GC::Ptr<PrimitiveString const> string;
+        Optional<Utf16FlyString> atom;
+    };
+
+    auto& string_to_atom_cache() { return m_string_to_atom_cache; }
+
+    struct NumericStringCacheEntry {
+        u64 number { 0 };
+        GC::Ptr<PrimitiveString> string;
+    };
+
+    auto& fly_string_cache() { return m_fly_string_cache; }
     auto& numeric_string_cache() { return m_numeric_string_cache; }
+    auto& large_numeric_string_cache() { return m_large_numeric_string_cache; }
 
     PrimitiveString& empty_string() { return *m_empty_string; }
 
@@ -303,21 +324,21 @@ public:
 
     ExecutionContext* previous_execution_context() const;
 
-    Environment const* lexical_environment() const { return running_execution_context().lexical_environment; }
-    Environment* lexical_environment() { return running_execution_context().lexical_environment; }
+    Environment const* lexical_environment() const { return running_execution_context().lexical_environment.ptr(); }
+    Environment* lexical_environment() { return running_execution_context().lexical_environment.ptr(); }
 
-    Environment const* variable_environment() const { return running_execution_context().variable_environment; }
-    Environment* variable_environment() { return running_execution_context().variable_environment; }
+    Environment const* variable_environment() const { return running_execution_context().variable_environment.ptr(); }
+    Environment* variable_environment() { return running_execution_context().variable_environment.ptr(); }
 
     // https://tc39.es/ecma262/#current-realm
     // The value of the Realm component of the running execution context is also called the current Realm Record.
-    Realm const* current_realm() const { return running_execution_context().realm; }
-    Realm* current_realm() { return running_execution_context().realm; }
+    Realm const* current_realm() const { return running_execution_context().realm.ptr(); }
+    Realm* current_realm() { return running_execution_context().realm.ptr(); }
 
     // https://tc39.es/ecma262/#active-function-object
     // The value of the Function component of the running execution context is also called the active function object.
-    FunctionObject const* active_function_object() const { return running_execution_context().function; }
-    FunctionObject* active_function_object() { return running_execution_context().function; }
+    FunctionObject const* active_function_object() const { return running_execution_context().function.ptr(); }
+    FunctionObject* active_function_object() { return running_execution_context().function.ptr(); }
     SharedFunctionInstanceData* active_shared_function_data();
 
     size_t argument_count() const
@@ -347,15 +368,57 @@ public:
     u32 execution_generation() const { return m_execution_generation; }
     void finish_execution_generation() { ++m_execution_generation; }
     FlatPtr primitive_storage_cage_base() const { return m_primitive_storage_cage_base; }
+    u32 register_native_function(NativeFunctionPointer, NativeFunctionType);
+    NativeFunctionPointer native_function(u32 index, NativeFunctionType expected_type) const;
 
-    ThrowCompletionOr<Reference> resolve_binding(Utf16FlyString const&, Strict, Environment* = nullptr);
+    ThrowCompletionOr<Reference> resolve_binding(Utf16FlyString const&, Strict, GC::Ptr<Environment> = nullptr);
     ThrowCompletionOr<Reference> get_identifier_reference(Environment*, Utf16FlyString, Strict, size_t hops = 0);
+
+    // The override only applies at the execution-context-stack depth the scope was created at, so
+    // callees pushed while the scope is alive are unaffected without any per-call bookkeeping.
+    class TypeErrorRealmScope {
+    public:
+        TypeErrorRealmScope(VM& vm, Realm& realm)
+            : m_vm(vm)
+            , m_previous_realm(vm.m_type_error_realm_override)
+            , m_previous_depth(vm.m_type_error_realm_override_depth)
+        {
+            m_vm.m_type_error_realm_override = &realm;
+            m_vm.m_type_error_realm_override_depth = vm.m_execution_context_stack.size();
+        }
+
+        ~TypeErrorRealmScope()
+        {
+            restore();
+        }
+
+        void restore()
+        {
+            if (!m_active)
+                return;
+            m_vm.m_type_error_realm_override = m_previous_realm;
+            m_vm.m_type_error_realm_override_depth = m_previous_depth;
+            m_active = false;
+        }
+
+    private:
+        VM& m_vm;
+        GC::Ptr<Realm> m_previous_realm;
+        size_t m_previous_depth { 0 };
+        bool m_active { true };
+    };
 
     // 5.2.3.2 Throw an Exception, https://tc39.es/ecma262/#sec-throw-an-exception
     template<typename T, typename... Args>
     COLD Completion throw_completion(Args&&... args)
     {
-        auto& realm = *current_realm();
+        auto& realm = [&]() -> Realm& {
+            if constexpr (IsSame<T, TypeError>) {
+                if (m_type_error_realm_override && m_execution_context_stack.size() == m_type_error_realm_override_depth)
+                    return *m_type_error_realm_override;
+            }
+            return *current_realm();
+        }();
         auto completion = T::create(realm, forward<Args>(args)...);
 
         return JS::throw_completion(completion);
@@ -379,7 +442,7 @@ public:
 
     Value get_new_target();
 
-    Object* get_import_meta();
+    GC::Ref<Object> get_import_meta();
 
     Object& get_global_object();
 
@@ -403,7 +466,7 @@ public:
         run_queued_promise_jobs_impl();
     }
 
-    void enqueue_promise_job(GC::Ref<GC::Function<ThrowCompletionOr<Value>()>> job, Realm*);
+    void enqueue_promise_job(GC::Ref<GC::Function<ThrowCompletionOr<Value>()>> job, GC::Ptr<Realm>);
 
     void run_queued_finalization_registry_cleanup_jobs();
     void enqueue_finalization_registry_cleanup_job(FinalizationRegistry&);
@@ -437,7 +500,7 @@ public:
     Function<void(Promise&, Promise::RejectionOperation)> host_promise_rejection_tracker;
     Function<ThrowCompletionOr<Value>(JobCallback&, Value, ReadonlySpan<Value>)> host_call_job_callback;
     Function<void(FinalizationRegistry&)> host_enqueue_finalization_registry_cleanup_job;
-    Function<void(GC::Ref<GC::Function<ThrowCompletionOr<Value>()>>, Realm*)> host_enqueue_promise_job;
+    Function<void(GC::Ref<GC::Function<ThrowCompletionOr<Value>()>>, GC::Ptr<Realm>)> host_enqueue_promise_job;
     Function<GC::Ref<JobCallback>(FunctionObject&)> host_make_job_callback;
     Function<GC::Ptr<PrimitiveString>(Object const&)> host_get_code_for_eval;
     Function<ThrowCompletionOr<void>(Realm&, ReadonlySpan<Utf16String>, Utf16View, Utf16View, CompilationType, ReadonlySpan<Value>, Value)> host_ensure_can_compile_strings;
@@ -452,6 +515,13 @@ public:
 
 private:
     using ErrorMessages = AK::Array<Utf16String, to_underlying(ErrorMessage::__Count)>;
+
+    struct NativeFunctionTableEntryTraits : public Traits<NativeFunctionTableEntry> {
+        static unsigned hash(NativeFunctionTableEntry const& entry)
+        {
+            return pair_int_hash(ptr_hash(bit_cast<FlatPtr>(entry.function)), to_underlying(entry.type));
+        }
+    };
 
     struct WellKnownSymbols {
 #define __JS_ENUMERATE(SymbolName, snake_name) \
@@ -504,6 +574,8 @@ private:
         Vector<ExecutionContext*> stack;
         Vector<ExecutionContext*> previous_running_contexts;
         ExecutionContext* running_execution_context { nullptr };
+        GC::Ptr<Realm> type_error_realm_override;
+        size_t type_error_realm_override_depth { 0 };
     };
 
     void load_imported_module(ImportedModuleReferrer, ModuleRequest const&, GC::Ptr<GraphLoadingState::HostDefined>, ImportedModulePayload);
@@ -516,10 +588,19 @@ private:
 
     static VM* s_the;
 
-    HashMap<Utf16String, GC::Ptr<PrimitiveString>> m_utf16_string_cache;
+    OwnPtr<Bytecode::KeyedPropertyLookupCache> m_keyed_property_lookup_cache;
+
+    static constexpr size_t string_to_atom_cache_size = 2;
+    AK::Array<StringToAtomCacheEntry, string_to_atom_cache_size> m_string_to_atom_cache;
+
+    static constexpr size_t fly_string_cache_size = 1024;
+    AK::Array<GC::Ptr<PrimitiveString>, fly_string_cache_size> m_fly_string_cache;
 
     static constexpr size_t numeric_string_cache_size = 1000;
     AK::Array<GC::Ptr<PrimitiveString>, numeric_string_cache_size> m_numeric_string_cache;
+
+    static constexpr size_t large_numeric_string_cache_size = 1024;
+    AK::Array<NumericStringCacheEntry, large_numeric_string_cache_size> m_large_numeric_string_cache;
 
     GC::Heap m_heap;
 
@@ -530,6 +611,13 @@ private:
     // walk the full active stack without relying on caller_frame there.
     Vector<ExecutionContext*> m_execution_context_stack_previous_running_contexts;
     ExecutionContext* m_running_execution_context { nullptr };
+    // This override is only active while generated WebIDL conversion code is
+    // running without re-entering ECMAScript. Any execution context push saves
+    // and clears it, so nested author script throws TypeErrors in its own realm
+    // and the pointer never remains active while that nested script can run
+    // arbitrary GC-visible code.
+    GC::Ptr<Realm> m_type_error_realm_override;
+    size_t m_type_error_realm_override_depth { 0 };
 
     Vector<SavedExecutionContextStack> m_saved_execution_context_stacks;
 
@@ -564,13 +652,18 @@ private:
 
     u32 m_execution_generation { 0 };
     FlatPtr m_primitive_storage_cage_base { 0 };
+    FlatPtr m_heap_region_base { 0 };
+    Vector<NativeFunctionTableEntry> m_native_function_table;
+    NativeFunctionTableEntry const* m_native_function_table_data { nullptr };
     u32 m_run_executable_depth { 0 };
     u32 m_module_execution_depth { 0 };
     u64 m_module_async_evaluation_count { 0 }; // [[ModuleAsyncEvaluationCount]]
 
+    OwnPtr<Debugger> m_debugger;
     OwnPtr<Agent> m_agent;
 
     bool m_dynamic_imports_allowed { false };
+    HashMap<NativeFunctionTableEntry, u32, NativeFunctionTableEntryTraits> m_native_function_indices;
 };
 
 template<typename GlobalObjectType, typename... Args>
@@ -578,7 +671,7 @@ template<typename GlobalObjectType, typename... Args>
 {
     auto root_execution_context = MUST(Realm::initialize_host_defined_realm(
         vm,
-        [&](Realm& realm_) -> GlobalObject* {
+        [&](Realm& realm_) -> GC::Ref<GlobalObject> {
             return vm.heap().allocate<GlobalObjectType>(realm_, forward<Args>(args)...);
         },
         nullptr));

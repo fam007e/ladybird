@@ -8,19 +8,27 @@
 #include <LibGC/Heap.h>
 #include <LibGfx/DecodedImageFrame.h>
 #include <LibWeb/Bindings/SVGImageElement.h>
+#include <LibWeb/CSS/Sizing.h>
+#include <LibWeb/CSS/StyleComputer.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/DocumentObserver.h>
 #include <LibWeb/DOM/Event.h>
 #include <LibWeb/HTML/PotentialCORSRequest.h>
+#include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/SharedResourceRequest.h>
-#include <LibWeb/Layout/SVGImageBox.h>
+#include <LibWeb/HighResolutionTime/TimeOrigin.h>
+#include <LibWeb/Layout/Box.h>
 #include <LibWeb/Namespace.h>
-#include <LibWeb/Painting/Paintable.h>
 #include <LibWeb/SVG/SVGDecodedImageData.h>
 
 namespace Web::SVG {
 
 GC_DEFINE_ALLOCATOR(SVGImageElement);
+
+Layout::Node const* SVGImageElement::image_provider_layout_node() const
+{
+    return unsafe_layout_node();
+}
 
 SVGImageElement::SVGImageElement(DOM::Document& document, DOM::QualifiedName qualified_name)
     : SVGGraphicsElement(document, move(qualified_name))
@@ -33,12 +41,6 @@ void SVGImageElement::finalize()
 {
     Base::finalize();
     unregister_with_decoded_image_data_if_needed();
-}
-
-void SVGImageElement::initialize(JS::Realm& realm)
-{
-    WEB_SET_PROTOTYPE_FOR_INTERFACE(SVGImageElement);
-    Base::initialize(realm);
 }
 
 void SVGImageElement::visit_edges(Cell::Visitor& visitor)
@@ -56,111 +58,58 @@ void SVGImageElement::adopted_from(DOM::Document& old_document)
         m_load_event_delayer.emplace(document());
 }
 
-void SVGImageElement::attribute_changed(FlyString const& name, Optional<String> const& old_value, Optional<String> const& value, Optional<FlyString> const& namespace_)
+void SVGImageElement::attribute_changed(Utf16FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_)
 {
     Base::attribute_changed(name, old_value, value, namespace_);
 
-    if (name == SVG::AttributeNames::x) {
-        m_x = AttributeParser::parse_number_percentage(value.value_or(String {}));
-    } else if (name == SVG::AttributeNames::y) {
-        m_y = AttributeParser::parse_number_percentage(value.value_or(String {}));
-    } else if (name == SVG::AttributeNames::width) {
-        m_width = AttributeParser::parse_number_percentage(value.value_or(String {}));
-    } else if (name == SVG::AttributeNames::height) {
-        m_height = AttributeParser::parse_number_percentage(value.value_or(String {}));
-    } else if (name == SVG::AttributeNames::href) {
+    if (name == SVG::AttributeNames::href) {
         // https://svgwg.org/svg2-draft/linking.html#XLinkRefAttrs
         // For backwards compatibility, elements with an ‘href’ attribute also recognize an ‘href’ attribute in the
         // XLink namespace. If the element is in the XLink namespace, it does not recognize an ‘href’ attribute in the
         // SVG namespace. When the ‘href’ attribute is present in both the XLink namespace and without a namespace, the
         // value of the attribute without a namespace shall be used. The attribute in the XLink namespace shall be ignored.
-        if (namespace_ == Namespace::XLink && has_attribute_ns({}, name))
+        if (namespace_ == Namespace::XLink && has_attribute_ns(Optional<Utf16FlyString> {}, name))
             return;
 
         auto href = value;
         if (!namespace_.has_value() && !href.has_value())
-            href = get_attribute_ns(SVG::AttributeNames::href, Namespace::XLink);
+            href = get_attribute_ns(Namespace::XLink, SVG::AttributeNames::href);
 
         process_the_url(href);
     }
 }
 
-// https://svgwg.org/svg2-draft/embedded.html#__svg__SVGImageElement__x
-GC::Ref<SVG::SVGAnimatedLength> SVGImageElement::x()
-{
-    // FIXME: Populate the unit type when it is parsed (0 here is "unknown").
-    // FIXME: Create a proper animated value when animations are supported.
-    auto value = m_x.value_or(NumberPercentage::create_number(0)).value();
-    auto base_length = SVGLength::create(realm(), 0, value, SVGLength::ReadOnly::No);
-    auto anim_length = SVGLength::create(realm(), 0, value, SVGLength::ReadOnly::Yes);
-    return SVGAnimatedLength::create(realm(), base_length, anim_length);
-}
-
-// https://svgwg.org/svg2-draft/embedded.html#__svg__SVGImageElement__y
-GC::Ref<SVG::SVGAnimatedLength> SVGImageElement::y()
-{
-    // FIXME: Populate the unit type when it is parsed (0 here is "unknown").
-    // FIXME: Create a proper animated value when animations are supported.
-    auto value = m_y.value_or(NumberPercentage::create_number(0)).value();
-    auto base_length = SVGLength::create(realm(), 0, value, SVGLength::ReadOnly::No);
-    auto anim_length = SVGLength::create(realm(), 0, value, SVGLength::ReadOnly::Yes);
-    return SVGAnimatedLength::create(realm(), base_length, anim_length);
-}
-
-// https://svgwg.org/svg2-draft/embedded.html#__svg__SVGImageElement__width
-GC::Ref<SVG::SVGAnimatedLength> SVGImageElement::width()
-{
-    // FIXME: Populate the unit type when it is parsed (0 here is "unknown").
-    // FIXME: Create a proper animated value when animations are supported.
-    auto value = m_width.has_value() ? m_width->value() : intrinsic_width().value_or(0).to_double();
-    auto base_length = SVGLength::create(realm(), 0, value, SVGLength::ReadOnly::No);
-    auto anim_length = SVGLength::create(realm(), 0, value, SVGLength::ReadOnly::Yes);
-    return SVGAnimatedLength::create(realm(), base_length, anim_length);
-}
-
-// https://svgwg.org/svg2-draft/embedded.html#__svg__SVGImageElement__height
-GC::Ref<SVG::SVGAnimatedLength> SVGImageElement::height()
-{
-    // FIXME: Populate the unit type when it is parsed (0 here is "unknown").
-    // FIXME: Create a proper animated value when animations are supported.
-    auto value = m_height.has_value() ? m_height->value() : intrinsic_height().value_or(0).to_double();
-    auto base_length = SVGLength::create(realm(), 0, value, SVGLength::ReadOnly::No);
-    auto anim_length = SVGLength::create(realm(), 0, value, SVGLength::ReadOnly::Yes);
-    return SVGAnimatedLength::create(realm(), base_length, anim_length);
-}
-
 Gfx::FloatRect SVGImageElement::bounding_box(CSSPixelSize viewport_size) const
 {
-    Optional<float> width;
-    if (m_width.has_value())
-        width = m_width->resolve_relative_to(viewport_size.width().to_float());
+    auto computed_values = this->computed_style();
+    VERIFY(computed_values);
 
-    Optional<float> height;
-    if (m_height.has_value())
-        height = m_height->resolve_relative_to(viewport_size.height().to_float());
+    // https://w3c.github.io/svgwg/svg2-draft/embedded.html#Placement
+    // Computation of automatically-sized values follows the Default Sizing Algorithm defined for replaced elements in
+    // CSS layout [css-images-3]. In particular, when the referenced resource does not have an intrinsic size (such as
+    // image types with no defined dimensions), it is assumed to have a width of 300px and a height of 150px.
+    auto specified_width = computed_values->width().is_length_percentage() ? computed_values->width().to_px(viewport_size.width()) : Optional<CSSPixels> {};
+    auto specified_height = computed_values->height().is_length_percentage() ? computed_values->height().to_px(viewport_size.height()) : Optional<CSSPixels> {};
 
-    if (!height.has_value() && width.has_value() && intrinsic_aspect_ratio().has_value())
-        height = width.value() / intrinsic_aspect_ratio().value().to_float();
+    CSS::SizeWithAspectRatio intrinsic_size_with_aspect_ratio { this->intrinsic_width(), this->intrinsic_height(), this->intrinsic_aspect_ratio() };
 
-    if (!width.has_value() && height.has_value() && intrinsic_aspect_ratio().has_value())
-        width = height.value() * intrinsic_aspect_ratio().value().to_float();
+    CSSPixelSize default_size {};
 
-    if (!width.has_value() && intrinsic_width().has_value())
-        width = intrinsic_width()->to_float();
+    if (decoded_image_data())
+        default_size = CSSPixelSize { 300, 150 };
 
-    if (!height.has_value() && intrinsic_height().has_value())
-        height = intrinsic_height()->to_float();
+    auto sizing = CSS::run_default_sizing_algorithm(specified_width, specified_height, intrinsic_size_with_aspect_ratio, default_size);
 
     return {
-        m_x.value_or(NumberPercentage::create_number(0)).resolve_relative_to(viewport_size.width().to_float()),
-        m_y.value_or(NumberPercentage::create_number(0)).resolve_relative_to(viewport_size.height().to_float()),
-        width.value_or(0.0f),
-        height.value_or(0.0f),
+        computed_values->x().to_px(viewport_size.width()).to_float(),
+        computed_values->y().to_px(viewport_size.height()).to_float(),
+        sizing.width().to_float(),
+        sizing.height().to_float()
     };
 }
 
 // https://www.w3.org/TR/SVG2/linking.html#processingURL
-void SVGImageElement::process_the_url(Optional<String> const& href)
+void SVGImageElement::process_the_url(Optional<Utf16String> const& href)
 {
     if (!href.has_value()) {
         m_href = {};
@@ -179,32 +128,35 @@ void SVGImageElement::fetch_the_document(URL::URL const& url)
 {
     m_load_event_delayer.emplace(document());
     unregister_with_decoded_image_data_if_needed();
-    m_resource_request = HTML::SharedResourceRequest::get_or_create(realm(), document().page(), url);
+    m_resource_request = HTML::SharedResourceRequest::get_or_create(document(), url);
     m_resource_request->add_callbacks(
         [this, resource_request = GC::Root { m_resource_request }] {
             m_load_event_delayer.clear();
             register_with_decoded_image_data_if_needed();
-            set_needs_style_update(true);
+            image_provider_contents_changed();
+            document().style_computer().style_engine().record_element_style_input_change(style_node_id());
             set_needs_layout_update(DOM::SetNeedsLayoutReason::SVGImageElementFetchTheDocument);
 
-            dispatch_event(DOM::Event::create(realm(), HTML::EventNames::load));
+            dispatch_event(DOM::Event::create(HTML::EventNames::load,
+                HighResolutionTime::current_high_resolution_time(HTML::relevant_global_object(*this))));
         },
         [this] {
             m_load_event_delayer.clear();
 
-            dispatch_event(DOM::Event::create(realm(), HTML::EventNames::error));
+            dispatch_event(DOM::Event::create(HTML::EventNames::error,
+                HighResolutionTime::current_high_resolution_time(HTML::relevant_global_object(*this))));
         });
 
     if (m_resource_request->needs_fetching()) {
-        auto request = HTML::create_potential_CORS_request(vm(), url, Fetch::Infrastructure::Request::Destination::Image, HTML::CORSSettingAttribute::NoCORS);
+        auto request = HTML::create_potential_CORS_request(url, Fetch::Infrastructure::Request::Destination::Image, HTML::CORSSettingAttribute::NoCORS);
         request->set_client(&document().relevant_settings_object());
-        m_resource_request->fetch_resource(realm(), request);
+        m_resource_request->fetch_resource(request);
     }
 }
 
-RefPtr<Layout::Node> SVGImageElement::create_layout_node(CSS::ComputedProperties const& style)
+Layout::Node* SVGImageElement::create_layout_node(CSS::LayoutStyle style)
 {
-    return make_ref_counted<Layout::SVGImageBox>(document(), *this, style);
+    return &Layout::allocate_layout_node<Layout::Box>(document(), *this, style, Layout::RustFFI::NodeKind::SVGImageBox);
 }
 
 GC::Ptr<HTML::DecodedImageData> SVGImageElement::decoded_image_data() const

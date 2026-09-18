@@ -22,22 +22,19 @@ public:
     }
     virtual ~AngleStyleValue() override;
 
-    Angle const& angle() const { return m_angle; }
-    virtual double raw_value() const override { return m_angle.raw_value(); }
-    virtual FlyString unit_name() const override { return m_angle.unit_name(); }
-
-    virtual ValueComparingNonnullRefPtr<StyleValue const> absolutized(ComputationContext const&) const override;
-
-    virtual void serialize(StringBuilder&, SerializationMode) const override;
-
-    bool equals(StyleValue const& other) const override;
-
-    virtual bool is_computationally_independent() const override { return true; }
+    Angle angle() const { return Angle(m_value->angle.value, static_cast<AngleUnit>(m_value->angle.unit)); }
+    virtual double raw_value() const override { return m_value->angle.value; }
+    virtual Utf16FlyString unit_name() const override { return angle().unit_name(); }
 
 private:
-    explicit AngleStyleValue(Angle angle);
+    friend class StyleValue;
 
-    Angle m_angle;
+    explicit AngleStyleValue(StyleValueFFI::StyleValueData const* data)
+        : DimensionStyleValue(Type::Angle, data)
+    {
+    }
+
+    explicit AngleStyleValue(Angle angle);
 };
 
 }

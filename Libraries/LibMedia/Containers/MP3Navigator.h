@@ -6,15 +6,15 @@
 
 #pragma once
 
+#include <AK/Mutex.h>
 #include <AK/NonnullRefPtr.h>
 #include <AK/Time.h>
 #include <AK/Vector.h>
 #include <LibMedia/Containers/ContainerNavigator.h>
-#include <LibSync/Mutex.h>
 
 namespace Media {
 
-class MP3Navigator final : public ContainerNavigator {
+class MP3Navigator final : public SingleTrackContainerNavigator {
 public:
     MP3Navigator(NonnullRefPtr<MediaStream> stream, size_t first_frame_position, AK::Duration total_duration);
 
@@ -25,7 +25,7 @@ public:
         u64 duration_in_ticks { 0 };
     };
 
-    TimeRanges buffered_time_ranges(Vector<MediaStream::ByteRange> const& byte_ranges) const override;
+    BufferedRangesScan buffered_time_ranges(Vector<MediaStream::ByteRange> const& byte_ranges) const override;
     DecoderErrorOr<SeekResult> seek_to_timestamp(AK::Duration timestamp) const override;
 
 private:
@@ -40,7 +40,7 @@ private:
     NonnullRefPtr<MediaStreamCursor> m_seek_range_scanning_cursor;
     NonnullRefPtr<MediaStreamCursor> m_seek_cursor;
 
-    mutable Sync::Mutex m_mutex;
+    mutable Mutex m_mutex;
     mutable Vector<CachedRange> m_cached_ranges;
 };
 

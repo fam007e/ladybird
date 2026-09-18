@@ -7,8 +7,8 @@
 
 #pragma once
 
+#include <AK/AtomicRefCounted.h>
 #include <AK/Error.h>
-#include <AK/RefCounted.h>
 #include <AK/RefPtr.h>
 #include <AK/Types.h>
 #include <LibCore/Export.h>
@@ -16,7 +16,7 @@
 namespace Core {
 
 // TODO: Hide the implementation from ABI
-class CORE_API AnonymousBufferImpl final : public RefCounted<AnonymousBufferImpl> {
+class CORE_API AnonymousBufferImpl final : public AtomicRefCounted<AnonymousBufferImpl> {
 public:
     static ErrorOr<NonnullRefPtr<AnonymousBufferImpl>> create(size_t);
     static ErrorOr<NonnullRefPtr<AnonymousBufferImpl>> create(int fd, size_t);
@@ -37,12 +37,19 @@ private:
 
 class CORE_API AnonymousBuffer {
 public:
-    static ErrorOr<AnonymousBuffer> create_with_size(size_t);
+    enum class Sealability {
+        Unsealable,
+        Sealable,
+    };
+
+    static ErrorOr<AnonymousBuffer> create_with_size(size_t, Sealability = Sealability::Unsealable);
     static ErrorOr<AnonymousBuffer> create_from_anon_fd(int fd, size_t);
 
     AnonymousBuffer() = default;
 
     bool is_valid() const { return m_impl; }
+
+    ErrorOr<AnonymousBuffer> snapshot(Sealability = Sealability::Unsealable) const;
 
     int fd() const { return m_impl ? m_impl->fd() : -1; }
     size_t size() const { return m_impl ? m_impl->size() : 0; }
