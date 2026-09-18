@@ -8,7 +8,9 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/Atomic.h>
 #include <AK/ByteString.h>
+#include <AK/Random.h>
 #include <AK/ScopeGuard.h>
 #include <AK/StdLibExtras.h>
 #include <AK/Vector.h>
@@ -39,6 +41,7 @@ static int memfd_create(char const* name, unsigned int flags)
 
 #if defined(AK_OS_MACOS) || defined(AK_OS_IOS)
 #    include <mach-o/dyld.h>
+#    include <mach/vm_statistics.h>
 #    include <sys/mman.h>
 #else
 extern char** environ;
@@ -142,27 +145,53 @@ ErrorOr<void> munmap(void* address, size_t size)
     return {};
 }
 
-ErrorOr<void*> reserve_address_space(size_t size)
+static int mmap_anonymous_fd([[maybe_unused]] MemoryTag tag)
+{
+#ifdef AK_OS_MACOS
+    if (tag == MemoryTag::GarbageCollector)
+        return VM_MAKE_TAG(VM_MEMORY_APPLICATION_SPECIFIC_2);
+#endif
+    return -1;
+}
+
+ErrorOr<void*> reserve_address_space(size_t size, MemoryTag tag)
 {
     int flags = MAP_PRIVATE | MAP_ANONYMOUS;
 #ifdef MAP_NORESERVE
     flags |= MAP_NORESERVE;
 #endif
-    auto* ptr = ::mmap(nullptr, size, PROT_NONE, flags, -1, 0);
+    auto* ptr = ::mmap(nullptr, size, PROT_NONE, flags, mmap_anonymous_fd(tag), 0);
     if (ptr == MAP_FAILED)
         return Error::from_syscall("mmap"sv, errno);
     return ptr;
 }
 
-ErrorOr<void> commit_memory(void* address, size_t size)
+ErrorOr<void*> allocate_anonymous_memory(size_t size, MemoryTag tag)
 {
-    auto* ptr = ::mmap(address, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    auto* ptr = ::mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, mmap_anonymous_fd(tag), 0);
+    if (ptr == MAP_FAILED)
+        return Error::from_syscall("mmap"sv, errno);
+    return ptr;
+}
+
+ErrorOr<void> commit_memory(void* address, size_t size, MemoryTag tag)
+{
+    auto* ptr = ::mmap(address, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, mmap_anonymous_fd(tag), 0);
     if (ptr == MAP_FAILED)
         return Error::from_syscall("mmap"sv, errno);
     return {};
 }
 
-ErrorOr<void> decommit_memory(void* address, size_t size)
+ErrorOr<void> protect_memory_readonly(void* address, size_t size)
+{
+    if (size == 0)
+        return {};
+    if (::mprotect(address, size, PROT_READ) < 0)
+        return Error::from_syscall("mprotect"sv, errno);
+    return {};
+}
+
+ErrorOr<void> decommit_memory(void* address, size_t size, MemoryTag tag)
 {
     if (size == 0)
         return {};
@@ -171,7 +200,16 @@ ErrorOr<void> decommit_memory(void* address, size_t size)
 #ifdef MAP_NORESERVE
     flags |= MAP_NORESERVE;
 #endif
-    auto* ptr = ::mmap(address, size, PROT_NONE, flags, -1, 0);
+    auto* ptr = ::mmap(address, size, PROT_NONE, flags, mmap_anonymous_fd(tag), 0);
+    if (ptr == MAP_FAILED)
+        return Error::from_syscall("mmap"sv, errno);
+    VERIFY(ptr == address);
+    return {};
+}
+
+ErrorOr<void> map_shared_memory_fixed(void* address, size_t size, int fd)
+{
+    auto* ptr = ::mmap(address, size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0);
     if (ptr == MAP_FAILED)
         return Error::from_syscall("mmap"sv, errno);
     VERIFY(ptr == address);
@@ -185,46 +223,74 @@ ErrorOr<void> release_address_space(void* address, size_t size)
     return {};
 }
 
-ErrorOr<int> anon_create([[maybe_unused]] size_t size, [[maybe_unused]] int options)
+ErrorOr<int> anon_create([[maybe_unused]] size_t size, [[maybe_unused]] int options, [[maybe_unused]] AllowSealing allow_sealing)
 {
     int fd = -1;
 #if defined(AK_OS_LINUX) || defined(AK_OS_FREEBSD)
-    // FIXME: Support more options on Linux.
     auto linux_options = ((options & O_CLOEXEC) > 0) ? MFD_CLOEXEC : 0;
+#    ifdef MFD_ALLOW_SEALING
+    if (allow_sealing == AllowSealing::Yes)
+        linux_options |= MFD_ALLOW_SEALING;
+#    endif
     fd = memfd_create("", linux_options);
 #elif defined(SHM_ANON)
     fd = shm_open(SHM_ANON, O_RDWR | O_CREAT | options, 0600);
 #elif defined(AK_OS_BSD_GENERIC) || defined(AK_OS_HAIKU)
-    static size_t shared_memory_id = 0;
-
-    auto name = ByteString::formatted("/shm-{}-{}", getpid(), shared_memory_id++);
+    // Create the shared memory object under an unpredictable, single-use name, and unlink it immediately — so only the
+    // returned fd keeps it alive. Use O_EXCL to ensure that if the name already exists, the open fails.
+    static Atomic<u32> shared_memory_id = 0;
+    auto name = ByteString::formatted("/shm-{:016x}-{:08x}", get_random<u64>(), shared_memory_id++);
     // Passing O_CLOEXEC to shm_open in the oflag argument isn't POSIX-compliant and is known to be rejected
     // in macOS 26.4+. So we filter it out here, and instead set FD_CLOEXEC via fcntl after opening.
-    fd = shm_open(name.characters(), O_RDWR | O_CREAT | (options & ~O_CLOEXEC), 0600);
+    fd = shm_open(name.characters(), O_RDWR | O_CREAT | O_EXCL | (options & ~O_CLOEXEC), 0600);
 
-    if (shm_unlink(name.characters()) == -1) {
-        auto saved_errno = errno;
-        if (fd >= 0)
-            TRY(close(fd));
-        return Error::from_errno(saved_errno);
-    }
-
-    if (fd >= 0 && (options & O_CLOEXEC)) {
-        if (::fcntl(fd, F_SETFD, FD_CLOEXEC) == -1) {
+    if (fd >= 0) {
+        if (shm_unlink(name.characters()) == -1) {
             auto saved_errno = errno;
             TRY(close(fd));
             return Error::from_errno(saved_errno);
+        }
+
+        if (options & O_CLOEXEC) {
+            if (::fcntl(fd, F_SETFD, FD_CLOEXEC) == -1) {
+                auto saved_errno = errno;
+                TRY(close(fd));
+                return Error::from_errno(saved_errno);
+            }
         }
     }
 #endif
     if (fd < 0)
         return Error::from_errno(errno);
 
-    if (::ftruncate(fd, size) < 0) {
+    int truncate_result;
+    do {
+        truncate_result = ::ftruncate(fd, size);
+    } while (truncate_result < 0 && errno == EINTR);
+    if (truncate_result < 0) {
         auto saved_errno = errno;
         TRY(close(fd));
         return Error::from_errno(saved_errno);
     }
+
+    // FIXME: Sealing is enforced only on Linux, via the memfd F_SEAL_* seals below. On macOS, the flag is
+    //        accepted, but the fd stays resizable (ftruncate remains possible). SAB backing relies on this seal to stop
+    //        a transferred fd from being shrunk under a peer. POSIX shared memory has no equivalent seal — so a macOS
+    //        equivalent would require implementing backing of the block with a Mach memory entry instead of an shm fd.
+#if defined(AK_OS_LINUX)
+    // Seal a fixed-size shared fd against resizing: A peer process holding the transferred fd must not be able to
+    // ftruncate it smaller, and SIGBUS siblings that touch the now-missing pages. Writes stay allowed on purpose (no
+    // F_SEAL_WRITE); the shared memory must remain writable. F_SEAL_SEAL is deliberately NOT set: it would block any
+    // later F_ADD_SEALS, and AllowSealing::Yes promises callers that the fd stays sealable. Leaving it off costs
+    // nothing, because a seal can never be removed once applied.
+    if (allow_sealing == AllowSealing::Yes) {
+        if (::fcntl(fd, F_ADD_SEALS, F_SEAL_SHRINK | F_SEAL_GROW) < 0) {
+            auto saved_errno = errno;
+            TRY(close(fd));
+            return Error::from_errno(saved_errno);
+        }
+    }
+#endif
 
     return fd;
 }
@@ -442,6 +508,20 @@ ErrorOr<bool> isatty(int fd)
     return rc == 1;
 }
 
+ErrorOr<TerminalSize> terminal_size(int fd)
+{
+    struct winsize ws {};
+    if (::ioctl(fd, TIOCGWINSZ, &ws) < 0)
+        return Error::from_syscall("ioctl"sv, errno);
+    return TerminalSize { ws.ws_col, ws.ws_row };
+}
+
+ErrorOr<void> enable_ansi_escape_sequence_processing(int)
+{
+    // POSIX terminals interpret escape sequences natively.
+    return {};
+}
+
 ErrorOr<void> link(StringView old_path, StringView new_path)
 {
     ByteString old_path_string = old_path;
@@ -523,6 +603,12 @@ ErrorOr<int> socket(int domain, int type, int protocol)
     if (fd < 0)
         return Error::from_syscall("socket"sv, errno);
     return fd;
+}
+
+ErrorOr<void> set_socket_blocking(int socket, bool enabled)
+{
+    int value = enabled ? 0 : 1;
+    return ioctl(socket, FIONBIO, &value);
 }
 
 ErrorOr<void> bind(int sockfd, struct sockaddr const* address, socklen_t address_length)

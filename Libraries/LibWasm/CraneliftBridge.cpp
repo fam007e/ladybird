@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/Array.h>
 #include <AK/ByteString.h>
 #include <AK/Checked.h>
 #include <AK/LexicalPath.h>
@@ -11,8 +12,10 @@
 #include <AK/Platform.h>
 #include <AK/ScopeGuard.h>
 #include <CraneliftFFI.h>
+#include <LibCore/AnonymousBuffer.h>
 #include <LibCore/Process.h>
 #include <LibCore/System.h>
+#include <LibFileSystem/FileSystem.h>
 #include <LibWasm/AbstractMachine/BytecodeInterpreter.h>
 #include <LibWasm/AbstractMachine/Configuration.h>
 #include <LibWasm/Printer/Printer.h>
@@ -21,6 +24,7 @@
 #include <stdlib.h>
 
 #if defined(AK_OS_WINDOWS)
+#    include <AK/Mutex.h>
 #    include <AK/Windows.h>
 #else
 #    include <fcntl.h>
@@ -40,10 +44,9 @@ namespace {
 
 struct InputHeader {
     u32 function_count;
-    u32 helpers_offset;
+    u32 layout_offset;
     u64 outcome_return;
-    u64 code_region_start;
-    u64 reloc_region_start;
+    u64 output_size;
     u64 total_size;
 };
 
@@ -51,6 +54,20 @@ struct InputFunctionEntry {
     u32 insn_offset;
     u32 insn_count;
     u32 result_arity;
+    u32 num_locals;
+    u32 locals_offset;
+    u32 num_params;
+};
+
+static_assert(sizeof(InputHeader) == 32);
+static_assert(sizeof(InputFunctionEntry) == 24);
+
+struct OutputHeader {
+    u32 function_count;
+    u32 _pad;
+    u64 code_base_offset;
+    u64 reloc_region_start;
+    u64 total_size;
 };
 
 struct OutputFunctionEntry {
@@ -63,10 +80,15 @@ struct OutputFunctionEntry {
     // with the live address of helper N for the current process.
     u64 reloc_offset;
     u32 reloc_count;
+    u32 _padding_after_reloc_count;
     u64 trap_offset;
     u32 trap_count;
-    u32 _pad;
+    u32 _padding;
 };
+
+static_assert(sizeof(OutputHeader) == 32);
+static_assert(sizeof(OutputFunctionEntry) == 48);
+static_assert(offsetof(OutputFunctionEntry, trap_offset) == 32);
 
 struct CodeMapping {
     void* mapping;
@@ -86,18 +108,71 @@ static size_t align_up(size_t value, size_t alignment)
     return remainder == 0 ? value : value + (alignment - remainder);
 }
 
+static ErrorOr<size_t> try_align_up(size_t value, size_t alignment)
+{
+    VERIFY(alignment > 0);
+    auto remainder = value % alignment;
+    if (remainder == 0)
+        return value;
+
+    Checked<size_t> result = value;
+    result += alignment - remainder;
+    if (result.has_overflow())
+        return Error::from_string_literal("Cranelift output size overflow");
+    return result.value();
+}
+
+static ErrorOr<size_t> compute_output_buffer_size(size_t function_count, size_t instruction_count)
+{
+    Checked<size_t> output_entries_size = sizeof(OutputFunctionEntry);
+    output_entries_size *= function_count;
+    if (output_entries_size.has_overflow())
+        return Error::from_string_literal("Cranelift output size overflow");
+
+    Checked<size_t> output_size = sizeof(OutputHeader);
+    output_size += output_entries_size.value();
+    if (output_size.has_overflow())
+        return Error::from_string_literal("Cranelift output size overflow");
+
+    output_size = TRY(try_align_up(output_size.value(), SERIALIZED_CODE_ALIGNMENT));
+
+    Checked<size_t> maximum_code_size = instruction_count;
+    maximum_code_size *= oop_code_bytes_per_insn;
+    if (maximum_code_size.has_overflow())
+        return Error::from_string_literal("Cranelift output size overflow");
+
+    output_size += max(oop_code_region_min_size, maximum_code_size.value());
+    if (output_size.has_overflow())
+        return Error::from_string_literal("Cranelift output size overflow");
+
+    output_size = TRY(try_align_up(output_size.value(), alignof(HelperReloc)));
+
+    Checked<size_t> maximum_reloc_size = instruction_count;
+    maximum_reloc_size *= oop_reloc_bytes_per_insn;
+    if (maximum_reloc_size.has_overflow())
+        return Error::from_string_literal("Cranelift output size overflow");
+
+    output_size += max(oop_reloc_region_min_size, maximum_reloc_size.value());
+    if (output_size.has_overflow())
+        return Error::from_string_literal("Cranelift output is too large");
+
+    return output_size.value();
+}
+
 struct BatchInput {
     Vector<CraneliftInsn> insns;
     u32 result_arity;
     u32 function_index;
     CompiledInstructions* target;
+    u32 num_locals;
+    u32 num_params;
 };
 
 // Disk-cache blob format. Stable: cached files name format_version + layout_hash so
 // any rebuild that changes those will simply miss the cache rather than try to
 // execute incompatible bytes.
 constexpr u64 cache_blob_magic = 0x4354494A4D534157ULL; // "WASMJITC" little-endian
-constexpr u32 cache_blob_format_version = 5;
+constexpr u32 cache_blob_format_version = 13;
 
 struct CacheBlobHeader {
     u64 magic;
@@ -152,7 +227,13 @@ static CacheState& cranelift_cache_state()
     return *state;
 }
 
-static u64 compute_layout_hash(RuntimeHelpers const& h)
+static CraneliftCompileCallback& cranelift_compile_callback()
+{
+    static NeverDestroyed<CraneliftCompileCallback> callback;
+    return *callback;
+}
+
+static u64 compute_layout_hash(RuntimeLayout const& layout)
 {
     auto fnv1a = [](u64 hash, u64 value) {
         for (int i = 0; i < 8; ++i) {
@@ -162,35 +243,33 @@ static u64 compute_layout_hash(RuntimeHelpers const& h)
         return hash;
     };
     u64 hash = 0xcbf29ce484222325ULL;
-    hash = fnv1a(hash, h.regs_offset);
-    hash = fnv1a(hash, h.value_size);
-    hash = fnv1a(hash, h.locals_base_offset);
-    hash = fnv1a(hash, h.default_memory_offset);
-    hash = fnv1a(hash, h.memory_instance_data_offset);
-    hash = fnv1a(hash, h.memory_buffer_size_offset);
-    hash = fnv1a(hash, h.memory_buffer_storage_offset_offset);
-    hash = fnv1a(hash, h.compiled_call_result_scratch_offset);
-    hash = fnv1a(hash, h.primitive_storage_cage_offset_mask);
+    hash = fnv1a(hash, layout.regs_offset);
+    hash = fnv1a(hash, layout.value_size);
+    hash = fnv1a(hash, layout.locals_base_offset);
+    hash = fnv1a(hash, layout.memory_instances_offset);
+    hash = fnv1a(hash, layout.global_instances_offset);
+    hash = fnv1a(hash, layout.global_instance_value_offset);
+    hash = fnv1a(hash, layout.memory_instance_data_offset);
+    hash = fnv1a(hash, layout.memory_buffer_storage_offset_offset);
+    hash = fnv1a(hash, layout.compiled_call_result_scratch_offset);
+    hash = fnv1a(hash, layout.value_stack_base_offset);
+    hash = fnv1a(hash, layout.value_stack_top_offset);
+    hash = fnv1a(hash, layout.call_record_base_offset);
     return hash;
 }
 
-// `HelperId` values are assigned in lockstep with the field order of `RuntimeHelpers`,
-// so the helper address for id N is simply the N-th `size_t` field of the struct.
-static_assert(offsetof(RuntimeHelpers, call_function) == 0);
-static_assert(offsetof(RuntimeHelpers, memory_fill) == sizeof(size_t) * 30);
-static_assert(offsetof(RuntimeHelpers, primitive_storage_cage_base) == sizeof(size_t) * 31);
-static_assert(HELPER_COUNT == 32);
+using RuntimeHelperAddresses = Array<size_t, HELPER_COUNT>;
+static_assert(HELPER_COUNT == 13);
 
-static bool apply_helper_relocs(u8* code_bytes, size_t code_size, HelperReloc const* relocs, size_t reloc_count, RuntimeHelpers const& helpers)
+static bool apply_helper_relocs(u8* code_bytes, size_t code_size, HelperReloc const* relocs, size_t reloc_count, RuntimeHelperAddresses const& helper_addresses)
 {
-    auto const* helper_table = reinterpret_cast<size_t const*>(&helpers);
     for (size_t i = 0; i < reloc_count; ++i) {
         auto const& r = relocs[i];
         if (r.helper_id >= HELPER_COUNT)
             return false;
         if (static_cast<size_t>(r.code_offset) + sizeof(u64) > code_size)
             return false;
-        u64 addr = static_cast<u64>(helper_table[r.helper_id]) + static_cast<u64>(r.addend);
+        u64 addr = static_cast<u64>(helper_addresses[r.helper_id]) + static_cast<u64>(r.addend);
         __builtin_memcpy(code_bytes + r.code_offset, &addr, sizeof(addr));
     }
     return true;
@@ -200,7 +279,7 @@ static bool apply_helper_relocs(u8* code_bytes, size_t code_size, HelperReloc co
 // helper-address patches, and install the resulting function pointer into `target`.
 // Used by both the fresh-compile path (bytes come from the subprocess shm) and the
 // cache-install path (bytes come from a `.wasmjit` blob).
-static bool install_compiled_function(CompiledInstructions& target, ReadonlyBytes code_bytes, HelperReloc const* relocs, size_t reloc_count, ReadonlySpan<CraneliftTrap> traps, RuntimeHelpers const& helpers)
+static bool install_compiled_function(CompiledInstructions& target, ReadonlyBytes code_bytes, HelperReloc const* relocs, size_t reloc_count, ReadonlySpan<CraneliftTrap> traps, RuntimeHelperAddresses const& helper_addresses)
 {
     if (target.dispatches.is_empty())
         return false;
@@ -218,7 +297,7 @@ static bool install_compiled_function(CompiledInstructions& target, ReadonlyByte
     if (!jit_mem)
         return false;
     __builtin_memcpy(jit_mem, code_bytes.data(), code_size);
-    if (!apply_helper_relocs(static_cast<u8*>(jit_mem), code_size, relocs, reloc_count, helpers)) {
+    if (!apply_helper_relocs(static_cast<u8*>(jit_mem), code_size, relocs, reloc_count, helper_addresses)) {
         VirtualFree(jit_mem, 0, MEM_RELEASE);
         return false;
     }
@@ -236,7 +315,7 @@ static bool install_compiled_function(CompiledInstructions& target, ReadonlyByte
 
     pthread_jit_write_protect_np(0);
     __builtin_memcpy(jit_mapping, code_bytes.data(), code_size);
-    if (!apply_helper_relocs(static_cast<u8*>(jit_mapping), code_size, relocs, reloc_count, helpers)) {
+    if (!apply_helper_relocs(static_cast<u8*>(jit_mapping), code_size, relocs, reloc_count, helper_addresses)) {
         munmap(jit_mapping, rx_aligned_size);
         return false;
     }
@@ -251,7 +330,7 @@ static bool install_compiled_function(CompiledInstructions& target, ReadonlyByte
     if (rw_mapping == MAP_FAILED)
         return false;
     __builtin_memcpy(rw_mapping, code_bytes.data(), code_size);
-    if (!apply_helper_relocs(static_cast<u8*>(rw_mapping), code_size, relocs, reloc_count, helpers) || mprotect(rw_mapping, rx_aligned_size, PROT_READ | PROT_EXEC) != 0) {
+    if (!apply_helper_relocs(static_cast<u8*>(rw_mapping), code_size, relocs, reloc_count, helper_addresses) || mprotect(rw_mapping, rx_aligned_size, PROT_READ | PROT_EXEC) != 0) {
         munmap(rw_mapping, rx_aligned_size);
         return false;
     }
@@ -277,7 +356,43 @@ static bool install_compiled_function(CompiledInstructions& target, ReadonlyByte
 
 extern "C" {
 
-static ALWAYS_INLINE i32 wasm_cl_finish_call(BytecodeInterpreter& interpreter, Configuration& config, FunctionAddress address, Vector<Value, ArgumentsStaticSize>& args)
+static ALWAYS_INLINE i32 wasm_cl_run_compiled(BytecodeInterpreter& interpreter, Configuration& config, CompiledFunctionEntry const& entry, Value* callee_locals)
+{
+    BytecodeInterpreter::CallFrameHandle handle { interpreter, config };
+    config.set_frame_lightweight(*entry.module, callee_locals, *entry.expression, entry.arity, entry.max_call_rec_size);
+    config.ip() = 0;
+
+    interpreter.clear_trap();
+    using HandlerFn = Outcome (*)(BytecodeInterpreter&, Configuration&, Instruction const*, u32, Dispatch const*, SourcesAndDestination const*);
+    auto const handler = bit_cast<HandlerFn>(entry.handler_ptr);
+    auto outcome = handler(interpreter, config, entry.first_insn, 0, bit_cast<Dispatch const*>(entry.dispatches_ptr), bit_cast<SourcesAndDestination const*>(entry.src_dst_ptr));
+
+    if (outcome != Outcome::Return) {
+        interpreter.set_trap("Compiled function returned unexpectedly"sv);
+        return 1;
+    }
+    if (interpreter.did_trap())
+        return 1;
+    if (entry.arity == 1)
+        config.compiled_call_result_scratch() = config.value_stack().unsafe_take_last();
+    // No label pop: set_frame_lightweight doesn't push labels.
+    return 0;
+}
+
+static NEVER_INLINE COLD i32 wasm_cl_run_compiled_with_heap_locals(BytecodeInterpreter& interpreter, Configuration& config, CompiledFunctionEntry const& entry, Value const* args, size_t arg_count)
+{
+    auto total = arg_count + entry.total_local_count;
+    Vector<Value, ArgumentsStaticSize> heap_locals;
+    heap_locals.ensure_capacity(total);
+    heap_locals.resize_and_keep_capacity(total);
+    auto* callee_locals = heap_locals.data();
+    for (size_t i = 0; i < arg_count; i++)
+        callee_locals[i] = args[i];
+    // The non-argument slots are left uninitialized; the compiled entry block zeroes its own locals.
+    return wasm_cl_run_compiled(interpreter, config, entry, callee_locals);
+}
+
+static ALWAYS_INLINE i32 wasm_cl_finish_call(BytecodeInterpreter& interpreter, Configuration& config, FunctionAddress address, Value const* args, size_t arg_count)
 {
     if (interpreter.trap_if_insufficient_native_stack_space())
         return 1;
@@ -290,56 +405,42 @@ static ALWAYS_INLINE i32 wasm_cl_finish_call(BytecodeInterpreter& interpreter, C
 
         // Fast compiled-to-compiled call: stack-allocate locals + non-owning frame.
         auto& func = wasm_function->code().func();
-        auto arg_count = args.size();
-        auto local_count = func.total_local_count();
-        auto total = arg_count + local_count;
-        auto callee_arity = wasm_function->type().results().size();
+        auto& ci = func.body().compiled_instructions;
+        CompiledFunctionEntry const entry {
+            .handler_ptr = cranelift_entry_acquire(ci),
+            .dispatches_ptr = bit_cast<FlatPtr>(ci.dispatches.data()),
+            .src_dst_ptr = bit_cast<FlatPtr>(ci.src_dst_mappings.data()),
+            .first_insn = ci.dispatches[0].instruction,
+            .expression = &func.body(),
+            .module = &wasm_function->module(),
+            // Match the direct-call table's sizing: the JIT frame is grown by the inlined-callee
+            // locals too, so the buffer must cover them or the callee scribbles past its end.
+            .total_local_count = static_cast<u32>(func.total_local_count()) + ci.cranelift_inlined_locals,
+            .arity = static_cast<u32>(wasm_function->type().results().size()),
+            .max_call_rec_size = static_cast<u32>(ci.max_call_rec_size),
+        };
 
-        Value callee_buf[64];
-        Value* callee_locals = callee_buf;
-        Vector<Value, ArgumentsStaticSize> heap_fallback;
-        if (total > 64) [[unlikely]] {
-            heap_fallback.ensure_capacity(total);
-            heap_fallback.resize_and_keep_capacity(total);
-            callee_locals = heap_fallback.data();
-        }
+        if (arg_count + entry.total_local_count > 64) [[unlikely]]
+            return wasm_cl_run_compiled_with_heap_locals(interpreter, config, entry, args, arg_count);
+
+        // Opt out of -ftrivial-auto-var-init: only the argument slots are written below, and the
+        // compiled entry block initializes its own locals, so nothing reads the rest.
+        __attribute__((uninitialized)) Value callee_locals[64];
         for (size_t i = 0; i < arg_count; i++)
             callee_locals[i] = args[i];
-        __builtin_memset(callee_locals + arg_count, 0, local_count * sizeof(Value));
-
-        auto& ci = func.body().compiled_instructions;
-        {
-            BytecodeInterpreter::CallFrameHandle handle { interpreter, config };
-            config.set_frame_lightweight(wasm_function->module(), callee_locals, func.body(), callee_arity);
-            config.setup_call_record_for_current_frame();
-            config.ip() = 0;
-
-            interpreter.clear_trap();
-            auto const* cc = ci.dispatches.data();
-            auto const* addrs = ci.src_dst_mappings.data();
-            using HandlerFn = Outcome (*)(BytecodeInterpreter&, Configuration&, Instruction const*, u32, Dispatch const*, SourcesAndDestination const*);
-            auto const handler = bit_cast<HandlerFn>(cranelift_entry_acquire(ci));
-            auto outcome = handler(interpreter, config, cc[0].instruction, 0, cc, addrs);
-
-            if (outcome != Outcome::Return) {
-                interpreter.set_trap("Compiled function returned unexpectedly"sv);
-                return 1;
-            }
-            if (interpreter.did_trap())
-                return 1;
-
-            if (callee_arity == 1)
-                config.compiled_call_result_scratch() = config.value_stack().unsafe_take_last();
-            // No label pop: set_frame_lightweight doesn't push labels.
-        }
-        return 0;
+        return wasm_cl_run_compiled(interpreter, config, entry, callee_locals);
     }
 
+    Vector<Value, ArgumentsStaticSize> args_vec;
+    config.get_arguments_allocation_if_possible(args_vec, arg_count);
+    args_vec.ensure_capacity(arg_count);
+    for (size_t i = 0; i < arg_count; i++)
+        args_vec.unchecked_append(args[i]);
+
     // direct-threaded interpreter path:
-    // CallFrameHandle saves/zeros/restores the direct call counter automatically.
     if (auto* wasm_function = instance->get_pointer<WasmFunction>(); wasm_function && !config.should_limit_instruction_count() && wasm_function->code().func().body().compiled_instructions.direct) {
         BytecodeInterpreter::CallFrameHandle handle { interpreter, config };
-        if (auto prepare_result = config.prepare_wasm_call(*wasm_function, args); prepare_result.is_error()) {
+        if (auto prepare_result = config.prepare_wasm_call(*wasm_function, args_vec); prepare_result.is_error()) {
             interpreter.set_trap(prepare_result.release_error());
             return 1;
         }
@@ -353,8 +454,8 @@ static ALWAYS_INLINE i32 wasm_cl_finish_call(BytecodeInterpreter& interpreter, C
             return 1;
         if (config.frame().arity() == 1)
             config.compiled_call_result_scratch() = config.value_stack().unsafe_take_last();
-        if (!config.label_stack().is_empty())
-            config.label_stack().take_last();
+        if (config.label_stack().size() > config.frame().label_index())
+            config.label_stack().shrink(config.frame().label_index(), true);
         return 0;
     }
 
@@ -362,10 +463,10 @@ static ALWAYS_INLINE i32 wasm_cl_finish_call(BytecodeInterpreter& interpreter, C
     Wasm::Result result { Vector<Value> {} };
     if (instance->has<WasmFunction>()) {
         BytecodeInterpreter::CallFrameHandle handle { interpreter, config };
-        result = config.call(interpreter, address, args);
+        result = config.call(interpreter, address, args_vec);
     } else {
-        result = config.call(interpreter, address, args);
-        config.release_arguments_allocation(args);
+        result = config.call(interpreter, address, args_vec);
+        config.release_arguments_allocation(args_vec);
     }
 
     if (result.is_trap()) {
@@ -411,222 +512,27 @@ void wasm_cl_set_trap(void* interp_ptr, u8 const* msg, i32 len)
     interpreter.set_trap(StringView(reinterpret_cast<char const*>(msg), len));
 }
 
-static inline MemoryInstance* wasm_cl_get_memory(void* config_ptr, i32 mem_idx)
+static inline MemoryInstance* wasm_cl_get_memory(void* config_ptr, u32 mem_idx)
 {
     auto& config = *static_cast<Configuration*>(config_ptr);
-    if (mem_idx == 0) [[likely]] {
-        if (auto* memory = config.default_memory())
-            return memory;
-    }
-    auto const& module = config.frame().module();
-    auto const& mem_address = module.memories().data()[mem_idx];
-    return config.store().unsafe_get(mem_address);
+    return config.memory_instance(mem_idx);
 }
 
-static inline u8 const* wasm_cl_memory_data_if_in_bounds(MemoryInstance* memory, u64 instance_addr, size_t size)
-{
-    if (instance_addr > memory->size() || size > memory->size() - instance_addr)
-        return nullptr;
-    return memory->data().offset_pointer(instance_addr);
-}
-
-i32 wasm_cl_memory_load8_s(void* interp_ptr, void* config_ptr, i32 mem_idx, i64 addr, i64* out);
-i32 wasm_cl_memory_load8_s(void* interp_ptr, void* config_ptr, i32 mem_idx, i64 addr, i64* out)
+i64 wasm_cl_memory_size(void* config_ptr, u32 mem_idx);
+i64 wasm_cl_memory_size(void* config_ptr, u32 mem_idx)
 {
     auto* memory = wasm_cl_get_memory(config_ptr, mem_idx);
-    auto const* data = wasm_cl_memory_data_if_in_bounds(memory, static_cast<u64>(addr), 1);
-    if (!data) {
-        static_cast<BytecodeInterpreter*>(interp_ptr)->set_trap("Memory access out of bounds"sv);
-        return 1;
-    }
-    *out = static_cast<i64>(static_cast<i8>(data[0]));
-    return 0;
-}
-
-i32 wasm_cl_memory_load8_u(void* interp_ptr, void* config_ptr, i32 mem_idx, i64 addr, i64* out);
-i32 wasm_cl_memory_load8_u(void* interp_ptr, void* config_ptr, i32 mem_idx, i64 addr, i64* out)
-{
-    auto* memory = wasm_cl_get_memory(config_ptr, mem_idx);
-    auto const* data = wasm_cl_memory_data_if_in_bounds(memory, static_cast<u64>(addr), 1);
-    if (!data) {
-        static_cast<BytecodeInterpreter*>(interp_ptr)->set_trap("Memory access out of bounds"sv);
-        return 1;
-    }
-    *out = static_cast<i64>(data[0]);
-    return 0;
-}
-
-i32 wasm_cl_memory_load16_s(void* interp_ptr, void* config_ptr, i32 mem_idx, i64 addr, i64* out);
-i32 wasm_cl_memory_load16_s(void* interp_ptr, void* config_ptr, i32 mem_idx, i64 addr, i64* out)
-{
-    auto* memory = wasm_cl_get_memory(config_ptr, mem_idx);
-    auto const* data = wasm_cl_memory_data_if_in_bounds(memory, static_cast<u64>(addr), 2);
-    if (!data) {
-        static_cast<BytecodeInterpreter*>(interp_ptr)->set_trap("Memory access out of bounds"sv);
-        return 1;
-    }
-    u16 val;
-    __builtin_memcpy(&val, data, sizeof(val));
-    *out = static_cast<i64>(static_cast<i16>(val));
-    return 0;
-}
-
-i32 wasm_cl_memory_load16_u(void* interp_ptr, void* config_ptr, i32 mem_idx, i64 addr, i64* out);
-i32 wasm_cl_memory_load16_u(void* interp_ptr, void* config_ptr, i32 mem_idx, i64 addr, i64* out)
-{
-    auto* memory = wasm_cl_get_memory(config_ptr, mem_idx);
-    auto const* data = wasm_cl_memory_data_if_in_bounds(memory, static_cast<u64>(addr), 2);
-    if (!data) {
-        static_cast<BytecodeInterpreter*>(interp_ptr)->set_trap("Memory access out of bounds"sv);
-        return 1;
-    }
-    u16 val;
-    __builtin_memcpy(&val, data, sizeof(val));
-    *out = static_cast<i64>(val);
-    return 0;
-}
-
-i32 wasm_cl_memory_load32_s(void* interp_ptr, void* config_ptr, i32 mem_idx, i64 addr, i64* out);
-i32 wasm_cl_memory_load32_s(void* interp_ptr, void* config_ptr, i32 mem_idx, i64 addr, i64* out)
-{
-    auto* memory = wasm_cl_get_memory(config_ptr, mem_idx);
-    auto const* data = wasm_cl_memory_data_if_in_bounds(memory, static_cast<u64>(addr), 4);
-    if (!data) {
-        static_cast<BytecodeInterpreter*>(interp_ptr)->set_trap("Memory access out of bounds"sv);
-        return 1;
-    }
-    u32 val;
-    __builtin_memcpy(&val, data, sizeof(val));
-    *out = static_cast<i64>(static_cast<i32>(val));
-    return 0;
-}
-
-i32 wasm_cl_memory_load32_u(void* interp_ptr, void* config_ptr, i32 mem_idx, i64 addr, i64* out);
-i32 wasm_cl_memory_load32_u(void* interp_ptr, void* config_ptr, i32 mem_idx, i64 addr, i64* out)
-{
-    auto* memory = wasm_cl_get_memory(config_ptr, mem_idx);
-    auto const* data = wasm_cl_memory_data_if_in_bounds(memory, static_cast<u64>(addr), 4);
-    if (!data) {
-        static_cast<BytecodeInterpreter*>(interp_ptr)->set_trap("Memory access out of bounds"sv);
-        return 1;
-    }
-    u32 val;
-    __builtin_memcpy(&val, data, sizeof(val));
-    *out = static_cast<i64>(val);
-    return 0;
-}
-
-i32 wasm_cl_memory_load64(void* interp_ptr, void* config_ptr, i32 mem_idx, i64 addr, i64* out);
-i32 wasm_cl_memory_load64(void* interp_ptr, void* config_ptr, i32 mem_idx, i64 addr, i64* out)
-{
-    auto* memory = wasm_cl_get_memory(config_ptr, mem_idx);
-    auto const* data = wasm_cl_memory_data_if_in_bounds(memory, static_cast<u64>(addr), 8);
-    if (!data) {
-        static_cast<BytecodeInterpreter*>(interp_ptr)->set_trap("Memory access out of bounds"sv);
-        return 1;
-    }
-    u64 val;
-    __builtin_memcpy(&val, data, sizeof(val));
-    *out = static_cast<i64>(val);
-    return 0;
-}
-
-static inline bool wasm_cl_memory_store_in_bounds(void* interp_ptr, void* config_ptr, i32 mem_idx, i64 addr, size_t size, u8*& data)
-{
-    auto* memory = wasm_cl_get_memory(config_ptr, mem_idx);
-    auto instance_addr = static_cast<u64>(addr);
-    if (instance_addr > memory->size() || size > memory->size() - instance_addr) {
-        static_cast<BytecodeInterpreter*>(interp_ptr)->set_trap("Memory access out of bounds"sv);
-        return false;
-    }
-    data = memory->data().offset_pointer(instance_addr);
-    return true;
-}
-
-i32 wasm_cl_memory_store8(void* interp_ptr, void* config_ptr, i32 mem_idx, i64 addr, i64 value);
-i32 wasm_cl_memory_store8(void* interp_ptr, void* config_ptr, i32 mem_idx, i64 addr, i64 value)
-{
-    u8* data;
-    if (!wasm_cl_memory_store_in_bounds(interp_ptr, config_ptr, mem_idx, addr, 1, data))
-        return 1; // OOB trap
-    data[0] = static_cast<u8>(value);
-    return 0;
-}
-
-i32 wasm_cl_memory_store16(void* interp_ptr, void* config_ptr, i32 mem_idx, i64 addr, i64 value);
-i32 wasm_cl_memory_store16(void* interp_ptr, void* config_ptr, i32 mem_idx, i64 addr, i64 value)
-{
-    u8* data;
-    if (!wasm_cl_memory_store_in_bounds(interp_ptr, config_ptr, mem_idx, addr, 2, data))
-        return 1;
-    u16 val = static_cast<u16>(value);
-    __builtin_memcpy(data, &val, sizeof(val));
-    return 0;
-}
-
-i32 wasm_cl_memory_store32(void* interp_ptr, void* config_ptr, i32 mem_idx, i64 addr, i64 value);
-i32 wasm_cl_memory_store32(void* interp_ptr, void* config_ptr, i32 mem_idx, i64 addr, i64 value)
-{
-    u8* data;
-    if (!wasm_cl_memory_store_in_bounds(interp_ptr, config_ptr, mem_idx, addr, 4, data))
-        return 1;
-    u32 val = static_cast<u32>(value);
-    __builtin_memcpy(data, &val, sizeof(val));
-    return 0;
-}
-
-i32 wasm_cl_memory_store64(void* interp_ptr, void* config_ptr, i32 mem_idx, i64 addr, i64 value);
-i32 wasm_cl_memory_store64(void* interp_ptr, void* config_ptr, i32 mem_idx, i64 addr, i64 value)
-{
-    u8* data;
-    if (!wasm_cl_memory_store_in_bounds(interp_ptr, config_ptr, mem_idx, addr, 8, data))
-        return 1;
-    u64 val = static_cast<u64>(value);
-    __builtin_memcpy(data, &val, sizeof(val));
-    return 0;
-}
-
-i64 wasm_cl_memory_size(void* config_ptr, i32 mem_idx);
-i64 wasm_cl_memory_size(void* config_ptr, i32 mem_idx)
-{
-    auto& config = *static_cast<Configuration*>(config_ptr);
-    auto const& module = config.frame().module();
-    auto const& mem_address = module.memories().data()[mem_idx];
-    auto* memory = config.store().unsafe_get(mem_address);
     return static_cast<i64>(memory->size() / Constants::page_size);
 }
 
-i32 wasm_cl_memory_grow(void* config_ptr, i32 mem_idx, i32 pages);
-i32 wasm_cl_memory_grow(void* config_ptr, i32 mem_idx, i32 pages)
+i32 wasm_cl_memory_grow(void* config_ptr, u32 mem_idx, i32 pages);
+i32 wasm_cl_memory_grow(void* config_ptr, u32 mem_idx, i32 pages)
 {
-    auto& config = *static_cast<Configuration*>(config_ptr);
-    auto const& module = config.frame().module();
-    auto const& mem_address = module.memories().data()[mem_idx];
-    auto* memory = config.store().unsafe_get(mem_address);
+    auto* memory = wasm_cl_get_memory(config_ptr, mem_idx);
     auto old_pages = memory->size() / Constants::page_size;
     if (!memory->grow(pages * Constants::page_size))
         return -1;
     return static_cast<i32>(old_pages);
-}
-
-i64 wasm_cl_read_global(void* config_ptr, i32 index);
-i64 wasm_cl_read_global(void* config_ptr, i32 index)
-{
-    auto& config = *static_cast<Configuration*>(config_ptr);
-    auto const& module = config.frame().module();
-    auto global_address = module.globals().data()[index];
-    auto* global = config.store().get(global_address);
-    return global->value().to<i64>();
-}
-
-void wasm_cl_write_global(void* config_ptr, i32 index, i64 value);
-void wasm_cl_write_global(void* config_ptr, i32 index, i64 value)
-{
-    auto& config = *static_cast<Configuration*>(config_ptr);
-    auto const& module = config.frame().module();
-    auto global_address = module.globals().data()[index];
-    auto* global = config.store().get(global_address);
-    global->set_value(Value(value));
 }
 
 i32 wasm_cl_call_indirect(void* interp_ptr, void* config_ptr, i32 table_idx, i32 type_idx, i32 element_index);
@@ -656,6 +562,20 @@ i32 wasm_cl_call_indirect(void* interp_ptr, void* config_ptr, i32 table_idx, i32
     if (!type_actual || !matches_defined_type(*type_actual, *type_expected))
         return interpreter.set_trap(Trap::from_string("Indirect call type mismatch"));
 
+    auto const& function_type = function->visit([](auto const& value) -> FunctionType const& { return value.type(); });
+    if (function_type.results().size() <= 1) {
+        auto parameter_count = function_type.parameters().size();
+        if (parameter_count > config.value_stack().size())
+            return interpreter.set_trap(Trap::from_string("Insufficient arguments for indirect call"));
+
+        auto arguments = config.value_stack().span().slice_from_end(parameter_count);
+        config.value_stack().shrink(config.value_stack().size() - parameter_count);
+        auto did_trap = wasm_cl_finish_call(interpreter, config, address, arguments.data(), arguments.size());
+        if (!did_trap && !function_type.results().is_empty())
+            config.value_stack().unchecked_append(config.compiled_call_result_scratch());
+        return did_trap;
+    }
+
     SourcesAndDestination addrs {};
     addrs.sources[0] = Dispatch::RegisterOrStack::Stack;
     addrs.sources[1] = Dispatch::RegisterOrStack::Stack;
@@ -667,15 +587,12 @@ i32 wasm_cl_call_indirect(void* interp_ptr, void* config_ptr, i32 table_idx, i32
     return outcome == Outcome::Return && interpreter.did_trap() ? 1 : 0;
 }
 
-i32 wasm_cl_memory_copy(void* interp_ptr, void* config_ptr, i32 dst_mem, i32 src_mem, i32 dst_offset, i32 src_offset, i32 count);
-i32 wasm_cl_memory_copy(void* interp_ptr, void* config_ptr, i32 dst_mem, i32 src_mem, i32 dst_offset, i32 src_offset, i32 count)
+i32 wasm_cl_memory_copy(void* interp_ptr, void* config_ptr, u32 dst_mem, u32 src_mem, i32 dst_offset, i32 src_offset, i32 count);
+i32 wasm_cl_memory_copy(void* interp_ptr, void* config_ptr, u32 dst_mem, u32 src_mem, i32 dst_offset, i32 src_offset, i32 count)
 {
     auto& interpreter = *static_cast<BytecodeInterpreter*>(interp_ptr);
-    auto& config = *static_cast<Configuration*>(config_ptr);
-
-    auto const& module = config.frame().module();
-    auto* src_instance = config.store().unsafe_get(module.memories().data()[src_mem]);
-    auto* dst_instance = config.store().unsafe_get(module.memories().data()[dst_mem]);
+    auto* src_instance = wasm_cl_get_memory(config_ptr, src_mem);
+    auto* dst_instance = wasm_cl_get_memory(config_ptr, dst_mem);
 
     auto src_end = static_cast<u64>(static_cast<u32>(src_offset)) + static_cast<u32>(count);
     auto dst_end = static_cast<u64>(static_cast<u32>(dst_offset)) + static_cast<u32>(count);
@@ -688,14 +605,11 @@ i32 wasm_cl_memory_copy(void* interp_ptr, void* config_ptr, i32 dst_mem, i32 src
     return 0;
 }
 
-i32 wasm_cl_memory_fill(void* interp_ptr, void* config_ptr, i32 mem_idx, i32 offset, i32 value, i32 count);
-i32 wasm_cl_memory_fill(void* interp_ptr, void* config_ptr, i32 mem_idx, i32 offset, i32 value, i32 count)
+i32 wasm_cl_memory_fill(void* interp_ptr, void* config_ptr, u32 mem_idx, i32 offset, i32 value, i32 count);
+i32 wasm_cl_memory_fill(void* interp_ptr, void* config_ptr, u32 mem_idx, i32 offset, i32 value, i32 count)
 {
     auto& interpreter = *static_cast<BytecodeInterpreter*>(interp_ptr);
-    auto& config = *static_cast<Configuration*>(config_ptr);
-
-    auto const& module = config.frame().module();
-    auto* instance = config.store().unsafe_get(module.memories().data()[mem_idx]);
+    auto* instance = wasm_cl_get_memory(config_ptr, mem_idx);
 
     auto end = static_cast<u64>(static_cast<u32>(offset)) + static_cast<u32>(count);
     if (end > instance->size())
@@ -705,76 +619,6 @@ i32 wasm_cl_memory_fill(void* interp_ptr, void* config_ptr, i32 mem_idx, i32 off
         instance->data().fill(static_cast<u32>(offset), static_cast<u8>(value), static_cast<u32>(count));
 
     return 0;
-}
-
-void wasm_cl_stack_push(void* config_ptr, i64 value);
-void wasm_cl_stack_push(void* config_ptr, i64 value)
-{
-    auto& config = *static_cast<Configuration*>(config_ptr);
-    config.value_stack().append(Value(value));
-}
-
-i64 wasm_cl_stack_pop(void* config_ptr);
-i64 wasm_cl_stack_pop(void* config_ptr)
-{
-    auto& config = *static_cast<Configuration*>(config_ptr);
-    return config.value_stack().unsafe_take_last().to<i64>();
-}
-
-i64 wasm_cl_stack_size(void* config_ptr);
-i64 wasm_cl_stack_size(void* config_ptr)
-{
-    auto& config = *static_cast<Configuration*>(config_ptr);
-    return static_cast<i64>(config.value_stack().size());
-}
-
-void wasm_cl_stack_cleanup(void* config_ptr, i64 initial_size, i32 result_arity);
-void wasm_cl_stack_cleanup(void* config_ptr, i64 initial_size, i32 result_arity)
-{
-    auto& config = *static_cast<Configuration*>(config_ptr);
-    auto& stack = config.value_stack();
-    auto expected = static_cast<size_t>(initial_size) + static_cast<size_t>(result_arity);
-    if (stack.size() == expected)
-        return;
-    if (stack.size() < expected) {
-        // Under-push (e.g. trap path), fill with zeros so the caller has something to pop.
-        while (stack.size() < expected)
-            stack.append(Value(static_cast<i64>(0)));
-        return;
-    }
-
-    // Take results, trim stack, and put them back.
-    Value saved[8];
-    auto n = min(static_cast<size_t>(result_arity), size_t(8));
-    for (size_t i = 0; i < n; i++)
-        saved[i] = stack.unsafe_take_last();
-
-    while (stack.size() > static_cast<size_t>(initial_size))
-        stack.unsafe_take_last();
-
-    for (size_t i = n; i > 0; i--)
-        stack.append(saved[i - 1]);
-}
-
-i64 wasm_cl_callrec_read(void* config_ptr, i32 index);
-i64 wasm_cl_callrec_read(void* config_ptr, i32 index)
-{
-    auto& config = *static_cast<Configuration*>(config_ptr);
-    return config.call_record_entry(index).to<i64>();
-}
-
-void wasm_cl_callrec_write(void* config_ptr, i32 index, i64 value);
-void wasm_cl_callrec_write(void* config_ptr, i32 index, i64 value)
-{
-    auto& config = *static_cast<Configuration*>(config_ptr);
-    if (!config.call_record_base()) [[unlikely]] {
-        // No call record yet, allocate now.
-        auto size = config.frame().expression().compiled_instructions.max_call_rec_size;
-        if (size == 0)
-            size = static_cast<size_t>(index) + 1;
-        config.setup_call_record(size);
-    }
-    config.call_record_entry(index) = Value(value);
 }
 
 i32 wasm_cl_call_with_record(void* interp_ptr, void* config_ptr, i32 func_index);
@@ -798,10 +642,12 @@ i32 wasm_cl_call_with_record(void* interp_ptr, void* config_ptr, i32 func_index)
     FunctionType const* type { nullptr };
     instance->visit([&](auto const& function) { type = &function.type(); });
 
-    Vector<Value, ArgumentsStaticSize> args;
-    config.take_call_record(args);
-    args.shrink(type->parameters().size(), true);
-    return wasm_cl_finish_call(interpreter, config, address, args);
+    return wasm_cl_finish_call(interpreter, config, address, config.call_record_base(), type->parameters().size());
+}
+
+static NEVER_INLINE COLD i32 wasm_cl_direct_call_fallback(BytecodeInterpreter& interpreter, Configuration& config, i32 func_index, Value const* args, size_t arg_count)
+{
+    return wasm_cl_finish_call(interpreter, config, config.frame().module().functions()[func_index], args, arg_count);
 }
 
 // Direct compiled-to-compiled call. Falls back to wasm_cl_finish_call for non-compiled targets.
@@ -809,14 +655,8 @@ static ALWAYS_INLINE i32 wasm_cl_direct_call_impl(BytecodeInterpreter& interpret
 {
     auto const* table = config.frame().compiled_fn_table();
     auto index = static_cast<size_t>(func_index);
-    if (!table || index >= table->size() || !(*table)[index].module) [[unlikely]] {
-        // Not Cranelift-compiled, fall back to full path.
-        Vector<Value, ArgumentsStaticSize> args_vec;
-        args_vec.ensure_capacity(arg_count);
-        for (size_t i = 0; i < arg_count; i++)
-            args_vec.unchecked_append(args[i]);
-        return wasm_cl_finish_call(interpreter, config, config.frame().module().functions()[func_index], args_vec);
-    }
+    if (!table || index >= table->size() || !(*table)[index].module) [[unlikely]]
+        return wasm_cl_direct_call_fallback(interpreter, config, func_index, args, arg_count);
 
     auto const& entry = (*table)[index];
 
@@ -825,41 +665,15 @@ static ALWAYS_INLINE i32 wasm_cl_direct_call_impl(BytecodeInterpreter& interpret
         return 1;
     }
 
-    // Stack-allocate callee locals: args + zero-initialized locals.
-    auto total = arg_count + entry.total_local_count;
-    Value callee_locals_buf[64];
-    Value* callee_locals = callee_locals_buf;
-    Vector<Value, ArgumentsStaticSize> heap_buf;
-    if (total > 64) [[unlikely]] {
-        heap_buf.ensure_capacity(total);
-        heap_buf.resize_and_keep_capacity(total);
-        callee_locals = heap_buf.data();
-    }
+    if (arg_count + entry.total_local_count > 64) [[unlikely]]
+        return wasm_cl_run_compiled_with_heap_locals(interpreter, config, entry, args, arg_count);
+
+    // Opt out of -ftrivial-auto-var-init as in wasm_cl_finish_call: only the argument slots are
+    // written, and the compiled entry block initializes its own locals.
+    __attribute__((uninitialized)) Value callee_locals[64];
     for (size_t i = 0; i < arg_count; i++)
         callee_locals[i] = args[i];
-    __builtin_memset(callee_locals + arg_count, 0, entry.total_local_count * sizeof(Value));
-
-    // Lightweight non-owning frame push + direct handler call.
-    BytecodeInterpreter::CallFrameHandle handle { interpreter, config };
-    config.set_frame_lightweight(*entry.module, callee_locals, *entry.expression, entry.arity);
-    config.setup_call_record_for_current_frame();
-    config.ip() = 0;
-
-    interpreter.clear_trap();
-    using HandlerFn = Outcome (*)(BytecodeInterpreter&, Configuration&, Instruction const*, u32, Dispatch const*, SourcesAndDestination const*);
-    auto const handler = bit_cast<HandlerFn>(entry.handler_ptr);
-    auto outcome = handler(interpreter, config, entry.first_insn, 0, bit_cast<Dispatch const*>(entry.dispatches_ptr), bit_cast<SourcesAndDestination const*>(entry.src_dst_ptr));
-
-    if (outcome != Outcome::Return) {
-        interpreter.set_trap("Compiled function returned unexpectedly"sv);
-        return 1;
-    }
-    if (interpreter.did_trap())
-        return 1;
-    if (entry.arity == 1)
-        config.compiled_call_result_scratch() = config.value_stack().unsafe_take_last();
-    // No label pop: set_frame_lightweight doesn't push labels.
-    return 0;
+    return wasm_cl_run_compiled(interpreter, config, entry, callee_locals);
 }
 
 i32 wasm_cl_direct_call_0(void* interp_ptr, void* config_ptr, i32 func_index);
@@ -909,14 +723,8 @@ i32 wasm_cl_push_frame(void* interp_ptr, void* config_ptr, Value* locals_ptr, u3
     if (interpreter.trap_if_insufficient_native_stack_space())
         return 1;
 
-    config.set_frame_lightweight(module, locals_ptr, expression, arity);
+    config.set_frame_lightweight(module, locals_ptr, expression, arity, max_call_rec_size);
     config.depth()++;
-
-    // Set up call record for the callee if needed.
-    if (max_call_rec_size > 0) {
-        config.set_call_record_base(nullptr);
-        config.setup_call_record(max_call_rec_size);
-    }
     return 0;
 }
 
@@ -935,51 +743,53 @@ void wasm_cl_pop_frame(void* config_ptr, u32 arity)
 
 namespace Wasm {
 
-static RuntimeHelpers make_runtime_helpers()
+static RuntimeHelperAddresses make_runtime_helper_addresses()
 {
-    return RuntimeHelpers {
-        .call_function = bit_cast<uintptr_t>(&wasm_cl_call_function),
-        .set_trap = bit_cast<uintptr_t>(&wasm_cl_set_trap),
-        .memory_load8_s = bit_cast<uintptr_t>(&wasm_cl_memory_load8_s),
-        .memory_load8_u = bit_cast<uintptr_t>(&wasm_cl_memory_load8_u),
-        .memory_load16_s = bit_cast<uintptr_t>(&wasm_cl_memory_load16_s),
-        .memory_load16_u = bit_cast<uintptr_t>(&wasm_cl_memory_load16_u),
-        .memory_load32_s = bit_cast<uintptr_t>(&wasm_cl_memory_load32_s),
-        .memory_load32_u = bit_cast<uintptr_t>(&wasm_cl_memory_load32_u),
-        .memory_load64 = bit_cast<uintptr_t>(&wasm_cl_memory_load64),
-        .memory_store8 = bit_cast<uintptr_t>(&wasm_cl_memory_store8),
-        .memory_store16 = bit_cast<uintptr_t>(&wasm_cl_memory_store16),
-        .memory_store32 = bit_cast<uintptr_t>(&wasm_cl_memory_store32),
-        .memory_store64 = bit_cast<uintptr_t>(&wasm_cl_memory_store64),
-        .memory_size = bit_cast<uintptr_t>(&wasm_cl_memory_size),
-        .memory_grow = bit_cast<uintptr_t>(&wasm_cl_memory_grow),
-        .read_global = bit_cast<uintptr_t>(&wasm_cl_read_global),
-        .write_global = bit_cast<uintptr_t>(&wasm_cl_write_global),
-        .stack_push = bit_cast<uintptr_t>(&wasm_cl_stack_push),
-        .stack_pop = bit_cast<uintptr_t>(&wasm_cl_stack_pop),
-        .stack_size = bit_cast<uintptr_t>(&wasm_cl_stack_size),
-        .stack_cleanup = bit_cast<uintptr_t>(&wasm_cl_stack_cleanup),
-        .callrec_read = bit_cast<uintptr_t>(&wasm_cl_callrec_read),
-        .callrec_write = bit_cast<uintptr_t>(&wasm_cl_callrec_write),
-        .call_with_record = bit_cast<uintptr_t>(&wasm_cl_call_with_record),
-        .direct_call_0 = bit_cast<uintptr_t>(&wasm_cl_direct_call_0),
-        .direct_call_1 = bit_cast<uintptr_t>(&wasm_cl_direct_call_1),
-        .direct_call_2 = bit_cast<uintptr_t>(&wasm_cl_direct_call_2),
-        .direct_call_3 = bit_cast<uintptr_t>(&wasm_cl_direct_call_3),
-        .call_indirect = bit_cast<uintptr_t>(&wasm_cl_call_indirect),
-        .memory_copy = bit_cast<uintptr_t>(&wasm_cl_memory_copy),
-        .memory_fill = bit_cast<uintptr_t>(&wasm_cl_memory_fill),
-        .primitive_storage_cage_base = bit_cast<uintptr_t>(&js_primitive_storage_cage_base),
-        .primitive_storage_cage_offset_mask = GC::PrimitiveStorage::cage_offset_mask,
+    RuntimeHelperAddresses addresses {};
+    addresses[to_underlying(HelperId::call_function)] = bit_cast<uintptr_t>(&wasm_cl_call_function);
+    addresses[to_underlying(HelperId::set_trap)] = bit_cast<uintptr_t>(&wasm_cl_set_trap);
+    addresses[to_underlying(HelperId::memory_size)] = bit_cast<uintptr_t>(&wasm_cl_memory_size);
+    addresses[to_underlying(HelperId::memory_grow)] = bit_cast<uintptr_t>(&wasm_cl_memory_grow);
+    addresses[to_underlying(HelperId::call_with_record)] = bit_cast<uintptr_t>(&wasm_cl_call_with_record);
+    addresses[to_underlying(HelperId::direct_call_0)] = bit_cast<uintptr_t>(&wasm_cl_direct_call_0);
+    addresses[to_underlying(HelperId::direct_call_1)] = bit_cast<uintptr_t>(&wasm_cl_direct_call_1);
+    addresses[to_underlying(HelperId::direct_call_2)] = bit_cast<uintptr_t>(&wasm_cl_direct_call_2);
+    addresses[to_underlying(HelperId::direct_call_3)] = bit_cast<uintptr_t>(&wasm_cl_direct_call_3);
+    addresses[to_underlying(HelperId::call_indirect)] = bit_cast<uintptr_t>(&wasm_cl_call_indirect);
+    addresses[to_underlying(HelperId::memory_copy)] = bit_cast<uintptr_t>(&wasm_cl_memory_copy);
+    addresses[to_underlying(HelperId::memory_fill)] = bit_cast<uintptr_t>(&wasm_cl_memory_fill);
+    addresses[to_underlying(HelperId::primitive_storage_cage_base)] = bit_cast<uintptr_t>(&js_primitive_storage_cage_base);
+    return addresses;
+}
+
+static RuntimeLayout make_runtime_layout()
+{
+    return RuntimeLayout {
         .regs_offset = static_cast<u32>(offsetof(Configuration, regs)),
         .value_size = static_cast<u32>(sizeof(Value)),
         .locals_base_offset = static_cast<u32>(Configuration::locals_base_offset()),
-        .default_memory_offset = static_cast<u32>(Configuration::default_memory_offset()),
+        .memory_instances_offset = static_cast<u32>(Configuration::memory_instances_offset()),
+        .global_instances_offset = static_cast<u32>(Configuration::global_instances_offset()),
+        .global_instance_value_offset = static_cast<u32>(GlobalInstance::value_offset()),
         .memory_instance_data_offset = static_cast<u32>(MemoryInstance::data_offset()),
-        .memory_buffer_size_offset = static_cast<u32>(MemoryBuffer::size_offset()),
         .memory_buffer_storage_offset_offset = static_cast<u32>(MemoryBuffer::storage_offset_offset()),
         .compiled_call_result_scratch_offset = static_cast<u32>(Configuration::compiled_call_result_scratch_offset()),
+        .value_stack_base_offset = static_cast<u32>(Configuration::value_stack_base_offset()),
+        .value_stack_top_offset = static_cast<u32>(Configuration::value_stack_top_offset()),
+        .call_record_base_offset = static_cast<u32>(Configuration::call_record_base_offset()),
     };
+}
+
+static RuntimeLayout const& runtime_layout()
+{
+    static auto const layout = make_runtime_layout();
+    return layout;
+}
+
+static u64 runtime_layout_hash()
+{
+    static auto const hash = compute_layout_hash(runtime_layout());
+    return hash;
 }
 
 static CraneliftInsn serialize_insn(Dispatch const& dispatch, SourcesAndDestination const& addr)
@@ -1116,12 +926,12 @@ static CraneliftInsn serialize_insn(Dispatch const& dispatch, SourcesAndDestinat
     return out;
 }
 
-static StringView resolve_cranelift_compiler_path()
+ByteString const& cranelift_compiler_path()
 {
     // Lookup order: LADYBIRD_CRANELIFT_COMPILER, compile-time path, sibling-of-self.
     static NeverDestroyed<ByteString> s_path = []() -> ByteString {
         auto file_exists = [](ByteString const& path) {
-            return !Core::System::stat(path).is_error();
+            return FileSystem::exists(path);
         };
 
         if (auto const* env = getenv("LADYBIRD_CRANELIFT_COMPILER"); env && *env) {
@@ -1140,15 +950,185 @@ static StringView resolve_cranelift_compiler_path()
 
         return WASM_CRANELIFT_COMPILER_PATH;
     }();
-    return s_path->view();
+
+    return *s_path;
 }
 
-static void try_cranelift_compile_batch(Vector<BatchInput>& batch)
+template<typename T>
+static ErrorOr<T> read_cranelift_input(ReadonlyBytes input, size_t offset)
+{
+    Checked<size_t> end = offset;
+    end += sizeof(T);
+    if (end.has_overflow() || end.value() > input.size())
+        return Error::from_string_literal("Cranelift input is truncated");
+
+    T value;
+    input.slice(offset, sizeof(T)).copy_to({ &value, sizeof(T) });
+    return value;
+}
+
+static ErrorOr<Core::AnonymousBuffer> create_cranelift_output_buffer(ReadonlyBytes input)
+{
+    if (input.size() < sizeof(InputHeader))
+        return Error::from_string_literal("Cranelift input header is truncated");
+
+    auto header = TRY(read_cranelift_input<InputHeader>(input, 0));
+    if (header.total_size != input.size())
+        return Error::from_string_literal("Cranelift input size does not match its header");
+
+    Checked<size_t> entries_size = sizeof(InputFunctionEntry);
+    entries_size *= header.function_count;
+    if (entries_size.has_overflow())
+        return Error::from_string_literal("Cranelift input entries are too large");
+
+    Checked<size_t> entries_end = sizeof(InputHeader);
+    entries_end += entries_size.value();
+    if (entries_end.has_overflow() || entries_end.value() > input.size())
+        return Error::from_string_literal("Cranelift input entries are truncated");
+
+    size_t instruction_count = 0;
+    size_t locals_size = 0;
+    for (size_t i = 0; i < header.function_count; ++i) {
+        auto entry = TRY(read_cranelift_input<InputFunctionEntry>(input, sizeof(InputHeader) + i * sizeof(InputFunctionEntry)));
+        Checked<size_t> new_instruction_count = instruction_count;
+        new_instruction_count += entry.insn_count;
+        if (new_instruction_count.has_overflow())
+            return Error::from_string_literal("Cranelift instruction count overflow");
+        instruction_count = new_instruction_count.value();
+
+        Checked<size_t> new_locals_size = locals_size;
+        new_locals_size += entry.num_locals;
+        if (new_locals_size.has_overflow())
+            return Error::from_string_literal("Cranelift locals size overflow");
+        locals_size = new_locals_size.value();
+    }
+
+    auto insn_region_offset = align_up(entries_end.value(), alignof(CraneliftInsn));
+    Checked<size_t> insn_region_size = instruction_count;
+    insn_region_size *= sizeof(CraneliftInsn);
+    if (insn_region_size.has_overflow())
+        return Error::from_string_literal("Cranelift instruction region is too large");
+
+    Checked<size_t> locals_region_offset = insn_region_offset;
+    locals_region_offset += insn_region_size.value();
+    if (locals_region_offset.has_overflow())
+        return Error::from_string_literal("Cranelift locals region offset overflow");
+
+    Checked<size_t> layout_offset = locals_region_offset.value();
+    layout_offset += locals_size;
+    if (layout_offset.has_overflow())
+        return Error::from_string_literal("Cranelift layout offset overflow");
+    auto aligned_layout_offset = align_up(layout_offset.value(), alignof(RuntimeLayout));
+
+    Checked<size_t> expected_input_size = aligned_layout_offset;
+    expected_input_size += sizeof(RuntimeLayout);
+    if (expected_input_size.has_overflow() || expected_input_size.value() != input.size() || header.layout_offset != aligned_layout_offset)
+        return Error::from_string_literal("Cranelift input regions are not canonical");
+
+    size_t insn_cursor = insn_region_offset;
+    size_t locals_cursor = locals_region_offset.value();
+    for (size_t i = 0; i < header.function_count; ++i) {
+        auto entry = TRY(read_cranelift_input<InputFunctionEntry>(input, sizeof(InputHeader) + i * sizeof(InputFunctionEntry)));
+        if (entry.insn_offset != insn_cursor || entry.locals_offset != locals_cursor)
+            return Error::from_string_literal("Cranelift input regions are not canonical");
+
+        insn_cursor += static_cast<size_t>(entry.insn_count) * sizeof(CraneliftInsn);
+        locals_cursor += entry.num_locals;
+    }
+
+    auto output_size = TRY(compute_output_buffer_size(header.function_count, instruction_count));
+    if (header.output_size != output_size)
+        return Error::from_string_literal("Cranelift output size does not match its input");
+
+    return Core::AnonymousBuffer::create_with_size(output_size, Core::AnonymousBuffer::Sealability::Sealable);
+}
+
+static ErrorOr<Core::AnonymousBuffer> finalize_cranelift_output_buffer(Core::AnonymousBuffer const& output)
+{
+    if (output.size() < sizeof(OutputHeader))
+        return Error::from_string_literal("Cranelift output header is truncated");
+
+    auto const& header = *output.data<OutputHeader>();
+    auto output_size = static_cast<size_t>(header.total_size);
+    if (output_size < sizeof(OutputHeader) || output_size > output.size())
+        return Error::from_string_literal("Cranelift output size is invalid");
+
+    auto output_fd = TRY(Core::System::dup(output.fd()));
+    return Core::AnonymousBuffer::create_from_anon_fd(output_fd, output_size);
+}
+
+ErrorOr<Core::AnonymousBuffer> compile_cranelift_buffer(Core::AnonymousBuffer const& input)
+{
+    auto output = TRY(create_cranelift_output_buffer(input.bytes()));
+
+#if defined(AK_OS_WINDOWS)
+    auto process = TRY([&]() -> ErrorOr<Core::Process> {
+        // FIXME: Use Core::FileAction::DupFd once it is supported on Windows so spawning does not require temporarily
+        //        inheritable handles.
+        static Mutex spawn_mutex;
+        MutexLocker locker(spawn_mutex);
+
+        auto inherited_input_fd = TRY(Core::System::dup(input.fd()));
+        ScopeGuard close_inherited_input_fd { [&]() { (void)Core::System::close(inherited_input_fd); } };
+        TRY(Core::System::set_close_on_exec(inherited_input_fd, false));
+
+        auto inherited_output_fd = TRY(Core::System::dup(output.fd()));
+        ScopeGuard close_inherited_output_fd { [&]() { (void)Core::System::close(inherited_output_fd); } };
+        TRY(Core::System::set_close_on_exec(inherited_output_fd, false));
+
+        Vector<ByteString> arguments;
+        arguments.append(ByteString::number(reinterpret_cast<uintptr_t>(to_handle(inherited_input_fd))));
+        arguments.append(ByteString::number(input.size()));
+        arguments.append(ByteString::number(reinterpret_cast<uintptr_t>(to_handle(inherited_output_fd))));
+        arguments.append(ByteString::number(output.size()));
+
+        return Core::Process::spawn({
+            .name = "cranelift-compiler"sv,
+            .executable = cranelift_compiler_path(),
+            .die_with_parent = true,
+            .arguments = arguments,
+        });
+    }());
+#else
+    // Reserve the child descriptor numbers with close-on-exec duplicates. This prevents concurrent spawns from claiming
+    // or inheriting them before the child-side DupFd actions replace them and clear close-on-exec.
+    auto compiler_input_fd = TRY(Core::System::fcntl(input.fd(), F_DUPFD_CLOEXEC, STDERR_FILENO + 1));
+    ScopeGuard close_compiler_input_fd { [&]() { (void)Core::System::close(compiler_input_fd); } };
+
+    auto compiler_output_fd = TRY(Core::System::fcntl(output.fd(), F_DUPFD_CLOEXEC, STDERR_FILENO + 1));
+    ScopeGuard close_compiler_output_fd { [&]() { (void)Core::System::close(compiler_output_fd); } };
+
+    Vector<ByteString> arguments;
+    arguments.append(ByteString::number(compiler_input_fd));
+    arguments.append(ByteString::number(input.size()));
+    arguments.append(ByteString::number(compiler_output_fd));
+    arguments.append(ByteString::number(output.size()));
+
+    auto process = TRY(Core::Process::spawn({
+        .name = "cranelift-compiler"sv,
+        .executable = cranelift_compiler_path(),
+        .die_with_parent = true,
+        .arguments = arguments,
+        .file_actions = {
+            Core::FileAction::DupFd { .write_fd = input.fd(), .fd = compiler_input_fd },
+            Core::FileAction::DupFd { .write_fd = output.fd(), .fd = compiler_output_fd },
+        },
+    }));
+#endif
+
+    if (TRY(process.wait_for_termination()) != 0)
+        return Error::from_string_literal("Failed to compile a WebAssembly module");
+
+    return finalize_cranelift_output_buffer(output);
+}
+
+static ErrorOr<void> try_cranelift_compile_batch(ReadonlySpan<BatchInput> batch)
 {
     if (batch.is_empty())
-        return;
+        return {};
 
-    static auto helpers = make_runtime_helpers();
+    static auto helper_addresses = make_runtime_helper_addresses();
+    auto const& layout = runtime_layout();
     u64 outcome_return = to_underlying(Outcome::Return);
 
     size_t function_count = batch.size();
@@ -1156,156 +1136,130 @@ static void try_cranelift_compile_batch(Vector<BatchInput>& batch)
     auto const entries_size = sizeof(InputFunctionEntry) * function_count;
 
     size_t total_insn_count = 0;
-    for (auto& entry : batch)
+    size_t total_locals_bytes = 0;
+    for (auto const& entry : batch) {
         total_insn_count += entry.insns.size();
+        total_locals_bytes += entry.num_locals;
+    }
 
     auto const insn_region_offset = align_up(entries_offset + entries_size, alignof(CraneliftInsn));
     auto const insn_bytes = total_insn_count * sizeof(CraneliftInsn);
-    auto const helpers_offset = align_up(insn_region_offset + insn_bytes, alignof(RuntimeHelpers));
-    auto const code_region_start = align_up(helpers_offset + sizeof(RuntimeHelpers), alignof(OutputFunctionEntry));
-    auto const code_region_size = max(oop_code_region_min_size, total_insn_count * oop_code_bytes_per_insn);
-    auto const reloc_region_start = align_up(code_region_start + sizeof(OutputFunctionEntry) * function_count + code_region_size, alignof(HelperReloc));
-    auto const reloc_region_size = max(oop_reloc_region_min_size, total_insn_count * oop_reloc_bytes_per_insn);
-    auto const total_size = reloc_region_start + reloc_region_size;
+    auto const locals_region_offset = insn_region_offset + insn_bytes; // u8, no alignment needed
+    auto const layout_offset = align_up(locals_region_offset + total_locals_bytes, alignof(RuntimeLayout));
+    auto const total_size = layout_offset + sizeof(RuntimeLayout);
+    auto const output_size = TRY(compute_output_buffer_size(function_count, total_insn_count));
 
-#if defined(AK_OS_WINDOWS)
-    DWORD size_hi = static_cast<DWORD>(static_cast<u64>(total_size) >> 32);
-    DWORD size_lo = static_cast<DWORD>(total_size & 0xFFFFFFFF);
-    HANDLE section_handle = CreateFileMapping(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, size_hi, size_lo, NULL);
-    if (!section_handle)
-        return;
-    SetHandleInformation(section_handle, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
-    ScopeGuard close_handle = [section_handle] { CloseHandle(section_handle); };
-
-    auto* mapping = MapViewOfFile(section_handle, FILE_MAP_ALL_ACCESS, 0, 0, total_size);
-    if (!mapping)
-        return;
-    ScopeGuard unmap = [mapping] { UnmapViewOfFile(mapping); };
-#elif defined(AK_OS_MACOS)
-    // macOS lacks memfd_create; use shm_open + shm_unlink for an anonymous fd.
-    char shm_name[] = "/libwasm-cranelift-XXXXXX";
-    arc4random_buf(shm_name + 21, 6);
-    for (int i = 21; i < 27; ++i)
-        shm_name[i] = 'A' + (static_cast<unsigned char>(shm_name[i]) % 26);
-    int fd = shm_open(shm_name, O_RDWR | O_CREAT | O_EXCL, 0600);
-    if (fd < 0)
-        return;
-    shm_unlink(shm_name);
-    // POSIX shm_open sets FD_CLOEXEC on the returned fd, which would close it
-    // in the spawned cranelift-compiler child. Clear it so the child inherits.
-    if (auto flags = fcntl(fd, F_GETFD); flags >= 0)
-        fcntl(fd, F_SETFD, flags & ~FD_CLOEXEC);
-    ScopeGuard close_fd = [fd] { close(fd); };
-    if (ftruncate(fd, static_cast<off_t>(total_size)) < 0)
-        return;
-
-    auto* mapping = mmap(nullptr, total_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    if (mapping == MAP_FAILED)
-        return;
-    ScopeGuard unmap = [mapping, total_size] { munmap(mapping, total_size); };
-#else
-    int fd = memfd_create("libwasm-cranelift", 0);
-    if (fd < 0)
-        return;
-    ScopeGuard close_fd = [fd] { close(fd); };
-    if (ftruncate(fd, static_cast<off_t>(total_size)) < 0)
-        return;
-
-    auto* mapping = mmap(nullptr, total_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    if (mapping == MAP_FAILED)
-        return;
-    ScopeGuard unmap = [mapping, total_size] { munmap(mapping, total_size); };
-#endif
-
-    auto* base = static_cast<u8*>(mapping);
+    auto buffer = TRY(Core::AnonymousBuffer::create_with_size(total_size, Core::AnonymousBuffer::Sealability::Sealable));
+    auto* base = buffer.data<u8>();
     __builtin_memset(base, 0, total_size);
 
     auto* header = reinterpret_cast<InputHeader*>(base);
     *header = InputHeader {
         .function_count = static_cast<u32>(function_count),
-        .helpers_offset = static_cast<u32>(helpers_offset),
+        .layout_offset = static_cast<u32>(layout_offset),
         .outcome_return = outcome_return,
-        .code_region_start = code_region_start,
-        .reloc_region_start = reloc_region_start,
+        .output_size = output_size,
         .total_size = total_size,
     };
 
     size_t insn_cursor = insn_region_offset;
+    size_t locals_cursor = locals_region_offset;
     for (size_t i = 0; i < function_count; ++i) {
-        auto& input = batch[i];
+        auto const& input = batch[i];
         auto* entry = reinterpret_cast<InputFunctionEntry*>(base + entries_offset + i * sizeof(InputFunctionEntry));
         *entry = InputFunctionEntry {
             .insn_offset = static_cast<u32>(insn_cursor),
             .insn_count = static_cast<u32>(input.insns.size()),
             .result_arity = input.result_arity,
+            .num_locals = input.num_locals,
+            .locals_offset = static_cast<u32>(locals_cursor),
+            .num_params = input.num_params,
         };
         __builtin_memcpy(base + insn_cursor, input.insns.data(), input.insns.size() * sizeof(CraneliftInsn));
         insn_cursor += input.insns.size() * sizeof(CraneliftInsn);
+
+        auto const& local_types = input.target->cranelift_local_types;
+        for (u32 l = 0; l < input.num_locals; ++l)
+            base[locals_cursor + l] = l < local_types.size() ? local_types[l] : static_cast<u8>(ValueType::I64);
+        locals_cursor += input.num_locals;
     }
 
-    __builtin_memcpy(base + helpers_offset, &helpers, sizeof(helpers));
+    __builtin_memcpy(base + layout_offset, &layout, sizeof(layout));
 
-    Vector<ByteString> arguments;
-#if defined(AK_OS_WINDOWS)
-    arguments.append(ByteString::number(reinterpret_cast<uintptr_t>(section_handle)));
-#else
-    arguments.append(ByteString::number(fd));
-#endif
-
-    auto process_result = Core::Process::spawn({
-        .name = "cranelift-compiler"sv,
-        .executable = resolve_cranelift_compiler_path(),
-        .arguments = arguments,
-    });
-    if (process_result.is_error())
-        return;
-    auto status_result = process_result.release_value().wait_for_termination();
-    if (status_result.is_error() || status_result.value() != 0)
-        return;
+    auto output_buffer = TRY([&]() -> ErrorOr<Core::AnonymousBuffer> {
+        if (auto& callback = cranelift_compile_callback()) {
+            auto output = callback(buffer);
+            return output.snapshot();
+        }
+        return compile_cranelift_buffer(buffer);
+    }());
+    if (!output_buffer.is_valid() || output_buffer.size() < sizeof(OutputHeader))
+        return Error::from_string_literal("Failed to compile a WebAssembly module");
 
     // Extract results for each function.
-    auto const code_base_offset = code_region_start + sizeof(OutputFunctionEntry) * function_count;
+    auto const* output_base = output_buffer.data<u8>();
+    auto const& output_header = *reinterpret_cast<OutputHeader const*>(output_base);
+    auto const output_entries_offset = sizeof(OutputHeader);
+    auto const output_entries_size = sizeof(OutputFunctionEntry) * function_count;
+    auto const code_base_offset = static_cast<size_t>(output_header.code_base_offset);
+    auto const reloc_region_start = static_cast<size_t>(output_header.reloc_region_start);
+    auto const compact_output_size = static_cast<size_t>(output_header.total_size);
+    if (output_header.function_count != function_count
+        || compact_output_size != output_buffer.size()
+        || code_base_offset < output_entries_offset + output_entries_size
+        || code_base_offset % SERIALIZED_CODE_ALIGNMENT != 0
+        || reloc_region_start < code_base_offset
+        || reloc_region_start % alignof(HelperReloc) != 0
+        || reloc_region_start > compact_output_size)
+        return Error::from_string_literal("Cranelift compiler returned an invalid buffer");
+
+    auto const code_region_size = reloc_region_start - code_base_offset;
+    auto const reloc_region_size = compact_output_size - reloc_region_start;
 
     for (size_t i = 0; i < function_count; ++i) {
-        auto const* output = reinterpret_cast<OutputFunctionEntry const*>(base + code_region_start + i * sizeof(OutputFunctionEntry));
-        if (!output->compiled)
+        auto const& output = *reinterpret_cast<OutputFunctionEntry const*>(output_base + output_entries_offset + i * sizeof(OutputFunctionEntry));
+        if (!output.compiled)
             continue;
 
-        auto code_offset = static_cast<size_t>(output->code_offset);
-        auto code_size = static_cast<size_t>(output->code_size);
+        auto code_offset = static_cast<size_t>(output.code_offset);
+        auto code_size = static_cast<size_t>(output.code_size);
         if (code_offset > code_region_size || code_size > code_region_size - code_offset)
             continue;
         auto code_start = code_base_offset + code_offset;
-        if (code_start + code_size > total_size)
+        if (code_start + code_size > compact_output_size)
             continue;
 
-        auto const reloc_offset = static_cast<size_t>(output->reloc_offset);
-        auto const reloc_count = static_cast<size_t>(output->reloc_count);
+        auto const reloc_offset = static_cast<size_t>(output.reloc_offset);
+        auto const reloc_count = static_cast<size_t>(output.reloc_count);
         auto const reloc_bytes = reloc_count * sizeof(HelperReloc);
         if (reloc_count != 0 && reloc_bytes / sizeof(HelperReloc) != reloc_count)
             continue;
+        if (reloc_offset % alignof(HelperReloc) != 0)
+            continue;
         if (reloc_offset > reloc_region_size || reloc_bytes > reloc_region_size - reloc_offset)
             continue;
-        if (reloc_region_start + reloc_offset + reloc_bytes > total_size)
+        if (reloc_region_start + reloc_offset + reloc_bytes > compact_output_size)
             continue;
 
-        auto const trap_offset = static_cast<size_t>(output->trap_offset);
-        auto const trap_count = static_cast<size_t>(output->trap_count);
+        auto const trap_offset = static_cast<size_t>(output.trap_offset);
+        auto const trap_count = static_cast<size_t>(output.trap_count);
         auto const trap_bytes = trap_count * sizeof(CraneliftTrap);
         if (trap_count != 0 && trap_bytes / sizeof(CraneliftTrap) != trap_count)
             continue;
+        if (trap_offset % alignof(CraneliftTrap) != 0)
+            continue;
         if (trap_offset > reloc_region_size || trap_bytes > reloc_region_size - trap_offset)
             continue;
-        if (reloc_region_start + trap_offset + trap_bytes > total_size)
+        if (reloc_region_start + trap_offset + trap_bytes > compact_output_size)
             continue;
 
-        auto code_bytes = ReadonlyBytes { base + code_start, code_size };
+        auto code_bytes = ReadonlyBytes { output_base + code_start, code_size };
         auto const* relocs = reloc_count == 0
             ? nullptr
-            : reinterpret_cast<HelperReloc const*>(base + reloc_region_start + reloc_offset);
+            : reinterpret_cast<HelperReloc const*>(output_base + reloc_region_start + reloc_offset);
         auto traps = trap_count == 0
             ? ReadonlySpan<CraneliftTrap> {}
-            : ReadonlySpan<CraneliftTrap> { reinterpret_cast<CraneliftTrap const*>(base + reloc_region_start + trap_offset), trap_count };
+            : ReadonlySpan<CraneliftTrap> { reinterpret_cast<CraneliftTrap const*>(output_base + reloc_region_start + trap_offset), trap_count };
 
         auto& capture = cranelift_cache_state().cache_capture;
         if (capture.capturing && batch[i].function_index != NumericLimits<u32>::max()) {
@@ -1323,8 +1277,10 @@ static void try_cranelift_compile_batch(Vector<BatchInput>& batch)
             }
         }
 
-        install_compiled_function(*batch[i].target, code_bytes, relocs, reloc_count, traps, helpers);
+        install_compiled_function(*batch[i].target, code_bytes, relocs, reloc_count, traps, helper_addresses);
     }
+
+    return {};
 }
 
 bool try_cranelift_compile(CompiledInstructions& compiled, u32 result_arity)
@@ -1353,14 +1309,14 @@ bool try_cranelift_compile(CompiledInstructions& compiled, u32 result_arity)
     if (cranelift_cache_state().pending_install.active && s_active_function_index != NumericLimits<u32>::max()) {
         auto record = cranelift_cache_state().pending_install.records.take(s_active_function_index);
         if (record.has_value()) {
-            static auto cache_install_helpers = make_runtime_helpers();
+            static auto cache_install_helper_addresses = make_runtime_helper_addresses();
             if (install_compiled_function(
                     compiled,
                     record->unpatched_code.bytes(),
                     record->relocs.is_empty() ? nullptr : record->relocs.data(),
                     record->relocs.size(),
                     record->traps.span(),
-                    cache_install_helpers)) {
+                    cache_install_helper_addresses)) {
                 return true;
             }
             // Put it back so we can try later.
@@ -1483,7 +1439,7 @@ bool try_cranelift_compile(CompiledInstructions& compiled, u32 result_arity)
         }
     }
 
-    cranelift_cache_state().pending_batch.append({ move(flat), result_arity, s_active_function_index, &compiled });
+    cranelift_cache_state().pending_batch.append({ move(flat), result_arity, s_active_function_index, &compiled, compiled.cranelift_local_count, compiled.cranelift_param_count });
     return false; // Not compiled yet, will be compiled in flush.
 #endif
 }
@@ -1492,7 +1448,11 @@ void flush_cranelift_batch()
 {
     if (cranelift_cache_state().pending_batch.is_empty())
         return;
-    try_cranelift_compile_batch(cranelift_cache_state().pending_batch);
+
+    auto result = try_cranelift_compile_batch(cranelift_cache_state().pending_batch);
+    if (result.is_error())
+        warnln("Cranelift compilation failed: {}", result.error());
+
     cranelift_cache_state().pending_batch.clear();
 }
 
@@ -1551,8 +1511,6 @@ Optional<ByteBuffer> serialize_cranelift_cache_blob(ReadonlyBytes wasm_hash)
     if (wasm_hash.size() != 32)
         return {};
 
-    static auto helpers = make_runtime_helpers();
-
     size_t total_size = sizeof(CacheBlobHeader);
     for (auto const& r : capture.records) {
         total_size += sizeof(CacheBlobFunctionEntry);
@@ -1571,7 +1529,7 @@ Optional<ByteBuffer> serialize_cranelift_cache_blob(ReadonlyBytes wasm_hash)
     header->magic = cache_blob_magic;
     header->format_version = cache_blob_format_version;
     header->helper_count = HELPER_COUNT;
-    header->layout_hash = compute_layout_hash(helpers);
+    header->layout_hash = runtime_layout_hash();
     __builtin_memcpy(header->wasm_hash, wasm_hash.data(), 32);
     header->function_count = static_cast<u32>(capture.records.size());
 
@@ -1618,8 +1576,7 @@ bool try_install_cranelift_cache_blob(ReadonlyBytes expected_wasm_hash, Readonly
     if (__builtin_memcmp(header->wasm_hash, expected_wasm_hash.data(), 32) != 0)
         return false;
 
-    static auto helpers = make_runtime_helpers();
-    if (header->layout_hash != compute_layout_hash(helpers))
+    if (header->layout_hash != runtime_layout_hash())
         return false;
 
     size_t offset = sizeof(CacheBlobHeader);
@@ -1671,6 +1628,14 @@ bool try_install_cranelift_cache_blob(ReadonlyBytes expected_wasm_hash, Readonly
 
     cranelift_cache_state().pending_install.active = true;
     return true;
+}
+
+void set_cranelift_compile_callback(CraneliftCompileCallback callback)
+{
+    auto& installed_callback = cranelift_compile_callback();
+    VERIFY(!installed_callback);
+
+    installed_callback = move(callback);
 }
 
 }

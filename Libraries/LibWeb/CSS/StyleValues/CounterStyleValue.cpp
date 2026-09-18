@@ -6,6 +6,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/Utf16StringBuilder.h>
 #include <LibWeb/CSS/CounterStyle.h>
 #include <LibWeb/CSS/CountersSet.h>
 #include <LibWeb/CSS/Enums.h>
@@ -20,35 +21,40 @@
 
 namespace Web::CSS {
 
-CounterStyleValue::CounterStyleValue(CounterFunction function, FlyString counter_name, ValueComparingNonnullRefPtr<StyleValue const> counter_style, FlyString join_string)
-    : StyleValueWithDefaultOperators(Type::Counter)
-    , m_properties {
-        .function = function,
-        .counter_name = move(counter_name),
-        .counter_style = move(counter_style),
-        .join_string = move(join_string)
-    }
+// The function discriminant crosses the style value FFI as a raw code; the Rust serializer
+// depends on it.
+static_assert(to_underlying(CounterStyleValue::CounterFunction::Counter) == 0);
+static_assert(to_underlying(CounterStyleValue::CounterFunction::Counters) == 1);
+
+static StyleValueFFI::StyleValueData const* make_counter_data(CounterStyleValue::CounterFunction function, Utf16FlyString const& counter_name, ValueComparingNonnullRefPtr<StyleValue const> const& counter_style, Utf16FlyString const& join_string)
+{
+    // The Rust allocation takes ownership of one strong reference to the counter style data.
+    return StyleValueFFI::rust_style_value_create_counter(to_underlying(function), counter_name.to_raw_leaked(), StyleValueFFI::rust_style_value_retain(counter_style->rust_style_value_data()), join_string.to_raw_leaked());
+}
+
+CounterStyleValue::CounterStyleValue(CounterFunction function, Utf16FlyString counter_name, ValueComparingNonnullRefPtr<StyleValue const> counter_style, Utf16FlyString join_string)
+    : StyleValueWithDefaultOperators(Type::Counter, make_counter_data(function, counter_name, counter_style, join_string))
 {
 }
 
 CounterStyleValue::~CounterStyleValue() = default;
 
-String CounterStyleValue::resolve(DOM::AbstractElement& element_reference) const
+Utf16String CounterStyleValue::resolve(DOM::AbstractElement& element_reference) const
 {
     // "If no counter named <counter-name> exists on an element where counter() or counters() is used,
     // one is first instantiated with a starting value of 0."
     auto& counters_set = element_reference.ensure_counters_set();
-    if (!counters_set.last_counter_with_name(m_properties.counter_name).has_value())
-        counters_set.instantiate_a_counter(m_properties.counter_name, element_reference, false, 0);
+    if (!counters_set.last_counter_with_name(counter_name()).has_value())
+        counters_set.instantiate_a_counter(counter_name(), element_reference, false, 0);
 
     // counter( <counter-name>, <counter-style>? )
     // "Represents the value of the innermost counter in the element’s CSS counters set named <counter-name>
     // using the counter style named <counter-style>."
-    if (m_properties.function == CounterFunction::Counter) {
+    if (function_type() == CounterFunction::Counter) {
         // NOTE: This should always be present because of the handling of a missing counter above.
-        auto& counter = counters_set.last_counter_with_name(m_properties.counter_name).value();
+        auto& counter = counters_set.last_counter_with_name(counter_name()).value();
         auto const& style_scope = element_reference.style_scope();
-        return generate_a_counter_representation(m_properties.counter_style->as_counter_style().resolve_counter_style(style_scope), style_scope, counter.value.value_or(0));
+        return generate_a_counter_representation(counter_style()->as_counter_style().resolve_counter_style(style_scope), style_scope, counter.value.value_or(0));
     }
 
     // counters( <counter-name>, <string>, <counter-style>? )
@@ -56,57 +62,18 @@ String CounterStyleValue::resolve(DOM::AbstractElement& element_reference) const
     // using the counter style named <counter-style>, sorted in outermost-first to innermost-last order
     // and joined by the specified <string>."
     // NOTE: The way counters sets are inherited, this should be the order they appear in the counters set.
-    StringBuilder stb;
+    Utf16StringBuilder stb;
     for (auto const& counter : counters_set.counters()) {
-        if (counter.name != m_properties.counter_name)
+        if (counter.name != counter_name())
             continue;
 
         auto const& style_scope = element_reference.style_scope();
-        auto counter_string = generate_a_counter_representation(m_properties.counter_style->as_counter_style().resolve_counter_style(style_scope), style_scope, counter.value.value_or(0));
+        auto counter_string = generate_a_counter_representation(counter_style()->as_counter_style().resolve_counter_style(style_scope), style_scope, counter.value.value_or(0));
         if (!stb.is_empty())
-            stb.append(m_properties.join_string);
+            stb.append(join_string().view());
         stb.append(counter_string);
     }
-    return stb.to_string_without_validation();
-}
-
-// https://drafts.csswg.org/cssom-1/#ref-for-typedef-counter
-void CounterStyleValue::serialize(StringBuilder& builder, SerializationMode mode) const
-{
-    // The return value of the following algorithm:
-    // 1. Let s be the empty string.
-    // (We use builder instead)
-
-    // 2. If <counter> has three CSS component values append the string "counters(" to s.
-    if (m_properties.function == CounterFunction::Counters)
-        builder.append("counters("sv);
-
-    // 3. If <counter> has two CSS component values append the string "counter(" to s.
-    else if (m_properties.function == CounterFunction::Counter)
-        builder.append("counter("sv);
-
-    // 4. Let list be a list of CSS component values belonging to <counter>,
-    //    omitting the last CSS component value if it is "decimal".
-    Vector<RefPtr<StyleValue const>> list;
-    list.append(CustomIdentStyleValue::create(m_properties.counter_name));
-    if (m_properties.function == CounterFunction::Counters)
-        list.append(StringStyleValue::create(m_properties.join_string.to_string()));
-    if (m_properties.counter_style->to_string(mode) != "decimal"sv)
-        list.append(m_properties.counter_style);
-
-    // 5. Let each item in list be the result of invoking serialize a CSS component value on that item.
-    // 6. Append the result of invoking serialize a comma-separated list on list to s.
-    serialize_a_comma_separated_list(builder, list, [mode](auto& b, auto& item) {
-        item->serialize(b, mode);
-    });
-
-    // 7. Append ")" (U+0029) to s.
-    builder.append(")"sv);
-}
-
-bool CounterStyleValue::properties_equal(CounterStyleValue const& other) const
-{
-    return m_properties == other.m_properties;
+    return stb.to_string();
 }
 
 }

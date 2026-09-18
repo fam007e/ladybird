@@ -6,6 +6,7 @@
  */
 
 #include <AK/Checked.h>
+#include <AK/Mutex.h>
 #include <AK/NonnullOwnPtr.h>
 #include <AK/ScopeGuard.h>
 #include <AK/Types.h>
@@ -16,8 +17,8 @@
 #include <LibIPC/Limits.h>
 #include <LibIPC/TransportHandle.h>
 #include <LibIPC/TransportSocket.h>
-#include <LibSync/Mutex.h>
 #include <LibThreading/Thread.h>
+#include <sys/ioctl.h>
 
 namespace IPC {
 
@@ -62,27 +63,26 @@ ErrorOr<TransportSocket::Paired> TransportSocket::create_paired()
     };
 }
 
-void SendQueue::enqueue_message(SocketMessageHeader header, MessageDataType payload, Vector<int>&& fds)
+void SendQueue::enqueue_message(SocketMessageHeader header, MessageDataType payload, Vector<NonnullRefPtr<AutoCloseFileDescriptor>>&& fds)
 {
     VERIFY(fds.size() <= Core::LocalSocket::MAX_TRANSFER_FDS);
-    Sync::MutexLocker locker(m_mutex);
+    MutexLocker locker(m_mutex);
     m_queued_byte_count += sizeof(SocketMessageHeader) + payload.size();
-    m_queued_messages.append(QueuedMessage { header, move(payload), fds.size() });
-    m_fds.append(fds.data(), fds.size());
+    m_queued_messages.append(QueuedMessage { header, move(payload), move(fds) });
 }
 
 SendQueue::BytesAndFds SendQueue::peek(size_t max_bytes)
 {
-    Sync::MutexLocker locker(m_mutex);
+    MutexLocker locker(m_mutex);
     BytesAndFds result;
 
     static_assert(Core::LocalSocket::MAX_TRANSFER_FDS == MAX_MESSAGE_FD_COUNT, "IPC message attachments must fit in one sendmsg()");
     size_t bytes_to_send = 0;
     size_t fds_to_send = 0;
     for (auto const& queued_message : m_queued_messages) {
-        if (fds_to_send + queued_message.unsent_fd_count > Core::LocalSocket::MAX_TRANSFER_FDS)
+        if (fds_to_send + queued_message.unsent_fds.size() > Core::LocalSocket::MAX_TRANSFER_FDS)
             break;
-        fds_to_send += queued_message.unsent_fd_count;
+        fds_to_send += queued_message.unsent_fds.size();
         bytes_to_send += queued_message.size() - queued_message.start_offset;
         if (bytes_to_send >= max_bytes) {
             bytes_to_send = max_bytes;
@@ -112,23 +112,28 @@ SendQueue::BytesAndFds SendQueue::peek(size_t max_bytes)
         }
     }
 
+    // NB: The batch above only ever includes the descriptors of whole messages.
     if (fds_to_send > 0) {
-        result.fds = Vector<int> { m_fds.span().slice(0, fds_to_send) };
-        // NOTE: This relies on a subsequent call to discard to actually remove the fds from m_fds
+        result.fds.ensure_capacity(fds_to_send);
+        for (auto const& queued_message : m_queued_messages) {
+            if (result.fds.size() == fds_to_send)
+                break;
+            for (auto const& fd : queued_message.unsent_fds)
+                result.fds.unchecked_append(fd->value());
+        }
     }
     return result;
 }
 
 void SendQueue::discard(size_t bytes_count, size_t fds_count)
 {
-    Sync::MutexLocker locker(m_mutex);
+    MutexLocker locker(m_mutex);
 
-    m_fds.remove(0, fds_count);
     for (auto& queued_message : m_queued_messages) {
         if (fds_count == 0)
             break;
-        auto consumed_fds = min(queued_message.unsent_fd_count, fds_count);
-        queued_message.unsent_fd_count -= consumed_fds;
+        auto consumed_fds = min(queued_message.unsent_fds.size(), fds_count);
+        queued_message.unsent_fds.remove(0, consumed_fds);
         fds_count -= consumed_fds;
     }
     VERIFY(fds_count == 0);
@@ -142,10 +147,27 @@ void SendQueue::discard(size_t bytes_count, size_t fds_count)
         queued_message.start_offset += consumed_bytes;
         bytes_count -= consumed_bytes;
         if (queued_message.start_offset == queued_message.size()) {
-            VERIFY(queued_message.unsent_fd_count == 0);
+            VERIFY(queued_message.unsent_fds.is_empty());
             (void)m_queued_messages.remove(m_queued_messages.begin());
         }
     }
+
+    if (m_queued_messages.is_empty())
+        m_drained_cv.broadcast();
+}
+
+void SendQueue::wait_until_drained()
+{
+    MutexLocker locker(m_mutex);
+    while (!m_drain_waiters_released && !m_queued_messages.is_empty())
+        m_drained_cv.wait();
+}
+
+void SendQueue::release_drain_waiters()
+{
+    MutexLocker locker(m_mutex);
+    m_drain_waiters_released = true;
+    m_drained_cv.broadcast();
 }
 
 TransportSocket::TransportSocket(NonnullOwnPtr<Core::LocalSocket> socket)
@@ -241,6 +263,7 @@ intptr_t TransportSocket::io_thread_loop()
     }
 
     VERIFY(m_io_thread_state == IOThreadState::Stopped);
+    m_send_queue->release_drain_waiters();
     if (!m_is_being_transferred.load(AK::MemoryOrder::memory_order_acquire)) {
         // The loop may have stopped on a send-side failure (the peer closed its end while we still had data queued to
         // send — so transfer_data() returned SocketClosed) without reading a final inbound message left buffered on the
@@ -248,11 +271,16 @@ intptr_t TransportSocket::io_thread_loop()
         // transform stream's "error") is actually delivered — rather than discarded.
         read_incoming_messages();
 
-        Sync::MutexLocker locker(m_incoming_mutex);
+        MutexLocker locker(m_incoming_mutex);
         m_peer_eof = true;
         m_incoming_eof = true;
         m_incoming_cv.broadcast();
         notify_read_available();
+    }
+    {
+        MutexLocker locker(m_incoming_mutex);
+        m_receive_loop_finished = true;
+        m_incoming_cv.broadcast();
     }
     return 0;
 }
@@ -299,7 +327,7 @@ void TransportSocket::set_up_read_hook(Function<void()> hook)
     };
 
     {
-        Sync::MutexLocker locker(m_incoming_mutex);
+        MutexLocker locker(m_incoming_mutex);
         if (!m_incoming_messages.is_empty()) {
             Array<u8, 1> bytes = { 0 };
             MUST(Core::System::write(m_notify_hook_write_fd->value(), bytes));
@@ -309,24 +337,54 @@ void TransportSocket::set_up_read_hook(Function<void()> hook)
 
 bool TransportSocket::is_open() const
 {
-    return m_socket->is_open();
+    return m_socket_is_open.load(AK::MemoryOrder::memory_order_relaxed);
 }
 
 void TransportSocket::close()
 {
+    m_socket_is_open.store(false, AK::MemoryOrder::memory_order_relaxed);
     stop_io_thread(IOThreadState::Stopped);
     m_socket->close();
 }
 
 void TransportSocket::close_after_sending_all_pending_messages()
 {
+    m_socket_is_open.store(false, AK::MemoryOrder::memory_order_relaxed);
     stop_io_thread(IOThreadState::SendPendingMessagesAndStop);
     m_socket->close();
 }
 
+void TransportSocket::flush()
+{
+    if (!m_socket_is_open.load(AK::MemoryOrder::memory_order_relaxed))
+        return;
+    wake_io_thread();
+    m_send_queue->wait_until_drained();
+}
+
+bool TransportSocket::incoming_is_behind_socket() const
+{
+    // A partial frame left after draining the socket needs new bytes, so it must not hold up the barrier.
+    if (m_read_in_progress)
+        return true;
+
+    int readable_bytes = 0;
+    if (ioctl(m_socket->fd().value(), FIONREAD, &readable_bytes) < 0)
+        return false;
+    return readable_bytes > 0;
+}
+
+void TransportSocket::wait_until_incoming_is_current()
+{
+    MutexLocker locker(m_incoming_mutex);
+    while (!m_incoming_eof && !m_receive_loop_finished
+        && (m_io_thread_state.load() != IOThreadState::Running || incoming_is_behind_socket()))
+        m_incoming_cv.wait();
+}
+
 void TransportSocket::wait_until_readable()
 {
-    Sync::MutexLocker lock(m_incoming_mutex);
+    MutexLocker lock(m_incoming_mutex);
     while (m_incoming_messages.is_empty() && m_io_thread_state == IOThreadState::Running) {
         m_incoming_cv.wait();
     }
@@ -338,7 +396,7 @@ static constexpr size_t MAX_UNPROCESSED_BUFFER_SIZE = 128 * MiB;
 // Maximum number of accumulated unprocessed file descriptors before we disconnect the peer
 static constexpr size_t MAX_UNPROCESSED_FDS = 512;
 
-void TransportSocket::post_message(MessageDataType bytes_to_write, Vector<Attachment>& attachments)
+ErrorOr<void> TransportSocket::post_message(MessageDataType bytes_to_write, Vector<Attachment>& attachments)
 {
     auto num_fds_to_transfer = attachments.size();
 
@@ -348,20 +406,14 @@ void TransportSocket::post_message(MessageDataType bytes_to_write, Vector<Attach
         .fd_count = static_cast<u32>(num_fds_to_transfer),
     };
 
-    auto raw_fds = Vector<int, 1> {};
-    if (num_fds_to_transfer > 0) {
-        raw_fds.ensure_capacity(num_fds_to_transfer);
-        Sync::MutexLocker locker(m_fds_retained_until_received_by_peer_mutex);
-        for (auto& attachment : attachments) {
-            int fd = attachment.to_fd();
-            auto auto_fd = adopt_ref(*new AutoCloseFileDescriptor(fd));
-            raw_fds.unchecked_append(auto_fd->value());
-            m_fds_retained_until_received_by_peer.enqueue(move(auto_fd));
-        }
-    }
+    Vector<NonnullRefPtr<AutoCloseFileDescriptor>> fds;
+    fds.ensure_capacity(num_fds_to_transfer);
+    for (auto& attachment : attachments)
+        fds.unchecked_append(adopt_ref(*new AutoCloseFileDescriptor(attachment.to_fd())));
 
-    m_send_queue->enqueue_message(header, move(bytes_to_write), move(raw_fds));
+    m_send_queue->enqueue_message(header, move(bytes_to_write), move(fds));
     wake_io_thread();
+    return {};
 }
 
 ErrorOr<void> TransportSocket::send_message(Core::LocalSocket& socket, ReadonlyBytes& bytes_to_write, Vector<int>& unowned_fds)
@@ -415,6 +467,16 @@ TransportSocket::TransferState TransportSocket::transfer_data(ReadonlyBytes& byt
 
 void TransportSocket::read_incoming_messages()
 {
+    {
+        MutexLocker locker(m_incoming_mutex);
+        m_read_in_progress = true;
+    }
+    ScopeGuard publish_read_finished = [this] {
+        MutexLocker locker(m_incoming_mutex);
+        m_read_in_progress = false;
+        m_incoming_cv.broadcast();
+    };
+
     Vector<NonnullOwnPtr<Message>> batch;
     while (m_socket->is_open()) {
         u8 buffer[4096];
@@ -470,8 +532,6 @@ void TransportSocket::read_incoming_messages()
         }
     }
 
-    Checked<u32> received_fd_count = 0;
-    Checked<u32> acknowledged_fd_count = 0;
     size_t index = 0;
     while (index + sizeof(SocketMessageHeader) <= m_unprocessed_bytes.size()) {
         SocketMessageHeader header;
@@ -494,12 +554,6 @@ void TransportSocket::read_incoming_messages()
             if (header.fd_count > m_unprocessed_attachments.size())
                 break;
             auto message = make<Message>();
-            received_fd_count += header.fd_count;
-            if (received_fd_count.has_overflow()) {
-                dbgln("TransportSocket: received_fd_count would overflow");
-                m_peer_eof = true;
-                break;
-            }
             for (size_t i = 0; i < header.fd_count; ++i)
                 message->attachments.enqueue(m_unprocessed_attachments.dequeue());
             Vector<u8> payload_bytes;
@@ -510,18 +564,6 @@ void TransportSocket::read_incoming_messages()
             }
             message->bytes = ReceivedMessageBytes::from_vector(move(payload_bytes));
             batch.append(move(message));
-        } else if (header.type == SocketMessageHeader::Type::FileDescriptorAcknowledgement) {
-            if (header.payload_size != 0) {
-                dbgln("TransportSocket: FileDescriptorAcknowledgement with non-zero payload_size {}", header.payload_size);
-                m_peer_eof = true;
-                break;
-            }
-            acknowledged_fd_count += header.fd_count;
-            if (acknowledged_fd_count.has_overflow()) {
-                dbgln("TransportSocket: acknowledged_fd_count would overflow");
-                m_peer_eof = true;
-                break;
-            }
         } else {
             dbgln("TransportSocket: Unknown message header type {}", static_cast<u8>(header.type));
             m_peer_eof = true;
@@ -538,29 +580,6 @@ void TransportSocket::read_incoming_messages()
         index = new_index.value();
     }
 
-    if (acknowledged_fd_count > 0u) {
-        Sync::MutexLocker locker(m_fds_retained_until_received_by_peer_mutex);
-        while (acknowledged_fd_count > 0u) {
-            if (m_fds_retained_until_received_by_peer.is_empty()) {
-                dbgln("TransportSocket: Peer acknowledged more FDs than we sent");
-                m_peer_eof = true;
-                break;
-            }
-            (void)m_fds_retained_until_received_by_peer.dequeue();
-            --acknowledged_fd_count;
-        }
-    }
-
-    if (received_fd_count > 0u) {
-        SocketMessageHeader header {
-            .type = SocketMessageHeader::Type::FileDescriptorAcknowledgement,
-            .payload_size = 0,
-            .fd_count = received_fd_count.value(),
-        };
-        m_send_queue->enqueue_message(header, {}, {});
-        wake_io_thread();
-    }
-
     if (index < m_unprocessed_bytes.size()) {
         auto remaining = m_unprocessed_bytes.size() - index;
         m_unprocessed_bytes.overwrite(0, m_unprocessed_bytes.data() + index, remaining);
@@ -571,7 +590,7 @@ void TransportSocket::read_incoming_messages()
 
     bool const peer_eof = m_peer_eof;
     if (!batch.is_empty() || peer_eof) {
-        Sync::MutexLocker locker(m_incoming_mutex);
+        MutexLocker locker(m_incoming_mutex);
         if (!batch.is_empty())
             m_incoming_messages.extend(move(batch));
         // Publish EOF only after the final batch is appended — under the same lock the consumer drains with — so that a
@@ -588,7 +607,7 @@ TransportSocket::ShouldShutdown TransportSocket::read_as_many_messages_as_possib
     Vector<NonnullOwnPtr<Message>> messages;
     bool eof;
     {
-        Sync::MutexLocker locker(m_incoming_mutex);
+        MutexLocker locker(m_incoming_mutex);
         messages = move(m_incoming_messages);
         eof = m_incoming_eof;
     }
@@ -600,6 +619,7 @@ TransportSocket::ShouldShutdown TransportSocket::read_as_many_messages_as_possib
 ErrorOr<TransportHandle> TransportSocket::release_for_transfer()
 {
     m_is_being_transferred.store(true, AK::MemoryOrder::memory_order_release);
+    m_socket_is_open.store(false, AK::MemoryOrder::memory_order_relaxed);
     stop_io_thread(IOThreadState::SendPendingMessagesAndStop);
     auto fd = TRY(m_socket->release_fd());
     return TransportHandle { File::adopt_fd(fd) };

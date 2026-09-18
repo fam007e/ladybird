@@ -8,14 +8,18 @@
 
 #include <AK/ByteBuffer.h>
 #include <AK/Debug.h>
+#include <AK/FlyString.h>
 #include <AK/LexicalPath.h>
 #include <AK/NeverDestroyed.h>
 #include <AK/Utf16FlyString.h>
 #include <LibCore/Promise.h>
 #include <LibCore/Resource.h>
+#include <LibGC/Heap.h>
+#include <LibGfx/ImageFormats/ImageDecoder.h>
 #include <LibJS/Runtime/NativeFunction.h>
 #include <LibTextCodec/Decoder.h>
 #include <LibURL/URL.h>
+#include <LibWeb/Bindings/WrapperWorld.h>
 #include <LibWeb/DOM/CustomEvent.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/DocumentLoading.h>
@@ -28,15 +32,36 @@
 #include <LibWeb/HTML/Parser/HTMLEncodingDetection.h>
 #include <LibWeb/HTML/Parser/HTMLParser.h>
 #include <LibWeb/HTML/Parser/IncrementalDocumentParser.h>
+#include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/Window.h>
+#include <LibWeb/HighResolutionTime/TimeOrigin.h>
 #include <LibWeb/Loader/GeneratedPagesLoader.h>
 #include <LibWeb/MimeSniff/Resource.h>
 #include <LibWeb/Namespace.h>
 #include <LibWeb/Platform/EventLoopPlugin.h>
+#include <LibWeb/WebIDL/CallbackType.h>
 #include <LibWeb/XML/XMLDocumentBuilder.h>
 #include <LibXML/Parser/Parser.h>
 
 namespace Web {
+
+static void add_pdf_viewer_ready_listener(DOM::Document& document, GC::Ref<Fetch::Infrastructure::Response> response)
+{
+    auto& realm = document.relevant_settings_object().realm();
+    auto js_response = Fetch::Response::create(response, Fetch::Headers::Guard::Response);
+
+    auto listener_function = JS::NativeFunction::create(
+        realm, [&document, js_response](JS::VM&) mutable -> JS::ThrowCompletionOr<JS::Value> {
+            DOM::CustomEventInit init;
+            auto& realm = document.relevant_settings_object().realm();
+            init.detail = Bindings::wrap(Bindings::host_defined_wrapper_world(realm), realm, GC::Ref { js_response });
+            document.dispatch_event(*DOM::CustomEvent::create("ladybirdpdf"_fly_string, init, HighResolutionTime::current_high_resolution_time(HTML::relevant_global_object(document))));
+            return JS::js_undefined();
+        },
+        0, Utf16FlyString {}, &realm);
+    auto callback = GC::Heap::the().allocate<WebIDL::CallbackType>(*listener_function, realm);
+    document.add_event_listener_without_options("ladybirdviewerready"_utf16_fly_string, *DOM::IDLEventListener::create(*callback));
+}
 
 // Replaces a document's content with a simple error message.
 static void convert_to_xml_error_document(DOM::Document& document, Utf16String error_string)
@@ -44,7 +69,7 @@ static void convert_to_xml_error_document(DOM::Document& document, Utf16String e
     auto html_element = MUST(DOM::create_element(document, HTML::TagNames::html, Namespace::HTML));
     auto body_element = MUST(DOM::create_element(document, HTML::TagNames::body, Namespace::HTML));
     MUST(html_element->append_child(body_element));
-    MUST(body_element->append_child(document.realm().create<DOM::Text>(document, move(error_string))));
+    MUST(body_element->append_child(DOM::Text::create(document, move(error_string))));
     document.remove_all_children();
     MUST(document.append_child(html_element));
 
@@ -57,7 +82,7 @@ static void convert_to_xml_error_document(DOM::Document& document, Utf16String e
     document.set_ready_for_post_load_tasks(true);
 }
 
-bool build_xml_document(DOM::Document& document, ByteBuffer const& data, Optional<String> content_encoding)
+bool build_xml_document(DOM::Document& document, ByteBuffer const& data, Optional<StringView> content_encoding)
 {
     Optional<TextCodec::Decoder&> decoder;
     // The actual HTTP headers and other metadata, not the headers as mutated or implied by the algorithms given in this specification,
@@ -91,17 +116,17 @@ static WebIDL::ExceptionOr<GC::Ref<DOM::Document>> load_html_document(HTML::Navi
     // To load an HTML document, given navigation params navigationParams:
 
     // 1. Let document be the result of creating and initializing a Document object given "html", "text/html", and navigationParams.
-    auto document = TRY(DOM::Document::create_and_initialize(DOM::Document::Type::HTML, "text/html"_string, navigation_params));
+    auto document = TRY(DOM::Document::create_and_initialize(DOM::Document::Type::HTML, "text/html"_utf16_fly_string, navigation_params));
 
     // 2. If document's URL is about:blank, then populate with html/head/body given document.
     // FIXME: The additional check for a non-empty body fixes issues with loading javascript urls in iframes, which
     //        default to an "about:blank" url. Is this a spec bug?
-    if (document->url_string() == "about:blank"_string
+    if (document->url().to_string() == "about:blank"_string
         && navigation_params.response->body()->length().value_or(0) == 0) {
         TRY(document->populate_with_html_head_and_body());
         if (navigation_params.navigable && navigation_params.navigable->is_top_level_traversable())
-            document->set_supported_color_schemes({ "light"_string, "dark"_string });
-        HTML::HTMLParser::the_end(document);
+            document->set_supported_color_schemes({ "light"_utf16_fly_string, "dark"_utf16_fly_string });
+        HTML::HTMLParser::the_end(document, HTML::HTMLParser::parserless_completion_token(document));
     }
 
     // AD-HOC: For about:srcdoc, the body bytes are always immediately available in the response source (the srcdoc
@@ -121,12 +146,13 @@ static WebIDL::ExceptionOr<GC::Ref<DOM::Document>> load_html_document(HTML::Navi
         auto mime_type = Fetch::Infrastructure::extract_mime_type(navigation_params.response->header_list());
         auto url = navigation_params.response->url().value();
         auto parser = HTML::HTMLParser::create_with_uncertain_encoding(document, *data, mime_type);
-        document->set_deferred_parser_start(GC::create_function(document->heap(), [parser, url] {
+        document->set_deferred_parser_start(GC::create_function(GC::Heap::the(), [parser, url] {
             parser->run(url);
         }));
     }
 
-    // 3. Otherwise, create an HTML parser and associate it with the document.
+    // 3. Otherwise, create an HTML parser whose allow declarative shadow roots is true and associate it with document.
+    //
     //    Each task that the networking task source places on the task queue while fetching runs must then fill the
     //    parser's input byte stream with the fetched bytes and cause the HTML parser to perform the appropriate
     //    processing of the input stream.
@@ -141,6 +167,7 @@ static WebIDL::ExceptionOr<GC::Ref<DOM::Document>> load_html_document(HTML::Navi
     else {
         auto body = GC::Ref { *navigation_params.response->body() };
         auto parser = HTML::IncrementalDocumentParser::create(document, body, navigation_params.response->url().value(), Fetch::Infrastructure::extract_mime_type(navigation_params.response->header_list()));
+        parser->set_allow_declarative_shadow_roots(HTML::HTMLParser::AllowDeclarativeShadowRoots::Yes);
         parser->start();
     }
 
@@ -178,18 +205,18 @@ static WebIDL::ExceptionOr<GC::Ref<DOM::Document>> load_xml_document(HTML::Navig
 
     // FIXME: Actually follow the spec! This is just the ad-hoc code we had before, modified somewhat.
 
-    auto document = TRY(DOM::Document::create_and_initialize(DOM::Document::Type::XML, type.essence(), navigation_params));
+    auto document = TRY(DOM::Document::create_and_initialize(DOM::Document::Type::XML, Utf16FlyString::from_utf8(type.essence()), navigation_params));
 
     Optional<String> content_encoding;
     if (auto maybe_encoding = type.parameters().get("charset"sv); maybe_encoding.has_value())
-        content_encoding = maybe_encoding.value();
+        content_encoding = *maybe_encoding;
 
-    auto process_body = GC::create_function(document->heap(), [document, url = navigation_params.response->url().value(), content_encoding = move(content_encoding), mime = type](ByteBuffer data) {
+    auto process_body = GC::create_function(GC::Heap::the(), [document, url = navigation_params.response->url().value(), content_encoding = move(content_encoding), mime = type](ByteBuffer data) {
         Optional<TextCodec::Decoder&> decoder;
         // The actual HTTP headers and other metadata, not the headers as mutated or implied by the algorithms given in this specification,
         // are the ones that must be used when determining the character encoding according to the rules given in the above specifications.
         if (content_encoding.has_value())
-            decoder = TextCodec::decoder_for(*content_encoding);
+            decoder = TextCodec::decoder_for(content_encoding->bytes_as_string_view());
         if (!decoder.has_value()) {
             // https://www.w3.org/TR/xml/#charencoding
             // [...] it is a fatal error [...] for an entity which begins with neither a Byte Order Mark nor an encoding
@@ -208,26 +235,29 @@ static WebIDL::ExceptionOr<GC::Ref<DOM::Document>> load_xml_document(HTML::Navig
         }
         auto run_xml_parser = [document, source_string = source.release_value()] {
             XML::Parser parser(source_string, { .preserve_cdata = true, .preserve_comments = true, .resolve_named_html_entity = resolve_named_html_entity });
-            XMLDocumentBuilder builder { document };
+            XMLDocumentBuilder builder { *document };
             auto result = parser.parse_with_listener(builder);
             if (result.is_error()) {
                 // FIXME: Insert error message into the document.
                 dbgln("Failed to parse XML document: {}", result.error());
                 convert_to_xml_error_document(document, Utf16String::formatted("Failed to parse XML document: {}", result.error()));
+            } else if (builder.has_error()) {
+                dbgln("Failed to parse XML document: not namespace-well-formed");
+                convert_to_xml_error_document(document, "Failed to parse XML document: not namespace-well-formed"_utf16);
             }
         };
         if (document->ready_to_run_scripts()) {
             run_xml_parser();
         } else {
-            document->set_deferred_parser_start(GC::create_function(document->heap(), move(run_xml_parser)));
+            document->set_deferred_parser_start(GC::create_function(GC::Heap::the(), move(run_xml_parser)));
         }
     });
 
-    auto process_body_error = GC::create_function(document->heap(), [](JS::Value) {
+    auto process_body_error = GC::create_function(GC::Heap::the(), [](JS::Value) {
         dbgln("FIXME: Load html page with an error if read of body failed.");
     });
 
-    auto& realm = document->realm();
+    auto& realm = document->relevant_settings_object().realm();
     navigation_params.response->body()->fully_read(realm, process_body, process_body_error, GC::Ref { realm.global_object() });
 
     return document;
@@ -239,7 +269,7 @@ static WebIDL::ExceptionOr<GC::Ref<DOM::Document>> load_text_document(HTML::Navi
     // To load a text document, given a navigation params navigationParams and a string type:
 
     // 1. Let document be the result of creating and initializing a Document object given "html", type, and navigationParams.
-    auto document = TRY(DOM::Document::create_and_initialize(DOM::Document::Type::HTML, type.essence(), navigation_params));
+    auto document = TRY(DOM::Document::create_and_initialize(DOM::Document::Type::HTML, Utf16FlyString::from_utf8(type.essence()), navigation_params));
 
     // 2. Set document's parser cannot change the mode flag to true.
     document->set_parser_cannot_change_the_mode(true);
@@ -261,44 +291,48 @@ static WebIDL::ExceptionOr<GC::Ref<DOM::Document>> load_text_document(HTML::Navi
     //    document's relevant global object to have the parser to process the implied EOF character, which eventually causes a
     //    load event to be fired.
     // FIXME: Parse as we receive the document data, instead of waiting for the whole document to be fetched first.
-    auto process_body = GC::create_function(document->heap(), [document, url = navigation_params.response->url().value(), mime = type](ByteBuffer data) {
-        auto encoding = run_encoding_sniffing_algorithm(document, data, mime);
+    auto process_body = GC::create_function(GC::Heap::the(), [document, url = navigation_params.response->url().value(), mime = type](ByteBuffer data) {
+        auto [encoding, confidence] = HTML::run_encoding_sniffing_algorithm(document, data, mime);
         dbgln_if(HTML_PARSER_DEBUG, "The encoding sniffing algorithm returned encoding '{}'", encoding);
 
         auto run_text_parser = [document, data = move(data), url, encoding = move(encoding)] {
             auto parser = HTML::HTMLParser::create_with_open_input_stream(document);
             parser->tokenizer().update_insertion_point();
 
-            parser->tokenizer().insert_input_at_insertion_point("<pre>\n"sv);
+            parser->tokenizer().insert_input_at_insertion_point(u"<pre>\n"sv);
             parser->run();
 
             parser->tokenizer().switch_to(HTML::HTMLTokenizer::State::PLAINTEXT);
-            parser->tokenizer().insert_input_at_insertion_point(data);
+            auto decoder = TextCodec::decoder_for(encoding);
+            VERIFY(decoder.has_value());
+            auto decoded = TextCodec::convert_input_to_utf16_using_given_decoder_unless_there_is_a_byte_order_mark(*decoder, data).release_value_but_fixme_should_propagate_errors();
+            parser->tokenizer().insert_input_at_insertion_point(decoded);
             parser->tokenizer().insert_eof();
             parser->run(url);
 
-            document->set_encoding(MUST(String::from_byte_string(encoding)));
+            document->set_encoding(Utf16String::from_ascii_without_validation(encoding.bytes()));
 
             // 5. User agents may add content to the head element of document, e.g., linking to a style sheet, providing
             //    script, or giving the document a title.
-            auto title = Utf16String::from_utf8_with_replacement_character(LexicalPath::basename(url.to_byte_string()));
+            auto title_basename = LexicalPath::basename(url.to_byte_string());
+            auto title = utf16_string_from_url_ascii(title_basename.view());
             auto title_element = MUST(DOM::create_element(document, HTML::TagNames::title, Namespace::HTML));
             MUST(document->head()->append_child(title_element));
-            auto title_text = document->realm().create<DOM::Text>(document, move(title));
+            auto title_text = DOM::Text::create(document, move(title));
             MUST(title_element->append_child(*title_text));
         };
         if (document->ready_to_run_scripts()) {
             run_text_parser();
         } else {
-            document->set_deferred_parser_start(GC::create_function(document->heap(), move(run_text_parser)));
+            document->set_deferred_parser_start(GC::create_function(GC::Heap::the(), move(run_text_parser)));
         }
     });
 
-    auto process_body_error = GC::create_function(document->heap(), [](JS::Value) {
+    auto process_body_error = GC::create_function(GC::Heap::the(), [](JS::Value) {
         dbgln("FIXME: Load html page with an error if read of body failed.");
     });
 
-    auto& realm = document->realm();
+    auto& realm = document->relevant_settings_object().realm();
     navigation_params.response->body()->fully_read(realm, process_body, process_body_error, GC::Ref { realm.global_object() });
 
     // 6. Return document.
@@ -311,7 +345,7 @@ static WebIDL::ExceptionOr<GC::Ref<DOM::Document>> load_media_document(HTML::Nav
     // To load a media document, given navigationParams and a string type:
 
     // 1. Let document be the result of creating and initializing a Document object given "html", type, and navigationParams.
-    auto document = TRY(DOM::Document::create_and_initialize(DOM::Document::Type::HTML, type.essence(), navigation_params));
+    auto document = TRY(DOM::Document::create_and_initialize(DOM::Document::Type::HTML, Utf16FlyString::from_utf8(type.essence()), navigation_params));
 
     // 2. Set document's mode to "no-quirks".
     document->set_quirks_mode(DOM::QuirksMode::No);
@@ -325,12 +359,13 @@ static WebIDL::ExceptionOr<GC::Ref<DOM::Document>> load_media_document(HTML::Nav
     // 6. User agents may add content to the head element of document, or attributes to host element, e.g., to link
     //    to a style sheet, to provide a script, to give the document a title, or to make the media autoplay.
     auto insert_title = [](auto& document, auto const& document_url) -> WebIDL::ExceptionOr<void> {
-        auto title = Utf16String::from_utf8_with_replacement_character(LexicalPath::basename(document_url.to_byte_string()));
+        auto title_basename = LexicalPath::basename(document_url.to_byte_string());
+        auto title = utf16_string_from_url_ascii(title_basename.view());
 
         auto title_element = TRY(DOM::create_element(document, HTML::TagNames::title, Namespace::HTML));
         TRY(document->head()->append_child(title_element));
 
-        auto title_text = document->realm().template create<DOM::Text>(document, move(title));
+        auto title_text = DOM::Text::create(document, move(title));
         TRY(title_element->append_child(*title_text));
         return {};
     };
@@ -353,26 +388,27 @@ static WebIDL::ExceptionOr<GC::Ref<DOM::Document>> load_media_document(HTML::Nav
     )~~~"_utf16);
     TRY(document->head()->append_child(style_element));
 
-    auto url_string = document->url_string();
+    auto url_string = document->url().to_string();
+    auto url_utf16 = utf16_string_from_url_ascii(url_string);
     if (type.is_image()) {
         auto img_element = TRY(DOM::create_element(document, HTML::TagNames::img, Namespace::HTML));
-        img_element->set_attribute_value(HTML::AttributeNames::src, url_string);
+        img_element->set_attribute_value(HTML::AttributeNames::src, url_utf16);
         TRY(document->body()->append_child(img_element));
         TRY(insert_title(document, url_string));
 
     } else if (type.type() == "video"sv) {
         auto video_element = TRY(DOM::create_element(document, HTML::TagNames::video, Namespace::HTML));
-        video_element->set_attribute_value(HTML::AttributeNames::src, url_string);
-        video_element->set_attribute_value(HTML::AttributeNames::autoplay, String {});
-        video_element->set_attribute_value(HTML::AttributeNames::controls, String {});
+        video_element->set_attribute_value(HTML::AttributeNames::src, url_utf16);
+        video_element->set_attribute_value(HTML::AttributeNames::autoplay, Utf16String {});
+        video_element->set_attribute_value(HTML::AttributeNames::controls, Utf16String {});
         TRY(document->body()->append_child(video_element));
         TRY(insert_title(document, url_string));
 
     } else if (type.type() == "audio"sv) {
         auto audio_element = TRY(DOM::create_element(document, HTML::TagNames::audio, Namespace::HTML));
-        audio_element->set_attribute_value(HTML::AttributeNames::src, url_string);
-        audio_element->set_attribute_value(HTML::AttributeNames::autoplay, String {});
-        audio_element->set_attribute_value(HTML::AttributeNames::controls, String {});
+        audio_element->set_attribute_value(HTML::AttributeNames::src, url_utf16);
+        audio_element->set_attribute_value(HTML::AttributeNames::autoplay, Utf16String {});
+        audio_element->set_attribute_value(HTML::AttributeNames::controls, Utf16String {});
         TRY(document->body()->append_child(audio_element));
         TRY(insert_title(document, url_string));
 
@@ -388,11 +424,11 @@ static WebIDL::ExceptionOr<GC::Ref<DOM::Document>> load_media_document(HTML::Nav
     // FIXME: We should not need to force the media file to load before saying that parsing has completed!
     //        However, if we don't, then we get stuck in HTMLParser::the_end() waiting for the media file to load, which
     //        never happens.
-    auto& realm = document->realm();
+    auto& realm = document->relevant_settings_object().realm();
     navigation_params.response->body()->fully_read(
         realm,
-        GC::create_function(document->heap(), [document](ByteBuffer) { HTML::HTMLParser::the_end(document); }),
-        GC::create_function(document->heap(), [](JS::Value) {}),
+        GC::create_function(GC::Heap::the(), [document](ByteBuffer) { HTML::HTMLParser::the_end(document, nullptr); }),
+        GC::create_function(GC::Heap::the(), [](JS::Value) {}),
         GC::Ref { realm.global_object() });
 
     // 9. Return document.
@@ -419,29 +455,17 @@ static GC::Ref<DOM::Document> load_pdf_document(HTML::NavigationParams const& na
 
     static NeverDestroyed<ByteBuffer> viewer_bytes { MUST(Core::Resource::load_from_uri("resource://ladybird/pdfjs/web/viewer.html"sv))->clone_data() };
 
-    auto document = MUST(DOM::Document::create_and_initialize(DOM::Document::Type::HTML, "text/html"_string, navigation_params));
+    auto document = MUST(DOM::Document::create_and_initialize(DOM::Document::Type::HTML, "text/html"_utf16_fly_string, navigation_params));
     document->set_origin(URL::Origin("resource"_string, String {}, {}));
 
-    auto& realm = document->realm();
-    auto js_response = Fetch::Response::create(realm, GC::Ref(*navigation_params.response), Fetch::Headers::Guard::Response);
+    add_pdf_viewer_ready_listener(document, GC::Ref(*navigation_params.response));
 
-    auto listener_fn = JS::NativeFunction::create(
-        realm, [document, js_response](JS::VM&) mutable -> JS::ThrowCompletionOr<JS::Value> {
-            Bindings::CustomEventInit init;
-            init.detail = JS::Value(js_response.ptr());
-            document->dispatch_event(*DOM::CustomEvent::create(document->realm(), "ladybirdpdf"_fly_string, init));
-            return JS::js_undefined();
-        },
-        0, Utf16FlyString {}, &realm);
-    auto callback = realm.heap().allocate<WebIDL::CallbackType>(*listener_fn, realm);
-    document->add_event_listener_without_options("ladybirdviewerready"_fly_string, *DOM::IDLEventListener::create(realm, *callback));
-
-    Platform::EventLoopPlugin::the().deferred_invoke(GC::create_function(document->heap(), [document, pdf_url] {
+    Platform::EventLoopPlugin::the().deferred_invoke(GC::create_function(GC::Heap::the(), [document, pdf_url] {
         auto parser = HTML::HTMLParser::create_with_uncertain_encoding(document, *viewer_bytes);
         if (document->ready_to_run_scripts()) {
             parser->run(pdf_url);
         } else {
-            document->set_deferred_parser_start(GC::create_function(document->heap(), [parser, pdf_url] {
+            document->set_deferred_parser_start(GC::create_function(GC::Heap::the(), [parser, pdf_url] {
                 parser->run(pdf_url);
             }));
         }
@@ -479,8 +503,6 @@ GC::Ptr<DOM::Document> load_document(HTML::NavigationParams const& navigation_pa
 {
     // To load a document given navigation params navigationParams, source snapshot params sourceSnapshotParams,
     // and origin initiatorOrigin, perform the following steps. They return a Document or null.
-
-    // NB: Use Core::Promise to signal SessionHistoryTraversalQueue that it can continue to execute next entry.
 
     // 1. Let type be the computed type of navigationParams's response.
     auto supplied_type = Fetch::Infrastructure::extract_mime_type(navigation_params.response->header_list());

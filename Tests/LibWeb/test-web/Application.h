@@ -8,9 +8,11 @@
 
 #include <AK/ByteString.h>
 #include <AK/Error.h>
+#include <AK/LexicalPath.h>
 #include <AK/String.h>
 #include <AK/Vector.h>
 #include <LibWebView/Application.h>
+#include <errno.h>
 
 namespace TestWeb {
 
@@ -23,7 +25,14 @@ public:
 
     virtual void create_platform_arguments(Core::ArgsParser&) override;
     virtual void create_platform_options(WebView::BrowserOptions&, WebView::RequestServerOptions&, WebView::WebContentOptions&) override;
+
+    // Tests must not read, or write, the browser settings of whoever is running them.
+    virtual bool should_use_temporary_profile_by_default() const override { return true; }
+    virtual WebView::SiteIsolationMode default_site_isolation_mode() const override { return WebView::SiteIsolationMode::IFrame; }
+    virtual bool should_coordinate_browser_process() const override { return false; }
     virtual bool should_capture_web_content_output() const override { return true; }
+
+    virtual ErrorOr<LexicalPath> default_path_for_downloaded_file(ByteString const&) const override { return Error::from_errno(ECANCELED); }
 
     ErrorOr<void> launch_test_fixtures();
 
@@ -47,6 +56,9 @@ public:
     bool rebaseline { false };
     bool shuffle { false };
     bool run_ui_process_session_history_tests { false };
+    bool verify_style { false };
+    bool verify_paint_cache { false };
+    bool verify_scroll_state { false };
     int per_test_timeout_in_seconds { 30 };
 
     u8 verbosity { 0 };

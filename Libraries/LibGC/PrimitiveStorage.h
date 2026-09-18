@@ -14,19 +14,13 @@
 #include <AK/Types.h>
 #include <AK/Vector.h>
 #include <LibGC/Export.h>
+#include <LibGC/ExternalEntityTable.h>
 
 namespace GC {
 
-struct PrimitiveStorageHandle {
-    static constexpr u32 invalid_index = NumericLimits<u32>::max();
+using PrimitiveStorageHandle = ExternalEntityTableHandle;
 
-    u32 index { invalid_index };
-    u32 generation { 0 };
-
-    bool is_valid() const { return index != invalid_index && generation != 0; }
-};
-
-class GC_API PrimitiveStorage {
+class GC_API PrimitiveStorage : private ExternalEntityTable {
     AK_MAKE_NONCOPYABLE(PrimitiveStorage);
     AK_MAKE_NONMOVABLE(PrimitiveStorage);
 
@@ -36,7 +30,7 @@ public:
         Yes,
     };
 
-    static constexpr size_t default_cage_size = 64ull * GiB;
+    static constexpr size_t default_cage_size = 4ull * TiB;
     static_assert(is_power_of_two(default_cage_size));
     static constexpr size_t cage_offset_mask = default_cage_size - 1;
     static constexpr size_t invalid_offset = NumericLimits<size_t>::max();
@@ -46,6 +40,8 @@ public:
 
     ErrorOr<PrimitiveStorageHandle> try_allocate(size_t size, ZeroFillNewBytes = ZeroFillNewBytes::Yes);
     ErrorOr<PrimitiveStorageHandle> try_reserve(size_t size, size_t capacity, ZeroFillNewBytes = ZeroFillNewBytes::Yes, size_t guard_size = 0);
+    ErrorOr<PrimitiveStorageHandle> try_adopt_shared_fd(int fd, size_t size);
+
     ErrorOr<void> ensure_cage();
 
     bool is_valid(PrimitiveStorageHandle) const;
@@ -91,6 +87,7 @@ private:
         };
 
         ErrorOr<Allocation> allocate(size_t size, size_t capacity, ZeroFillNewBytes, size_t guard_size, bool force_large);
+        ErrorOr<Allocation> adopt_shared_fd(int fd, size_t size);
         ErrorOr<void> resize(Allocation&, size_t old_size, size_t new_size, ZeroFillNewBytes);
         ErrorOr<Allocation> reallocate(Allocation const&, size_t old_size, size_t new_size, size_t new_capacity, ZeroFillNewBytes, bool force_large);
         void deallocate(Allocation&);
@@ -138,8 +135,6 @@ private:
     };
 
     struct Entry {
-        u32 generation { 1 };
-        bool allocated { false };
         size_t size { 0 };
         Allocator::Allocation allocation;
     };
@@ -152,7 +147,6 @@ private:
 
     Allocator m_allocator;
     Vector<Entry> m_entries;
-    Vector<u32> m_free_entry_indices;
 };
 
 }

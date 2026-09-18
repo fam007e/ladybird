@@ -19,46 +19,27 @@ public:
     static ValueComparingNonnullRefPtr<RectStyleValue const> create(NonnullRefPtr<StyleValue const> top, NonnullRefPtr<StyleValue const> right, NonnullRefPtr<StyleValue const> bottom, NonnullRefPtr<StyleValue const> left);
     virtual ~RectStyleValue() override = default;
 
-    NonnullRefPtr<StyleValue const> top() const { return m_top; }
-    NonnullRefPtr<StyleValue const> right() const { return m_right; }
-    NonnullRefPtr<StyleValue const> bottom() const { return m_bottom; }
-    NonnullRefPtr<StyleValue const> left() const { return m_left; }
+    ValueComparingNonnullRefPtr<StyleValue const> top() const { return wrap_rust_child(m_value->rect.top); }
+    ValueComparingNonnullRefPtr<StyleValue const> right() const { return wrap_rust_child(m_value->rect.right); }
+    ValueComparingNonnullRefPtr<StyleValue const> bottom() const { return wrap_rust_child(m_value->rect.bottom); }
+    ValueComparingNonnullRefPtr<StyleValue const> left() const { return wrap_rust_child(m_value->rect.left); }
 
-    EdgeRect rect() const { return { LengthOrAuto::from_style_value(m_top, {}), LengthOrAuto::from_style_value(m_right, {}), LengthOrAuto::from_style_value(m_bottom, {}), LengthOrAuto::from_style_value(m_left, {}) }; }
-    virtual void serialize(StringBuilder&, SerializationMode) const override;
+    EdgeRect rect() const { return { LengthOrAuto::from_style_value(top(), {}), LengthOrAuto::from_style_value(right(), {}), LengthOrAuto::from_style_value(bottom(), {}), LengthOrAuto::from_style_value(left(), {}) }; }
 
-    virtual ValueComparingNonnullRefPtr<StyleValue const> absolutized(ComputationContext const&) const override;
-
-    bool properties_equal(RectStyleValue const& other) const
-    {
-        return m_top == other.m_top
-            && m_right == other.m_right
-            && m_bottom == other.m_bottom
-            && m_left == other.m_left;
-    }
-
-    virtual bool is_computationally_independent() const override
-    {
-        return m_top->is_computationally_independent()
-            && m_right->is_computationally_independent()
-            && m_bottom->is_computationally_independent()
-            && m_left->is_computationally_independent();
-    }
+    ValueComparingNonnullRefPtr<StyleValue const> absolutized(ComputationContext const&) const;
 
 private:
-    explicit RectStyleValue(NonnullRefPtr<StyleValue const> top, NonnullRefPtr<StyleValue const> right, NonnullRefPtr<StyleValue const> bottom, NonnullRefPtr<StyleValue const> left)
-        : StyleValueWithDefaultOperators(Type::Rect)
-        , m_top(move(top))
-        , m_right(move(right))
-        , m_bottom(move(bottom))
-        , m_left(move(left))
+    friend class StyleValue;
+
+    explicit RectStyleValue(StyleValueFFI::StyleValueData const* data)
+        : StyleValueWithDefaultOperators(Type::Rect, data)
     {
     }
 
-    ValueComparingNonnullRefPtr<StyleValue const> m_top;
-    ValueComparingNonnullRefPtr<StyleValue const> m_right;
-    ValueComparingNonnullRefPtr<StyleValue const> m_bottom;
-    ValueComparingNonnullRefPtr<StyleValue const> m_left;
+    explicit RectStyleValue(NonnullRefPtr<StyleValue const> top, NonnullRefPtr<StyleValue const> right, NonnullRefPtr<StyleValue const> bottom, NonnullRefPtr<StyleValue const> left)
+        : StyleValueWithDefaultOperators(Type::Rect, StyleValueFFI::rust_style_value_create_rect(StyleValueFFI::rust_style_value_retain(top->rust_style_value_data()), StyleValueFFI::rust_style_value_retain(right->rust_style_value_data()), StyleValueFFI::rust_style_value_retain(bottom->rust_style_value_data()), StyleValueFFI::rust_style_value_retain(left->rust_style_value_data())))
+    {
+    }
 };
 
 }

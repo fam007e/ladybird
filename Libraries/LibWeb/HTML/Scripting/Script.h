@@ -41,6 +41,7 @@ public:
 
 protected:
     Script(Optional<URL::URL> base_url, ByteString filename, EnvironmentSettingsObject&);
+    Script(Optional<URL::URL> base_url, ByteString filename, Utf16String display_filename, EnvironmentSettingsObject&);
 
     virtual void visit_edges(Visitor&) override;
 
@@ -63,7 +64,7 @@ private:
     JS::Value m_error_to_rethrow;
 };
 
-void register_javascript_source(Script&, NonnullRefPtr<JS::SourceCode const>, ScriptRegistry::IsInlineSource, size_t source_line_number);
+void register_javascript_source(Script&, NonnullRefPtr<JS::SourceCode const>, ScriptRegistry::JavaScriptSource::Type, ScriptRegistry::IsInlineSource, size_t source_line_number);
 
 }
 

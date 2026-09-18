@@ -25,7 +25,7 @@ interface HTMLButtonElement : HTMLElement {
 
     readonly attribute boolean willValidate;
     readonly attribute ValidityState validity;
-    readonly attribute Utf16DOMString validationMessage;
+    readonly attribute DOMString validationMessage;
     boolean checkValidity();
     boolean reportValidity();
     undefined setCustomValidity(DOMString error);

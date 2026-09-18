@@ -6,6 +6,7 @@
 
 #include <AK/BinarySearch.h>
 #include <AK/Math.h>
+#include <LibGC/Heap.h>
 #include <LibWeb/IndexedDB/IDBKeyRange.h>
 #include <LibWeb/IndexedDB/Internal/MutationLog.h>
 #include <LibWeb/IndexedDB/Internal/ObjectStore.h>
@@ -17,9 +18,9 @@ GC_DEFINE_ALLOCATOR(ObjectStore);
 
 ObjectStore::~ObjectStore() = default;
 
-GC::Ref<ObjectStore> ObjectStore::create(JS::Realm& realm, GC::Ref<Database> database, String name, bool auto_increment, Optional<KeyPath> const& key_path)
+GC::Ref<ObjectStore> ObjectStore::create(GC::Ref<Database> database, Utf16String name, bool auto_increment, Optional<KeyPath> const& key_path)
 {
-    return realm.create<ObjectStore>(database, name, auto_increment, key_path);
+    return GC::Heap::the().allocate<ObjectStore>(database, move(name), auto_increment, key_path);
 }
 
 size_t ObjectStore::mutation_log_position() const
@@ -35,7 +36,7 @@ void ObjectStore::revert_mutations_from(size_t position)
         m_mutation_log->revert_from(*this, position);
 }
 
-ObjectStore::ObjectStore(GC::Ref<Database> database, String name, bool auto_increment, Optional<KeyPath> const& key_path)
+ObjectStore::ObjectStore(GC::Ref<Database> database, Utf16String name, bool auto_increment, Optional<KeyPath> const& key_path)
     : m_database(database)
     , m_name(move(name))
     , m_key_path(key_path)

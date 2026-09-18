@@ -5,7 +5,7 @@ interface HTMLIFrameElement : HTMLElement {
     [HTMLConstructor] constructor();
 
     [CEReactions, Reflect, URL] attribute USVString src;
-    [CEReactions] attribute (TrustedHTML or Utf16DOMString) srcdoc;
+    [CEReactions] attribute (TrustedHTML or DOMString) srcdoc;
     [CEReactions, Reflect] attribute DOMString name;
     [SameObject, PutForwards=value] readonly attribute DOMTokenList sandbox;
     [CEReactions, Reflect] attribute DOMString allow;

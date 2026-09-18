@@ -32,10 +32,12 @@ If you have any questions that are not answered here or in the [FAQ](FAQ.md), yo
 
 ## Browser/LibWeb
 * [General Architecture](ProcessArchitecture.md)
+* [Omnibox Design](Omnibox.md)
 * [LibWeb: From Loading to Painting](LibWebFromLoadingToPainting.md)
 * [LibWeb: Browsing Contexts and Navigables](BrowsingContextsAndNavigables.md)
 * [How to Add a CSS Property](CSSProperties.md)
 * [How to Add an IDL File](AddNewIDLFile.md)
 * [LibWeb Code Style & Patterns](LibWebPatterns.md)
+* [Investigating Websites with WebDriver](WebDriver.md)
 * [CSS Generated Files](CSSGeneratedFiles.md)
 * [Media Pipeline Design](MediaPipelineDesign.md)

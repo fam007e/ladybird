@@ -11,12 +11,13 @@
 
 #include <AK/String.h>
 #include <AK/Vector.h>
-#include <LibWeb/CSS/Parser/ComponentValue.h>
+#include <LibWeb/CSS/Parser/SubstitutionFunctionsPresence.h>
 #include <LibWeb/CSS/StyleValues/StyleValue.h>
+#include <LibWeb/Export.h>
 
 namespace Web::CSS {
 
-class UnresolvedStyleValue final : public StyleValue {
+class WEB_API UnresolvedStyleValue final : public StyleValue {
 public:
     enum class SourceTextMode : u8 {
         Trim,
@@ -24,35 +25,50 @@ public:
         Preserve,
     };
 
-    static ValueComparingNonnullRefPtr<UnresolvedStyleValue const> create(Vector<Parser::ComponentValue>&& values, Parser::SubstitutionFunctionsPresence, Optional<String> original_source_text = {}, SourceTextMode = SourceTextMode::Trim, bool contains_attr_tainted_values = false);
+    static ValueComparingNonnullRefPtr<UnresolvedStyleValue const> create(Utf16String token_source, Parser::SubstitutionFunctionsPresence, Optional<Utf16String> original_source_text = {}, SourceTextMode = SourceTextMode::Trim, bool contains_attr_tainted_values = false);
+    static ValueComparingNonnullRefPtr<UnresolvedStyleValue const> create_attr_tainted_with_parsed_value(Utf16String token_source, Parser::SubstitutionFunctionsPresence, Optional<Utf16String> original_source_text, SourceTextMode, NonnullRefPtr<StyleValue const> parsed_value);
     virtual ~UnresolvedStyleValue() override = default;
 
-    virtual void serialize(StringBuilder&, SerializationMode) const override;
-    virtual Vector<Parser::ComponentValue> tokenize() const override;
+    Utf16String serialized_components() const;
+    Utf16String token_source() const;
+    bool contains_arbitrary_substitution_function() const
+    {
+        auto const& data = m_value->unresolved;
+        return data.presence_attr || data.presence_dashed_function || data.presence_env || data.presence_if || data.presence_inherit || data.presence_var;
+    }
+    bool contains_attr_tainted_values() const { return m_value->unresolved.contains_attr_tainted_values; }
+    bool includes_attr_function() const { return m_value->unresolved.presence_attr; }
+    bool includes_inherit_function() const { return m_value->unresolved.presence_inherit; }
+    bool includes_if_function() const { return m_value->unresolved.presence_if; }
+    bool includes_var_function() const { return m_value->unresolved.presence_var; }
+    bool includes_dashed_function() const { return m_value->unresolved.presence_dashed_function; }
+    RefPtr<StyleValue const> parsed_value() const { return wrap_rust_child_or_null(m_value->unresolved.parsed_value); }
 
-    Vector<Parser::ComponentValue> values() const;
-    bool contains_arbitrary_substitution_function() const { return m_substitution_functions_presence.has_any(); }
-    bool contains_attr_tainted_values() const { return m_contains_attr_tainted_values; }
-    bool includes_attr_function() const { return m_substitution_functions_presence.attr; }
-    bool includes_inherit_function() const { return m_substitution_functions_presence.inherit; }
-    bool includes_if_function() const { return m_substitution_functions_presence.if_; }
-    bool includes_var_function() const { return m_substitution_functions_presence.var; }
+    bool equals(StyleValue const& other) const;
 
-    virtual bool equals(StyleValue const& other) const override;
-
-    virtual GC::Ref<CSSStyleValue> reify(JS::Realm&, Utf16FlyString const& associated_property) const override;
-
-    virtual bool is_computationally_independent() const override { VERIFY_NOT_REACHED(); }
+    GC::Ref<CSSStyleValue> reify(Utf16FlyString const& associated_property) const;
 
 private:
-    UnresolvedStyleValue(String source_text, String value_comparison_text, Parser::SubstitutionFunctionsPresence, bool contains_attr_tainted_values);
+    friend class StyleValue;
 
-    StringView comparison_text() const;
+    explicit UnresolvedStyleValue(StyleValueFFI::StyleValueData const* data)
+        : StyleValue(Type::Unresolved, data)
+    {
+    }
 
-    String m_source_text;
-    String m_value_comparison_text;
-    Parser::SubstitutionFunctionsPresence m_substitution_functions_presence {};
-    bool m_contains_attr_tainted_values { false };
+    static ValueComparingNonnullRefPtr<UnresolvedStyleValue const> create_internal(Utf16String token_source, Parser::SubstitutionFunctionsPresence, Optional<Utf16String> original_source_text, SourceTextMode, bool contains_attr_tainted_values, RefPtr<StyleValue const> parsed_value);
+
+    Utf16String comparison_text() const;
+    Utf16String serialize_components(u8 mode) const;
+
+    static Utf16String string_from_rust_data(StyleValueFFI::CssString const& string)
+    {
+        auto view = StyleValueFFI::rust_css_string_view(&string);
+        return Utf16String::from_utf16({ reinterpret_cast<char16_t const*>(view.data), view.length });
+    }
+
+    Utf16String source_text() const { return string_from_rust_data(m_value->unresolved.source_text); }
+    Utf16String value_comparison_text() const { return string_from_rust_data(m_value->unresolved.value_comparison_text); }
 };
 
 }

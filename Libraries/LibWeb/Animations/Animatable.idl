@@ -6,7 +6,7 @@ interface mixin Animatable {
 
 // https://drafts.csswg.org/web-animations-1/#dictdef-keyframeanimationoptions
 dictionary KeyframeAnimationOptions : KeyframeEffectOptions {
-    DOMString id = "";
+    [FlyString] DOMString id = "";
     AnimationTimeline? timeline;
 };
 

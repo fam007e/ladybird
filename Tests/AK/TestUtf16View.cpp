@@ -67,6 +67,34 @@ TEST_CASE(encode_utf8)
     }
 }
 
+TEST_CASE(encode_utf8_with_replacement_into)
+{
+    {
+        Array<u8, 5> output {};
+        auto bytes_written = Utf16View { "Hello"sv }.to_utf8_with_replacement_into(output);
+        EXPECT_EQ(bytes_written, 5uz);
+        EXPECT_EQ(output, (Array<u8, 5> { 'H', 'e', 'l', 'l', 'o' }));
+    }
+    {
+        Array<u8, 5> output {};
+        auto bytes_written = Utf16View { u"A\U0001F600"sv }.to_utf8_with_replacement_into(output);
+        EXPECT_EQ(bytes_written, 5uz);
+        EXPECT_EQ(output, (Array<u8, 5> { 0x41, 0xf0, 0x9f, 0x98, 0x80 }));
+    }
+    {
+        Array<u8, 7> output {};
+        auto bytes_written = Utf16View { u"\xd834\u0041\xdf06"sv }.to_utf8_with_replacement_into(output);
+        EXPECT_EQ(bytes_written, 7uz);
+        EXPECT_EQ(output, (Array<u8, 7> { 0xef, 0xbf, 0xbd, 0x41, 0xef, 0xbf, 0xbd }));
+    }
+    {
+        Array<u8, 3> output { 0xaa, 0xbb, 0xcc };
+        auto bytes_written = Utf16View { u"\U0001F600"sv }.to_utf8_with_replacement_into(output);
+        EXPECT(!bytes_written.has_value());
+        EXPECT_EQ(output, (Array<u8, 3> { 0xaa, 0xbb, 0xcc }));
+    }
+}
+
 TEST_CASE(decode_utf16)
 {
     Utf16View view { u"Привет, мир! 😀 γειά σου κόσμος こんにちは世界"sv };
@@ -392,6 +420,14 @@ TEST_CASE(to_ascii_lowercase)
     EXPECT_EQ(u"FooBar"sv.to_ascii_lowercase(), u"foobar"sv);
     EXPECT_EQ(u"FOOBAR"sv.to_ascii_lowercase(), u"foobar"sv);
     EXPECT_EQ(u"FOO 😀 BAR"sv.to_ascii_lowercase(), u"foo 😀 bar"sv);
+
+    EXPECT_EQ(Utf16View { ""sv }.to_ascii_lowercase(), u""sv);
+    EXPECT_EQ(Utf16View { "FooBar"sv }.to_ascii_lowercase(), u"foobar"sv);
+    EXPECT_EQ(Utf16View { "@[`{ AZ az 09"sv }.to_ascii_lowercase(), u"@[`{ az az 09"sv);
+
+    auto lowercase = Utf16View { "ABCDEFGHIJKLMNOPQRSTUVWXYZ abcdefghijklmnopqrstuvwxyz"sv }.to_ascii_lowercase();
+    EXPECT(lowercase.has_ascii_storage());
+    EXPECT_EQ(lowercase, u"abcdefghijklmnopqrstuvwxyz abcdefghijklmnopqrstuvwxyz"sv);
 }
 
 TEST_CASE(to_ascii_uppercase)
@@ -401,6 +437,14 @@ TEST_CASE(to_ascii_uppercase)
     EXPECT_EQ(u"FooBar"sv.to_ascii_uppercase(), u"FOOBAR"sv);
     EXPECT_EQ(u"FOOBAR"sv.to_ascii_uppercase(), u"FOOBAR"sv);
     EXPECT_EQ(u"foo 😀 bar"sv.to_ascii_uppercase(), u"FOO 😀 BAR"sv);
+
+    EXPECT_EQ(Utf16View { ""sv }.to_ascii_uppercase(), u""sv);
+    EXPECT_EQ(Utf16View { "FooBar"sv }.to_ascii_uppercase(), u"FOOBAR"sv);
+    EXPECT_EQ(Utf16View { "@[`{ AZ az 09"sv }.to_ascii_uppercase(), u"@[`{ AZ AZ 09"sv);
+
+    auto uppercase = Utf16View { "ABCDEFGHIJKLMNOPQRSTUVWXYZ abcdefghijklmnopqrstuvwxyz"sv }.to_ascii_uppercase();
+    EXPECT(uppercase.has_ascii_storage());
+    EXPECT_EQ(uppercase, u"ABCDEFGHIJKLMNOPQRSTUVWXYZ ABCDEFGHIJKLMNOPQRSTUVWXYZ"sv);
 }
 
 TEST_CASE(to_ascii_titlecase)
@@ -852,6 +896,29 @@ TEST_CASE(find_code_unit_offset)
     EXPECT_EQ(7u, view.find_code_unit_offset(u"bar"sv).value());
 
     EXPECT(!view.find_code_unit_offset(u"baz"sv).has_value());
+}
+
+TEST_CASE(find_code_unit_offset_nul_at_any_alignment)
+{
+    // The AVX-512 implementation of simdutf versions before 9.0.0 reported false positives
+    // for a NUL needle when the searched range straddled a 64-byte boundary.
+    alignas(64) Array<char, 96> ascii_buffer;
+    ascii_buffer.fill('A');
+
+    for (size_t start_offset = 0; start_offset < 64; ++start_offset) {
+        Utf16View view { StringView { ascii_buffer.data() + start_offset, 6 } };
+        EXPECT(!view.find_code_unit_offset(u'\0').has_value());
+        EXPECT(!view.contains(u'\0'));
+    }
+
+    alignas(64) Array<char16_t, 96> utf16_buffer;
+    utf16_buffer.fill(u'A');
+
+    for (size_t start_offset = 0; start_offset < 32; ++start_offset) {
+        Utf16View view { utf16_buffer.data() + start_offset, 6 };
+        EXPECT(!view.find_code_unit_offset(u'\0').has_value());
+        EXPECT(!view.contains(u'\0'));
+    }
 }
 
 TEST_CASE(find_code_unit_offset_ignoring_case)

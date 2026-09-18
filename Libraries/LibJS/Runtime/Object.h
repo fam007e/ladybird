@@ -52,10 +52,12 @@ struct CacheableGetPropertyMetadata {
         NotCacheable,
         GetOwnProperty,
         GetPropertyInPrototypeChain,
+        GetMissingProperty,
     };
     Type type { Type::NotCacheable };
     Optional<u32> property_offset;
     GC::Ptr<Object const> prototype;
+    bool property_absence_is_cacheable { true };
 };
 
 struct CacheableSetPropertyMetadata {
@@ -82,8 +84,10 @@ class JS_API Object : public Cell {
     GC_DECLARE_ALLOCATOR(Object);
 
 public:
-    static GC::Ref<Object> create_prototype(Realm&, Object* prototype);
-    static GC::Ref<Object> create(Realm&, Object* prototype);
+    static constexpr GC::CellKind cell_kind_for_class = GC::CellKind::Object;
+
+    static GC::Ref<Object> create_prototype(Realm&, GC::Ptr<Object> prototype);
+    static GC::Ref<Object> create(Realm&, GC::Ptr<Object> prototype);
     static GC::Ref<Object> create_with_premade_shape(Shape&);
 
     virtual void initialize(Realm&) override;
@@ -133,11 +137,10 @@ public:
     // 7.3 Operations on Objects, https://tc39.es/ecma262/#sec-operations-on-objects
 
     ThrowCompletionOr<Value> get(PropertyKey const&) const;
-    ThrowCompletionOr<Value> get(PropertyKey const&, Bytecode::PropertyLookupCache&) const;
+    ThrowCompletionOr<Value> get(PropertyKey const&, Bytecode::StaticPropertyLookupCache&) const;
     ThrowCompletionOr<void> set(PropertyKey const&, Value, ShouldThrowExceptions);
     ThrowCompletionOr<void> set(PropertyKey const&, Value, Bytecode::PropertyLookupCache&);
     ThrowCompletionOr<bool> create_data_property(PropertyKey const&, Value, Optional<u32>* new_property_offset = nullptr);
-    void create_method_property(PropertyKey const&, Value);
     ThrowCompletionOr<bool> create_data_property_or_throw(PropertyKey const&, Value);
     void create_non_enumerable_data_property_or_throw(PropertyKey const&, Value);
     ThrowCompletionOr<void> define_property_or_throw(PropertyKey const&, PropertyDescriptor&);
@@ -148,7 +151,6 @@ public:
     ThrowCompletionOr<bool> test_integrity_level(IntegrityLevel) const;
     ThrowCompletionOr<GC::RootVector<Value>> enumerable_own_property_names(PropertyKind kind) const;
     ThrowCompletionOr<void> copy_data_properties(VM&, Value source, HashTable<PropertyKey> const& excluded_keys, HashTable<JS::Value> const& excluded_values = {});
-    ThrowCompletionOr<GC::Ref<Object>> snapshot_own_properties(VM&, GC::Ptr<Object> prototype, HashTable<PropertyKey> const& excluded_keys = {}, HashTable<Value> const& excluded_values = {});
 
     PrivateElement* private_element_find(PrivateName const& name);
     ThrowCompletionOr<void> private_field_add(PrivateName const& name, Value value);
@@ -172,6 +174,8 @@ public:
         PrototypeChain,
     };
     virtual ThrowCompletionOr<Value> internal_get(PropertyKey const&, Value receiver, CacheableGetPropertyMetadata* = nullptr, PropertyLookupPhase = PropertyLookupPhase::OwnProperty) const;
+    virtual bool is_cacheable_for_property_absence() const { return true; }
+    virtual bool is_cacheable_for_inherited_property() const { return true; }
     virtual ThrowCompletionOr<bool> internal_set(PropertyKey const&, Value value, Value receiver, CacheableSetPropertyMetadata* = nullptr, PropertyLookupPhase = PropertyLookupPhase::OwnProperty);
     virtual ThrowCompletionOr<bool> internal_delete(PropertyKey const&);
     virtual ThrowCompletionOr<GC::RootVector<Value>> internal_own_property_keys() const;
@@ -191,6 +195,21 @@ public:
 
     [[nodiscard]] bool may_interfere_with_indexed_property_access() const { return m_flags & Flag::MayInterfereWithIndexedPropertyAccess; }
     void set_may_interfere_with_indexed_property_access() { m_flags |= Flag::MayInterfereWithIndexedPropertyAccess; }
+
+    // Objects with this flag must not participate in AddOwnProperty IC caching:
+    // ordinary_set_with_own_descriptor() skips emitting AddOwnProperty metadata,
+    // and AddOwnProperty cache-hit paths check the flag before consuming an
+    // existing cache entry. Both sides are required: a plain object can share a
+    // Shape* with a flagged object, e.g. Object.create(Element.prototype), and
+    // prime a cache entry; the flagged object must still fail the consumption
+    // check. Conversely, only checking consumption would leave permanently-dead
+    // cache entries that evict useful ones.
+    [[nodiscard]] bool requires_slow_add_own_property() const { return m_flags & Flag::RequiresSlowAddOwnProperty; }
+    void set_requires_slow_add_own_property() { m_flags |= Flag::RequiresSlowAddOwnProperty; }
+    void clear_requires_slow_add_own_property() { m_flags &= ~Flag::RequiresSlowAddOwnProperty; }
+
+    [[nodiscard]] bool is_platform_object() const { return m_flags & Flag::IsPlatformObject; }
+    void set_is_platform_object() { m_flags |= Flag::IsPlatformObject; }
 
     ThrowCompletionOr<bool> ordinary_set_with_own_descriptor(PropertyKey const&, Value, Value, Optional<PropertyDescriptor>, CacheableSetPropertyMetadata* = nullptr, PropertyLookupPhase = PropertyLookupPhase::OwnProperty);
 
@@ -221,7 +240,14 @@ public:
     Value get_without_side_effects(PropertyKey const&) const;
 
     void define_direct_property(PropertyKey const& property_key, Value value, PropertyAttributes attributes) { (void)storage_set(property_key, { value, attributes }); }
-    void define_direct_accessor(PropertyKey const&, FunctionObject* getter, FunctionObject* setter, PropertyAttributes attributes);
+    void define_unimplemented_property(Utf16FlyString const& property_name);
+    Optional<ValueAndAttributes> get_engine_private_property(GC::Ref<Symbol>) const;
+    void set_engine_private_property(GC::Ref<Symbol>, Value);
+    void delete_engine_private_property(GC::Ref<Symbol>);
+    void define_direct_accessor(PropertyKey const&, GC::Ptr<FunctionObject> getter, GC::Ptr<FunctionObject> setter, PropertyAttributes attributes);
+    // Cache the getter's result in an engine-private property on this object.
+    void define_direct_cached_accessor(PropertyKey const&, GC::Ptr<FunctionObject> getter, GC::Ptr<FunctionObject> setter, PropertyAttributes attributes);
+    void clear_cached_accessor_value(PropertyKey const&);
 
     using IntrinsicAccessor = Value (*)(Realm&);
     void define_intrinsic_accessor(PropertyKey const&, PropertyAttributes attributes, IntrinsicAccessor accessor);
@@ -258,10 +284,14 @@ public:
     virtual bool is_proxy_object() const { return false; }
     virtual bool is_native_function() const { return false; }
     [[nodiscard]] bool is_raw_native_function() const { return m_flags & Flag::IsRawNativeFunction; }
+    [[nodiscard]] bool is_direct_getter_function() const { return m_flags & Flag::IsDirectGetterFunction; }
+    [[nodiscard]] bool has_global_object_flag() const { return m_flags & Flag::IsGlobalObject; }
     [[nodiscard]] bool is_ecmascript_function_object() const { return m_flags & Flag::IsECMAScriptFunctionObject; }
     void set_is_ecmascript_function_object() { m_flags |= Flag::IsECMAScriptFunctionObject; }
     void set_is_function() { m_flags |= Flag::IsFunction; }
     void set_is_raw_native_function() { m_flags |= Flag::IsRawNativeFunction; }
+    void set_is_direct_getter_function() { m_flags |= Flag::IsDirectGetterFunction; }
+    void set_global_object_flag() { m_flags |= Flag::IsGlobalObject; }
     void clear_is_function() { m_flags &= ~Flag::IsFunction; }
     virtual bool is_array_iterator() const { return false; }
     virtual bool is_raw_json_object() const { return false; }
@@ -295,8 +325,20 @@ public:
     virtual void visit_edges(Cell::Visitor&) override;
     virtual size_t external_memory_size() const override;
 
-    Value get_direct(size_t index) const { return m_named_properties[index]; }
-    void put_direct(size_t index, Value value) { m_named_properties[index] = value; }
+    // Named-property slot offsets come from shape lookups and from inline caches. A corrupted cache
+    // can hand us an offset past the allocation, so we bound every direct slot access by the storage
+    // capacity. This turns an out-of-bounds slot into a controlled crash instead of a memory
+    // read/write primitive.
+    Value get_direct(size_t index) const
+    {
+        VERIFY(index < named_storage_capacity());
+        return m_named_properties[index];
+    }
+    void put_direct(size_t index, Value value)
+    {
+        VERIFY(index < named_storage_capacity());
+        m_named_properties[index] = value;
+    }
 
     // Indexed property storage
     Optional<ValueAndAttributes> indexed_get(u32 index) const;
@@ -304,13 +346,26 @@ public:
     bool indexed_has(u32 index) const;
     void indexed_delete(u32 index);
     u32 indexed_array_like_size() const { return m_indexed_array_like_size; }
+    // The number of packed elements that are really in the buffer. The logical size sits on the
+    // Object while the capacity sits with the allocation, so the two can drift apart if the size
+    // field is corrupted. Packed indexing goes through this, which keeps such a drift a wrong
+    // answer rather than an access past the allocation.
+    u32 indexed_packed_element_count() const;
+
+    // The indexed elements buffer keeps its capacity in a header word right in front of the first
+    // element. The interpreter's layout generator emits this offset so the interpreter can read
+    // the same capacity the C++ side reads.
+    static constexpr size_t indexed_elements_header_size = sizeof(Value);
     bool set_indexed_array_like_size(size_t new_size);
     void indexed_append(Value value, PropertyAttributes attributes = default_attributes);
+    void indexed_append(ReadonlySpan<Value> values);
     ValueAndAttributes indexed_take_first();
     ValueAndAttributes indexed_take_last();
     size_t indexed_real_size() const;
     Vector<u32> indexed_indices() const;
-    void set_indexed_property_elements(Vector<Value>&& values);
+    void set_indexed_property_elements(ReadonlySpan<Value> values);
+    // Replaces the indexed storage with `size` packed undefined elements, and returns them to be overwritten in place.
+    Span<Value> set_indexed_property_elements_to_undefined(u32 size);
     IndexedStorageKind indexed_storage_kind() const { return m_indexed_storage_kind; }
 
     template<typename Callback>
@@ -344,11 +399,12 @@ public:
     void unsafe_set_shape(Shape&);
 
     void convert_to_prototype_if_needed();
+    void invalidate_property_lookup_caches();
 
     template<typename T>
     bool fast_is() const = delete;
 
-    void set_prototype(Object*);
+    void set_prototype(GC::Ptr<Object>);
 
     [[nodiscard]] bool has_magical_length_property() const { return m_flags & Flag::HasMagicalLengthProperty; }
     void set_has_magical_length_property() { m_flags |= Flag::HasMagicalLengthProperty; }
@@ -368,25 +424,64 @@ protected:
 
     Object(GlobalObjectTag, Realm&, MayInterfereWithIndexedPropertyAccess = MayInterfereWithIndexedPropertyAccess::No);
     Object(ConstructWithoutPrototypeTag, Realm&, MayInterfereWithIndexedPropertyAccess = MayInterfereWithIndexedPropertyAccess::No);
-    Object(Realm&, Object* prototype, MayInterfereWithIndexedPropertyAccess = MayInterfereWithIndexedPropertyAccess::No);
+    Object(Realm&, GC::Ptr<Object> prototype, MayInterfereWithIndexedPropertyAccess = MayInterfereWithIndexedPropertyAccess::No);
     Object(ConstructWithPrototypeTag, Object& prototype, MayInterfereWithIndexedPropertyAccess = MayInterfereWithIndexedPropertyAccess::No);
     explicit Object(Shape&, MayInterfereWithIndexedPropertyAccess = MayInterfereWithIndexedPropertyAccess::No);
 
 private:
-    struct Flag {
-        static constexpr u8 IsExtensible = 1 << 0;
-        static constexpr u8 IsRawNativeFunction = 1 << 1;
-        static constexpr u8 HasMagicalLengthProperty = 1 << 2;
-        static constexpr u8 IsTypedArray = 1 << 3;
-        static constexpr u8 MayInterfereWithIndexedPropertyAccess = 1 << 4;
-        static constexpr u8 HasIntrinsicAccessors = 1 << 5;
-        static constexpr u8 IsECMAScriptFunctionObject = 1 << 6;
-        static constexpr u8 IsFunction = 1 << 7;
+    class StoragePointer {
+    public:
+        constexpr StoragePointer() = default;
+        constexpr StoragePointer(Value* storage)
+            : m_storage(storage)
+        {
+        }
+
+        ALWAYS_INLINE Value* data() { return m_storage; }
+        ALWAYS_INLINE Value const* data() const { return m_storage; }
+
+        ALWAYS_INLINE Value& operator[](size_t index) { return m_storage[index]; }
+        ALWAYS_INLINE Value const& operator[](size_t index) const { return m_storage[index]; }
+
+        ALWAYS_INLINE explicit operator bool() const { return m_storage != nullptr; }
+        ALWAYS_INLINE bool operator==(Value const* other) const { return m_storage == other; }
+
+        template<typename T>
+        ALWAYS_INLINE T* as() const
+        {
+            return reinterpret_cast<T*>(m_storage);
+        }
+
+        ALWAYS_INLINE StoragePointer& operator=(Value* storage)
+        {
+            m_storage = storage;
+            return *this;
+        }
+
+    private:
+        Value* m_storage { nullptr };
     };
 
-    u8 m_flags { Flag::IsExtensible };
+    static_assert(sizeof(StoragePointer) == sizeof(Value*));
+
+    struct Flag {
+        static constexpr u16 IsExtensible = 1 << 0;
+        static constexpr u16 IsRawNativeFunction = 1 << 1;
+        static constexpr u16 HasMagicalLengthProperty = 1 << 2;
+        static constexpr u16 IsTypedArray = 1 << 3;
+        static constexpr u16 MayInterfereWithIndexedPropertyAccess = 1 << 4;
+        static constexpr u16 HasIntrinsicAccessors = 1 << 5;
+        static constexpr u16 IsECMAScriptFunctionObject = 1 << 6;
+        static constexpr u16 IsFunction = 1 << 7;
+        static constexpr u16 RequiresSlowAddOwnProperty = 1 << 8;
+        static constexpr u16 IsPlatformObject = 1 << 9;
+        static constexpr u16 IsDirectGetterFunction = 1 << 10;
+        static constexpr u16 IsGlobalObject = 1 << 11;
+        static constexpr u16 HasUnimplementedProperties = 1 << 12;
+    };
+
+    u16 m_flags { Flag::IsExtensible };
     IndexedStorageKind m_indexed_storage_kind { IndexedStorageKind::None };
-    // 2 bytes padding
     u32 m_indexed_array_like_size { 0 };
     void set_shape(Shape& shape) { m_shape = &shape; }
 
@@ -398,25 +493,38 @@ private:
     void ensure_indexed_elements(u32 needed_capacity);
     void grow_indexed_elements(u32 needed_capacity);
     void transition_to_dictionary();
+    NEVER_INLINE COLD void transition_to_packed();
+    NEVER_INLINE COLD void indexed_put_into_dictionary(u32, Value, PropertyAttributes);
     void free_indexed_elements();
     void ensure_named_storage_capacity(u32 needed);
-    bool named_storage_is_inline() const { return m_named_properties == const_cast<Object*>(this)->m_inline_named_storage; }
+    bool named_storage_is_inline() const { return m_named_properties == m_inline_named_storage; }
+    // Capacity of the current named-property storage in Values. Heap storage keeps its capacity in a
+    // u32 just before the first element (see HeapValueStorage in Object.cpp); inline storage is fixed.
+    ALWAYS_INLINE u32 named_storage_capacity() const
+    {
+        if (named_storage_is_inline())
+            return INLINE_NAMED_PROPERTY_CAPACITY;
+        return *reinterpret_cast<u32 const*>(reinterpret_cast<u8 const*>(m_named_properties.data()) - indexed_elements_header_size);
+    }
     size_t named_storage_external_memory_size() const;
     size_t indexed_storage_external_memory_size() const;
+
+    [[nodiscard]] bool has_unimplemented_properties() const { return m_flags & Flag::HasUnimplementedProperties; }
+    [[nodiscard]] bool is_unimplemented_property(PropertyKey const&) const;
 
 public:
     static constexpr u32 INLINE_NAMED_PROPERTY_CAPACITY = 2;
 
 private:
     GC::Ptr<Shape> m_shape;
-    Value* m_named_properties { m_inline_named_storage };
-    Value* m_indexed_elements { nullptr };
+    StoragePointer m_named_properties { m_inline_named_storage };
+    StoragePointer m_indexed_elements;
     OwnPtr<Vector<PrivateElement>> m_private_elements; // [[PrivateElements]]
     Value m_inline_named_storage[INLINE_NAMED_PROPERTY_CAPACITY] {};
 };
 
 #if !defined(AK_OS_WINDOWS)
-static_assert(sizeof(Object) <= 64, "Keep the size of JS::Object down!");
+static_assert(sizeof(Object) <= 72, "Keep the size of JS::Object down!");
 #endif
 
 }

@@ -13,27 +13,27 @@ namespace Web::SVG {
 
 class SVGSymbolElement final : public SVGGraphicsElement
     , public SVGFitToViewBox {
-    WEB_PLATFORM_OBJECT(SVGSymbolElement, SVGGraphicsElement);
+    WEB_WRAPPABLE(SVGSymbolElement, SVGGraphicsElement);
     GC_DECLARE_ALLOCATOR(SVGSymbolElement);
 
 public:
     virtual ~SVGSymbolElement() override = default;
 
-    virtual void adjust_computed_style(CSS::ComputedProperties::Builder&) override;
+    virtual SVGFitToViewBox const* fit_to_view_box() const override { return this; }
 
 private:
     virtual bool is_svg_symbol_element() const final { return true; }
 
     SVGSymbolElement(DOM::Document&, DOM::QualifiedName);
 
-    virtual void initialize(JS::Realm&) override;
+    virtual void initialize_element() override;
     virtual void visit_edges(Cell::Visitor&) override;
 
-    virtual RefPtr<Layout::Node> create_layout_node(CSS::ComputedProperties const&) override;
+    virtual Layout::Node* create_layout_node(CSS::LayoutStyle) override;
 
     bool is_direct_child_of_use_shadow_tree() const;
 
-    virtual void attribute_changed(FlyString const& name, Optional<String> const& old_value, Optional<String> const& value, Optional<FlyString> const& namespace_) override;
+    virtual void attribute_changed(Utf16FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_) override;
 };
 
 }

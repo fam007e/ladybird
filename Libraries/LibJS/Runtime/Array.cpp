@@ -20,7 +20,7 @@ namespace JS {
 GC_DEFINE_ALLOCATOR(Array);
 
 // 10.4.2.2 ArrayCreate ( length [ , proto ] ), https://tc39.es/ecma262/#sec-arraycreate
-ThrowCompletionOr<GC::Ref<Array>> Array::create(Realm& realm, u64 length, Object* prototype)
+ThrowCompletionOr<GC::Ref<Array>> Array::create(Realm& realm, u64 length, GC::Ptr<Object> prototype)
 {
     auto& vm = realm.vm();
 
@@ -53,12 +53,11 @@ GC::Ref<Array> Array::create_from(Realm& realm, ReadonlySpan<Value> elements)
 
     // 2. Let n be 0.
     // 3. For each element e of elements, do
-    for (u32 n = 0; n < elements.size(); ++n) {
-        // a. Perform ! CreateDataPropertyOrThrow(array, ! ToString(𝔽(n)), e).
-        MUST(array->create_data_property_or_throw(n, elements[n]));
-
-        // b. Set n to n + 1.
-    }
+    // a. Perform ! CreateDataPropertyOrThrow(array, ! ToString(𝔽(n)), e).
+    // b. Set n to n + 1.
+    // OPTIMIZATION: These are consecutive default data properties, so initialize the packed
+    //               indexed storage in one allocation instead of defining them individually.
+    array->set_indexed_property_elements(elements);
 
     // 4. Return array.
     return array;

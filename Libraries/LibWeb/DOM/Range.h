@@ -9,12 +9,20 @@
 
 #pragma once
 
+#include <AK/IntrusiveList.h>
+#include <LibJS/Forward.h>
 #include <LibWeb/DOM/AbstractRange.h>
 #include <LibWeb/DOM/Node.h>
 #include <LibWeb/Export.h>
 #include <LibWeb/Selection/Selection.h>
 #include <LibWeb/TrustedTypes/TrustedHTML.h>
 #include <LibWeb/WebIDL/Types.h>
+
+namespace Web::HTML {
+
+enum class ParserScriptingMode : u8;
+
+}
 
 namespace Web::DOM {
 
@@ -28,16 +36,15 @@ enum class RelativeBoundaryPointPosition {
 RelativeBoundaryPointPosition position_of_boundary_point_relative_to_other_boundary_point(BoundaryPoint a, BoundaryPoint b);
 
 class WEB_API Range final : public AbstractRange {
-    WEB_PLATFORM_OBJECT(Range, AbstractRange);
+    WEB_WRAPPABLE(Range, AbstractRange);
     GC_DECLARE_ALLOCATOR(Range);
 
 public:
     static constexpr bool OVERRIDES_FINALIZE = true;
 
     [[nodiscard]] static GC::Ref<Range> create(Document&);
-    [[nodiscard]] static GC::Ref<Range> create(HTML::Window&);
+    [[nodiscard]] static WebIDL::ExceptionOr<GC::Ref<Range>> create_for_constructor(JS::Object&);
     [[nodiscard]] static GC::Ref<Range> create(GC::Ref<Node> start_container, WebIDL::UnsignedLong start_offset, GC::Ref<Node> end_container, WebIDL::UnsignedLong end_offset);
-    static WebIDL::ExceptionOr<GC::Ref<Range>> construct_impl(JS::Realm&);
 
     virtual ~Range() override;
 
@@ -85,7 +92,7 @@ public:
 
     Utf16String to_string() const;
 
-    static HashTable<Range*>& live_ranges();
+    void update_owner_document(Badge<Document>) { update_owner_document(); }
 
     GC::Ref<Geometry::DOMRectList> get_client_rects();
     GC::Ref<Geometry::DOMRect> get_bounding_client_rect();
@@ -94,7 +101,8 @@ public:
 
     void set_associated_selection(Badge<Selection::Selection>, GC::Ptr<Selection::Selection>);
 
-    WebIDL::ExceptionOr<GC::Ref<DocumentFragment>> create_contextual_fragment(TrustedTypes::TrustedHTMLOrString const& fragment);
+    WebIDL::ExceptionOr<GC::Ref<DocumentFragment>> create_contextual_fragment(TrustedTypes::TrustedHTMLOrString const&);
+    WebIDL::ExceptionOr<GC::Ref<DocumentFragment>> create_contextual_fragment(StringView fragment);
 
     template<typename Callback>
     void for_each_contained(Callback callback) const
@@ -127,8 +135,7 @@ private:
     explicit Range(Document&);
     Range(GC::Ref<Node> start_container, WebIDL::UnsignedLong start_offset, GC::Ref<Node> end_container, WebIDL::UnsignedLong end_offset);
 
-    virtual void initialize(JS::Realm&) override;
-    virtual void visit_edges(Cell::Visitor&) override;
+    virtual void visit_edges(GC::Cell::Visitor&) override;
     virtual void finalize() override;
 
     GC::Ref<Node> root() const;
@@ -140,9 +147,17 @@ private:
         End,
     };
 
-    void set_start_node(GC::Ref<Node> node) { m_start_container = node; }
+    void set_start_node(GC::Ref<Node> node)
+    {
+        m_start_container = node;
+        update_owner_document();
+    }
     void set_start_offset(WebIDL::UnsignedLong offset) { m_start_offset = offset; }
-    void set_end_node(GC::Ref<Node> node) { m_end_container = node; }
+    void set_end_node(GC::Ref<Node> node)
+    {
+        m_end_container = node;
+        update_owner_document();
+    }
     void set_end_offset(WebIDL::UnsignedLong offset) { m_end_offset = offset; }
 
     void increase_start_offset(WebIDL::UnsignedLong count) { m_start_offset += count; }
@@ -159,7 +174,15 @@ private:
 
     bool partially_contains_node(GC::Ref<Node>) const;
 
+    void update_owner_document();
+
     GC::Ptr<Selection::Selection> m_associated_selection;
+    GC::Ptr<Document> m_owner_document;
+
+    IntrusiveListNode<Range> m_live_range_list_node;
+
+public:
+    using DocumentLiveRangeList = IntrusiveList<&Range::m_live_range_list_node>;
 };
 
 }

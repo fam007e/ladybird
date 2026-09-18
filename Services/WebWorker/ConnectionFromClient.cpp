@@ -6,8 +6,14 @@
 
 #include <LibCore/Process.h>
 #include <LibCore/System.h>
+#include <LibGfx/Font/FontDatabase.h>
+#include <LibGfx/Font/SharedFontProvider.h>
+#include <LibWeb/DOMURL/DOMURL.h>
+#include <LibWeb/FileAPI/BlobURLStore.h>
 #include <LibWeb/HTML/BroadcastChannel.h>
 #include <LibWeb/HTML/WorkerAgentParent.h>
+#include <LibWeb/Platform/FontPlugin.h>
+#include <LibWebView/CompositorConnection.h>
 #include <WebWorker/ConnectionFromClient.h>
 #include <WebWorker/PageHost.h>
 #include <WebWorker/WorkerHost.h>
@@ -27,12 +33,72 @@ void ConnectionFromClient::connect_to_request_server(IPC::TransportHandle handle
 {
     if (on_request_server_connection)
         on_request_server_connection(handle);
+
+    // A real connection loss defers this callback. Exercise the case where the replacement connection arrives before
+    // that deferred callback runs.
+    if (auto request_server_died_callback = move(m_request_server_died_callback_for_testing))
+        request_server_died_callback();
+}
+
+void ConnectionFromClient::simulate_request_server_connection_loss_and_reconnect_for_testing(IPC::TransportHandle replacement_handle)
+{
+    auto disconnected_client = move(Web::ResourceLoader::the().request_client());
+    m_request_server_died_callback_for_testing = move(disconnected_client->on_request_server_died);
+    disconnected_client = nullptr;
+
+    connect_to_request_server(move(replacement_handle));
 }
 
 void ConnectionFromClient::connect_to_image_decoder(IPC::TransportHandle handle)
 {
     if (on_image_decoder_connection)
         on_image_decoder_connection(handle);
+}
+
+void ConnectionFromClient::connect_to_wasm_compiler([[maybe_unused]] IPC::TransportHandle handle)
+{
+#if defined(HAVE_WASM_COMPILER_SERVICE)
+    if (on_wasm_compiler_connection)
+        on_wasm_compiler_connection(move(handle));
+#endif
+}
+
+void ConnectionFromClient::connect_to_compositor(IPC::TransportHandle handle)
+{
+    auto transport = MUST(handle.create_transport());
+    m_compositor_connection = adopt_ref(*new WebView::CompositorConnection(move(transport)));
+    m_compositor_connection->on_compositor_lost = [this] {
+        m_page_host->compositor_process_lost();
+    };
+
+#ifdef AK_OS_WINDOWS
+    if constexpr (requires { m_compositor_connection->transport().set_peer_pid(0); }) {
+        auto response = m_compositor_connection->send_sync<Messages::CompositorWebContentServer::InitTransport>(Core::System::getpid());
+        m_compositor_connection->transport().set_peer_pid(response->compositor_pid());
+    }
+#endif
+}
+
+WebView::CompositorConnection* ConnectionFromClient::compositor_process_connection() const
+{
+    if (!m_compositor_connection || !m_compositor_connection->is_open())
+        return nullptr;
+    return m_compositor_connection.ptr();
+}
+
+void ConnectionFromClient::set_system_font_family(String family)
+{
+    Web::Platform::FontPlugin::the().set_system_font_family(FlyString { family });
+}
+
+void ConnectionFromClient::set_site_compatibility_data(JsonValue data)
+{
+    auto parsed_data = Web::SiteCompatibilityData::from_json(data);
+    if (parsed_data.is_error()) {
+        warnln("Ignoring invalid site compatibility data: {}", parsed_data.error());
+        return;
+    }
+    Web::ResourceLoader::the().set_site_compatibility_data(parsed_data.release_value());
 }
 
 void ConnectionFromClient::close_worker()
@@ -61,13 +127,68 @@ void ConnectionFromClient::request_file(Web::FileRequest request)
     async_did_request_file(path, request_id);
 }
 
+void ConnectionFromClient::blob_url_entry_removed(Utf16String url)
+{
+    if (auto url_record = Web::DOMURL::parse(url.utf16_view()); url_record.has_value())
+        Web::FileAPI::remove_entry_from_blob_url_store(*url_record);
+}
+
 ConnectionFromClient::ConnectionFromClient(NonnullOwnPtr<IPC::Transport> transport)
     : IPC::ConnectionFromClient<WebWorkerClientEndpoint, WebWorkerServerEndpoint>(*this, move(transport), 1)
-    , m_page_host(PageHost::create(Web::Bindings::main_thread_vm(), *this))
+    , m_page_host(PageHost::create(*this))
 {
 }
 
 ConnectionFromClient::~ConnectionFromClient() = default;
+
+void ConnectionFromClient::set_font_catalog(IPC::File file, u64 size, u64 generation)
+{
+    if (m_font_provider) {
+        if (auto result = m_font_provider->replace_catalog(move(file), size, generation); result.is_error())
+            dbgln("WebWorker: Unable to replace font catalog: {}", result.error());
+        else
+            Web::Platform::FontPlugin::the().update_generic_fonts();
+        return;
+    }
+
+    Gfx::SharedFontProviderCallbacks callbacks;
+    callbacks.open_font = [this](u64 requested_generation, u64 face_id) {
+        auto response = send_sync_but_allow_failure<Messages::WebWorkerClient::OpenSystemFont>(requested_generation, face_id);
+        if (!response)
+            return Gfx::BrokeredFont {};
+        return response->take_font();
+    };
+    callbacks.match_font = [this](String const& family, u16 weight, u16 width, u8 slope) {
+        auto response = send_sync_but_allow_failure<Messages::WebWorkerClient::MatchSystemFont>(family, weight, width, slope);
+        if (!response)
+            return Gfx::BrokeredFont {};
+        return response->take_font();
+    };
+    callbacks.match_font_for_code_point = [this](u32 code_point, u16 weight, u16 width, u8 slope, bool prefer_color_emoji) {
+        auto response = send_sync_but_allow_failure<Messages::WebWorkerClient::MatchSystemFontForCodePoint>(code_point, weight, width, slope, prefer_color_emoji);
+        if (!response)
+            return Gfx::BrokeredFont {};
+        return response->take_font();
+    };
+    callbacks.resolve_generic_family = [this](String const& family, u16 weight, u8 slope) -> Optional<FlyString> {
+        auto response = send_sync_but_allow_failure<Messages::WebWorkerClient::ResolveGenericFont>(family, weight, slope);
+        if (!response)
+            return {};
+        auto resolved_family = response->take_resolved_family();
+        if (!resolved_family.has_value())
+            return {};
+        return FlyString { resolved_family.release_value() };
+    };
+
+    auto provider = Gfx::SharedFontProvider::create_from_catalog_file_or_empty(move(file), size, generation, move(callbacks));
+    if (provider.is_error()) {
+        dbgln("WebWorker: Unable to install fallback font catalog: {}", provider.error());
+        return;
+    }
+    m_font_provider = provider.value().ptr();
+    Gfx::FontDatabase::the().install_system_font_provider(provider.release_value());
+    Web::Platform::FontPlugin::install(*new Web::Platform::FontPlugin(false, m_font_provider));
+}
 
 Web::Page& ConnectionFromClient::page()
 {
@@ -79,12 +200,12 @@ Web::Page const& ConnectionFromClient::page() const
     return m_page_host->page();
 }
 
-void ConnectionFromClient::start_worker(URL::URL url, Web::Bindings::WorkerType type, Web::Bindings::RequestCredentials credentials, String name, Web::HTML::TransferDataEncoder implicit_port, Web::HTML::SerializedEnvironmentSettingsObject outside_settings, Web::Bindings::AgentType agent_type)
+void ConnectionFromClient::start_worker(URL::URL url, Web::HTML::WorkerType type, Web::HTML::RequestCredentials credentials, String name, Web::HTML::TransferDataEncoder implicit_port, Web::HTML::SerializedEnvironmentSettingsObject outside_settings, Web::HTML::AgentType agent_type)
 {
     m_worker_host = make_ref_counted<WorkerHost>(move(url), type, move(name));
 
-    bool const is_shared = agent_type == Web::Bindings::AgentType::SharedWorker;
-    VERIFY(is_shared || agent_type == Web::Bindings::AgentType::DedicatedWorker);
+    bool const is_shared = agent_type == Web::HTML::AgentType::SharedWorker;
+    VERIFY(is_shared || agent_type == Web::HTML::AgentType::DedicatedWorker);
 
     // FIXME: Add an assertion that the agent_type passed here is the same that was passed at process creation to initialize_main_thread_vm()
 
@@ -108,17 +229,12 @@ void ConnectionFromClient::handle_file_return(i32 error, Optional<IPC::File> fil
     file_request.value().on_file_request_finish(error != 0 ? Error::from_errno(error) : ErrorOr<i32> { file->take_fd() });
 }
 
-void ConnectionFromClient::did_worker_agent_finish_loading_script(Web::HTML::WorkerAgentOwnerToken owner_token)
-{
-    Web::HTML::WorkerAgentParent::did_finish_loading_worker_script(owner_token);
-}
-
 void ConnectionFromClient::did_worker_agent_fail_loading_script(Web::HTML::WorkerAgentOwnerToken owner_token)
 {
     Web::HTML::WorkerAgentParent::did_fail_loading_worker_script(owner_token);
 }
 
-void ConnectionFromClient::did_worker_agent_report_exception(Web::HTML::WorkerAgentOwnerToken owner_token, String message, String filename, u32 lineno, u32 colno)
+void ConnectionFromClient::did_worker_agent_report_exception(Web::HTML::WorkerAgentOwnerToken owner_token, Utf16String message, Utf16String filename, u32 lineno, u32 colno)
 {
     Web::HTML::WorkerAgentParent::did_report_worker_exception(owner_token, move(message), move(filename), lineno, colno);
 }
@@ -126,6 +242,11 @@ void ConnectionFromClient::did_worker_agent_report_exception(Web::HTML::WorkerAg
 void ConnectionFromClient::did_worker_agent_close(Web::HTML::WorkerAgentOwnerToken owner_token)
 {
     Web::HTML::WorkerAgentParent::did_close_worker(owner_token);
+}
+
+void ConnectionFromClient::did_worker_agent_die(Web::HTML::WorkerAgentOwnerToken owner_token)
+{
+    Web::HTML::WorkerAgentParent::did_worker_agent_die(owner_token);
 }
 
 void ConnectionFromClient::broadcast_channel_message(Web::HTML::BroadcastChannelMessage message)

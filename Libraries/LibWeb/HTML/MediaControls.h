@@ -6,8 +6,8 @@
 
 #pragma once
 
-#include <AK/FlyString.h>
 #include <AK/Optional.h>
+#include <AK/Utf16FlyString.h>
 #include <AK/Vector.h>
 #include <LibCore/Timer.h>
 #include <LibGC/Cell.h>
@@ -35,25 +35,36 @@ private:
     };
 
     template<typename T, CallableAs<bool, T&> Handler>
-    GC::Ref<DOM::IDLEventListener> add_event_listener(JS::Realm&, DOM::EventTarget&, FlyString const& event_name, ListenOnce, Handler);
+    GC::Ref<DOM::IDLEventListener> add_event_listener(JS::Realm&, DOM::EventTarget&, Utf16FlyString const& event_name, ListenOnce, Handler);
     template<CallableAs<bool> Handler>
-    GC::Ref<DOM::IDLEventListener> add_event_listener(JS::Realm&, DOM::EventTarget&, FlyString const& event_nam, Handler);
+    GC::Ref<DOM::IDLEventListener> add_event_listener(JS::Realm&, DOM::EventTarget&, Utf16FlyString const& event_name, Handler);
     template<CallableAs<bool, UIEvents::MouseEvent const&> Handler>
-    GC::Ref<DOM::IDLEventListener> add_event_listener(JS::Realm&, DOM::EventTarget&, FlyString const& event_name, Handler);
+    GC::Ref<DOM::IDLEventListener> add_event_listener(JS::Realm&, DOM::EventTarget&, Utf16FlyString const& event_name, Handler);
     template<CallableAs<bool, UIEvents::MouseEvent const&> Handler>
-    GC::Ref<DOM::IDLEventListener> add_event_listener(JS::Realm&, DOM::EventTarget&, FlyString const& event_name, ListenOnce, Handler);
+    GC::Ref<DOM::IDLEventListener> add_event_listener(JS::Realm&, DOM::EventTarget&, Utf16FlyString const& event_name, ListenOnce, Handler);
     template<CallableAs<bool, UIEvents::KeyboardEvent const&> Handler>
-    GC::Ref<DOM::IDLEventListener> add_event_listener(JS::Realm&, DOM::EventTarget&, FlyString const& event_name, Handler);
+    GC::Ref<DOM::IDLEventListener> add_event_listener(JS::Realm&, DOM::EventTarget&, Utf16FlyString const& event_name, Handler);
 
     void remove_event_listeners();
     void set_up_event_listeners();
 
-    void play();
     void toggle_playback();
     void set_current_time(double);
+    void seek_while_scrubbing(double);
+    void submit_pending_scrub_seek();
     void set_volume(double);
     void toggle_mute();
     void toggle_fullscreen();
+
+    struct TimelineRange {
+        double start { 0 };
+        double end { 0 };
+
+        double span() const { return end - start; }
+        double time_at(double progress) const { return start + (progress * span()); }
+        double progress_at(double time) const { return (time - start) / span(); }
+    };
+    Optional<TimelineRange> timeline_range() const;
 
     void update_play_pause_icon();
     void update_timeline();
@@ -76,11 +87,10 @@ private:
 
     struct RegisteredEventListener {
         GC::Weak<DOM::EventTarget> target;
-        FlyString event_name;
+        Utf16FlyString event_name;
         GC::Weak<DOM::IDLEventListener> listener;
     };
     Vector<RegisteredEventListener> m_registered_event_listeners;
-    GC::Ptr<WebIDL::CallbackType> m_request_animation_frame_callback;
     u32 m_request_animation_frame_id { 0 };
 
     enum class Scrubbing : u8 {
@@ -89,6 +99,8 @@ private:
         WhilePlaying,
     };
     Scrubbing m_scrubbing_timeline { Scrubbing::No };
+    Optional<double> m_pending_scrub_seek_time;
+    RefPtr<Core::Timer> m_scrub_seek_preemption_timer;
     bool m_scrubbing_volume { false };
     bool m_hovering_controls { false };
 
@@ -105,7 +117,7 @@ private:
 
     double m_last_timeline_progress { 0.0 };
     i64 m_last_timestamp_time { -1 };
-    i64 m_last_timestamp_duration { -1 };
+    Optional<i64> m_last_timestamp_duration;
 
     struct BufferedRange {
         GC::Weak<DOM::Element> element;

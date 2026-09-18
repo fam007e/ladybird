@@ -7,19 +7,20 @@
 #include <LibGC/Heap.h>
 #include <LibGfx/Bitmap.h>
 #include <LibJS/Runtime/ExternalMemory.h>
-#include <LibJS/Runtime/Realm.h>
 #include <LibWeb/CSS/ComputedValues.h>
 #include <LibWeb/HTML/BitmapDecodedImageData.h>
-#include <LibWeb/Painting/DisplayListRecorder.h>
-#include <LibWeb/Painting/DisplayListRecordingContext.h>
 
 namespace Web::HTML {
 
 GC_DEFINE_ALLOCATOR(BitmapDecodedImageData);
 
-GC::Ref<BitmapDecodedImageData> BitmapDecodedImageData::create(JS::Realm& realm, Gfx::DecodedImageFrame&& frame)
+ErrorOr<GC::Ref<BitmapDecodedImageData>> BitmapDecodedImageData::create(Vector<Frame>&& frames, size_t loop_count, bool animated)
 {
-    return realm.create<BitmapDecodedImageData>(move(frame));
+    (void)loop_count;
+    (void)animated;
+    if (frames.is_empty())
+        return Error::from_string_literal("Bitmap image has no frames");
+    return GC::Heap::the().allocate<BitmapDecodedImageData>(move(frames[0].frame));
 }
 
 BitmapDecodedImageData::BitmapDecodedImageData(Gfx::DecodedImageFrame&& frame)
@@ -59,11 +60,17 @@ Optional<CSSPixelFraction> BitmapDecodedImageData::intrinsic_aspect_ratio() cons
     return CSSPixels(m_frame.width()) / CSSPixels(m_frame.height());
 }
 
-void BitmapDecodedImageData::paint(DisplayListRecordingContext& context, Gfx::IntRect dst_rect, CSS::ImageRendering image_rendering) const
+Optional<Gfx::Color> BitmapDecodedImageData::color_if_single_pixel_bitmap() const
 {
-    auto scaling_mode = CSS::to_gfx_scaling_mode(image_rendering, m_frame.size(), dst_rect.size());
+    auto const& bitmap = m_frame.bitmap();
+    if (bitmap.width() != 1 || bitmap.height() != 1)
+        return {};
+    return bitmap.get_pixel(0, 0);
+}
 
-    context.display_list_recorder().draw_scaled_decoded_image_frame(dst_rect, m_frame, scaling_mode);
+Optional<Painting::ImagePaint> BitmapDecodedImageData::image_paint(Painting::ImagePaintRequest const&) const
+{
+    return Painting::ImagePaint { Painting::ImagePaint::DecodedFrame { .frame = m_frame, .natural_size = m_frame.size() } };
 }
 
 }

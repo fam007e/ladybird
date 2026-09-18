@@ -1,30 +1,62 @@
 set(SOURCES
     Application.cpp
+    ApplyHistoryStep.cpp
     Attribute.cpp
     Autocomplete.cpp
+    AutocompleteMuxer.cpp
+    AutocompleteRanker.cpp
+    AutocompleteService.cpp
+    BlobURLStore.cpp
+    BrowsingSession.cpp
     BookmarkStore.cpp
+    CanonicalBrowsingContext.cpp
+    CanonicalBrowsingContextGroup.cpp
+    CanonicalNavigable.cpp
     CanonicalTraversable.cpp
     BrowserProcess.cpp
+    CompositorClient.cpp
+    CompositorFontServiceConnection.cpp
+    CompositorConnection.cpp
+    CompositorHostBase.cpp
     ConsoleOutput.cpp
     CookieJar.cpp
+    CrashReport.cpp
+    Debugger.cpp
+    DictionaryLookup.cpp
     DOMNodeProperties.cpp
+    DownloadPresentation.cpp
+    DownloadSegmentation.cpp
+    DownloadStore.cpp
+    ExternalURLHandler.cpp
+    FaviconStore.cpp
     FileDownloader.cpp
+    FontService.cpp
+    Geolocation.cpp
     HeadlessWebView.cpp
+    HelperProcess.cpp
     HistoryDebug.cpp
     HistoryStore.cpp
-    HelperProcess.cpp
     HSTSStore.cpp
     Menu.cpp
     Mutation.cpp
+    NavigationLoader.cpp
     Omnibox.cpp
+    OmniboxEngagement.cpp
     Plugins/ImageCodecPlugin.cpp
     Process.cpp
     ProcessHandle.cpp
     ProcessManager.cpp
+    TabPerformanceStats.cpp
+    TabPerformanceMonitor.cpp
     ProcessMonitor.cpp
+    Profile.cpp
     SearchEngine.cpp
     SessionHistory.cpp
+    SessionHistorySnapshotStorage.cpp
+    SessionHistoryTraversalQueue.cpp
+    SessionStore.cpp
     Settings.cpp
+    SiteCompatibility.cpp
     SiteIsolation.cpp
     SiteIsolationManager.cpp
     SourceHighlighter.cpp
@@ -34,22 +66,25 @@ set(SOURCES
     Utilities.cpp
     ViewImplementation.cpp
     WebContentClient.cpp
-    WebWorkerClient.cpp
-    WorkerProcessManager.cpp
+    WebContentTestClient.cpp
+    WebDriverBrowserConnection.cpp
     WebUI.cpp
     WebUI/BookmarksUI.cpp
     WebUI/DownloadsUI.cpp
     WebUI/HistoryUI.cpp
-    WebUI/ProcessesUI.cpp
     WebUI/SettingsUI.cpp
     WebUI/VersionUI.cpp
-    CompositorClient.cpp
+    WebWorkerClient.cpp
+    WorkerProcessManager.cpp
 )
 
 if (APPLE)
     list(APPEND SOURCES
+        CrashReportPOSIX.cpp
         PlatformColorsMacOS.cpp
     )
+elseif (LINUX)
+    list(APPEND SOURCES CrashReportPOSIX.cpp)
 endif()
 
 set(GENERATED_SOURCES ${CURRENT_LIB_GENERATED})
@@ -67,14 +102,18 @@ set(GENERATED_SOURCES
     ${GENERATED_SOURCES}
     ../../Services/Compositor/CompositorControlClientEndpoint.h
     ../../Services/Compositor/CompositorControlServerEndpoint.h
+    ../../Services/Compositor/CompositorFontClientEndpoint.h
+    ../../Services/Compositor/CompositorFontServerEndpoint.h
     ../../Services/Compositor/CompositorWebContentClientEndpoint.h
     ../../Services/Compositor/CompositorWebContentServerEndpoint.h
     ../../Services/RequestServer/RequestClientEndpoint.h
     ../../Services/RequestServer/RequestServerEndpoint.h
     ../../Services/WebContent/WebContentClientEndpoint.h
     ../../Services/WebContent/WebContentServerEndpoint.h
-    ../../Services/WebContent/WebDriverClientEndpoint.h
-    ../../Services/WebContent/WebDriverServerEndpoint.h
+    ../../Services/WebContent/WebContentTestClientEndpoint.h
+    ../../Services/WebContent/WebContentTestServerEndpoint.h
+    ../../Services/WebDriver/WebDriverBrowserClientEndpoint.h
+    ../../Services/WebDriver/WebDriverBrowserServerEndpoint.h
     ../../Services/WebContent/WebUIClientEndpoint.h
     ../../Services/WebContent/WebUIServerEndpoint.h
     UIProcessClientEndpoint.h
@@ -83,17 +122,54 @@ set(GENERATED_SOURCES
 
 compile_ipc(${LADYBIRD_SOURCE_DIR}/Services/Compositor/CompositorControlClient.ipc ${CMAKE_BINARY_DIR}/Services/Compositor/CompositorControlClientEndpoint.h)
 compile_ipc(${LADYBIRD_SOURCE_DIR}/Services/Compositor/CompositorControlServer.ipc ${CMAKE_BINARY_DIR}/Services/Compositor/CompositorControlServerEndpoint.h)
+compile_ipc(${LADYBIRD_SOURCE_DIR}/Services/Compositor/CompositorFontClient.ipc ${CMAKE_BINARY_DIR}/Services/Compositor/CompositorFontClientEndpoint.h)
+compile_ipc(${LADYBIRD_SOURCE_DIR}/Services/Compositor/CompositorFontServer.ipc ${CMAKE_BINARY_DIR}/Services/Compositor/CompositorFontServerEndpoint.h)
 compile_ipc(${LADYBIRD_SOURCE_DIR}/Services/Compositor/CompositorWebContentClient.ipc ${CMAKE_BINARY_DIR}/Services/Compositor/CompositorWebContentClientEndpoint.h)
 compile_ipc(${LADYBIRD_SOURCE_DIR}/Services/Compositor/CompositorWebContentServer.ipc ${CMAKE_BINARY_DIR}/Services/Compositor/CompositorWebContentServerEndpoint.h)
 compile_ipc(${LADYBIRD_SOURCE_DIR}/Services/WebContent/WebContentClient.ipc ${CMAKE_BINARY_DIR}/Services/WebContent/WebContentClientEndpoint.h)
 compile_ipc(${LADYBIRD_SOURCE_DIR}/Services/WebContent/WebContentServer.ipc ${CMAKE_BINARY_DIR}/Services/WebContent/WebContentServerEndpoint.h)
-compile_ipc(${LADYBIRD_SOURCE_DIR}/Services/WebContent/WebDriverClient.ipc ${CMAKE_BINARY_DIR}/Services/WebContent/WebDriverClientEndpoint.h)
-compile_ipc(${LADYBIRD_SOURCE_DIR}/Services/WebContent/WebDriverServer.ipc ${CMAKE_BINARY_DIR}/Services/WebContent/WebDriverServerEndpoint.h)
+compile_ipc(${LADYBIRD_SOURCE_DIR}/Services/WebContent/WebContentTestClient.ipc ${CMAKE_BINARY_DIR}/Services/WebContent/WebContentTestClientEndpoint.h)
+compile_ipc(${LADYBIRD_SOURCE_DIR}/Services/WebContent/WebContentTestServer.ipc ${CMAKE_BINARY_DIR}/Services/WebContent/WebContentTestServerEndpoint.h)
+compile_ipc(${LADYBIRD_SOURCE_DIR}/Services/WebDriver/WebDriverBrowserClient.ipc ${CMAKE_BINARY_DIR}/Services/WebDriver/WebDriverBrowserClientEndpoint.h)
+compile_ipc(${LADYBIRD_SOURCE_DIR}/Services/WebDriver/WebDriverBrowserServer.ipc ${CMAKE_BINARY_DIR}/Services/WebDriver/WebDriverBrowserServerEndpoint.h)
 compile_ipc(${LADYBIRD_SOURCE_DIR}/Services/WebContent/WebUIClient.ipc ${CMAKE_BINARY_DIR}/Services/WebContent/WebUIClientEndpoint.h)
 compile_ipc(${LADYBIRD_SOURCE_DIR}/Services/WebContent/WebUIServer.ipc ${CMAKE_BINARY_DIR}/Services/WebContent/WebUIServerEndpoint.h)
 
+set(build_information_header "${CMAKE_CURRENT_BINARY_DIR}/BuildInformation.h")
+set(build_information_stamp "${CMAKE_CURRENT_BINARY_DIR}/BuildInformation.stamp")
+set(build_information_depfile "${CMAKE_CURRENT_BINARY_DIR}/BuildInformation.d")
+set(build_information_generator "${LADYBIRD_SOURCE_DIR}/Meta/Generators/generate-build-information.py")
+
+add_custom_command(
+    COMMAND
+        "${Python3_EXECUTABLE}" "${build_information_generator}"
+        "${LADYBIRD_SOURCE_DIR}" "${CMAKE_BINARY_DIR}" "${build_information_header}"
+        "${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}"
+        --depfile "${build_information_depfile}"
+        --stamp "${build_information_stamp}"
+    COMMAND
+        ${CMAKE_COMMAND} -E touch "${build_information_stamp}"
+    DEPENDS
+        "${build_information_generator}"
+        "${LADYBIRD_BUILD_HEAD}"
+        "${LADYBIRD_BUILD_HEAD_LOG}"
+        "${CMAKE_BINARY_DIR}/CMakeCache.txt"
+        "${CMAKE_BINARY_DIR}/compile_commands.json"
+    DEPFILE "${build_information_depfile}"
+    OUTPUT "${build_information_stamp}"
+    BYPRODUCTS "${build_information_header}"
+    VERBATIM
+)
+add_custom_target(generate_build_information DEPENDS ${build_information_stamp})
+
 ladybird_lib(LibWebView webview EXPLICIT_SYMBOL_EXPORT)
-target_link_libraries(LibWebView PRIVATE LibCore LibDatabase LibDevTools LibFileSystem LibGfx LibHTTP LibImageDecoderClient LibIPC LibRequests LibJS LibWeb LibUnicode LibURL LibSync LibSyntax LibTextCodec)
+add_dependencies(LibWebView generate_build_information)
+target_link_libraries(LibWebView PRIVATE LibCore LibCrypto LibDatabase LibDevTools LibFileSystem LibGC LibGfx LibHTTP LibImageDecoderClient LibIPC LibRequests LibJS LibMedia LibWeb LibUnicode LibURL LibSyntax LibTextCodec LibThreading)
+
+if (ENABLE_CRANELIFT_JIT)
+    target_link_libraries(LibWebView PRIVATE LibWasmCompilerClient)
+    target_compile_definitions(LibWebView PUBLIC HAVE_WASM_COMPILER_SERVICE=1)
+endif()
 
 # Third-party
 if (HAS_FONTCONFIG)

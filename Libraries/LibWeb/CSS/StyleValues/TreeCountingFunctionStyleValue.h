@@ -22,33 +22,24 @@ public:
         Integer
     };
 
-    static ValueComparingNonnullRefPtr<TreeCountingFunctionStyleValue const> create(TreeCountingFunction function, ComputedType computed_type)
-    {
-        return adopt_ref(*new (nothrow) TreeCountingFunctionStyleValue(function, computed_type));
-    }
     virtual ~TreeCountingFunctionStyleValue() override = default;
-
-    virtual void serialize(StringBuilder&, SerializationMode) const override;
 
     size_t resolve(DOM::AbstractElement const&) const;
 
-    virtual RefPtr<CalculationNode const> resolve_to_calculation_node(CalculationContext const&, CalculationResolutionContext const&) const override;
-    virtual ValueComparingNonnullRefPtr<StyleValue const> absolutized(ComputationContext const&) const override;
-
-    virtual bool equals(StyleValue const& other) const override;
-
-    virtual bool is_computationally_independent() const override { return false; }
+    virtual Optional<CalcNodeRef> resolve_to_calculation_node(CalculationContext const&, CalculationResolutionContext const&) const override;
+    ValueComparingNonnullRefPtr<StyleValue const> absolutized(ComputationContext const&) const;
 
 private:
-    TreeCountingFunctionStyleValue(TreeCountingFunction function, ComputedType computed_type)
-        : AbstractNonMathCalcFunctionStyleValue(Type::TreeCountingFunction)
-        , m_function(function)
-        , m_computed_type(computed_type)
+    // NB: StyleValue dispatches operations by type tag, so it may call private constructors.
+    friend class StyleValue;
+
+    TreeCountingFunction function() const { return static_cast<TreeCountingFunction>(m_value->tree_counting_function.function); }
+    ComputedType computed_type() const { return static_cast<ComputedType>(m_value->tree_counting_function.computed_type); }
+
+    explicit TreeCountingFunctionStyleValue(StyleValueFFI::StyleValueData const* data)
+        : AbstractNonMathCalcFunctionStyleValue(Type::TreeCountingFunction, data)
     {
     }
-
-    TreeCountingFunction m_function;
-    ComputedType m_computed_type;
 };
 
 }

@@ -20,29 +20,23 @@ public:
 
     Ratio resolved() const;
 
-    virtual ValueComparingNonnullRefPtr<StyleValue const> absolutized(ComputationContext const&) const override;
-
-    virtual void serialize(StringBuilder&, SerializationMode) const override;
-    Vector<Parser::ComponentValue> tokenize() const override;
-
-    bool properties_equal(RatioStyleValue const& other) const
-    {
-        return m_numerator == other.m_numerator
-            && m_denominator == other.m_denominator;
-    }
-
-    virtual bool is_computationally_independent() const override { return m_numerator->is_computationally_independent() && m_denominator->is_computationally_independent(); }
+    ValueComparingNonnullRefPtr<StyleValue const> absolutized(ComputationContext const&) const;
 
 private:
-    RatioStyleValue(ValueComparingNonnullRefPtr<StyleValue const> numerator, ValueComparingNonnullRefPtr<StyleValue const> denominator)
-        : StyleValueWithDefaultOperators(Type::Ratio)
-        , m_numerator(move(numerator))
-        , m_denominator(move(denominator))
+    friend class StyleValue;
+
+    explicit RatioStyleValue(StyleValueFFI::StyleValueData const* data)
+        : StyleValueWithDefaultOperators(Type::Ratio, data)
     {
     }
 
-    ValueComparingNonnullRefPtr<StyleValue const> m_numerator;
-    ValueComparingNonnullRefPtr<StyleValue const> m_denominator;
+    RatioStyleValue(ValueComparingNonnullRefPtr<StyleValue const> numerator, ValueComparingNonnullRefPtr<StyleValue const> denominator)
+        : StyleValueWithDefaultOperators(Type::Ratio, StyleValueFFI::rust_style_value_create_ratio(StyleValueFFI::rust_style_value_retain(numerator->rust_style_value_data()), StyleValueFFI::rust_style_value_retain(denominator->rust_style_value_data())))
+    {
+    }
+
+    ValueComparingNonnullRefPtr<StyleValue const> numerator() const { return wrap_rust_child(m_value->ratio.numerator); }
+    ValueComparingNonnullRefPtr<StyleValue const> denominator() const { return wrap_rust_child(m_value->ratio.denominator); }
 };
 
 }

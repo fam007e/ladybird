@@ -7,7 +7,9 @@
 #pragma once
 
 #include <AK/ByteString.h>
+#include <AK/StringView.h>
 #include <AK/Types.h>
+#include <AK/Utf16String.h>
 #include <LibHTTP/Cookie/Cookie.h>
 #include <LibHTTP/HSTS/ParsedHSTSPolicy.h>
 #include <LibIPC/ConnectionToServer.h>
@@ -16,6 +18,8 @@
 #include <LibWeb/HTML/WorkerAgentTypes.h>
 #include <LibWeb/Worker/WebWorkerClientEndpoint.h>
 #include <LibWeb/Worker/WebWorkerServerEndpoint.h>
+#include <LibWebView/BlobURLStore.h>
+#include <LibWebView/BrowsingSession.h>
 #include <LibWebView/Export.h>
 
 namespace WebView {
@@ -28,8 +32,11 @@ class WEBVIEW_API WebWorkerClient final
 public:
     using InitTransport = Messages::WebWorkerServer::InitTransport;
 
-    explicit WebWorkerClient(NonnullOwnPtr<IPC::Transport>, Web::HTML::WorkerAgentId agent_id);
+    WebWorkerClient(NonnullOwnPtr<IPC::Transport>, IsPrivate, Web::HTML::WorkerAgentId agent_id);
     ~WebWorkerClient();
+
+    IsPrivate is_private() const { return m_is_private; }
+    void remove_blob_url_entries();
 
     pid_t pid() const { return m_pid; }
     void set_pid(pid_t pid) { m_pid = pid; }
@@ -37,17 +44,29 @@ public:
     virtual void did_close_worker() override;
     virtual void did_finish_loading_worker_script(bool worker_is_secure_context) override;
     virtual void did_fail_loading_worker_script() override;
-    virtual void did_report_worker_exception(String message, String filename, u32 lineno, u32 colno) override;
+    virtual void did_report_worker_exception(Utf16String message, Utf16String filename, u32 lineno, u32 colno) override;
     virtual Messages::WebWorkerClient::DidRequestCookieResponse did_request_cookie(URL::URL, HTTP::Cookie::Source) override;
+    virtual Messages::WebWorkerClient::DidAddBlobUrlEntryResponse did_add_blob_url_entry(Utf16String url, Web::FileAPI::SerializedBlobURLEntry entry) override;
+    virtual void did_remove_blob_url_entries(Vector<Utf16String> urls, URL::Origin origin) override;
+    virtual Messages::WebWorkerClient::DidRequestBlobUrlEntryResponse did_request_blob_url_entry(Utf16String url, Optional<URL::BlobURLEntry::Token> token) override;
     virtual void did_request_file(ByteString path, i32 request_id) override;
     virtual void did_store_hsts_policy(String domain, HTTP::HSTS::ParsedHSTSPolicy policy) override;
     virtual Messages::WebWorkerClient::DidIsKnownHstsHostResponse did_is_known_hsts_host(String domain) override;
     virtual void did_post_broadcast_channel_message(Web::HTML::BroadcastChannelMessage) override;
     virtual Messages::WebWorkerClient::StartWorkerAgentResponse start_worker_agent(Web::HTML::WorkerAgentStartRequest request) override;
     virtual void close_worker_agent(Web::HTML::WorkerAgentId, Web::HTML::WorkerAgentOwnerToken) override;
+    virtual Messages::WebWorkerClient::OpenSystemFontResponse open_system_font(u64 generation, u64 face_id) override;
+    virtual Messages::WebWorkerClient::MatchSystemFontResponse match_system_font(String family, u16 weight, u16 width, u8 slope) override;
+    virtual Messages::WebWorkerClient::MatchSystemFontForCodePointResponse match_system_font_for_code_point(u32 code_point, u16 weight, u16 width, u8 slope, bool prefer_color_emoji) override;
+    virtual Messages::WebWorkerClient::ResolveGenericFontResponse resolve_generic_font(String family, u16 weight, u8 slope) override;
 
 private:
+    virtual void did_misbehave(StringView message_name, StringView reason) override;
+
     virtual void die() override;
+
+    IsPrivate m_is_private { IsPrivate::No };
+    WeakPtr<BrowsingSession> m_session;
 
     pid_t m_pid { -1 };
     Web::HTML::WorkerAgentId m_agent_id { 0 };

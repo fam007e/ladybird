@@ -14,10 +14,10 @@
 #include <AK/NumericLimits.h>
 #include <AK/String.h>
 #include <AK/Time.h>
+#include <AK/Utf16FlyString.h>
 #include <AK/Utf16String.h>
 #include <AK/Utf16View.h>
 #include <LibCore/AnonymousBuffer.h>
-#include <LibCore/Proxy.h>
 #include <LibIPC/Attachment.h>
 #include <LibIPC/Encoder.h>
 #include <LibIPC/File.h>
@@ -62,6 +62,12 @@ template<>
 ErrorOr<void> encode(Encoder& encoder, Utf16String const& value)
 {
     return encoder.encode(value.utf16_view());
+}
+
+template<>
+ErrorOr<void> encode(Encoder& encoder, Utf16FlyString const& value)
+{
+    return encoder.encode(value.view());
 }
 
 template<>
@@ -129,17 +135,20 @@ template<>
 ErrorOr<void> encode(Encoder& encoder, URL::URL const& value)
 {
     TRY(encoder.encode(value.serialize()));
+    TRY(encoder.encode(value.blob_url_entry()));
+    return {};
+}
 
-    if (!value.blob_url_entry().has_value())
-        return encoder.encode(false);
-
-    TRY(encoder.encode(true));
-
-    auto const& entry = value.blob_url_entry().value();
-
-    TRY(encoder.encode(entry.object));
+template<>
+ErrorOr<void> encode(Encoder& encoder, URL::BlobURLEntry const& entry)
+{
+    // NB: The entry's object stays in this process. Only the origin and the token are sent, and the receiver asks the
+    //     user agent's blob URL store for the object by token.
+    auto const* blob = entry.object.get_pointer<URL::BlobURLEntry::Blob>();
+    TRY(encoder.encode(blob != nullptr));
+    if (blob)
+        TRY(encoder.encode(blob->token));
     TRY(encoder.encode(entry.environment.origin));
-
     return {};
 }
 
@@ -169,6 +178,12 @@ ErrorOr<void> encode(Encoder& encoder, URL::Host const& host)
 }
 
 template<>
+ErrorOr<void> encode(Encoder& encoder, URL::OpaqueHost const& opaque_host)
+{
+    return encoder.encode(opaque_host.value);
+}
+
+template<>
 ErrorOr<void> encode(Encoder& encoder, File const& file)
 {
     int fd = file.take_fd();
@@ -190,33 +205,10 @@ ErrorOr<void> encode(Encoder& encoder, Core::AnonymousBuffer const& buffer)
     TRY(encoder.encode(buffer.is_valid()));
 
     if (buffer.is_valid()) {
-        TRY(encoder.encode_size(buffer.size()));
+        TRY(encoder.encode(static_cast<u64>(buffer.size())));
         TRY(encoder.encode(TRY(IPC::File::clone_fd(buffer.fd()))));
     }
 
-    return {};
-}
-
-template<>
-ErrorOr<void> encode(Encoder& encoder, Core::ProxyData const& proxy)
-{
-    TRY(encoder.encode(proxy.type));
-    TRY(encoder.encode(proxy.host_ipv4));
-    TRY(encoder.encode(proxy.port));
-    return {};
-}
-
-template<>
-ErrorOr<void> encode(Encoder& encoder, URL::BlobURLEntry::Blob const& blob)
-{
-    TRY(encoder.encode(blob.type));
-    TRY(encoder.encode(blob.data));
-    return {};
-}
-
-template<>
-ErrorOr<void> encode(Encoder&, URL::BlobURLEntry::MediaSource const&)
-{
     return {};
 }
 

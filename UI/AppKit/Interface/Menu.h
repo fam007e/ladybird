@@ -24,6 +24,7 @@ NSMenuItem* create_application_menu_item(WebView::Action&);
 NSMenuItem* create_application_menu_item(WebView::Menu&);
 
 NSButton* create_application_button(WebView::Action&);
+NSButton* create_application_button(WebView::Action&, Class button_class);
 NSImageView* create_application_icon(WebView::Action&);
 
 void add_control_properties(id control, WebView::Action const&);
@@ -31,5 +32,6 @@ void add_control_properties(id control, WebView::Menu const&);
 NSString* get_control_property(id control, NSString* key);
 
 void set_control_image(id control, NSString*);
+void set_control_image(id control, NSImage*);
 
 }

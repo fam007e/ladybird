@@ -4,9 +4,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibWeb/Bindings/HTMLTableColElement.h>
-#include <LibWeb/Bindings/Intrinsics.h>
-#include <LibWeb/CSS/ComputedProperties.h>
+#include <LibWeb/CSS/PropertyID.h>
 #include <LibWeb/HTML/HTMLTableColElement.h>
 #include <LibWeb/HTML/Numbers.h>
 #include <LibWeb/HTML/Parser/HTMLParser.h>
@@ -21,12 +19,6 @@ HTMLTableColElement::HTMLTableColElement(DOM::Document& document, DOM::Qualified
 }
 
 HTMLTableColElement::~HTMLTableColElement() = default;
-
-void HTMLTableColElement::initialize(JS::Realm& realm)
-{
-    WEB_SET_PROTOTYPE_FOR_INTERFACE(HTMLTableColElement);
-    Base::initialize(realm);
-}
 
 // https://html.spec.whatwg.org/multipage/tables.html#dom-colgroup-span
 WebIDL::UnsignedLong HTMLTableColElement::span() const
@@ -48,10 +40,10 @@ void HTMLTableColElement::set_span(unsigned int value)
 {
     if (value > 2147483647)
         value = 1;
-    set_attribute_value(HTML::AttributeNames::span, String::number(value));
+    set_attribute_value(HTML::AttributeNames::span, Utf16String::number(value));
 }
 
-bool HTMLTableColElement::is_presentational_hint(FlyString const& name) const
+bool HTMLTableColElement::is_presentational_hint(Utf16FlyString const& name) const
 {
     if (Base::is_presentational_hint(name))
         return true;
@@ -62,7 +54,7 @@ bool HTMLTableColElement::is_presentational_hint(FlyString const& name) const
 void HTMLTableColElement::apply_presentational_hints(Vector<CSS::StyleProperty>& properties) const
 {
     Base::apply_presentational_hints(properties);
-    for_each_attribute([&](auto& name, auto& value) {
+    for_each_attribute([&](Utf16FlyString const& name, Utf16View value) {
         // https://html.spec.whatwg.org/multipage/rendering.html#tables-2:maps-to-the-dimension-property-2
         if (name == HTML::AttributeNames::width) {
             if (auto parsed_value = parse_dimension_value(value))

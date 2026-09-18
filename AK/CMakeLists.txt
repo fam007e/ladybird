@@ -28,6 +28,7 @@ set(SOURCES
     StringConversions.cpp
     StringUtils.cpp
     StringView.cpp
+    ThreadID.cpp
     Time.cpp
     Utf16FlyString.cpp
     Utf16String.cpp
@@ -42,9 +43,17 @@ if (WIN32)
     list(APPEND SOURCES
         LexicalPathWindows.cpp
         DemangleWindows.cpp
+        ConditionVariableWindows.cpp
+        MutexWindows.cpp
+        RWLockWindows.cpp
     )
 else()
-    list(APPEND SOURCES LexicalPath.cpp)
+    list(APPEND SOURCES
+        LexicalPath.cpp
+        ConditionVariablePOSIX.cpp
+        MutexPOSIX.cpp
+        RWLockPOSIX.cpp
+    )
 endif()
 
 ladybird_lib(AK ak)
@@ -110,14 +119,6 @@ elseif (APPLE)
         set(ASSERTION_HANDLER_VISIBILITY INTERFACE)
     endif()
     target_link_options(AK ${ASSERTION_HANDLER_VISIBILITY} LINKER:-U,_ak_assertion_handler)
-    if (NOT BUILD_SHARED_LIBS)
-        target_link_options(AK INTERFACE
-            LINKER:-u,_ladybird_rust_alloc
-            LINKER:-u,_ladybird_rust_alloc_zeroed
-            LINKER:-u,_ladybird_rust_dealloc
-            LINKER:-u,_ladybird_rust_realloc
-        )
-    endif()
 endif()
 
 # Manually install AK headers

@@ -6,18 +6,30 @@
 
 #pragma once
 
+#include <AK/Optional.h>
+#include <AK/OwnPtr.h>
+#include <AK/RefPtr.h>
+#include <AK/Vector.h>
 #include <LibJS/Forward.h>
 #include <LibWeb/Bindings/AnalyserNode.h>
-#include <LibWeb/Bindings/PlatformObject.h>
 #include <LibWeb/WebAudio/AudioNode.h>
+#include <LibWeb/WebAudio/Rendering/FFT.h>
 #include <LibWeb/WebIDL/Buffers.h>
 #include <LibWeb/WebIDL/ExceptionOr.h>
 
+namespace Media {
+
+class SpscAudioFrameRing;
+
+}
+
 namespace Web::WebAudio {
+
+using AnalyserOptions = Bindings::AnalyserOptions;
 
 // https://webaudio.github.io/web-audio-api/#AnalyserNode
 class AnalyserNode : public AudioNode {
-    WEB_PLATFORM_OBJECT(AnalyserNode, AudioNode);
+    WEB_WRAPPABLE(AnalyserNode, AudioNode);
     GC_DECLARE_ALLOCATOR(AnalyserNode);
 
 public:
@@ -42,19 +54,28 @@ public:
     WebIDL::ExceptionOr<void> set_min_decibels(double);
     WebIDL::ExceptionOr<void> set_smoothing_time_constant(double);
 
-    static WebIDL::ExceptionOr<GC::Ref<AnalyserNode>> create(JS::Realm&, GC::Ref<BaseAudioContext>, Bindings::AnalyserOptions const& = {});
-    static WebIDL::ExceptionOr<GC::Ref<AnalyserNode>> construct_impl(JS::Realm&, GC::Ref<BaseAudioContext>, Bindings::AnalyserOptions const& = {});
+    static WebIDL::ExceptionOr<GC::Ref<AnalyserNode>> create(GC::Ref<BaseAudioContext>, AnalyserOptions const& = {});
+    static WebIDL::ExceptionOr<void> validate_options(AnalyserOptions const&);
+    static WebIDL::ExceptionOr<GC::Ref<AnalyserNode>> create_for_constructor(GC::Ref<BaseAudioContext>, AnalyserOptions const& = {});
 
 protected:
-    AnalyserNode(JS::Realm&, GC::Ref<BaseAudioContext>, Bindings::AnalyserOptions const& = {});
-
-    virtual void initialize(JS::Realm&) override;
+    AnalyserNode(GC::Ref<BaseAudioContext>, AnalyserOptions const& = {});
 
 private:
+    // https://webaudio.github.io/web-audio-api/#dom-analysernode-fftsize
+    // The maximum allowed fftSize; the node must keep this many past sample-frames around so
+    // that growing fftSize immediately exposes older data.
+    static constexpr unsigned long MAX_FFT_SIZE = 32768;
+
     unsigned long m_fft_size;
+    OwnPtr<Rendering::FFT> m_fft;
     double m_max_decibels;
     double m_min_decibels;
     double m_smoothing_time_constant;
+
+    void set_fft_size_without_validation(unsigned long);
+
+    void drain_time_domain_ring();
 
     // https://webaudio.github.io/web-audio-api/#current-frequency-data
     Vector<f32> current_frequency_data();
@@ -73,6 +94,17 @@ private:
 
     // https://webaudio.github.io/web-audio-api/#conversion-to-db
     Vector<f32> conversion_to_dB(Vector<f32> const& X_hat) const;
+
+    RefPtr<Media::SpscAudioFrameRing> m_time_domain_ring;
+
+    Vector<f32> m_history;
+    size_t m_history_write_index { 0 };
+    size_t m_history_valid_frames { 0 };
+
+    // Frequency data computed within the current render quantum, per the spec's requirement
+    // that repeated getter calls in one quantum return identical data.
+    Vector<f32> m_cached_frequency_data;
+    Optional<double> m_frequency_data_cache_time;
 };
 
 }

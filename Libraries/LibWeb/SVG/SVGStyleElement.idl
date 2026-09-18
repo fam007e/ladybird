@@ -3,7 +3,8 @@
 interface SVGStyleElement : SVGElement {
     [Reflect] attribute DOMString media;
     [Reflect] attribute DOMString title;
-    
+    attribute boolean disabled;
+
     // obsolete members
     [Reflect] attribute DOMString type;
 };

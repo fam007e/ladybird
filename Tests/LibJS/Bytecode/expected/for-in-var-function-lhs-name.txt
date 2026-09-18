@@ -1,13 +1,14 @@
-$491e5adb for-in-var-function-lhs-name.js:7:1
+$d0083583 for-in-var-function-lhs-name.js:7:1
   Registers: 7
   Blocks:    1
   Constants:
     [0] = Undefined
 
 block0:
-  [   0] GetGlobal dst:reg6, `fn`
-  [  10] Call dst:reg5, callee:reg6, this_value:Undefined, fn
-  [  30] End value:reg5
+  [   0] Enter
+  [   8] GetGlobal dst:reg6, `fn`
+  [  18] Call dst:reg5, callee:reg6, this_value:Undefined, fn
+  [  38] End value:reg5
 
 
 fn$c5d921e2 for-in-var-function-lhs-name.js:4:19
@@ -18,7 +19,8 @@ fn$c5d921e2 for-in-var-function-lhs-name.js:4:19
     [0] = Undefined
 
 block0:
-  [   0] Mov dst:f~0, src:Undefined
+  [   0] Enter
+  [   8] MovSrcUndefined dst:f~0
   [  10] NewFunction dst:reg5, shared_function_data_index:0 (f)
   [  28] Mov dst:f~0, src:reg5
   [  38] NewObject dst:reg5

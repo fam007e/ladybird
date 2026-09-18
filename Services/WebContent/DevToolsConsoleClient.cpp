@@ -8,10 +8,12 @@
 #include <AK/JsonObject.h>
 #include <AK/JsonValue.h>
 #include <AK/MemoryStream.h>
+#include <LibGC/Heap.h>
 #include <LibJS/Print.h>
 #include <LibJS/Runtime/BigInt.h>
 #include <LibJS/Runtime/ErrorData.h>
 #include <LibJS/Runtime/Realm.h>
+#include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/Scripting/TemporaryExecutionContext.h>
 #include <LibWeb/HTML/Window.h>
 #include <WebContent/ConsoleGlobalEnvironmentExtensions.h>
@@ -24,21 +26,21 @@ GC_DEFINE_ALLOCATOR(DevToolsConsoleClient);
 
 GC::Ref<DevToolsConsoleClient> DevToolsConsoleClient::create(JS::Realm& realm, JS::Console& console, PageClient& client)
 {
-    auto& window = as<Web::HTML::Window>(realm.global_object());
+    auto& window = Web::HTML::relevant_window(realm.global_object());
     auto console_global_environment_extensions = realm.create<ConsoleGlobalEnvironmentExtensions>(realm, window);
 
-    return realm.heap().allocate<DevToolsConsoleClient>(realm, console, client, console_global_environment_extensions);
+    return GC::Heap::the().allocate<DevToolsConsoleClient>(console, client, console_global_environment_extensions);
 }
 
-DevToolsConsoleClient::DevToolsConsoleClient(JS::Realm& realm, JS::Console& console, PageClient& client, ConsoleGlobalEnvironmentExtensions& console_global_environment_extensions)
-    : WebContentConsoleClient(realm, console, client, console_global_environment_extensions)
+DevToolsConsoleClient::DevToolsConsoleClient(JS::Console& console, PageClient& client, ConsoleGlobalEnvironmentExtensions& console_global_environment_extensions)
+    : WebContentConsoleClient(console, client, console_global_environment_extensions)
 {
 }
 
 DevToolsConsoleClient::~DevToolsConsoleClient() = default;
 
 // https://firefox-source-docs.mozilla.org/devtools/backend/protocol.html#grips
-static JsonValue serialize_js_value(JS::Realm& realm, JS::Value value)
+JsonValue DevToolsConsoleClient::serialize_value(JS::Realm& realm, JS::Value value)
 {
     auto& vm = realm.vm();
 
@@ -97,10 +99,11 @@ static JsonValue serialize_js_value(JS::Realm& realm, JS::Value value)
 
 void DevToolsConsoleClient::handle_result(JS::Value result)
 {
-    m_client->did_execute_js_console_input(serialize_js_value(m_realm, result));
+    auto& settings = Web::HTML::relevant_settings_object(*m_console_global_environment_extensions);
+    m_client->did_execute_js_console_input(serialize_value(settings.realm(), result));
 }
 
-void DevToolsConsoleClient::report_exception(String const& name, String const& message, JS::ErrorData const& error_data, bool in_promise)
+void DevToolsConsoleClient::report_exception(Utf16View name, Utf16View message, JS::ErrorData const& error_data, bool in_promise)
 {
     Vector<WebView::StackFrame> trace;
     trace.ensure_capacity(error_data.traceback().size());
@@ -125,8 +128,8 @@ void DevToolsConsoleClient::report_exception(String const& name, String const& m
     send_console_output({
         .timestamp = UnixDateTime::now(),
         .output = WebView::ConsoleError {
-            .name = name,
-            .message = message,
+            .name = MUST(name.to_utf8()),
+            .message = MUST(message.to_utf8()),
             .trace = move(trace),
             .inside_promise = in_promise,
         },
@@ -186,13 +189,16 @@ JS::ThrowCompletionOr<JS::Value> DevToolsConsoleClient::printer(JS::Console::Log
     serialized_arguments.ensure_capacity(argument_values.size());
 
     for (auto value : argument_values)
-        serialized_arguments.unchecked_append(serialize_js_value(m_console->realm(), value));
+        serialized_arguments.unchecked_append(serialize_value(m_console->realm(), value));
 
     send_console_output({
         .timestamp = UnixDateTime::now(),
         .output = WebView::ConsoleLog {
             .level = log_level,
             .arguments = move(serialized_arguments),
+            .type = WebView::ConsoleLogType::ConsoleAPI,
+            .location = {},
+            .stacktrace = {},
         },
     });
 

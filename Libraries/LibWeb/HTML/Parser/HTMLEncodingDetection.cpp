@@ -8,6 +8,8 @@
 #include <AK/CharacterTypes.h>
 #include <AK/GenericLexer.h>
 #include <AK/StringView.h>
+#include <AK/Utf16FlyString.h>
+#include <AK/Utf16StringBuilder.h>
 #include <LibTextCodec/Decoder.h>
 #include <LibURL/URL.h>
 #include <LibWeb/DOM/Attr.h>
@@ -18,6 +20,16 @@
 #include <LibWeb/Infra/CharacterTypes.h>
 
 namespace Web::HTML {
+
+static Utf16FlyString prescan_attribute_name(Utf16StringBuilder const& attribute_name)
+{
+    return Utf16FlyString::from_utf16(attribute_name.view());
+}
+
+static Utf16String prescan_attribute_value(Utf16StringBuilder& attribute_value)
+{
+    return attribute_value.to_string();
+}
 
 static bool prescan_should_abort(ReadonlyBytes input, size_t const& position)
 {
@@ -120,7 +132,7 @@ GC::Ptr<DOM::Attr> prescan_get_attribute(DOM::Document& document, ReadonlyBytes 
 
     // 3. Otherwise, the byte at position is the start of the attribute name. Let attribute name and attribute value be the empty string.
     // 4. Process the byte at position as follows:
-    StringBuilder attribute_name;
+    Utf16StringBuilder attribute_name;
     while (true) {
         // -> If it is 0x3D (=), and the attribute name is longer than the empty string
         if (input[position] == '=' && !attribute_name.is_empty()) {
@@ -136,7 +148,7 @@ GC::Ptr<DOM::Attr> prescan_get_attribute(DOM::Document& document, ReadonlyBytes 
         // -> If it is 0x2F (/) or 0x3E (>)
         if (input[position] == '/' || input[position] == '>') {
             // Abort the get an attribute algorithm. The attribute's name is the value of attribute name, its value is the empty string.
-            return DOM::Attr::create(document, MUST(attribute_name.to_string()), String {});
+            return DOM::Attr::create(document, prescan_attribute_name(attribute_name), Utf16String {});
         }
         // -> If it is in the range 0x41 (A) to 0x5A (Z)
         if (input[position] >= 'A' && input[position] <= 'Z') {
@@ -166,7 +178,7 @@ spaces:
     // 7. If the byte at position is not 0x3D (=), abort the get an attribute algorithm.
     //    The attribute's name is the value of attribute name, its value is the empty string.
     if (input[position] != '=')
-        return DOM::Attr::create(document, MUST(attribute_name.to_string()), String {});
+        return DOM::Attr::create(document, prescan_attribute_name(attribute_name), Utf16String {});
 
     // 8. Advance position past the 0x3D (=) byte.
     ++position;
@@ -177,7 +189,7 @@ value:
     if (!prescan_skip_whitespace_and_slashes(input, position))
         return {};
 
-    StringBuilder attribute_value;
+    Utf16StringBuilder attribute_value;
     // 10. Process the byte at position as follows:
 
     // -> If it is 0x22 (") or 0x27 (')
@@ -194,7 +206,7 @@ value:
             //    The attribute's name is the value of attribute name, and its value is the value of attribute value.
             if (input[position] == quote_character) {
                 ++position;
-                return DOM::Attr::create(document, MUST(attribute_name.to_string()), MUST(attribute_value.to_string()));
+                return DOM::Attr::create(document, prescan_attribute_name(attribute_name), prescan_attribute_value(attribute_value));
             }
 
             // 4. Otherwise, if the value of the byte at position is in the range 0x41 (A) to 0x5A (Z),
@@ -215,7 +227,7 @@ value:
     // -> If it is 0x3E (>)
     if (input[position] == '>') {
         // Abort the get an attribute algorithm. The attribute's name is the value of attribute name, its value is the empty string.
-        return DOM::Attr::create(document, MUST(attribute_name.to_string()), String {});
+        return DOM::Attr::create(document, prescan_attribute_name(attribute_name), Utf16String {});
     }
 
     // -> If it is in the range 0x41 (A) to 0x5A (Z)
@@ -241,7 +253,7 @@ value:
         // -> If it is 0x09 (HT), 0x0A (LF), 0x0C (FF), 0x0D (CR), 0x20 (SP), or 0x3E (>)
         if (is_whitespace_or_end_chevron(input[position])) {
             // Abort the get an attribute algorithm. The attribute's name is the value of attribute name and its value is the value of attribute value.
-            return DOM::Attr::create(document, MUST(attribute_name.to_string()), MUST(attribute_value.to_string()));
+            return DOM::Attr::create(document, prescan_attribute_name(attribute_name), prescan_attribute_value(attribute_value));
         }
 
         // -> If it is in the range 0x41 (A) to 0x5A (Z)
@@ -313,7 +325,7 @@ Optional<ByteString> run_prescan_byte_stream_algorithm(DOM::Document& document, 
             position += 6;
 
             // 2. Let attribute list be an empty list of strings.
-            Vector<FlyString> attribute_list {};
+            Vector<Utf16FlyString> attribute_list {};
 
             // 3. Let got pragma be false.
             bool got_pragma = false;
@@ -344,7 +356,7 @@ Optional<ByteString> run_prescan_byte_stream_algorithm(DOM::Document& document, 
                 //    * If the attribute's name is "http-equiv"
                 if (attribute_name == AttributeNames::http_equiv) {
                     // If the attribute's value is "content-type", then set got pragma to true.
-                    got_pragma = attribute->value() == "content-type";
+                    got_pragma = attribute->value() == "content-type"sv;
                 }
 
                 //    * If the attribute's name is "content"
@@ -478,13 +490,12 @@ ByteString extract_tld_hint(URL::URL const& url)
 }
 
 // https://html.spec.whatwg.org/multipage/parsing.html#determining-the-character-encoding
-ByteString run_encoding_sniffing_algorithm(DOM::Document& document, ReadonlyBytes input, Optional<MimeSniff::MimeType> maybe_mime_type)
+EncodingSniffingResult run_encoding_sniffing_algorithm(DOM::Document& document, ReadonlyBytes input, Optional<MimeSniff::MimeType> maybe_mime_type)
 {
     // 1. If the result of BOM sniffing is an encoding, return that encoding with confidence certain.
-    // FIXME: There is no concept of decoding certainty yet.
     auto bom = run_bom_sniff(input);
     if (bom.has_value())
-        return bom.value();
+        return { bom.release_value(), EncodingConfidence::Certain };
     // 2. FIXME: If the user has explicitly instructed the user agent to override the document's character encoding with a specific encoding,
     //    optionally return that encoding with the confidence certain.
 
@@ -498,7 +509,7 @@ ByteString run_encoding_sniffing_algorithm(DOM::Document& document, ReadonlyByte
         // FIXME: This is awkward because lecacy_extract_an_encoding can not fail
         auto maybe_transport_encoding = Fetch::Infrastructure::legacy_extract_an_encoding(maybe_mime_type, "invalid"sv);
         if (maybe_transport_encoding != "invalid"sv)
-            return maybe_transport_encoding;
+            return { maybe_transport_encoding, EncodingConfidence::Certain };
     }
 
     // 5. Optionally, prescan the byte stream to determine its encoding, with the end condition being when the user agent decides that scanning further bytes would not
@@ -507,7 +518,7 @@ ByteString run_encoding_sniffing_algorithm(DOM::Document& document, ReadonlyByte
     //    The aforementioned algorithm returns either a character encoding or failure. If it returns a character encoding, then return the same encoding, with confidence tentative.
     auto prescan = run_prescan_byte_stream_algorithm(document, input);
     if (prescan.has_value())
-        return prescan.value();
+        return { prescan.release_value(), EncodingConfidence::Tentative };
 
     // 6. FIXME: If the HTML parser for which this algorithm is being run is associated with a Document d whose container document is non-null, then:
     // 1. Let parentDocument be d's container document.
@@ -540,13 +551,13 @@ ByteString run_encoding_sniffing_algorithm(DOM::Document& document, ReadonlyByte
         auto detected = StringView { reinterpret_cast<char const*>(encoding_name_ptr), encoding_name_len };
         auto standardized = TextCodec::get_standardized_encoding(detected);
         if (standardized.has_value())
-            return ByteString { standardized.value() };
+            return { ByteString { standardized.value() }, EncodingConfidence::Tentative };
     }
 
     // 9. Otherwise, return an implementation-defined or user-specified default character encoding, with the confidence tentative.
     //    In controlled environments or in environments where the encoding of documents can be prescribed (for example, for user agents intended for dedicated use in new
     //    networks), the comprehensive UTF-8 encoding is suggested.
-    return "UTF-8";
+    return { "UTF-8", EncodingConfidence::Tentative };
 }
 
 }

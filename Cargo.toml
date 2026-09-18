@@ -1,6 +1,8 @@
 [workspace]
 members = [
+    "AK/Rust",
     "Libraries/LibGfx/Rust",
+    "Libraries/LibImageDecoders/Rust",
     "Libraries/LibJS/Rust",
     "Libraries/LibRegex/Rust",
     "Libraries/LibTextCodec/Rust",
@@ -12,7 +14,7 @@ members = [
     "Libraries/LibWeb/HTML/Parser/Rust",
 ]
 exclude = [
-    "Libraries/LibJS/AsmIntGen",
+    "Libraries/LibJS/Flap",
 ]
 resolver = "2"
 

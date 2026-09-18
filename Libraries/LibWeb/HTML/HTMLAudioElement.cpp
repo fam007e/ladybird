@@ -4,12 +4,12 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <LibGC/Heap.h>
 #include <LibWeb/Bindings/HTMLAudioElement.h>
-#include <LibWeb/CSS/ComputedProperties.h>
 #include <LibWeb/CSS/StyleValues/DisplayStyleValue.h>
 #include <LibWeb/HTML/HTMLAudioElement.h>
 #include <LibWeb/HTML/Window.h>
-#include <LibWeb/Layout/AudioBox.h>
+#include <LibWeb/Layout/Box.h>
 
 namespace Web::HTML {
 
@@ -22,39 +22,16 @@ HTMLAudioElement::HTMLAudioElement(DOM::Document& document, DOM::QualifiedName q
 
 HTMLAudioElement::~HTMLAudioElement() = default;
 
-void HTMLAudioElement::initialize(JS::Realm& realm)
+Layout::Node* HTMLAudioElement::create_layout_node(CSS::LayoutStyle style)
 {
-    WEB_SET_PROTOTYPE_FOR_INTERFACE(HTMLAudioElement);
-    Base::initialize(realm);
-}
-
-void HTMLAudioElement::adjust_computed_style(CSS::ComputedProperties::Builder& style)
-{
-    Base::adjust_computed_style(style);
-
-    // https://html.spec.whatwg.org/multipage/rendering.html#embedded-content-rendering-rules
-    if (!has_attribute(AttributeNames::controls))
-        style.set_property(CSS::PropertyID::Display, CSS::DisplayStyleValue::create(CSS::Display::from_short(CSS::Display::Short::None)));
-}
-
-RefPtr<Layout::Node> HTMLAudioElement::create_layout_node(CSS::ComputedProperties const& style)
-{
-    return make_ref_counted<Layout::AudioBox>(document(), *this, style);
-}
-
-Layout::AudioBox* HTMLAudioElement::layout_node()
-{
-    return static_cast<Layout::AudioBox*>(Node::layout_node());
+    auto& audio_box = Layout::allocate_layout_node<Layout::Box>(document(), *this, style, Layout::RustFFI::NodeKind::AudioBox);
+    audio_box.set_replaced_box_can_have_children(shadow_root() != nullptr);
+    return &audio_box;
 }
 
 bool HTMLAudioElement::should_paint() const
 {
     return has_attribute(HTML::AttributeNames::controls) || is_scripting_disabled();
-}
-
-Layout::AudioBox const* HTMLAudioElement::layout_node() const
-{
-    return static_cast<Layout::AudioBox const*>(Node::layout_node());
 }
 
 }

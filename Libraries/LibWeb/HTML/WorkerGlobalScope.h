@@ -9,18 +9,47 @@
 
 #include <AK/Optional.h>
 #include <AK/RefCounted.h>
+#include <AK/Utf16String.h>
 #include <LibCore/Socket.h>
+#include <LibJS/Forward.h>
 #include <LibURL/URL.h>
 #include <LibWeb/DOM/EventTarget.h>
 #include <LibWeb/Export.h>
 #include <LibWeb/Forward.h>
 #include <LibWeb/HTML/Scripting/Fetching.h>
 #include <LibWeb/HTML/Scripting/SerializedEnvironmentSettingsObject.h>
-#include <LibWeb/HTML/UniversalGlobalScope.h>
 #include <LibWeb/HTML/WindowOrWorkerGlobalScope.h>
 #include <LibWeb/HTML/WorkerLocation.h>
 #include <LibWeb/HTML/WorkerNavigator.h>
+#include <LibWeb/HTML/WorkerTypes.h>
 #include <LibWeb/WebIDL/ExceptionOr.h>
+
+namespace Web::HTML {
+
+class WorkerGlobalScope;
+
+}
+
+namespace Web::Bindings {
+
+WEB_API HTML::WorkerGlobalScope* worker_global_scope_from_global_object(JS::Object&);
+WEB_API HTML::WorkerGlobalScope const* worker_global_scope_from_global_object(JS::Object const&);
+WEB_API JS::Realm& main_world_realm(HTML::WorkerGlobalScope const&);
+WEB_API void initialize_worker_web_interfaces(HTML::WorkerGlobalScope&);
+
+}
+
+namespace Web::ServiceWorker {
+
+class ServiceWorkerGlobalScope;
+
+}
+
+namespace Web::Bindings {
+
+WEB_API ServiceWorker::ServiceWorkerGlobalScope* service_worker_global_scope_from_global_object(JS::Object&);
+
+}
 
 #define ENUMERATE_WORKER_GLOBAL_SCOPE_EVENT_HANDLERS(E)       \
     E(onerror, HTML::EventNames::error)                       \
@@ -37,10 +66,12 @@ namespace Web::HTML {
 // user agent runs the run a worker algorithm.
 class WEB_API WorkerGlobalScope
     : public DOM::EventTarget
-    , public WindowOrWorkerGlobalScopeMixin
-    , public UniversalGlobalScopeMixin {
-    WEB_PLATFORM_OBJECT(WorkerGlobalScope, DOM::EventTarget);
+    , public WindowOrWorkerGlobalScopeMixin {
+    WEB_WRAPPABLE(WorkerGlobalScope, DOM::EventTarget);
     GC_DECLARE_ALLOCATOR(WorkerGlobalScope);
+
+    friend JS::Realm& Bindings::main_world_realm(WorkerGlobalScope const&);
+    friend void Bindings::initialize_worker_web_interfaces(WorkerGlobalScope&);
 
 public:
     using Owner = Variant<SerializedDocument, SerializedWorkerGlobalScope>;
@@ -49,21 +80,11 @@ public:
 
     virtual ~WorkerGlobalScope() override;
 
+    JS::Realm& realm() const;
+
     // ^WindowOrWorkerGlobalScopeMixin
     virtual DOM::EventTarget& this_impl() override { return *this; }
     virtual DOM::EventTarget const& this_impl() const override { return *this; }
-
-    using UniversalGlobalScopeMixin::atob;
-    using UniversalGlobalScopeMixin::btoa;
-    using UniversalGlobalScopeMixin::queue_microtask;
-    using UniversalGlobalScopeMixin::structured_clone;
-    using WindowOrWorkerGlobalScopeMixin::clear_interval;
-    using WindowOrWorkerGlobalScopeMixin::clear_timeout;
-    using WindowOrWorkerGlobalScopeMixin::create_image_bitmap;
-    using WindowOrWorkerGlobalScopeMixin::fetch;
-    using WindowOrWorkerGlobalScopeMixin::performance;
-    using WindowOrWorkerGlobalScopeMixin::set_interval;
-    using WindowOrWorkerGlobalScopeMixin::set_timeout;
 
     // Following methods are from the WorkerGlobalScope IDL definition
     // https://html.spec.whatwg.org/multipage/workers.html#the-workerglobalscope-common-interface
@@ -72,11 +93,10 @@ public:
     GC::Ref<WorkerGlobalScope const> self() const { return *this; }
 
     virtual Optional<URL::Origin> extract_an_origin() const override { return window_or_worker_global_scope_extract_an_origin(); }
-    virtual JS::ThrowCompletionOr<bool> internal_set_prototype_of(JS::Object* prototype) override;
 
     GC::Ref<WorkerLocation> location() const;
     GC::Ref<WorkerNavigator> navigator() const;
-    WebIDL::ExceptionOr<void> import_scripts(Vector<String> const& urls, PerformTheFetchHook = nullptr);
+    WebIDL::ExceptionOr<void> import_scripts(Vector<Utf16String> const& urls, PerformTheFetchHook = nullptr);
 
 #undef __ENUMERATE
 #define __ENUMERATE(attribute_name, event_name)       \
@@ -92,19 +112,21 @@ public:
     URL::URL const& url() const { return m_url.value(); }
     void set_url(URL::URL const& url) { m_url = url; }
 
-    String const& name() const { return m_name; }
-    void set_name(String name) { m_name = move(name); }
+    // https://html.spec.whatwg.org/multipage/workers.html#concept-workerglobalscope-cross-origin-isolated-capability
+    bool cross_origin_isolated_capability() const { return m_cross_origin_isolated_capability; }
+    void set_cross_origin_isolated_capability(bool value) { m_cross_origin_isolated_capability = value; }
 
-    Bindings::WorkerType type() const { return m_type; }
-    void set_type(Bindings::WorkerType type) { m_type = type; }
+    Utf16String const& name() const { return m_name; }
+    void set_name(Utf16String name) { m_name = move(name); }
+
+    WorkerType type() const { return m_type; }
+    void set_type(WorkerType type) { m_type = type; }
 
     // Spec note: While the WorkerLocation object is created after the WorkerGlobalScope object,
     //            this is not problematic as it cannot be observed from script.
     void set_location(GC::Ref<WorkerLocation> loc) { m_location = move(loc); }
 
     void set_internal_port(GC::Ref<MessagePort> port);
-
-    void initialize_web_interfaces(Badge<WorkerEnvironmentSettingsObject>) { initialize_web_interfaces_impl(); }
 
     Web::Page* page() { return m_page.ptr(); }
 
@@ -119,7 +141,7 @@ public:
     auto const& owner_set() const { return m_owner_set; }
 
 protected:
-    explicit WorkerGlobalScope(JS::Realm&, GC::Ref<Web::Page>);
+    explicit WorkerGlobalScope(GC::Ref<Web::Page>);
 
     virtual void visit_edges(Cell::Visitor&) override;
 
@@ -132,8 +154,6 @@ protected:
     GC::Ptr<MessagePort> m_internal_port;
 
 private:
-    virtual bool is_universal_global_scope_mixin() const final { return true; }
-
     GC::Ptr<WorkerLocation> m_location;
     GC::Ptr<WorkerNavigator> m_navigator;
 
@@ -145,7 +165,7 @@ private:
 
     // https://html.spec.whatwg.org/multipage/workers.html#concept-workerglobalscope-type
     // A WorkerGlobalScope object has an associated type ("classic" or "module"). It is set during creation.
-    Bindings::WorkerType m_type { Bindings::WorkerType::Classic };
+    WorkerType m_type { WorkerType::Classic };
 
     // https://html.spec.whatwg.org/multipage/workers.html#concept-workerglobalscope-url
     // A WorkerGlobalScope object has an associated url (null or a URL). It is initially null.
@@ -157,7 +177,7 @@ private:
     //        For DedicatedWorkerGlobalScope instances, it is simply a developer-supplied name, useful mostly for debugging purposes.
     //        For SharedWorkerGlobalScope instances, it allows obtaining a reference to a common shared worker via the SharedWorker() constructor.
     //        For ServiceWorkerGlobalScope objects, it doesn't make sense (and as such isn't exposed through the JavaScript API at all).
-    String m_name;
+    Utf16String m_name;
 
     // https://html.spec.whatwg.org/multipage/workers.html#concept-workerglobalscope-policy-container
     // A WorkerGlobalScope object has an associated policy container (a policy container). It is initially a new policy container.

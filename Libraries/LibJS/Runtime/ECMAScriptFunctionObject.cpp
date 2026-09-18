@@ -75,8 +75,8 @@ GC::Ref<ECMAScriptFunctionObject> ECMAScriptFunctionObject::create_from_function
 
 ECMAScriptFunctionObject::ECMAScriptFunctionObject(
     GC::Ref<SharedFunctionInstanceData> shared_data,
-    Environment* parent_environment,
-    PrivateEnvironment* private_environment,
+    GC::Ptr<Environment> parent_environment,
+    GC::Ptr<PrivateEnvironment> private_environment,
     Object& prototype)
     : FunctionObject(prototype)
     , m_shared_data(shared_data)
@@ -84,13 +84,27 @@ ECMAScriptFunctionObject::ECMAScriptFunctionObject(
     , m_private_environment(private_environment)
 {
     set_is_ecmascript_function_object();
-    if (!is_arrow_function() && kind() == FunctionKind::Normal) {
-        auto normal_function_shape = realm()->intrinsics().normal_function_shape();
-        if (normal_function_shape->prototype() == &prototype)
-            unsafe_set_shape(normal_function_shape);
-        else
-            unsafe_set_shape(*normal_function_shape->create_prototype_transition(&prototype));
-    }
+
+    // OPTIMIZATION: Start from a premade shape that already has this function kind's own properties in spec order.
+    //               Arrow functions use the same shape as other functions of their kind, but never get a lazy prototype.
+    auto& intrinsics = realm()->intrinsics();
+    auto function_shape = [&] {
+        switch (kind()) {
+        case FunctionKind::Normal:
+            return intrinsics.normal_function_shape();
+        case FunctionKind::Generator:
+            return intrinsics.generator_function_shape();
+        case FunctionKind::Async:
+            return intrinsics.async_function_shape();
+        case FunctionKind::AsyncGenerator:
+            return intrinsics.async_generator_function_shape();
+        }
+        VERIFY_NOT_REACHED();
+    }();
+    if (function_shape->prototype() == &prototype)
+        unsafe_set_shape(function_shape);
+    else
+        unsafe_set_shape(*function_shape->create_prototype_transition(&prototype));
 
     // 15. Set F.[[ScriptOrModule]] to GetActiveScriptOrModule().
     m_script_or_module = vm().get_active_script_or_module();
@@ -108,37 +122,29 @@ void ECMAScriptFunctionObject::initialize(Realm& realm)
 
     m_name_string = PrimitiveString::create(vm, name());
 
-    if (!is_arrow_function() && kind() == FunctionKind::Normal) {
-        put_direct(realm.intrinsics().normal_function_length_offset(), Value(function_length()));
-        put_direct(realm.intrinsics().normal_function_name_offset(), m_name_string);
-        m_may_need_lazy_prototype_instantiation = true;
-    } else {
-        PropertyDescriptor length_descriptor { .value = Value(function_length()), .writable = false, .enumerable = false, .configurable = true };
-        MUST(define_property_or_throw(vm.names.length, length_descriptor));
-        PropertyDescriptor name_descriptor { .value = m_name_string, .writable = false, .enumerable = false, .configurable = true };
-        MUST(define_property_or_throw(vm.names.name, name_descriptor));
+    // NOTE: The constructor gave us a premade shape with "length" and "name" (and "prototype" for generator kinds) at
+    //       these offsets, with the attributes the spec requires, so we only have to store the values.
+    put_direct(realm.intrinsics().normal_function_length_offset(), Value(function_length()));
+    put_direct(realm.intrinsics().normal_function_name_offset(), m_name_string);
 
-        if (!is_arrow_function()) {
-            Object* prototype = nullptr;
-            switch (kind()) {
-            case FunctionKind::Normal:
-                VERIFY_NOT_REACHED();
-                break;
-            case FunctionKind::Generator:
-                // prototype is "g1.prototype" in figure-2 (https://tc39.es/ecma262/img/figure-2.png)
-                prototype = Object::create_prototype(realm, realm.intrinsics().generator_function_prototype_prototype());
-                break;
-            case FunctionKind::Async:
-                break;
-            case FunctionKind::AsyncGenerator:
-                prototype = Object::create_prototype(realm, realm.intrinsics().async_generator_function_prototype_prototype());
-                break;
-            }
-            // 27.7.4 AsyncFunction Instances, https://tc39.es/ecma262/#sec-async-function-instances
-            // AsyncFunction instances do not have a prototype property as they are not constructible.
-            if (kind() != FunctionKind::Async)
-                define_direct_property(vm.names.prototype, prototype, Attribute::Writable);
-        }
+    switch (kind()) {
+    case FunctionKind::Normal:
+        if (!is_arrow_function())
+            m_may_need_lazy_prototype_instantiation = true;
+        break;
+    case FunctionKind::Generator:
+        // prototype is "g1.prototype" in figure-2 (https://tc39.es/ecma262/img/figure-2.png)
+        put_direct(realm.intrinsics().generator_function_prototype_property_offset(),
+            Object::create_prototype(realm, realm.intrinsics().generator_function_prototype_prototype()));
+        break;
+    case FunctionKind::Async:
+        // 27.7.4 AsyncFunction Instances, https://tc39.es/ecma262/#sec-async-function-instances
+        // AsyncFunction instances do not have a prototype property as they are not constructible.
+        break;
+    case FunctionKind::AsyncGenerator:
+        put_direct(realm.intrinsics().generator_function_prototype_property_offset(),
+            Object::create_prototype(realm, realm.intrinsics().async_generator_function_prototype_prototype()));
+        break;
     }
 }
 
@@ -151,7 +157,7 @@ void ECMAScriptFunctionObject::get_stack_frame_info(size_t& registers_and_locals
         m_shared_data->set_executable(rust_executable);
         executable = rust_executable;
         executable->name = name();
-        if (Bytecode::g_dump_bytecode)
+        if (Bytecode::should_dump_bytecode())
             executable->dump();
         m_shared_data->clear_compile_inputs();
     }
@@ -425,22 +431,6 @@ void ECMAScriptFunctionObject::ordinary_call_bind_this(VM& vm, ExecutionContext&
 }
 
 // 27.7.5.1 AsyncFunctionStart ( promiseCapability, asyncFunctionBody ), https://tc39.es/ecma262/#sec-async-functions-abstract-operations-async-function-start
-template<typename T>
-void async_function_start(VM& vm, PromiseCapability const& promise_capability, T const& async_function_body)
-{
-    // 1. Let runningContext be the running execution context.
-    auto& running_context = vm.running_execution_context();
-
-    // 2. Let asyncContext be a copy of runningContext.
-    auto async_context = running_context.copy();
-
-    // 3. NOTE: Copying the execution state is required for AsyncBlockStart to resume its execution. It is ill-defined to resume a currently executing context.
-
-    // 4. Perform AsyncBlockStart(promiseCapability, asyncFunctionBody, asyncContext).
-    async_block_start(vm, async_function_body, promise_capability, *async_context);
-
-    // 5. Return unused.
-}
 
 // 27.7.5.2 AsyncBlockStart ( promiseCapability, asyncBody, asyncContext ), https://tc39.es/ecma262/#sec-asyncblockstart
 template<typename T>
@@ -509,7 +499,6 @@ void async_block_start(VM& vm, T const& async_body, PromiseCapability const& pro
 }
 
 template void async_block_start(VM&, GC::Function<Completion()> const& async_body, PromiseCapability const&, ExecutionContext&);
-template void async_function_start(VM&, PromiseCapability const&, GC::Function<Completion()> const& async_function_body);
 
 // 10.2.1.4 OrdinaryCallEvaluateBody ( F, argumentsList ), https://tc39.es/ecma262/#sec-ordinarycallevaluatebody
 // 15.8.4 Runtime Semantics: EvaluateAsyncFunctionBody, https://tc39.es/ecma262/#sec-runtime-semantics-evaluatefunctionbody

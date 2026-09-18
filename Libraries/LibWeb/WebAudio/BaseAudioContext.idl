@@ -8,14 +8,14 @@ callback DecodeSuccessCallback = undefined (AudioBuffer decodedData);
 // https://webaudio.github.io/web-audio-api/#BaseAudioContext
 [Exposed=Window]
 interface BaseAudioContext : EventTarget {
-    readonly attribute AudioDestinationNode destination;
+    [DirectGetter] readonly attribute AudioDestinationNode destination;
     readonly attribute float sampleRate;
     readonly attribute double currentTime;
     readonly attribute AudioListener listener;
     readonly attribute AudioContextState state;
     readonly attribute unsigned long renderQuantumSize;
     // FIXME: [SameObject, SecureContext]
-    [FIXME] readonly attribute AudioWorklet audioWorklet;
+    [SecureContext] readonly attribute AudioWorklet audioWorklet;
     attribute EventHandler onstatechange;
 
     AnalyserNode createAnalyser ();
@@ -25,7 +25,7 @@ interface BaseAudioContext : EventTarget {
     ChannelMergerNode createChannelMerger (optional unsigned long numberOfInputs = 6);
     ChannelSplitterNode createChannelSplitter (optional unsigned long numberOfOutputs = 6);
     ConstantSourceNode createConstantSource ();
-    [FIXME] ConvolverNode createConvolver ();
+    ConvolverNode createConvolver ();
     DelayNode createDelay (optional double maxDelayTime = 1.0);
     DynamicsCompressorNode createDynamicsCompressor();
     GainNode createGain();

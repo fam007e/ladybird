@@ -47,7 +47,7 @@ public:
         other.m_value = { .short_ascii_string = ShortString::create_empty() };
     }
 
-    constexpr ~Utf16StringBase()
+    ALWAYS_INLINE constexpr ~Utf16StringBase()
     {
         if !consteval {
             destroy_string();
@@ -286,6 +286,16 @@ public:
         }
     }
 
+    [[nodiscard]] ALWAYS_INLINE bool has_fly_string_storage() const
+    {
+        if (has_short_ascii_storage())
+            return true;
+        auto const* data = data_without_union_member_assertion();
+        return !data || data->is_fly_string();
+    }
+
+    [[nodiscard]] constexpr FlatPtr raw_identity() const { return raw(); }
+
     // This is primarily interesting to unit tests.
     [[nodiscard]] ALWAYS_INLINE bool has_long_ascii_storage() const
     {
@@ -326,13 +336,6 @@ public:
         return data_without_union_member_assertion();
     }
 
-    ALWAYS_INLINE void set_data(Badge<Utf16FlyString>, Utf16StringData const* data)
-    {
-        auto const** this_data = __builtin_launder(&m_value.data);
-        (*this_data) = data;
-        (*this_data)->ref();
-    }
-
     template<OneOf<Utf16String, Utf16FlyString> T>
     constexpr Utf16StringBase(Badge<T>, nullptr_t)
         : m_value { .data = nullptr }
@@ -340,6 +343,26 @@ public:
     }
 
     [[nodiscard]] constexpr FlatPtr raw(Badge<Utf16FlyString>) const { return raw(); }
+
+    template<OneOf<Utf16String, Utf16FlyString> T>
+    [[nodiscard]] constexpr FlatPtr leak_raw(Badge<T>)
+    {
+        auto raw_value = raw();
+        m_value = { .short_ascii_string = ShortString::create_empty() };
+        return raw_value;
+    }
+
+    // NB: Adopts a raw value previously produced by raw(), together with ownership of one
+    //     reference to its data if it has long storage. For FFI bridges that retain the raw
+    //     representation of a string.
+    template<OneOf<Utf16String, Utf16FlyString> T>
+    [[nodiscard]] ALWAYS_INLINE static Utf16StringBase adopt_raw(Badge<T>, FlatPtr raw)
+    {
+        Utf16StringBase string;
+        auto const** data = __builtin_launder(&string.m_value.data);
+        *data = bit_cast<Utf16StringData const*>(raw);
+        return string;
+    }
 
 protected:
     [[nodiscard]] constexpr FlatPtr raw() const { return bit_cast<FlatPtr>(m_value); }

@@ -7,7 +7,11 @@
 
 #pragma once
 
+#include <AK/Optional.h>
+#include <LibWakeLock/DisplaySleepInhibitor.h>
 #include <LibWeb/HTML/AudioPlayState.h>
+#include <LibWeb/Page/PageId.h>
+#include <LibWeb/Page/ScreenWakeLockHandle.h>
 #include <LibWebView/FileDownloader.h>
 #include <LibWebView/Settings.h>
 #include <UI/Qt/BookmarksBar.h>
@@ -19,15 +23,21 @@
 #include <QLabel>
 #include <QMenu>
 #include <QPointer>
+#include <QPushButton>
 #include <QToolButton>
 #include <QWidget>
 
 class QTimer;
+class QColorDialog;
+class QFileDialog;
+class QMessageBox;
 namespace Ladybird {
 
 class BrowserWindow;
 enum class ChromeIcon;
 class DownloadsPopover;
+class JavaScriptDialog;
+class PrivateSessionPopover;
 class WindowControlButton;
 
 class HyperlinkLabel final : public QLabel {
@@ -35,8 +45,9 @@ class HyperlinkLabel final : public QLabel {
 
 public:
     explicit HyperlinkLabel(QWidget* parent = nullptr)
-        : QLabel(parent)
+        : QLabel(parent, Qt::ToolTip | Qt::FramelessWindowHint | Qt::NoDropShadowWindowHint)
     {
+        setAttribute(Qt::WA_ShowWithoutActivating);
         setMouseTracking(true);
     }
 
@@ -56,7 +67,7 @@ class Tab final
     Q_OBJECT
 
 public:
-    Tab(BrowserWindow* window, RefPtr<WebView::WebContentClient> parent_client = nullptr, size_t page_index = 0);
+    Tab(BrowserWindow* window, RefPtr<WebView::WebContentClient> parent_client = nullptr, Web::PageId page_index = 0);
     virtual ~Tab() override;
 
     WebContentView& view() { return *m_view; }
@@ -97,7 +108,6 @@ public:
 
 public slots:
     void focus_location_editor();
-    void location_edit_return_pressed();
 
 signals:
     void title_changed(int id, QString const&);
@@ -105,26 +115,29 @@ signals:
     void audio_play_state_changed(int id, Web::HTML::AudioPlayState);
 
 private:
+    void location_edit_return_pressed(String, Optional<URL::URL>, WebView::OmniboxDestinationKind);
     virtual void resizeEvent(QResizeEvent*) override;
+    virtual void hideEvent(QHideEvent*) override;
     virtual bool event(QEvent*) override;
 
     virtual void tab_settings_changed() override;
-    virtual void show_menu_bar_changed() override;
     virtual void config_variable_changed(WebView::ConfigVariableID) override;
 
     void recreate_toolbar_icons();
     void update_vertical_tabs_toolbar_button_placement();
     void connect_hamburger_menu();
-    void update_hamburger_menu();
     void update_chrome_style();
     void update_tab_title();
     void update_downloads_button();
     void update_downloads_popover();
     void show_downloads_popover();
     void position_downloads_popover();
+    void show_private_session_popover();
+    void position_private_session_popover();
     void set_loading(bool);
     void update_tab_icon();
     int tab_index();
+    void set_screen_wake_lock_state(Web::ScreenWakeLockState);
 
     virtual void download_added(WebView::FileDownloader::Download const&) override;
     virtual void download_updated(WebView::FileDownloader::Download const&) override;
@@ -132,9 +145,9 @@ private:
 
     QWidget* m_toolbar_container { nullptr };
     QWidget* m_toolbar { nullptr };
+    QWidget* m_performance_monitor { nullptr };
     QWidget* m_toolbar_window_controls_separator { nullptr };
     QWidget* m_toolbar_window_controls { nullptr };
-    QSpacerItem* m_toolbar_window_controls_spacer { nullptr };
     QSpacerItem* m_sidebar_toggle_navigation_spacer { nullptr };
     QToolButton* m_left_toggle_vertical_tabs_expanded_button { nullptr };
     QToolButton* m_right_toggle_vertical_tabs_expanded_button { nullptr };
@@ -142,12 +155,15 @@ private:
     WindowControlButton* m_maximize_window_button { nullptr };
     WindowControlButton* m_close_window_button { nullptr };
     BookmarksBar* m_bookmarks_bar { nullptr };
+    QPushButton* m_private_badge { nullptr };
     QToolButton* m_hamburger_button { nullptr };
     QToolButton* m_downloads_button { nullptr };
     QPointer<DownloadsPopover> m_downloads_popover;
+    QPointer<PrivateSessionPopover> m_private_session_popover;
     LocationEdit* m_location_edit { nullptr };
     WebContentView* m_view { nullptr };
     FindInPageWidget* m_find_in_page { nullptr };
+    Optional<WakeLock::DisplaySleepInhibitor> m_screen_display_sleep_inhibitor;
     BrowserWindow* m_window { nullptr };
     QString m_title;
     HyperlinkLabel* m_hover_label { nullptr };
@@ -162,6 +178,7 @@ private:
     QMenu* m_context_menu { nullptr };
     QMenu* m_page_context_menu { nullptr };
     QMenu* m_link_context_menu { nullptr };
+    QMenu* m_selected_text_link_context_menu { nullptr };
     QMenu* m_image_context_menu { nullptr };
     QMenu* m_media_context_menu { nullptr };
     QMenu* m_select_dropdown { nullptr };
@@ -174,8 +191,12 @@ private:
     Optional<ChromeIcon> m_downloads_button_icon;
     QString m_downloads_button_tooltip;
 
-    QPointer<QDialog> m_dialog;
+    JavaScriptDialog* m_javascript_dialog { nullptr };
+    QPointer<QColorDialog> m_color_picker_dialog;
+    QPointer<QFileDialog> m_file_picker_dialog;
+    QPointer<QMessageBox> m_external_url_confirmation_dialog;
 
+    bool m_suppress_javascript_dialogs_until_navigation { false };
     bool m_already_requested_close { false };
 };
 

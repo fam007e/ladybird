@@ -23,7 +23,7 @@
         return new Promise(resolve => {
             const object = document.createElement("object");
             object.type = "text/html";
-            object.data = "about:srcdoc";
+            object.data = "../../data/blank.html";
             object.onload = () => resolve(object);
             document.body.appendChild(object);
         });
@@ -39,7 +39,7 @@
         return object;
     }
 
-    asyncTest(async done => {
+    promiseTest(async () => {
         const before = document.getElementById("before");
         const after = document.getElementById("after");
         const object = await createObject();
@@ -112,7 +112,5 @@
         hideAfterFocusFrame.style.display = "none";
         hideAfterFocusFrame.blur();
         println(`hidden focused iframe blur: active=${activeElementName()}, frameBlur=${hideAfterFocusFrameBlurCount}, windowBlur=${hideAfterFocusFrameWindowBlurCount}`);
-
-        done();
     });
 </script>

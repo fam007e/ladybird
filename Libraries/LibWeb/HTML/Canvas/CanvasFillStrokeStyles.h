@@ -18,7 +18,7 @@ namespace Web::HTML {
 class CanvasFillStrokeStyles : protected virtual AbstractCanvasMixin {
 public:
     ~CanvasFillStrokeStyles() = default;
-    using FillOrStrokeStyleVariant = Variant<String, GC::Ref<CanvasGradient>, GC::Ref<CanvasPattern>>;
+    using FillOrStrokeStyleVariant = Variant<Utf16String, GC::Ref<CanvasGradient>, GC::Ref<CanvasPattern>>;
 
     void set_fill_style(FillOrStrokeStyleVariant style);
     FillOrStrokeStyleVariant fill_style() const;
@@ -27,9 +27,9 @@ public:
     FillOrStrokeStyleVariant stroke_style() const;
 
     WebIDL::ExceptionOr<GC::Ref<CanvasGradient>> create_radial_gradient(double x0, double y0, double r0, double x1, double y1, double r1);
-    GC::Ref<CanvasGradient> create_linear_gradient(double x0, double y0, double x1, double y1);
-    GC::Ref<CanvasGradient> create_conic_gradient(double start_angle, double x, double y);
-    WebIDL::ExceptionOr<GC::Ptr<CanvasPattern>> create_pattern(CanvasImageSource const& image, StringView repetition);
+    WebIDL::ExceptionOr<GC::Ref<CanvasGradient>> create_linear_gradient(double x0, double y0, double x1, double y1);
+    WebIDL::ExceptionOr<GC::Ref<CanvasGradient>> create_conic_gradient(double start_angle, double x, double y);
+    WebIDL::ExceptionOr<GC::Ptr<CanvasPattern>> create_pattern(CanvasImageSource const& image, Utf16FlyString const& repetition);
 
 protected:
     CanvasFillStrokeStyles() = default;

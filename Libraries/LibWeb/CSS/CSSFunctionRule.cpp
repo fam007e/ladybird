@@ -5,166 +5,179 @@
  */
 
 #include "CSSFunctionRule.h"
+#include <AK/Utf16StringBuilder.h>
 #include <LibWeb/Bindings/CSSFunctionRule.h>
 #include <LibWeb/Bindings/Intrinsics.h>
+#include <LibWeb/CSS/CustomPropertyRegistration.h>
+#include <LibWeb/CSS/HypotheticalElement.h>
+#include <LibWeb/CSS/Parser/Parser.h>
+#include <LibWeb/CSS/Parser/SyntaxParsing.h>
 #include <LibWeb/CSS/Serialize.h>
+#include <LibWeb/CSS/StyleComputer.h>
+#include <LibWeb/CSS/StyleValues/UnresolvedStyleValue.h>
+#include <LibWeb/DOM/Document.h>
 
 namespace Web::CSS {
 
 GC_DEFINE_ALLOCATOR(CSSFunctionRule);
 
-// https://drafts.csswg.org/css-mixins-1/#dictdef-functionparameter
-FunctionParameter FunctionParameter::from_internal_function_parameter(FunctionParameterInternal const& internal)
+static Utf16View parameter_name(Parser::ValueParserFFI::FfiFunctionParameterView const& parameter)
 {
+    return { reinterpret_cast<char16_t const*>(parameter.name.utf16), parameter.name.length };
+}
+
+static RefPtr<StyleValue const> parameter_default_value(Parser::ValueParserFFI::FfiFunctionParameterView const& parameter)
+{
+    if (!parameter.default_value)
+        return {};
+    return StyleValue::adopt_rust_style_value_data(StyleValueFFI::rust_style_value_retain(static_cast<StyleValueFFI::StyleValueData const*>(parameter.default_value)));
+}
+
+// https://drafts.csswg.org/css-mixins-1/#dictdef-functionparameter
+FunctionParameter FunctionParameter::from_native_parameter(Parser::ValueParserFFI::FfiFunctionParameterView const& parameter)
+{
+    auto type = Parser::RustSyntaxHandle { Parser::ValueParserFFI::rust_syntax_retain(parameter.syntax) };
+    auto default_value = parameter_default_value(parameter);
     return {
         // name
         // The name of the function parameter.
-        internal.name,
+        Utf16FlyString::from_utf16(parameter_name(parameter)),
 
         // type
         // The type of the function parameter, represented as a syntax string, or "*" if the parameter has no type.
-        internal.type->to_string(),
+        type.serialize(),
 
         // defaultValue
         // The default value of the function parameter, or `null` if the argument does not have a default.
-        internal.default_value.has_value() ? MUST(serialize_a_series_of_component_values(internal.default_value.value()).trim_ascii_whitespace()) : Optional<String> {},
+        default_value
+            ? default_value->to_utf16_string(SerializationMode::Normal)
+            : Optional<Utf16String> {},
     };
 }
 
 // https://drafts.csswg.org/css-mixins-1/#serialize-a-css-type
-static void serialize_a_css_type(StringBuilder& builder, Parser::SyntaxNode const& type)
+static void serialize_a_css_type(Utf16StringBuilder& builder, Parser::RustSyntaxHandle const& type)
 {
     // To serialize a CSS type, return the concatenation of the following:
 
     // If the <css-type> consists of a single <syntax-component>, return the corresponding syntax string.
-    auto const is_single_syntax_component = [&]() {
-        if (type.type() == Parser::SyntaxNode::NodeType::Universal)
-            return true;
-
-        if (first_is_one_of(type.type(), Parser::SyntaxNode::NodeType::Ident, Parser::SyntaxNode::NodeType::Type))
-            return true;
-
-        if (first_is_one_of(type.type(), Parser::SyntaxNode::NodeType::Multiplier, Parser::SyntaxNode::NodeType::CommaSeparatedMultiplier) && first_is_one_of(as<Parser::MultiplierSyntaxNode>(type).child().type(), Parser::SyntaxNode::NodeType::Ident, Parser::SyntaxNode::NodeType::Type))
-            return true;
-
-        return false;
-    }();
-
-    if (is_single_syntax_component) {
-        builder.append(type.to_string());
+    if (type.is_single_component()) {
+        builder.append(type.serialize());
         return;
     }
 
     // Otherwise, return the concatenation of the following:
     // The string "type(", i.e. "type" followed by a single LEFT PARENTHESIS (U+0028).
-    builder.append("type("sv);
+    builder.append_ascii("type("sv);
 
     // The corresponding syntax string.
-    builder.append(type.to_string());
+    builder.append(type.serialize());
 
     // The string ")", i.e. a single RIGHT PARENTHESIS (U+0029).
-    builder.append(')');
+    builder.append_ascii(')');
 }
 
 // https://drafts.csswg.org/css-mixins-1/#serialize-a-function-parameter
-void FunctionParameterInternal::serialize(StringBuilder& builder) const
+static void serialize_function_parameter(Utf16StringBuilder& builder, Parser::ValueParserFFI::FfiFunctionParameterView const& parameter)
 {
+    auto type = Parser::RustSyntaxHandle { Parser::ValueParserFFI::rust_syntax_retain(parameter.syntax) };
     // To serialize a function parameter, return the concatenation of the following:
 
     // The result of performing serialize an identifier on the name of the function parameter.
-    serialize_an_identifier(builder, name);
+    serialize_an_identifier(builder, parameter_name(parameter));
 
     // If the function parameter has a type, and that type is not the universal syntax definition:
-    if (type->type() != Parser::SyntaxNode::NodeType::Universal) {
+    if (!type.is_universal()) {
         // - A single SPACE (U+0020), followed by the result of performing serialize a CSS type on that type.
-        builder.append(' ');
-        serialize_a_css_type(builder, *type);
+        builder.append_ascii(' ');
+        serialize_a_css_type(builder, type);
     }
 
     // If the function parameter has a default value:
-    if (default_value.has_value()) {
+    if (auto default_value = parameter_default_value(parameter)) {
         // - A single COLON (U+003A), followed by a single SPACE (U+0020), followed by the result of performing
         //   serialize a CSS value on that value.
-        builder.appendff(": {}", MUST(serialize_a_series_of_component_values(default_value.value()).trim_ascii_whitespace()));
+        builder.append_ascii(": "sv);
+        default_value->serialize(builder, SerializationMode::Normal);
     }
 }
 
-GC::Ref<CSSFunctionRule> CSSFunctionRule::create(JS::Realm& realm, CSSRuleList& rules, FlyString name, Vector<FunctionParameterInternal> parameters, NonnullRefPtr<Parser::SyntaxNode> return_type)
+GC::Ref<CSSFunctionRule> CSSFunctionRule::create(RustRule rule, CSSRuleList& rules)
 {
-    return realm.create<CSSFunctionRule>(realm, rules, move(name), move(parameters), move(return_type));
+    return GC::Heap::the().allocate<CSSFunctionRule>(move(rule), rules);
 }
 
-CSSFunctionRule::CSSFunctionRule(JS::Realm& realm, CSSRuleList& rules, FlyString name, Vector<FunctionParameterInternal> parameters, NonnullRefPtr<Parser::SyntaxNode> return_type)
-    : CSSGroupingRule(realm, rules, Type::Function)
-    , m_name(move(name))
-    , m_parameters(move(parameters))
-    , m_return_type(move(return_type))
+CSSFunctionRule::CSSFunctionRule(RustRule rule, CSSRuleList& rules)
+    : CSSGroupingRule(rules, move(rule))
+    , m_signature(*native_rule().payload().function_signature)
 {
 }
 
-void CSSFunctionRule::initialize(JS::Realm& realm)
+Utf16String CSSFunctionRule::name() const
 {
-    WEB_SET_PROTOTYPE_FOR_INTERFACE(CSSFunctionRule);
-    Base::initialize(realm);
+    auto name = Parser::ValueParserFFI::rust_function_signature_view(&m_signature).name;
+    return Utf16String::from_utf16({ reinterpret_cast<char16_t const*>(name.utf16), name.length });
 }
 
 // https://drafts.csswg.org/css-mixins-1/#dom-cssfunctionrule-getparameters
 Vector<FunctionParameter> CSSFunctionRule::get_parameters() const
 {
     Vector<FunctionParameter> parameters;
-    parameters.ensure_capacity(m_parameters.size());
+    auto count = Parser::ValueParserFFI::rust_function_signature_view(&m_signature).parameter_count;
+    parameters.ensure_capacity(count);
 
-    for (auto const& parameter : m_parameters)
-        parameters.append(FunctionParameter::from_internal_function_parameter(parameter));
+    for (size_t index = 0; index < count; ++index)
+        parameters.append(FunctionParameter::from_native_parameter(Parser::ValueParserFFI::rust_function_signature_parameter(&m_signature, index)));
 
     return parameters;
 }
 
 // https://drafts.csswg.org/css-mixins-1/#dom-cssfunctionrule-returntype
-String CSSFunctionRule::return_type() const
+Utf16String CSSFunctionRule::return_type() const
 {
     // The return type of the custom function, represented as a syntax string. If the custom function has no return
     // type, returns "*".
     // NB: We always store a return type (defaulting to "*")
-    return m_return_type->to_string();
+    return Parser::RustSyntaxHandle { Parser::ValueParserFFI::rust_syntax_retain(Parser::ValueParserFFI::rust_function_signature_view(&m_signature).return_type) }.serialize();
 }
 
 // https://drafts.csswg.org/css-mixins-1/#serialize-a-cssfunctionrule
-String CSSFunctionRule::serialized() const
+Utf16String CSSFunctionRule::serialized() const
 {
+    auto signature = Parser::ValueParserFFI::rust_function_signature_view(&m_signature);
     // To serialize a CSSFunctionRule, return the concatenation of the following:
-    StringBuilder builder;
+    Utf16StringBuilder builder;
 
     // 1. The string "@function" followed by a single SPACE (U+0020).
-    builder.append("@function "sv);
+    builder.append_ascii("@function "sv);
 
     // 2. The result of performing serialize an identifier on the name of the custom function, followed by a single LEFT
     //    PARENTHESIS (U+0028).
-    serialize_an_identifier(builder, m_name);
-    builder.append('(');
+    serialize_an_identifier(builder, { reinterpret_cast<char16_t const*>(signature.name.utf16), signature.name.length });
+    builder.append_ascii('(');
 
     // 3. The result of serialize a function parameter on each of the custom function’s parameters, all joined by ", "
     //    (COMMA U+002C, followed by a single SPACE U+0020).
-    for (size_t i = 0; i < m_parameters.size(); ++i) {
+    for (size_t i = 0; i < signature.parameter_count; ++i) {
         if (i > 0)
-            builder.append(", "sv);
-        m_parameters[i].serialize(builder);
+            builder.append_ascii(", "sv);
+        serialize_function_parameter(builder, Parser::ValueParserFFI::rust_function_signature_parameter(&m_signature, i));
     }
 
     // 4. A single RIGHT PARENTHESIS (U+0029).
-    builder.append(')');
+    builder.append_ascii(')');
 
     // 5. If the custom function has return type, and that return type is not the universal syntax definition ("*"):
-    if (m_return_type->type() != Parser::SyntaxNode::NodeType::Universal) {
+    if (auto return_type = Parser::RustSyntaxHandle { Parser::ValueParserFFI::rust_syntax_retain(signature.return_type) }; !return_type.is_universal()) {
         // - A single SPACE (U+0020), followed by the string "returns", followed by a single SPACE (U+0020).
-        builder.append(" returns "sv);
+        builder.append_ascii(" returns "sv);
 
         // - The result of performing serialize a CSS type on that type.
-        serialize_a_css_type(builder, *m_return_type);
+        serialize_a_css_type(builder, return_type);
     }
 
     // 6. A single SPACE (U+0020), followed by a LEFT CURLY BRACKET (U+007B).
-    builder.append(" {"sv);
+    builder.append_ascii(" {"sv);
 
     // 7. The result of performing serialize a CSS rule on each rule in cssRules, filtering out empty strings, each
     //    preceded by a single SPACE (U+0020).
@@ -176,15 +189,15 @@ String CSSFunctionRule::serialized() const
         auto serialized_rule = rule->serialized();
 
         if (!serialized_rule.is_empty()) {
-            builder.append(' ');
+            builder.append_ascii(' ');
             builder.append(serialized_rule);
         }
     }
 
     // 8. A single SPACE (U+0020), followed by a single RIGHT CURLY BRACKET (U+007D).
-    builder.append(" }"sv);
+    builder.append_ascii(" }"sv);
 
-    return MUST(builder.to_string());
+    return builder.to_string();
 }
 
 }

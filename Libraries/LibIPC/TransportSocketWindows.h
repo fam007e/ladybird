@@ -7,6 +7,8 @@
 
 #pragma once
 
+#include <AK/Atomic.h>
+#include <AK/Mutex.h>
 #include <AK/Queue.h>
 #include <LibCore/Socket.h>
 #include <LibIPC/Attachment.h>
@@ -18,7 +20,7 @@ namespace IPC {
 
 class TransportSocketWindows {
     AK_MAKE_NONCOPYABLE(TransportSocketWindows);
-    AK_MAKE_DEFAULT_MOVABLE(TransportSocketWindows);
+    AK_MAKE_NONMOVABLE(TransportSocketWindows);
 
 public:
     struct Paired {
@@ -29,8 +31,10 @@ public:
     static ErrorOr<NonnullOwnPtr<TransportSocketWindows>> from_socket(NonnullOwnPtr<Core::LocalSocket> socket);
 
     explicit TransportSocketWindows(NonnullOwnPtr<Core::LocalSocket> socket);
+    ~TransportSocketWindows();
 
     void set_peer_pid(int pid);
+    int peer_pid() const { return m_peer_pid; }
     void set_up_read_hook(Function<void()>);
     bool is_open() const;
     void close();
@@ -38,7 +42,12 @@ public:
 
     void wait_until_readable();
 
-    void post_message(MessageDataType, Vector<Attachment>& attachments);
+    // Both are no-ops here: post_message() writes to the socket before it returns, and the read path below reads the
+    // socket itself, so neither direction has a queue that can lag behind another transport.
+    void flush() { }
+    void wait_until_incoming_is_current() { }
+
+    ErrorOr<void> post_message(MessageDataType, Vector<Attachment>& attachments);
 
     enum class ShouldShutdown {
         No,
@@ -59,6 +68,8 @@ private:
 
 private:
     NonnullOwnPtr<Core::LocalSocket> m_socket;
+    Atomic<bool> m_socket_is_open { true };
+    Mutex m_send_mutex;
     ByteBuffer m_unprocessed_bytes;
     int m_peer_pid = -1;
 };

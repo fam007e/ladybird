@@ -9,29 +9,30 @@ $460e17ea for-in-register-lifetime.js:1:1
     [4] = Undefined
 
 block0:
-  [   0] SetGlobal `result`, src:String("")
-  [  10] NewObject dst:reg5
-  [  20] InitObjectLiteralProperty object:reg5, `a`, src:Int32(1), shape_cache_index:0, property_slot:0
-  [  38] InitObjectLiteralProperty object:reg5, `b`, src:Int32(2), shape_cache_index:0, property_slot:1
-  [  50] InitObjectLiteralProperty object:reg5, `c`, src:Int32(3), shape_cache_index:0, property_slot:2
-  [  68] CacheObjectShape object:reg5
-  [  78] SetGlobal `obj`, src:reg5
-  [  88] GetGlobal dst:reg5, `obj`
-  [  98] JumpNullish condition:reg5, true_target:block3, false_target:block4
+  [   0] Enter
+  [   8] SetGlobal `result`, src:String("")
+  [  18] NewObject dst:reg5
+  [  28] InitObjectLiteralProperty object:reg5, `a`, src:Int32(1), shape_cache_index:0, property_slot:0
+  [  40] InitObjectLiteralProperty object:reg5, `b`, src:Int32(2), shape_cache_index:0, property_slot:1
+  [  58] InitObjectLiteralProperty object:reg5, `c`, src:Int32(3), shape_cache_index:0, property_slot:2
+  [  70] CacheObjectShape object:reg5
+  [  80] SetGlobal `obj`, src:reg5
+  [  90] GetGlobal dst:reg5, `obj`
+  [  a0] JumpNullish condition:reg5, true_target:block3, false_target:block4
 
 block1:
-  [  a8] End value:reg5
+  [  b0] End value:reg5
 
 block2:
-  [  b0] ObjectPropertyIteratorNext dst_value:reg7, dst_done:reg8, iterator_object:reg6
-  [  c0] JumpIf condition:reg8, true_target:block1, false_target:block5
+  [  b8] ObjectPropertyIteratorNext dst_value:reg7, dst_done:reg8, iterator_object:reg6
+  [  c8] JumpIf condition:reg8, true_target:block1, false_target:block5
 
 block3:
-  [  d0] End value:reg5
+  [  d8] End value:reg5
 
 block4:
-  [  d8] GetObjectPropertyIterator dst_iterator:reg6, object:reg5
-  [  e8] Mov dst:reg5, src:Undefined
+  [  e0] GetObjectPropertyIterator dst_iterator:reg6, object:reg5
+  [  f0] MovSrcUndefined dst:reg5
   [  f8] Jump target:block2
 
 block5:

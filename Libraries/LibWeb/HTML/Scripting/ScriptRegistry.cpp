@@ -6,6 +6,7 @@
 
 #include <LibIPC/Decoder.h>
 #include <LibIPC/Encoder.h>
+#include <LibJS/RustIntegration.h>
 #include <LibJS/SourceCode.h>
 #include <LibURL/Parser.h>
 #include <LibWeb/HTML/Scripting/ScriptRegistry.h>
@@ -18,12 +19,12 @@ static ScriptRegistry::Content source_content(ScriptRegistry::Script const& scri
         [&](ScriptRegistry::JavaScriptSource const& js_source) -> ScriptRegistry::Content {
             return {
                 .content_type = script.description.content_type,
-                .text = js_source.source_code->code().to_utf8(),
+                .text = js_source.source_code->code(),
             };
         });
 }
 
-ScriptRegistry::Script const& ScriptRegistry::register_javascript_source(NonnullRefPtr<JS::SourceCode const> source_code, ByteString const& filename, String introduction_type, IsInlineSource is_inline_source, size_t source_line_number, size_t source_length)
+ScriptRegistry::Script const& ScriptRegistry::register_javascript_source(NonnullRefPtr<JS::SourceCode const> source_code, JavaScriptSource::Type type, ByteString const& filename, Utf16String display_url, Utf16String introduction_type, IsInlineSource is_inline_source, size_t source_line_number, size_t source_length)
 {
     // FIXME: Support WebAssembly sources once WebAssembly modules retain their original binary module bytes.
     // FIXME: Register worker sources when DevTools can target workers.
@@ -34,31 +35,80 @@ ScriptRegistry::Script const& ScriptRegistry::register_javascript_source(Nonnull
                           .description = {
                               .id = { .document_id = {}, .script_id = id },
                               .url = move(parsed_url),
-                              .display_url = String::from_utf8_with_replacement_character(filename),
+                              .display_url = move(display_url),
                               .introduction_type = move(introduction_type),
-                              .content_type = is_inline ? "text/html"_string : "text/javascript"_string,
+                              .content_type = is_inline ? "text/html"_utf16 : "text/javascript"_utf16,
                               .is_inline_source = is_inline,
                               .source_start_line = static_cast<u32>(source_line_number),
                               .source_start_column = 0,
                               .source_length = source_length,
                           },
-                          .content = ContentHandle { JavaScriptSource { move(source_code) } },
+                          .content = ContentHandle { JavaScriptSource {
+                              .source_code = move(source_code),
+                              .type = type,
+                              .line_number_offset = source_line_number,
+                              .breakpoint_positions = {},
+                          } },
                       });
 
     return m_scripts.find(id)->value;
 }
 
-Optional<ScriptRegistry::Content> ScriptRegistry::script_content(u64 script_id, String const& document_source) const
+Optional<ScriptRegistry::Script const&> ScriptRegistry::script_for_source_code(JS::SourceCode const& source_code) const
+{
+    for (auto const& script : m_scripts) {
+        bool has_matching_source_code = false;
+        script.value.content.visit([&](JavaScriptSource const& javascript_source) {
+            has_matching_source_code = javascript_source.source_code.ptr() == &source_code;
+        });
+        if (has_matching_source_code)
+            return script.value;
+    }
+    return {};
+}
+
+Optional<NonnullRefPtr<JS::SourceCode const>> ScriptRegistry::source_code(u64 script_id) const
+{
+    auto script = m_scripts.find(script_id);
+    if (script == m_scripts.end())
+        return {};
+    return script->value.content.visit(
+        [](JavaScriptSource const& javascript_source) -> Optional<NonnullRefPtr<JS::SourceCode const>> {
+            return javascript_source.source_code;
+        });
+}
+
+Optional<ScriptRegistry::Content> ScriptRegistry::script_content(u64 script_id, Utf16View document_source) const
 {
     auto script = m_scripts.find(script_id);
     if (script == m_scripts.end())
         return {};
 
     if (script->value.description.is_inline_source && !document_source.is_empty()) {
-        return Content { .content_type = script->value.description.content_type, .text = document_source };
+        return Content { .content_type = script->value.description.content_type, .text = Utf16String::from_utf16(document_source) };
     }
 
     return source_content(script->value);
+}
+
+ReadonlySpan<JS::Position> ScriptRegistry::breakpoint_positions(u64 script_id) const
+{
+    auto script = m_scripts.find(script_id);
+    if (script == m_scripts.end())
+        return {};
+
+    return script->value.content.visit(
+        [](JavaScriptSource const& source) -> ReadonlySpan<JS::Position> {
+            if (!source.breakpoint_positions.has_value()) {
+                // Function bodies are compiled lazily, so the live Executables do not necessarily contain every breakpoint
+                // position. Recompile a GC-free copy once when DevTools first requests the complete set.
+                auto program_type = source.type == JavaScriptSource::Type::Script
+                    ? JS::RustIntegration::ProgramType::Script
+                    : JS::RustIntegration::ProgramType::Module;
+                source.breakpoint_positions = JS::RustIntegration::breakpoint_positions_for_source(*source.source_code, program_type, source.line_number_offset);
+            }
+            return source.breakpoint_positions->span();
+        });
 }
 
 }
@@ -105,9 +155,9 @@ ErrorOr<Web::HTML::ScriptRegistry::Description> decode(Decoder& decoder)
 {
     auto id = TRY(decoder.decode<Web::HTML::ScriptRegistry::Identifier>());
     auto url = TRY(decoder.decode<Optional<URL::URL>>());
-    auto display_url = TRY(decoder.decode<String>());
-    auto introduction_type = TRY(decoder.decode<String>());
-    auto content_type = TRY(decoder.decode<String>());
+    auto display_url = TRY(decoder.decode<Utf16String>());
+    auto introduction_type = TRY(decoder.decode<Utf16String>());
+    auto content_type = TRY(decoder.decode<Utf16String>());
     auto is_inline_source = TRY(decoder.decode<bool>());
     auto source_start_line = TRY(decoder.decode<u32>());
     auto source_start_column = TRY(decoder.decode<u32>());
@@ -137,8 +187,8 @@ ErrorOr<void> encode(Encoder& encoder, Web::HTML::ScriptRegistry::Content const&
 template<>
 ErrorOr<Web::HTML::ScriptRegistry::Content> decode(Decoder& decoder)
 {
-    auto content_type = TRY(decoder.decode<String>());
-    auto text = TRY(decoder.decode<String>());
+    auto content_type = TRY(decoder.decode<Utf16String>());
+    auto text = TRY(decoder.decode<Utf16String>());
 
     return Web::HTML::ScriptRegistry::Content {
         .content_type = move(content_type),

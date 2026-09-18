@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <AK/ByteBuffer.h>
 #include <AK/Function.h>
 #include <AK/HashMap.h>
 #include <AK/NonnullOwnPtr.h>
@@ -31,11 +32,14 @@ enum class ActionID {
     ViewHistory,
     ClearBrowsingData,
 
+    Undo,
+    Redo,
     CopySelection,
     CutSelection,
     Paste,
     SelectAll,
 
+    LookUpSelectedText,
     SearchSelectedText,
 
     TakeVisibleScreenshot,
@@ -51,7 +55,9 @@ enum class ActionID {
     ToggleBookmarksBar,
     BookmarkItem,
 
+    OpenAllBookmarksInTabs,
     AddBookmark,
+    AddBookmarkAllTabs,
     AddBookmarkFolder,
     DeleteBookmark,
     DeleteBookmarkFolder,
@@ -59,13 +65,16 @@ enum class ActionID {
     EditBookmarkFolder,
 
     OpenAboutPage,
-    OpenProcessesPage,
+    OpenTaskManager,
     OpenSettingsPage,
     ToggleDevTools,
     ViewSource,
 
     OpenInNewTab,
     OpenInNewWindow,
+    OpenInNewPrivateWindow,
+    DownloadLinkedFile,
+    DownloadLinkedFileAs,
     CopyURL,
 
     OpenImage,
@@ -96,7 +105,6 @@ enum class ActionID {
     DumpSessionHistoryTree,
     DumpDOMTree,
     DumpLayoutTree,
-    DumpPaintTree,
     DumpStackingContextTree,
     DumpSiteIsolationProcessTree,
     DumpDisplayList,
@@ -142,8 +150,8 @@ public:
     StringView tooltip() const { return action_text_to_string_view(*m_tooltip); }
     void set_tooltip(ActionText);
 
-    void set_base64_png_icon(Optional<String> base64_png_icon) { m_base64_png_icon = move(base64_png_icon); }
-    Optional<String const&> base64_png_icon() const { return m_base64_png_icon; }
+    void set_png_icon(Optional<ByteBuffer> png_icon) { m_png_icon = move(png_icon); }
+    Optional<ByteBuffer const&> png_icon() const { return m_png_icon; }
 
     ActionID id() const { return m_id; }
 
@@ -191,7 +199,7 @@ private:
 
     ActionText m_text;
     Optional<ActionText> m_tooltip;
-    Optional<String> m_base64_png_icon;
+    Optional<ByteBuffer> m_png_icon;
 
     ActionID m_id;
     HashMap<StringView, String> m_properties;

@@ -69,7 +69,6 @@ function createRow(variable) {
     row.dataset.filterText = `${variable.name} ${variable.title} ${variable.description}`.toLowerCase();
 
     const title = document.createElement("p");
-    title.classList.add("config-title");
     title.textContent = variable.title;
 
     const name = document.createElement("p");
@@ -112,5 +111,17 @@ configFilter.addEventListener("input", applyFilter);
 document.addEventListener("WebUIMessage", event => {
     if (event.detail.name === "loadSettings") {
         loadConfigVariables(event.detail.data);
+    }
+});
+
+const crashReportsStatus = document.querySelector("#crash-reports-status");
+document.querySelector("#open-crash-reports").addEventListener("click", () => {
+    crashReportsStatus.hidden = true;
+    ladybird.sendMessage("showCrashReports");
+});
+document.addEventListener("WebUIMessage", event => {
+    if (event.detail.name === "crashReportsStatus") {
+        crashReportsStatus.textContent = event.detail.data;
+        crashReportsStatus.hidden = !event.detail.data;
     }
 });

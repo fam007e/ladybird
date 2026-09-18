@@ -1,34 +1,43 @@
 /*
- * Copyright (c) 2026, The Ladybird developers
+ * Copyright (c) 2026-present, the Ladybird developers.
  *
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
 #pragma once
 
+#include <LibJS/Forward.h>
+#include <LibWeb/Bindings/MediaStreamTrackEvent.h>
 #include <LibWeb/DOM/Event.h>
 #include <LibWeb/MediaCapture/MediaStreamTrack.h>
 
+namespace Web::HTML {
+
+class Window;
+
+}
+
 namespace Web::MediaCapture {
+
+using MediaStreamTrackEventInit = Bindings::MediaStreamTrackEventInit;
 
 // https://w3c.github.io/mediacapture-main/#mediastreamtrackevent
 class MediaStreamTrackEvent final : public DOM::Event {
-    WEB_PLATFORM_OBJECT(MediaStreamTrackEvent, DOM::Event);
+    WEB_WRAPPABLE(MediaStreamTrackEvent, DOM::Event);
     GC_DECLARE_ALLOCATOR(MediaStreamTrackEvent);
 
 public:
-    [[nodiscard]] static GC::Ref<MediaStreamTrackEvent> create(JS::Realm&, FlyString const& event_name, Bindings::MediaStreamTrackEventInit const&);
-    [[nodiscard]] static GC::Ref<MediaStreamTrackEvent> construct_impl(JS::Realm&, FlyString const& event_name, Bindings::MediaStreamTrackEventInit const&);
+    static constexpr size_t track_offset() { return offsetof(MediaStreamTrackEvent, m_track); }
+    [[nodiscard]] static GC::Ref<MediaStreamTrackEvent> create(Utf16FlyString const& event_name, MediaStreamTrackEventInit const&, HighResolutionTime::DOMHighResTimeStamp);
 
     virtual ~MediaStreamTrackEvent() override;
 
     GC::Ref<MediaStreamTrack> track() const { return m_track; }
 
 private:
-    MediaStreamTrackEvent(JS::Realm&, FlyString const& event_name, Bindings::MediaStreamTrackEventInit const&);
+    MediaStreamTrackEvent(Utf16FlyString const& event_name, MediaStreamTrackEventInit const&, HighResolutionTime::DOMHighResTimeStamp);
 
-    virtual void initialize(JS::Realm&) override;
-    virtual void visit_edges(Cell::Visitor&) override;
+    virtual void visit_edges(GC::Cell::Visitor&) override;
 
     GC::Ref<MediaStreamTrack> m_track;
 };

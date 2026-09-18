@@ -9,6 +9,7 @@
 
 #include "PositionStyleValue.h"
 #include <LibWeb/CSS/Enums.h>
+#include <LibWeb/CSS/PercentageOr.h>
 
 namespace Web::CSS {
 
@@ -24,13 +25,6 @@ ValueComparingNonnullRefPtr<PositionStyleValue const> PositionStyleValue::create
         EdgeStyleValue::create(PositionEdge::Center, {})));
 }
 
-ValueComparingNonnullRefPtr<PositionStyleValue const> PositionStyleValue::create_computed_center()
-{
-    return adopt_ref(*new (nothrow) PositionStyleValue(
-        EdgeStyleValue::create({}, PercentageStyleValue::create(Percentage { 50 })),
-        EdgeStyleValue::create({}, PercentageStyleValue::create(Percentage { 50 }))));
-}
-
 bool PositionStyleValue::is_center(SerializationMode mode) const
 {
     return edge_x()->is_center(mode) && edge_y()->is_center(mode);
@@ -39,8 +33,8 @@ bool PositionStyleValue::is_center(SerializationMode mode) const
 CSSPixelPoint PositionStyleValue::resolved(CSSPixelRect const& rect) const
 {
     // Note: A preset + a none default x/y_relative_to is impossible in the syntax (and makes little sense)
-    CSSPixels x = LengthPercentage::from_style_value(m_properties.edge_x->offset()).to_px(rect.width());
-    CSSPixels y = LengthPercentage::from_style_value(m_properties.edge_y->offset()).to_px(rect.height());
+    CSSPixels x = LengthPercentage::from_style_value(edge_x()->offset()).to_px(rect.width());
+    CSSPixels y = LengthPercentage::from_style_value(edge_y()->offset()).to_px(rect.height());
     return CSSPixelPoint { rect.x() + x, rect.y() + y };
 }
 
@@ -49,13 +43,6 @@ ValueComparingNonnullRefPtr<StyleValue const> PositionStyleValue::absolutized(Co
     return PositionStyleValue::create(
         edge_x()->absolutized(computation_context)->as_edge(),
         edge_y()->absolutized(computation_context)->as_edge());
-}
-
-void PositionStyleValue::serialize(StringBuilder& builder, SerializationMode mode) const
-{
-    m_properties.edge_x->serialize(builder, mode);
-    builder.append(' ');
-    m_properties.edge_y->serialize(builder, mode);
 }
 
 }

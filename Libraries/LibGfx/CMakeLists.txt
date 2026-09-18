@@ -13,10 +13,12 @@ set(SOURCES
     Cursor.cpp
     Filter.cpp
     Font/Font.cpp
+    Font/FontCatalog.cpp
     Font/FontDatabase.cpp
     Font/FontSupport.cpp
     Font/FontVariationSettings.cpp
     Font/PathFontProvider.cpp
+    Font/SharedFontProvider.cpp
     Font/Typeface.cpp
     Font/TypefaceSkia.cpp
     Font/WOFF/Loader.cpp
@@ -56,11 +58,11 @@ set(SOURCES
 )
 
 if (APPLE)
-    list(APPEND SOURCES MetalContext.mm)
+    list(APPEND SOURCES MetalContext.mm VideoSurfaceImage.mm)
 endif()
 
 if (HAS_DIRECTX)
-    list(APPEND SOURCES Direct3DContext.cpp)
+    list(APPEND SOURCES D3DSharedTexture.cpp Direct3DContext.cpp)
 endif()
 
 if (HAS_VULKAN)
@@ -73,11 +75,11 @@ endif()
 
 ladybird_lib(LibGfx gfx)
 
-target_link_libraries(LibGfx PRIVATE LibCompress LibCore LibCrypto LibFileSystem LibTextCodec LibIPC LibSync LibUnicode)
+target_link_libraries(LibGfx PRIVATE LibCompress LibCore LibCrypto LibFileSystem LibTextCodec LibIPC LibUnicode)
 
 target_link_libraries(LibGfx PRIVATE PkgConfig::WOFF2 JPEG::JPEG PNG::PNG skia harfbuzz)
 
-import_rust_crate(MANIFEST_PATH Rust/Cargo.toml CRATE_NAME libgfx_rust FFI_HEADER RustFFI.h)
+import_rust_crate(MANIFEST_PATH Rust/Cargo.toml CRATE_NAME libgfx_rust FEATURES allocator FFI_HEADER RustFFI.h)
 target_link_libraries(LibGfx PRIVATE libgfx_rust)
 
 if (HAS_FONTCONFIG)

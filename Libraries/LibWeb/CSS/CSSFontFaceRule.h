@@ -9,44 +9,39 @@
 
 #include <LibWeb/CSS/CSSFontFaceDescriptors.h>
 #include <LibWeb/CSS/CSSRule.h>
-#include <LibWeb/CSS/ParsedFontFace.h>
 
 namespace Web::CSS {
 
-class FontFace;
+class FontFaceState;
 
 class CSSFontFaceRule final : public CSSRule {
-    WEB_PLATFORM_OBJECT(CSSFontFaceRule, CSSRule);
+    WEB_WRAPPABLE(CSSFontFaceRule, CSSRule);
     GC_DECLARE_ALLOCATOR(CSSFontFaceRule);
 
 public:
-    [[nodiscard]] static GC::Ref<CSSFontFaceRule> create(JS::Realm&, GC::Ref<CSSFontFaceDescriptors>);
+    [[nodiscard]] static GC::Ref<CSSFontFaceRule> create(RustRule);
 
     virtual ~CSSFontFaceRule() override = default;
 
     bool is_valid() const;
-    ParsedFontFace font_face() const;
-    GC::Ref<CSSStyleDeclaration> style() { return m_style; }
-    GC::Ref<CSSFontFaceDescriptors> descriptors() { return m_style; }
-    GC::Ref<CSSFontFaceDescriptors const> descriptors() const { return m_style; }
+    GC::Ref<CSSFontFaceDescriptors> descriptors() const;
 
-    GC::Ptr<FontFace> css_connected_font_face() const { return m_css_connected_font_face; }
-    void set_css_connected_font_face(GC::Ptr<FontFace> font_face) { m_css_connected_font_face = font_face; }
+    RefPtr<FontFaceState> css_connected_font_face() const;
     void handle_descriptor_change(Utf16FlyString const& property);
     void disconnect_font_face();
 
 private:
-    CSSFontFaceRule(JS::Realm&, GC::Ref<CSSFontFaceDescriptors>);
+    CSSFontFaceRule(RustRule);
 
-    virtual void initialize(JS::Realm&) override;
-    virtual String serialized() const override;
+    virtual size_t external_memory_size() const override;
+    virtual Utf16String serialized() const override;
     virtual void visit_edges(Visitor&) override;
     virtual void dump(StringBuilder&, int indent_levels) const override;
 
     void handle_src_descriptor_change();
 
-    GC::Ref<CSSFontFaceDescriptors> m_style;
-    GC::Ptr<FontFace> m_css_connected_font_face;
+    RustDescriptorBlock m_descriptors;
+    mutable GC::Ptr<CSSFontFaceDescriptors> m_style;
 };
 
 template<>

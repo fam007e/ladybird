@@ -7,6 +7,7 @@
 #pragma once
 
 #include <LibGfx/CompositingAndBlendingOperator.h>
+#include <LibWeb/CSS/Enums.h>
 #include <LibWeb/Forward.h>
 
 namespace Web::Painting {

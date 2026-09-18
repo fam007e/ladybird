@@ -1,13 +1,17 @@
 /*
- * Copyright (c) 2026, Ladybird contributors
+ * Copyright (c) 2026-present, the Ladybird developers.
  *
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/ScopeGuard.h>
 #include <LibCore/EventLoop.h>
 #include <LibCore/File.h>
 #include <LibIPC/File.h>
+#include <LibWebView/Application.h>
+#include <LibWebView/CanonicalNavigable.h>
 #include <LibWebView/HelperProcess.h>
+#include <LibWebView/ViewImplementation.h>
 #include <LibWebView/WebContentClient.h>
 #include <LibWebView/WebWorkerClient.h>
 #include <LibWebView/WorkerProcessManager.h>
@@ -20,7 +24,7 @@ WorkerProcessManager& WorkerProcessManager::the()
     return manager;
 }
 
-Web::HTML::WorkerAgentId WorkerProcessManager::start_worker_agent(WebContentClient& owner, u64 page_id, Web::HTML::WorkerAgentStartRequest request)
+Web::HTML::WorkerAgentId WorkerProcessManager::start_worker_agent(WebContentClient& owner, Web::PageId page_id, Web::HTML::WorkerAgentStartRequest request)
 {
     auto abstract_owner = Owner {
         .client = WebContentOwner {
@@ -29,7 +33,7 @@ Web::HTML::WorkerAgentId WorkerProcessManager::start_worker_agent(WebContentClie
         },
         .token = request.owner_token,
     };
-    return start_worker_agent(move(abstract_owner), move(request));
+    return start_worker_agent(move(abstract_owner), move(request), owner.is_private());
 }
 
 Web::HTML::WorkerAgentId WorkerProcessManager::start_worker_agent(WebWorkerClient& owner, Web::HTML::WorkerAgentStartRequest request)
@@ -40,18 +44,19 @@ Web::HTML::WorkerAgentId WorkerProcessManager::start_worker_agent(WebWorkerClien
         },
         .token = request.owner_token,
     };
-    return start_worker_agent(move(abstract_owner), move(request));
+    return start_worker_agent(move(abstract_owner), move(request), owner.is_private());
 }
 
 // https://html.spec.whatwg.org/multipage/workers.html#dom-sharedworker
-Web::HTML::WorkerAgentId WorkerProcessManager::start_worker_agent(Owner owner, Web::HTML::WorkerAgentStartRequest request)
+Web::HTML::WorkerAgentId WorkerProcessManager::start_worker_agent(Owner owner, Web::HTML::WorkerAgentStartRequest request, IsPrivate is_private)
 {
     // 11.1. Let workerGlobalScope be null.
-    if (request.agent_type == Web::Bindings::AgentType::SharedWorker) {
+    if (request.agent_type == Web::HTML::AgentType::SharedWorker) {
         SharedWorkerKey key {
+            .is_private = is_private,
             .storage_key = request.storage_key,
             .url = request.url,
-            .name = request.name,
+            .name = Utf16String::from_utf8(request.name),
         };
 
         // 11.2. For each scope in the list of all SharedWorkerGlobalScope objects: if workerStorageKey
@@ -97,7 +102,6 @@ Web::HTML::WorkerAgentId WorkerProcessManager::start_worker_agent(Owner owner, W
                     //         handles steps 11.5.5-11.5.7).
                     agent.owners.append(owner);
                     agent.client->async_connect_shared_worker(move(request.outside_port), request.outside_settings);
-                    notify_worker_script_load_success(owner);
                     return agent.id;
                 }
             }
@@ -111,12 +115,23 @@ Web::HTML::WorkerAgentId WorkerProcessManager::start_worker_agent(Owner owner, W
     // AD-HOC: For DedicatedWorker there is no shared worker manager step; we always launch a fresh
     //         worker process here.
     auto agent_id = ++m_next_agent_id;
-    auto client = MUST(launch_web_worker_process(request.agent_type, agent_id));
+    auto client = MUST(launch_web_worker_process(request.agent_type, is_private, agent_id));
 
-    auto request_server_handle = MUST(connect_new_request_server_client());
+    auto request_server_handle = MUST(connect_new_request_server_client(is_private));
     auto image_decoder_handle = MUST(connect_new_image_decoder_client());
-    client->async_connect_to_request_server(move(request_server_handle));
-    client->async_connect_to_image_decoder(move(image_decoder_handle));
+#if defined(HAVE_WASM_COMPILER_SERVICE)
+    auto wasm_compiler_handle = MUST(connect_new_wasm_compiler_client());
+#endif
+
+    client->async_connect_to_request_server(request_server_handle);
+    client->async_set_site_compatibility_data(Application::the().site_compatibility_data());
+    client->async_connect_to_image_decoder(image_decoder_handle);
+#if defined(HAVE_WASM_COMPILER_SERVICE)
+    client->async_connect_to_wasm_compiler(wasm_compiler_handle);
+#endif
+
+    if (auto compositor_handle = Application::the().connect_new_compositor_canvas_client(); !compositor_handle.is_error())
+        client->async_connect_to_compositor(compositor_handle.release_value());
 
     Vector<Owner> owners;
     owners.append(owner);
@@ -133,15 +148,17 @@ Web::HTML::WorkerAgentId WorkerProcessManager::start_worker_agent(Owner owner, W
         .credentials = request.credentials,
         .extended_lifetime = request.extended_lifetime,
         .worker_is_secure_context = request.caller_is_secure_context,
+        .is_private = is_private,
         .shared_worker_key = {},
         .owners = move(owners),
     };
 
-    if (request.agent_type == Web::Bindings::AgentType::SharedWorker) {
+    if (request.agent_type == Web::HTML::AgentType::SharedWorker) {
         agent.shared_worker_key = SharedWorkerKey {
+            .is_private = is_private,
             .storage_key = request.storage_key,
             .url = request.url,
-            .name = request.name,
+            .name = Utf16String::from_utf8(request.name),
         };
         m_shared_workers.set(*agent.shared_worker_key, agent_id);
     }
@@ -150,6 +167,12 @@ Web::HTML::WorkerAgentId WorkerProcessManager::start_worker_agent(Owner owner, W
     client->async_start_worker(request.url, request.type, request.credentials, request.name, move(request.outside_port), request.outside_settings, request.agent_type);
 
     return agent_id;
+}
+
+void WorkerProcessManager::update_site_compatibility_data(JsonValue const& data)
+{
+    for (auto const& agent : m_agents)
+        agent.value.client->async_set_site_compatibility_data(data);
 }
 
 void WorkerProcessManager::close_worker_agent(WebContentClient& client, Web::HTML::WorkerAgentId agent_id, Web::HTML::WorkerAgentOwnerToken owner_token)
@@ -184,7 +207,7 @@ void WorkerProcessManager::remove_web_content_owner(WebContentClient& client)
     }
 
     for (auto agent_id : agents_to_close)
-        remove_agent(agent_id);
+        remove_agent(agent_id, AgentRemovalCause::OwnerSetEmptied);
 }
 
 void WorkerProcessManager::remove_web_worker_owner(WebWorkerClient& client)
@@ -201,29 +224,63 @@ void WorkerProcessManager::remove_web_worker_owner(WebWorkerClient& client)
     }
 
     for (auto agent_id : agents_to_close)
-        remove_agent(agent_id);
+        remove_agent(agent_id, AgentRemovalCause::OwnerSetEmptied);
 }
 
-void WorkerProcessManager::broadcast_channel_message_from_web_content(Web::HTML::BroadcastChannelMessage const& message)
+void WorkerProcessManager::broadcast_channel_message_from_web_content(Web::HTML::BroadcastChannelMessage const& message, IsPrivate is_private)
 {
     for (auto& entry : m_agents) {
         auto& agent = entry.value;
         if (agent.client->pid() == message.source_process_id)
             continue;
+        if (agent.is_private != is_private)
+            continue;
         agent.client->async_broadcast_channel_message(message);
     }
 }
 
-void WorkerProcessManager::notify_worker_script_load_success(Owner const& owner)
+ErrorOr<void> WorkerProcessManager::reconnect_to_request_server()
 {
-    owner.client.visit(
-        [&](WebContentOwner const& web_content_owner) {
-            if (web_content_owner.client)
-                web_content_owner.client->async_did_worker_agent_finish_loading_script(owner.token);
-        },
-        [&](WebWorkerOwner const& web_worker_owner) {
-            web_worker_owner.client->async_did_worker_agent_finish_loading_script(owner.token);
+    return reconnect_to_request_server([](auto const&) { return true; });
+}
+
+ErrorOr<void> WorkerProcessManager::reconnect_to_request_server(Function<bool(WorkerAgent const&)> should_reconnect)
+{
+    for (auto& entry : m_agents) {
+        auto& agent = entry.value;
+        if (!agent.client->is_open() || !should_reconnect(agent))
+            continue;
+
+        auto request_server_handle = TRY(connect_new_request_server_client(agent.is_private));
+        agent.client->async_connect_to_request_server(move(request_server_handle));
+    }
+    return {};
+}
+
+ErrorOr<void> WorkerProcessManager::simulate_request_server_connection_loss_for_testing(WebContentClient& owner, Web::PageId page_id)
+{
+    auto is_owned_by_page = [&](WorkerAgent const& agent) {
+        return any_of(agent.owners, [&](Owner const& candidate) {
+            auto const* web_content_owner = candidate.client.get_pointer<WebContentOwner>();
+            return web_content_owner && web_content_owner->client.ptr() == &owner && web_content_owner->page_id == page_id;
         });
+    };
+
+    Vector<NonnullRefPtr<WebWorkerClient>> clients;
+    for (auto& entry : m_agents) {
+        auto& agent = entry.value;
+        if (agent.client->is_open() && is_owned_by_page(agent))
+            clients.append(agent.client);
+    }
+
+    for (auto& client : clients) {
+        auto request_server_handle = TRY(connect_new_request_server_client(client->is_private()));
+        auto response = client->send_sync_but_allow_failure<Messages::WebWorkerServer::SimulateRequestServerConnectionLossAndReconnectForTesting>(move(request_server_handle));
+        if (!response)
+            return Error::from_string_literal("WebWorker disconnected while reconnecting to RequestServer");
+    }
+
+    return {};
 }
 
 void WorkerProcessManager::notify_worker_script_load_failure(Owner const& owner)
@@ -238,7 +295,7 @@ void WorkerProcessManager::notify_worker_script_load_failure(Owner const& owner)
         });
 }
 
-void WorkerProcessManager::notify_worker_exception(Owner const& owner, String const& message, String const& filename, u32 lineno, u32 colno)
+void WorkerProcessManager::notify_worker_exception(Owner const& owner, Utf16String const& message, Utf16String const& filename, u32 lineno, u32 colno)
 {
     owner.client.visit(
         [&](WebContentOwner const& web_content_owner) {
@@ -262,6 +319,18 @@ void WorkerProcessManager::notify_worker_close(Owner const& owner)
         });
 }
 
+void WorkerProcessManager::notify_worker_death(Owner const& owner)
+{
+    owner.client.visit(
+        [&](WebContentOwner const& web_content_owner) {
+            if (web_content_owner.client)
+                web_content_owner.client->async_did_worker_agent_die(owner.token);
+        },
+        [&](WebWorkerOwner const& web_worker_owner) {
+            web_worker_owner.client->async_did_worker_agent_die(owner.token);
+        });
+}
+
 void WorkerProcessManager::worker_did_finish_loading_script(Web::HTML::WorkerAgentId agent_id, bool worker_is_secure_context)
 {
     auto maybe_agent = m_agents.find(agent_id);
@@ -270,9 +339,6 @@ void WorkerProcessManager::worker_did_finish_loading_script(Web::HTML::WorkerAge
 
     auto& agent = maybe_agent->value;
     agent.worker_is_secure_context = worker_is_secure_context;
-
-    for (auto const& owner : agent.owners)
-        notify_worker_script_load_success(owner);
 }
 
 void WorkerProcessManager::worker_did_fail_loading_script(Web::HTML::WorkerAgentId agent_id)
@@ -291,11 +357,11 @@ void WorkerProcessManager::worker_did_fail_loading_script(Web::HTML::WorkerAgent
         notify_worker_script_load_failure(owner);
 
     Core::deferred_invoke([this, agent_id] {
-        remove_agent(agent_id);
+        remove_agent(agent_id, AgentRemovalCause::AgentTerminated);
     });
 }
 
-void WorkerProcessManager::worker_did_report_exception(Web::HTML::WorkerAgentId agent_id, String message, String filename, u32 lineno, u32 colno)
+void WorkerProcessManager::worker_did_report_exception(Web::HTML::WorkerAgentId agent_id, Utf16String message, Utf16String filename, u32 lineno, u32 colno)
 {
     auto maybe_agent = m_agents.find(agent_id);
     if (maybe_agent == m_agents.end())
@@ -321,13 +387,31 @@ void WorkerProcessManager::worker_did_close(Web::HTML::WorkerAgentId agent_id)
         notify_worker_close(owner);
 
     Core::deferred_invoke([this, agent_id] {
-        remove_agent(agent_id);
+        remove_agent(agent_id, AgentRemovalCause::AgentTerminated);
     });
 }
 
 void WorkerProcessManager::worker_did_die(Web::HTML::WorkerAgentId agent_id)
 {
-    worker_did_close(agent_id);
+    auto maybe_agent = m_agents.find(agent_id);
+    if (maybe_agent == m_agents.end())
+        return;
+
+    // A close we initiated is expected to drop the connection; any other loss must not look like a clean close.
+    auto& agent = maybe_agent->value;
+    if (agent.closing) {
+        worker_did_close(agent_id);
+        return;
+    }
+
+    agent.closing = true;
+    auto owners = agent.owners;
+    for (auto const& owner : owners)
+        notify_worker_death(owner);
+
+    Core::deferred_invoke([this, agent_id] {
+        remove_agent(agent_id, AgentRemovalCause::AgentTerminated);
+    });
 }
 
 void WorkerProcessManager::worker_did_request_file(Web::HTML::WorkerAgentId agent_id, ByteString path, i32 request_id)
@@ -345,8 +429,15 @@ void WorkerProcessManager::worker_did_request_file(Web::HTML::WorkerAgentId agen
 
 void WorkerProcessManager::worker_did_post_broadcast_channel_message(Web::HTML::WorkerAgentId agent_id, Web::HTML::BroadcastChannelMessage message)
 {
+    auto source_agent = m_agents.find(agent_id);
+    if (source_agent == m_agents.end())
+        return;
+    auto source_is_private = source_agent->value.is_private;
+
     WebContentClient::for_each_client([&](auto& client) {
         if (client.pid() == message.source_process_id)
+            return IterationDecision::Continue;
+        if (client.is_private() != source_is_private)
             return IterationDecision::Continue;
         client.async_broadcast_channel_message(message);
         return IterationDecision::Continue;
@@ -358,15 +449,22 @@ void WorkerProcessManager::worker_did_post_broadcast_channel_message(Web::HTML::
         auto& agent = entry.value;
         if (agent.client->pid() == message.source_process_id)
             continue;
+        if (agent.is_private != source_is_private)
+            continue;
         agent.client->async_broadcast_channel_message(message);
     }
 }
 
-void WorkerProcessManager::remove_agent(Web::HTML::WorkerAgentId agent_id)
+void WorkerProcessManager::remove_agent(Web::HTML::WorkerAgentId agent_id, AgentRemovalCause cause)
 {
     auto maybe_agent = m_agents.find(agent_id);
     if (maybe_agent == m_agents.end())
         return;
+
+    // A worker still reachable from an owner is actively needed, and closing it here would be the
+    // wrapper-lifetime bug this ownership model exists to prevent.
+    if (cause == AgentRemovalCause::OwnerSetEmptied)
+        VERIFY(maybe_agent->value.owners.is_empty());
 
     auto agent = move(maybe_agent->value);
     m_agents.remove(agent_id);
@@ -404,8 +502,48 @@ void WorkerProcessManager::remove_owner(Web::HTML::WorkerAgentId agent_id, Owner
     if (!agent_owned_by_specified_owner)
         return;
 
-    if (agent.agent_type == Web::Bindings::AgentType::DedicatedWorker || agent.owners.is_empty())
-        remove_agent(agent_id);
+    if (agent.owners.is_empty())
+        remove_agent(agent_id, AgentRemovalCause::OwnerSetEmptied);
+    else if (agent.agent_type == Web::HTML::AgentType::DedicatedWorker)
+        remove_agent(agent_id, AgentRemovalCause::AgentTerminated);
+}
+
+Optional<u64> WorkerProcessManager::exclusive_performance_owner(pid_t pid) const
+{
+    HashTable<Web::HTML::WorkerAgentId> visiting;
+    Function<Optional<u64>(WorkerAgent const&)> resolve = [&](WorkerAgent const& agent) -> Optional<u64> {
+        if (agent.closing || visiting.contains(agent.id))
+            return {};
+        visiting.set(agent.id);
+        ScopeGuard remove_visit = [&] { visiting.remove(agent.id); };
+        Optional<u64> result;
+        for (auto const& owner : agent.owners) {
+            auto id = owner.client.visit(
+                [&](WebContentOwner const& content) -> Optional<u64> {
+                if (!content.client)
+                    return {};
+                auto* navigable = content.client->traversable_for_page(content.page_id);
+                if (!navigable)
+                    return {};
+                auto view = ViewImplementation::find_view_for_traversable(navigable->top_level_traversable());
+                return view.has_value() ? Optional<u64> { view->view_id() } : Optional<u64> {}; },
+                [&](WebWorkerOwner const& worker) -> Optional<u64> {
+                for (auto const& candidate : m_agents) {
+                    if (candidate.value.client.ptr() == worker.client.ptr())
+                        return resolve(candidate.value);
+                }
+                return {}; });
+            if (!id.has_value() || (result.has_value() && *result != *id))
+                return {};
+            result = id;
+        }
+        return result;
+    };
+    for (auto const& agent : m_agents) {
+        if (agent.value.client->pid() == pid)
+            return resolve(agent.value);
+    }
+    return {};
 }
 
 }

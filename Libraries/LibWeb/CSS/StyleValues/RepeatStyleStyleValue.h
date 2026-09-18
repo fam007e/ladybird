@@ -15,29 +15,18 @@ namespace Web::CSS {
 
 class RepeatStyleStyleValue final : public StyleValueWithDefaultOperators<RepeatStyleStyleValue> {
 public:
-    static ValueComparingNonnullRefPtr<RepeatStyleStyleValue const> create(Repetition repeat_x, Repetition repeat_y)
-    {
-        return adopt_ref(*new (nothrow) RepeatStyleStyleValue(repeat_x, repeat_y));
-    }
-    virtual ~RepeatStyleStyleValue() override;
+    virtual ~RepeatStyleStyleValue() override = default;
 
-    Repetition repeat_x() const { return m_properties.repeat_x; }
-    Repetition repeat_y() const { return m_properties.repeat_y; }
-
-    virtual void serialize(StringBuilder&, SerializationMode) const override;
-
-    bool properties_equal(RepeatStyleStyleValue const& other) const { return m_properties == other.m_properties; }
-
-    virtual bool is_computationally_independent() const override { return true; }
+    Repetition repeat_x() const { return static_cast<Repetition>(m_value->repeat_style.repeat_x); }
+    Repetition repeat_y() const { return static_cast<Repetition>(m_value->repeat_style.repeat_y); }
 
 private:
-    RepeatStyleStyleValue(Repetition repeat_x, Repetition repeat_y);
+    friend class StyleValue;
 
-    struct Properties {
-        Repetition repeat_x;
-        Repetition repeat_y;
-        bool operator==(Properties const&) const = default;
-    } m_properties;
+    explicit RepeatStyleStyleValue(StyleValueFFI::StyleValueData const* data)
+        : StyleValueWithDefaultOperators(Type::RepeatStyle, data)
+    {
+    }
 };
 
 }

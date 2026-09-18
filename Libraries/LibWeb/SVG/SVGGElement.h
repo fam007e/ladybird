@@ -11,20 +11,18 @@
 namespace Web::SVG {
 
 class SVGGElement final : public SVGGraphicsElement {
-    WEB_PLATFORM_OBJECT(SVGGElement, SVGGraphicsElement);
+    WEB_WRAPPABLE(SVGGElement, SVGGraphicsElement);
     GC_DECLARE_ALLOCATOR(SVGGElement);
 
 public:
     virtual ~SVGGElement() override = default;
 
-    virtual RefPtr<Layout::Node> create_layout_node(CSS::ComputedProperties const&) override;
+    virtual Layout::Node* create_layout_node(CSS::LayoutStyle) override;
 
 private:
     virtual bool is_svg_g_element() const final { return true; }
 
     SVGGElement(DOM::Document&, DOM::QualifiedName);
-
-    virtual void initialize(JS::Realm&) override;
 };
 
 }

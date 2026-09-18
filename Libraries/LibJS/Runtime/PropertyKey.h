@@ -40,6 +40,7 @@ public:
     bool is_string() const { return (m_bits & 3) == NORMAL_STRING_FLAG || (m_bits & 3) == SHORT_STRING_FLAG; }
     bool is_number() const { return (m_bits & 3) == NUMBER_FLAG; }
     bool is_symbol() const { return (m_bits & 3) == SYMBOL_FLAG; }
+    bool is_private() const { return is_symbol() && as_symbol()->is_private(); }
 
     PropertyKey() = delete;
 
@@ -146,6 +147,7 @@ public:
 
     Value to_value(VM& vm) const
     {
+        VERIFY(!is_private());
         if (is_string())
             return Value { PrimitiveString::create(vm, as_string()) };
         if (is_symbol())
@@ -212,8 +214,11 @@ template<>
 struct Traits<JS::PropertyKey> : public DefaultTraits<JS::PropertyKey> {
     static unsigned hash(JS::PropertyKey const& name)
     {
-        if (name.is_string())
+        if (name.is_string()) {
+            if (name.as_string().has_short_ascii_storage())
+                return u64_hash(name.as_string().raw_identity());
             return name.as_string().hash();
+        }
         if (name.is_symbol())
             return ptr_hash(name.as_symbol());
         if (name.is_number())

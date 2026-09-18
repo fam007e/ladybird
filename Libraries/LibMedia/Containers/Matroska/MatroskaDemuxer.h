@@ -7,11 +7,13 @@
 #pragma once
 
 #include <AK/HashMap.h>
+#include <AK/Mutex.h>
+#include <LibMedia/ContainerID.h>
 #include <LibMedia/Demuxer.h>
+#include <LibMedia/DemuxerScanThread.h>
 #include <LibMedia/Export.h>
 #include <LibMedia/Forward.h>
 #include <LibMedia/IncrementallyPopulatedStream.h>
-#include <LibSync/Mutex.h>
 
 #include "Reader.h"
 
@@ -19,7 +21,10 @@ namespace Media::Matroska {
 
 class MEDIA_API MatroskaDemuxer final : public Demuxer {
 public:
-    static DecoderErrorOr<NonnullRefPtr<MatroskaDemuxer>> from_stream(NonnullRefPtr<MediaStream> const&);
+    static bool should_attempt(NonnullRefPtr<MediaStream> const&);
+    static DecoderErrorOr<NonnullRefPtr<Demuxer>> from_stream(NonnullRefPtr<MediaStream> const&);
+    static bool supports_container_mime_type(ContainerMimeType);
+    static bool supports_codec_in_container(ContainerID, CodecID);
 
     MatroskaDemuxer(NonnullRefPtr<MediaStream> const& stream, Reader&& reader);
     ~MatroskaDemuxer();
@@ -35,24 +40,30 @@ public:
     virtual DecoderErrorOr<AK::Duration> duration_of_track(Track const&) override;
     virtual DecoderErrorOr<AK::Duration> total_duration() override;
 
-    virtual TimeRanges buffered_time_ranges() const override;
-
-    virtual DecoderErrorOr<CodecID> get_codec_id_for_track(Track const&) override;
-
-    virtual DecoderErrorOr<ReadonlyBytes> get_codec_initialization_data_for_track(Track const&) override;
+    virtual DemuxerScanState const& scan_state() const LIFETIME_BOUND override;
+    virtual void set_scan_state_change_handler(Function<void()>) override;
 
     virtual DecoderErrorOr<CodedFrame> get_next_sample_for_track(Track const&) override;
 
     virtual void set_blocking_reads_aborted_for_track(Track const&) override;
     virtual void reset_blocking_reads_aborted_for_track(Track const&) override;
-    virtual bool is_read_blocked_for_track(Track const&) override;
+    virtual void set_read_blocked_change_handler_for_track(Track const&, ReadBlockedChangeHandler) override;
 
 private:
+    struct BufferedScanPayload {
+        Reader reader;
+        NonnullRefPtr<MediaStreamCursor> scan_cursor;
+        Vector<Track> tracks;
+    };
+
+    void start_buffered_scan_thread(Reader&& scan_reader);
+
     struct TrackStatus {
         SampleIterator iterator;
         Optional<Block> block;
-        Vector<ByteBuffer, 4> frames;
+        SampleIterator::Frames frames;
         size_t frame_index { 0 };
+        bool needs_codec_configuration { true };
 
         TrackStatus(SampleIterator&& iterator)
             : iterator(iterator)
@@ -63,10 +74,10 @@ private:
     TrackStatus& get_track_status(Track const&);
 
     NonnullRefPtr<MediaStream> m_stream;
-    NonnullRefPtr<MediaStreamCursor> m_buffered_scan_cursor;
     Reader m_reader;
+    RefPtr<DemuxerScanThread<BufferedScanPayload>> m_buffered_scan_thread;
 
-    mutable Sync::Mutex m_track_statuses_mutex;
+    mutable Mutex m_track_statuses_mutex;
     HashMap<Track, TrackStatus> m_track_statuses;
 };
 

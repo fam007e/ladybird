@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <AK/Mutex.h>
 #include <AK/NonnullRefPtr.h>
 #include <AK/OwnPtr.h>
 #include <AK/RefPtr.h>
@@ -16,7 +17,6 @@
 #include <LibMedia/PipelineStatus.h>
 #include <LibMedia/Processors/AudioProcessor.h>
 #include <LibMedia/Producers/AudioProducer.h>
-#include <LibSync/Mutex.h>
 
 namespace Media {
 
@@ -33,18 +33,19 @@ public:
     virtual ErrorOr<void> set_output_sample_specification(Audio::SampleSpecification) override;
     virtual void start() override;
 
-    virtual PipelineStatus status() const override;
-    virtual void pull(AudioBlock&) override;
+    virtual AudioProducerOutput peek() override;
+    virtual void consume() override;
     virtual void set_wake_handler(PipelineWakeHandler) override;
     virtual void set_playback_rate(float) override;
 
 private:
     void ensure_stretcher_while_locked() const;
+    void prime_stretcher_for_input_seek_while_locked(i64 target_frame, i64 output_frame) const;
     void maybe_recover_from_stale_upstream_eos_while_locked() const;
     PipelineStatus produce_block_while_locked(AudioBlock&) const;
     void dispatch_wake();
 
-    mutable Sync::Mutex m_mutex;
+    mutable Mutex m_mutex;
     Audio::SampleSpecification m_sample_specification;
     RefPtr<AudioProducer> m_input;
 
@@ -56,10 +57,8 @@ private:
     mutable AK::Duration m_next_emit_media_time;
     mutable bool m_stretcher_reached_eos { false };
 
-    mutable AudioBlock m_input_block;
     mutable AudioBlock m_pending_block;
     mutable bool m_downstream_needs_wake { true };
-    bool m_moved_position_pending { false };
 
     PipelineWakeHandler m_wake_handler;
 };

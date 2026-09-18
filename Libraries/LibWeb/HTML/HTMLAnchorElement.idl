@@ -9,7 +9,7 @@ interface HTMLAnchorElement : HTMLElement {
     [CEReactions, Reflect] attribute DOMString rel;
     [SameObject, PutForwards=value] readonly attribute DOMTokenList relList;
 
-    [CEReactions] attribute Utf16DOMString text;
+    [CEReactions] attribute DOMString text;
 
     [CEReactions, Reflect=referrerpolicy, Enumerated=ReferrerPolicy] attribute DOMString referrerPolicy;
 

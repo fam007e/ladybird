@@ -9,7 +9,12 @@
 namespace Web::SVG::TagNames {
 
 #define __ENUMERATE_SVG_TAG(name, tag) \
-    FlyString const& name = *new FlyString(tag##_fly_string);
+    Utf16FlyString const& name = *new Utf16FlyString(tag##_utf16_fly_string);
+ENUMERATE_SVG_TAGS
+#undef __ENUMERATE_SVG_TAG
+
+#define __ENUMERATE_SVG_TAG(name, tag) \
+    extern "C" FlatPtr const ladybird_svg_tag_name_##name = name.raw_identity();
 ENUMERATE_SVG_TAGS
 #undef __ENUMERATE_SVG_TAG
 

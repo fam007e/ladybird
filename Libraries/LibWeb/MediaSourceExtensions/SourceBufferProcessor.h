@@ -17,6 +17,7 @@
 #include <LibMedia/Forward.h>
 #include <LibMedia/TimeRanges.h>
 #include <LibMedia/Track.h>
+#include <LibWeb/MediaSourceExtensions/SourceBuffer.h>
 
 namespace Web::MediaSourceExtensions {
 
@@ -25,19 +26,11 @@ struct DemuxedCodedFrame;
 class TrackBuffer;
 class TrackBufferDemuxer;
 
-// These enums are declared separately from the bindings to avoid including the entire prototype header here.
-
 // https://w3c.github.io/media-source/#dfn-append-state
 enum class AppendState : u8 {
     WaitingForSegment,
     ParsingInitSegment,
     ParsingMediaSegment,
-};
-
-// https://w3c.github.io/media-source/#dom-appendmode
-enum class AppendMode : u8 {
-    Segments,
-    Sequence,
 };
 
 struct InitializationSegmentTrack {
@@ -65,6 +58,7 @@ public:
     bool is_parsing_media_segment() const;
     bool generate_timestamps_flag() const;
     AK::Duration group_end_timestamp() const;
+    AK::Duration timestamp_offset() const;
     bool is_buffer_full() const;
 
     size_t total_buffered_bytes() const;
@@ -73,6 +67,7 @@ public:
     void set_mode(AppendMode);
     void set_generate_timestamps_flag(bool);
     void set_group_start_timestamp(Optional<AK::Duration>);
+    void set_timestamp_offset(AK::Duration);
     bool first_initialization_segment_received_flag() const;
     void set_first_initialization_segment_received_flag(bool);
     void set_pending_initialization_segment_for_change_type_flag(bool);
@@ -93,6 +88,7 @@ public:
 
     void run_segment_parser_loop();
     void reset_parser_state();
+    void run_coded_frame_removal(AK::Duration start, AK::Duration end);
     void run_coded_frame_eviction(size_t new_data_size, AK::Duration current_time);
 
     void set_reached_end_of_stream();
@@ -105,7 +101,7 @@ private:
     void unset_all_track_buffer_timestamps();
     void set_need_random_access_point_flag_on_all_track_buffers(bool);
 
-    void initialization_segment_received();
+    [[nodiscard]] bool initialization_segment_received();
     void run_coded_frame_processing(Vector<DemuxedCodedFrame>&);
 
     // https://w3c.github.io/media-source/#dom-sourcebuffer-updating
@@ -130,6 +126,8 @@ private:
     Optional<AK::Duration> m_group_start_timestamp;
     // https://w3c.github.io/media-source/#dfn-group-end-timestamp
     AK::Duration m_group_end_timestamp;
+    // https://w3c.github.io/media-source/#dom-sourcebuffer-timestampoffset
+    AK::Duration m_timestamp_offset;
     // https://w3c.github.io/media-source/#dfn-generate-timestamps-flag
     bool m_generate_timestamps_flag { false };
     // https://w3c.github.io/media-source/#dfn-first-initialization-segment-received-flag

@@ -22,21 +22,21 @@ class SharedResourceRequest final : public JS::Cell {
 public:
     static constexpr bool OVERRIDES_FINALIZE = true;
 
-    [[nodiscard]] static GC::Ref<SharedResourceRequest> get_or_create(JS::Realm&, GC::Ref<Page>, URL::URL const&);
+    [[nodiscard]] static GC::Ref<SharedResourceRequest> get_or_create(DOM::Document&, URL::URL const&);
 
     virtual ~SharedResourceRequest() override;
 
     URL::URL const& url() const { return m_url; }
 
     [[nodiscard]] GC::Ptr<DecodedImageData> image_data() const;
-    [[nodiscard]] bool can_be_pruned_from_memory_cache() const { return m_image_data; }
+    [[nodiscard]] bool can_be_pruned_from_memory_cache() const;
     [[nodiscard]] u64 cache_touch_serial() const { return m_cache_touch_serial; }
     void touch_memory_cache_entry();
 
     [[nodiscard]] GC::Ptr<Fetch::Infrastructure::FetchController> fetch_controller();
     void set_fetch_controller(GC::Ptr<Fetch::Infrastructure::FetchController>);
 
-    void fetch_resource(JS::Realm&, GC::Ref<Fetch::Infrastructure::Request>);
+    void fetch_resource(GC::Ref<Fetch::Infrastructure::Request>);
 
     void add_callbacks(Function<void()> on_finish, Function<void()> on_fail);
 
@@ -49,7 +49,12 @@ private:
     virtual void finalize() override;
     virtual void visit_edges(JS::Cell::Visitor&) override;
 
-    void handle_successful_fetch(URL::URL const&, StringView mime_type, ByteBuffer data, bool image_data_is_cors_cross_origin);
+    enum class IsSVGImage {
+        No,
+        Yes,
+    };
+
+    void handle_successful_fetch(URL::URL const&, IsSVGImage, ByteBuffer data, bool image_data_is_cors_cross_origin);
     void handle_failed_fetch();
     void handle_successful_resource_load();
 

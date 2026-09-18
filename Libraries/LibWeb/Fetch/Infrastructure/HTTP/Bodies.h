@@ -10,6 +10,7 @@
 #include <AK/Forward.h>
 #include <AK/NonnullRefPtr.h>
 #include <AK/Optional.h>
+#include <AK/Utf16String.h>
 #include <AK/Variant.h>
 #include <LibCore/ImmutableBytes.h>
 #include <LibGC/Ptr.h>
@@ -41,8 +42,8 @@ public:
     // processEndOfBody must be an algorithm accepting no arguments
     using ProcessEndOfBodyCallback = GC::Ref<GC::Function<void()>>;
 
-    [[nodiscard]] static GC::Ref<Body> create(JS::VM&, GC::Ref<Streams::ReadableStream>);
-    [[nodiscard]] static GC::Ref<Body> create(JS::VM&, GC::Ref<Streams::ReadableStream>, SourceType, Optional<u64>);
+    [[nodiscard]] static GC::Ref<Body> create(GC::Ref<Streams::ReadableStream>);
+    [[nodiscard]] static GC::Ref<Body> create(GC::Ref<Streams::ReadableStream>, SourceType, Optional<u64>);
 
     [[nodiscard]] GC::Ref<Streams::ReadableStream> stream() const { return *m_stream; }
     void set_stream(GC::Ref<Streams::ReadableStream> value) { m_stream = value; }
@@ -67,6 +68,7 @@ public:
     [[nodiscard]] GC::Ref<Body> clone(JS::Realm&);
 
     void fully_read(JS::Realm&, ProcessBodyCallback process_body, ProcessBodyErrorCallback process_body_error, TaskDestination) const;
+    GC::Ref<Streams::ReadableStreamDefaultReader> incrementally_read(JS::Realm&, ProcessBodyChunkCallback process_body_chunk, ProcessEndOfBodyCallback process_end_of_body, ProcessBodyErrorCallback process_body_error, TaskDestination);
     GC::Ref<Streams::ReadableStreamDefaultReader> incrementally_read(ProcessBodyChunkCallback process_body_chunk, ProcessEndOfBodyCallback process_end_of_body, ProcessBodyErrorCallback process_body_error, TaskDestination);
     void incrementally_read_loop(Streams::ReadableStreamDefaultReader& reader, TaskDestination, ProcessBodyChunkCallback process_body_chunk, ProcessEndOfBodyCallback process_end_of_body, ProcessBodyErrorCallback process_body_error);
 
@@ -99,7 +101,7 @@ private:
 // A body with type is a tuple that consists of a body (a body) and a type (a header value or null).
 struct BodyWithType {
     GC::Ref<Body> body;
-    Optional<ByteString> type;
+    Optional<Utf16String> type;
 };
 
 WEB_API GC::Ref<Body> byte_sequence_as_body(JS::Realm&, ReadonlyBytes);

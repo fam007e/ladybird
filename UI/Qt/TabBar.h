@@ -10,6 +10,7 @@
 
 #include <AK/TypeCasts.h>
 #include <LibWebView/Settings.h>
+#include <UI/Qt/Tab.h>
 
 #include <QPointer>
 #include <QPushButton>
@@ -37,7 +38,6 @@ class QWheelEvent;
 
 namespace Ladybird {
 
-class Tab;
 class TabPreviewPopup;
 class TabWidget;
 
@@ -126,6 +126,8 @@ private:
     QTimer* m_tab_preview_timer { nullptr };
     TabPreviewPopup* m_tab_preview_popup { nullptr };
     int m_tab_preview_index { -1 };
+    QPointer<Tab> m_previewed_tab;
+    QMetaObject::Connection m_tab_preview_paint_connection;
 };
 
 class TabWidget final : public QWidget {
@@ -211,6 +213,7 @@ private:
     void recreate_icons();
     void update_chrome_style();
     void update_vertical_tabs_overlay_geometry();
+    void update_vertical_tabs_content_overlay();
     void set_vertical_tabs_hover_expanded(bool);
     void defer_update_vertical_tabs_hover_expanded();
     void update_vertical_tabs_hover_expanded();
@@ -220,6 +223,8 @@ private:
     void accept_tab_drop(QDropEvent*, int index);
 
     TabBar* m_tab_bar { nullptr };
+    void size_hidden_pages_like_the_current_one();
+
     QStackedWidget* m_stacked_widget { nullptr };
     QToolButton* m_new_tab_button { nullptr };
     QToolButton* m_minimize_window_button { nullptr };
@@ -263,6 +268,7 @@ public:
 
 protected:
     virtual bool event(QEvent* event) override;
+    virtual void paintEvent(QPaintEvent*) override;
 };
 
 }

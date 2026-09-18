@@ -35,6 +35,7 @@ template<>
 ErrorOr<void> encode(Encoder& encoder, Web::HTML::SerializedWorkerGlobalScope const& worker_global_scope)
 {
     TRY(encoder.encode(worker_global_scope.relevant_settings_object_is_secure_context));
+    TRY(encoder.encode(worker_global_scope.is_supported_animation_frame_provider));
     return {};
 }
 
@@ -43,6 +44,7 @@ ErrorOr<Web::HTML::SerializedWorkerGlobalScope> decode(Decoder& decoder)
 {
     return Web::HTML::SerializedWorkerGlobalScope {
         .relevant_settings_object_is_secure_context = TRY(decoder.decode<bool>()),
+        .is_supported_animation_frame_provider = TRY(decoder.decode<bool>()),
     };
 }
 
@@ -58,6 +60,7 @@ ErrorOr<void> encode(Encoder& encoder, Web::HTML::SerializedEnvironmentSettingsO
     TRY(encoder.encode(object.has_cross_site_ancestor));
     TRY(encoder.encode(object.policy_container));
     TRY(encoder.encode(object.cross_origin_isolated_capability));
+    TRY(encoder.encode(object.agent_cluster_id));
     TRY(encoder.encode(object.time_origin));
     TRY(encoder.encode(object.global));
 
@@ -68,7 +71,7 @@ template<>
 ErrorOr<Web::HTML::SerializedEnvironmentSettingsObject> decode(Decoder& decoder)
 {
     return Web::HTML::SerializedEnvironmentSettingsObject {
-        .id = TRY(decoder.decode<String>()),
+        .id = TRY(decoder.decode<Utf16String>()),
         .creation_url = TRY(decoder.decode<URL::URL>()),
         .top_level_creation_url = TRY(decoder.decode<Optional<URL::URL>>()),
         .top_level_origin = TRY(decoder.decode<Optional<URL::Origin>>()),
@@ -77,6 +80,7 @@ ErrorOr<Web::HTML::SerializedEnvironmentSettingsObject> decode(Decoder& decoder)
         .has_cross_site_ancestor = TRY(decoder.decode<bool>()),
         .policy_container = TRY(decoder.decode<Web::HTML::SerializedPolicyContainer>()),
         .cross_origin_isolated_capability = TRY(decoder.decode<Web::HTML::CanUseCrossOriginIsolatedAPIs>()),
+        .agent_cluster_id = TRY(decoder.decode<Optional<u64>>()),
         .time_origin = TRY(decoder.decode<double>()),
         .global = TRY(decoder.decode<Web::HTML::SerializedGlobal>()),
     };

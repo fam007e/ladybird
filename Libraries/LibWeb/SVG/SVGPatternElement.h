@@ -7,9 +7,10 @@
 #pragma once
 
 #include <LibGC/RootHashTable.h>
+#include <LibGfx/Matrix4x4.h>
 #include <LibWeb/Forward.h>
 #include <LibWeb/Layout/Node.h>
-#include <LibWeb/SVG/AttributeParser.h>
+#include <LibWeb/SVG/AttributeParsing.h>
 #include <LibWeb/SVG/SVGAnimatedLength.h>
 #include <LibWeb/SVG/SVGElement.h>
 #include <LibWeb/SVG/SVGFitToViewBox.h>
@@ -22,13 +23,15 @@ class SVGPatternElement
     : public SVGElement
     , public SVGFitToViewBox
     , public SVGURIReferenceMixin<SupportsXLinkHref::Yes> {
-    WEB_PLATFORM_OBJECT(SVGPatternElement, SVGElement);
+    WEB_WRAPPABLE(SVGPatternElement, SVGElement);
     GC_DECLARE_ALLOCATOR(SVGPatternElement);
 
 public:
     virtual ~SVGPatternElement() override = default;
 
-    virtual void attribute_changed(FlyString const& name, Optional<String> const& old_value, Optional<String> const& value, Optional<FlyString> const& namespace_) override;
+    virtual SVGFitToViewBox const* fit_to_view_box() const override { return this; }
+
+    virtual void attribute_changed(Utf16FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_) override;
 
     SVGUnits pattern_units() const;
     SVGUnits pattern_content_units() const;
@@ -38,21 +41,28 @@ public:
     NumberPercentage pattern_width() const;
     NumberPercentage pattern_height() const;
 
-    GC::Ref<SVGAnimatedLength> x() const;
-    GC::Ref<SVGAnimatedLength> y() const;
-    GC::Ref<SVGAnimatedLength> width() const;
-    GC::Ref<SVGAnimatedLength> height() const;
+    // https://w3c.github.io/svgwg/svg2-draft/pservers.html#__svg__SVGPatternElement__x
+    REFLECT_ANIMATED_LENGTH_ATTRIBUTE(x, Horizontal, SVGLengthValue::number(0));
+
+    // https://w3c.github.io/svgwg/svg2-draft/pservers.html#__svg__SVGPatternElement__y
+    REFLECT_ANIMATED_LENGTH_ATTRIBUTE(y, Vertical, SVGLengthValue::number(0));
+
+    // https://w3c.github.io/svgwg/svg2-draft/pservers.html#__svg__SVGPatternElement__width
+    REFLECT_ANIMATED_LENGTH_ATTRIBUTE(width, Horizontal, SVGLengthValue::number(0));
+
+    // https://w3c.github.io/svgwg/svg2-draft/pservers.html#__svg__SVGPatternElement__height
+    REFLECT_ANIMATED_LENGTH_ATTRIBUTE(height, Vertical, SVGLengthValue::number(0));
 
     GC::Ptr<SVGPatternElement const> pattern_content_element() const;
 
-    Optional<Painting::PaintStyle> to_gfx_paint_style(SVGPaintContext const&, DisplayListRecordingContext&, Layout::Node const& target_layout_node) const;
+    void push_paint_server_description(void* sink, Layout::Node const& target_layout_node) const;
 
-    virtual RefPtr<Layout::Node> create_layout_node(CSS::ComputedProperties const&) override { return nullptr; }
+    virtual Layout::Node* create_layout_node(CSS::LayoutStyle) override { return nullptr; }
 
 protected:
     SVGPatternElement(DOM::Document&, DOM::QualifiedName);
 
-    virtual void initialize(JS::Realm&) override;
+    virtual void initialize_element() override;
     virtual void visit_edges(Cell::Visitor&) override;
 
 private:

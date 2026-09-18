@@ -10,14 +10,14 @@
 #include <AK/ByteBuffer.h>
 #include <AK/Debug.h>
 #include <LibCore/ImmutableBytes.h>
+#include <LibGC/Heap.h>
 #include <LibGfx/Bitmap.h>
 #include <LibGfx/DecodedImageFrame.h>
 #include <LibTextCodec/Decoder.h>
 #include <LibURL/URL.h>
-#include <LibWeb/Bindings/HTMLLinkElement.h>
-#include <LibWeb/CSS/CSSStyleSheet.h>
 #include <LibWeb/CSS/Parser/Parser.h>
-#include <LibWeb/CSS/StyleSheetList.h>
+#include <LibWeb/CSS/StyleScope.h>
+#include <LibWeb/CSS/StyleSheetState.h>
 #include <LibWeb/DOM/DOMTokenList.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/Event.h>
@@ -35,6 +35,9 @@
 #include <LibWeb/HTML/HTMLLinkElement.h>
 #include <LibWeb/HTML/LocalTraversableNavigable.h>
 #include <LibWeb/HTML/PotentialCORSRequest.h>
+#include <LibWeb/HTML/Scripting/Environments.h>
+#include <LibWeb/HTML/Scripting/Fetching.h>
+#include <LibWeb/HighResolutionTime/TimeOrigin.h>
 #include <LibWeb/Infra/CharacterTypes.h>
 #include <LibWeb/Loader/ResourceLoader.h>
 #include <LibWeb/Page/Page.h>
@@ -45,18 +48,17 @@ namespace Web::HTML {
 
 GC_DEFINE_ALLOCATOR(HTMLLinkElement);
 
+static GC::Ref<DOM::Event> create_event_for_element(HTMLElement& element, Utf16FlyString const& event_name)
+{
+    return DOM::Event::create(event_name, HighResolutionTime::current_high_resolution_time(relevant_global_object(element)));
+}
+
 HTMLLinkElement::HTMLLinkElement(DOM::Document& document, DOM::QualifiedName qualified_name)
     : HTMLElement(document, move(qualified_name))
 {
 }
 
 HTMLLinkElement::~HTMLLinkElement() = default;
-
-void HTMLLinkElement::initialize(JS::Realm& realm)
-{
-    WEB_SET_PROTOTYPE_FOR_INTERFACE(HTMLLinkElement);
-    Base::initialize(realm);
-}
 
 void HTMLLinkElement::visit_edges(Cell::Visitor& visitor)
 {
@@ -72,7 +74,7 @@ void HTMLLinkElement::adopted_from(DOM::Document& old_document)
     Base::adopted_from(old_document);
 
     if (m_document_load_event_delayer.has_value())
-        m_document_load_event_delayer.emplace(document());
+        m_document_load_event_delayer.emplace(document(), DOM::DocumentLoadEventDelayerReason::StyleSheetRequest);
 }
 
 void HTMLLinkElement::inserted()
@@ -93,25 +95,44 @@ void HTMLLinkElement::inserted()
 void HTMLLinkElement::removed_from(IsSubtreeRoot is_subtree_root, Node* old_ancestor, Node& old_root)
 {
     Base::removed_from(is_subtree_root, old_ancestor, old_root);
+    cancel_pending_stylesheet_processing();
 
     if (m_loaded_style_sheet) {
         // NB: We can't use `old_root` here. When this link element is nested
         //     inside a shadow tree within a larger removed subtree, `old_root`
         //     is the outer subtree's root, not the shadow root that actually
         //     contains our stylesheet. Use the sheet's own tracked owning
-        //     root, which is the one whose StyleSheetList it belongs to.
+        //     root, which is the one whose style scope owns it.
         auto const& owning_roots = m_loaded_style_sheet->owning_documents_or_shadow_roots();
         VERIFY(owning_roots.size() == 1);
         auto& owning_root = **owning_roots.begin();
-        auto& style_sheet_list = [&owning_root] -> CSS::StyleSheetList& {
+        auto& style_scope = [&owning_root] -> CSS::StyleScope& {
             if (auto* shadow_root = as_if<DOM::ShadowRoot>(owning_root))
-                return shadow_root->style_sheets();
-            return as<DOM::Document>(owning_root).style_sheets();
+                return shadow_root->style_scope();
+            return as<DOM::Document>(owning_root).style_scope();
         }();
 
-        style_sheet_list.remove_a_css_style_sheet(*m_loaded_style_sheet);
+        style_scope.remove_a_css_style_sheet(*m_loaded_style_sheet);
         m_loaded_style_sheet = nullptr;
     }
+}
+
+void HTMLLinkElement::moved_from(IsSubtreeRoot is_subtree_root, GC::Ptr<Node> old_ancestor)
+{
+    Base::moved_from(is_subtree_root, old_ancestor);
+
+    if (!m_loaded_style_sheet)
+        return;
+
+    auto const& owning_roots = m_loaded_style_sheet->owning_documents_or_shadow_roots();
+    VERIFY(owning_roots.size() == 1);
+    auto& owning_root = **owning_roots.begin();
+    auto& source = [&owning_root] -> CSS::StyleScope& {
+        if (auto* shadow_root = as_if<DOM::ShadowRoot>(owning_root))
+            return shadow_root->style_scope();
+        return as<DOM::Document>(owning_root).style_scope();
+    }();
+    source.move_sheet(*m_loaded_style_sheet, document_or_shadow_root_style_scope());
 }
 
 // https://html.spec.whatwg.org/multipage/semantics.html#dom-link-rellist
@@ -132,20 +153,25 @@ GC::Ref<DOM::DOMTokenList> HTMLLinkElement::sizes()
     return *m_sizes;
 }
 
-void HTMLLinkElement::set_media(String media)
+void HTMLLinkElement::set_media(Utf16View media)
 {
     set_attribute_value(HTML::AttributeNames::media, media);
     if (auto sheet = m_loaded_style_sheet)
-        sheet->set_media(move(media));
+        sheet->set_media(media);
 }
 
-String HTMLLinkElement::media() const
+Utf16String HTMLLinkElement::media() const
 {
-    return attribute(HTML::AttributeNames::media).value_or(String {});
+    return get_attribute_value(HTML::AttributeNames::media);
 }
 
 // https://drafts.csswg.org/cssom/#dom-linkstyle-sheet
-GC::Ptr<CSS::CSSStyleSheet> HTMLLinkElement::sheet() const
+CSS::CSSStyleSheet* HTMLLinkElement::cssom_sheet() const
+{
+    return m_loaded_style_sheet ? &m_loaded_style_sheet->cssom_sheet() : nullptr;
+}
+
+RefPtr<CSS::StyleSheetState> HTMLLinkElement::sheet() const
 {
     return m_loaded_style_sheet;
 }
@@ -165,7 +191,7 @@ bool HTMLLinkElement::has_icon_keyword() const
     return m_relationship & Relationship::Icon;
 }
 
-void HTMLLinkElement::attribute_changed(FlyString const& name, Optional<String> const& old_value, Optional<String> const& value, Optional<FlyString> const& namespace_)
+void HTMLLinkElement::attribute_changed(Utf16FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_)
 {
     Base::attribute_changed(name, old_value, value, namespace_);
 
@@ -183,30 +209,39 @@ void HTMLLinkElement::attribute_changed(FlyString const& name, Optional<String> 
     // 4.6.7 Link types - https://html.spec.whatwg.org/multipage/links.html#linkTypes
     auto old_relationship = m_relationship;
     if (name == HTML::AttributeNames::rel) {
-        m_relationship = 0;
-        // Keywords are always ASCII case-insensitive, and must be compared as such.
-        auto lowercased_value = value.value_or(String {}).to_ascii_lowercase();
         // To determine which link types apply to a link, a, area, or form element,
         // the element's rel attribute must be split on ASCII whitespace.
         // The resulting tokens are the keywords for the link types that apply to that element.
-        auto parts = lowercased_value.bytes_as_string_view().split_view_if(Infra::is_ascii_whitespace);
-        for (auto& part : parts) {
-            if (part == "stylesheet"sv)
-                m_relationship |= Relationship::Stylesheet;
-            else if (part == "alternate"sv)
-                m_relationship |= Relationship::Alternate;
-            else if (part == "preload"sv)
-                m_relationship |= Relationship::Preload;
-            else if (part == "dns-prefetch"sv)
-                m_relationship |= Relationship::DNSPrefetch;
-            else if (part == "preconnect"sv)
-                m_relationship |= Relationship::Preconnect;
-            else if (part == "icon"sv)
-                m_relationship |= Relationship::Icon;
+        m_relationship = 0;
+        auto link_types = value.has_value() ? value->utf16_view() : u""sv;
+        size_t start = 0;
+        for (size_t i = 0; i <= link_types.length_in_code_units(); ++i) {
+            if (i != link_types.length_in_code_units() && !Infra::is_ascii_whitespace(link_types.code_unit_at(i)))
+                continue;
+
+            if (i > start) {
+                auto token = link_types.substring_view(start, i - start);
+                if (token.equals_ignoring_ascii_case(u"stylesheet"sv))
+                    m_relationship |= Relationship::Stylesheet;
+                else if (token.equals_ignoring_ascii_case(u"alternate"sv))
+                    m_relationship |= Relationship::Alternate;
+                else if (token.equals_ignoring_ascii_case(u"preload"sv))
+                    m_relationship |= Relationship::Preload;
+                else if (token.equals_ignoring_ascii_case(u"modulepreload"sv))
+                    m_relationship |= Relationship::ModulePreload;
+                else if (token.equals_ignoring_ascii_case(u"dns-prefetch"sv))
+                    m_relationship |= Relationship::DNSPrefetch;
+                else if (token.equals_ignoring_ascii_case(u"preconnect"sv))
+                    m_relationship |= Relationship::Preconnect;
+                else if (token.equals_ignoring_ascii_case(u"icon"sv))
+                    m_relationship |= Relationship::Icon;
+            }
+
+            start = i + 1;
         }
 
         if (m_rel_list)
-            m_rel_list->associated_attribute_changed(value.value_or(String {}));
+            m_rel_list->associated_attribute_changed(value.has_value() ? value->utf16_view() : u""sv);
     }
 
     // https://html.spec.whatwg.org/multipage/semantics.html#the-link-element:explicitly-enabled
@@ -216,10 +251,10 @@ void HTMLLinkElement::attribute_changed(FlyString const& name, Optional<String> 
 
     if ((m_relationship & Relationship::Stylesheet) && m_loaded_style_sheet) {
         if (name == HTML::AttributeNames::disabled) {
-            document_or_shadow_root_style_sheets().remove_a_css_style_sheet(*m_loaded_style_sheet);
+            document_or_shadow_root_style_scope().remove_a_css_style_sheet(*m_loaded_style_sheet);
             m_loaded_style_sheet = nullptr;
         } else if (name == HTML::AttributeNames::media) {
-            m_loaded_style_sheet->set_media(value.value_or(String {}));
+            m_loaded_style_sheet->set_media(value.has_value() ? value->utf16_view() : u""sv);
         }
     }
 
@@ -241,6 +276,11 @@ void HTMLLinkElement::attribute_changed(FlyString const& name, Optional<String> 
                 // FIXME: - When the type attribute of the link element of an external resource link that is already browsing-context connected, but was previously not obtained due to the type attribute specifying an unsupported type for the request destination, is set, removed, or changed.
                 // FIXME: - When the media attribute of the link element of an external resource link that is already browsing-context connected, but was previously not obtained due to the media attribute not matching the environment, is changed or removed.
                 ;
+        }
+
+        if (!fetch && (m_relationship & Relationship::ModulePreload)) {
+            // - When the external resource link is created on a link element that is already browsing-context connected.
+            fetch = name == AttributeNames::rel && !(old_relationship & Relationship::ModulePreload);
         }
 
         if (!fetch && (m_relationship & Relationship::Stylesheet)) {
@@ -301,16 +341,18 @@ GC::Ref<HTMLLinkElement::LinkProcessingOptions> HTMLLinkElement::create_link_opt
 {
     // 1. Let document be el's node document.
     auto& document = this->document();
+    auto referrerpolicy = get_attribute(AttributeNames::referrerpolicy);
+    auto referrerpolicy_value = referrerpolicy.has_value() ? referrerpolicy->utf16_view() : u""sv;
 
     // 2. Let options be a new link processing options with
-    auto options = realm().create<LinkProcessingOptions>(
+    auto options = GC::Heap::the().allocate<LinkProcessingOptions>(
         // crossorigin
         //     the state of el's crossorigin content attribute
-        cors_setting_attribute_from_keyword(get_attribute(AttributeNames::crossorigin)),
+        cors_setting_attribute_from_keyword(get_attribute(AttributeNames::crossorigin).map([](auto const& value) { return value.utf16_view(); })),
 
         // referrer policy
         //     the state of el's referrerpolicy content attribute
-        ReferrerPolicy::from_string(get_attribute(AttributeNames::referrerpolicy).value_or({})).value_or(ReferrerPolicy::ReferrerPolicy::EmptyString),
+        ReferrerPolicy::from_string(referrerpolicy_value).value_or(ReferrerPolicy::ReferrerPolicy::EmptyString),
 
         // FIXME: source set
         //     el's source set
@@ -337,23 +379,23 @@ GC::Ref<HTMLLinkElement::LinkProcessingOptions> HTMLLinkElement::create_link_opt
 
         // cryptographic nonce metadata
         //     the current value of el's [[CryptographicNonce]] internal slot
-        m_cryptographic_nonce,
+        nonce(),
 
         // fetch priority
         //     the state of el's fetchpriority content attribute
-        Fetch::Infrastructure::request_priority_from_string(get_attribute_value(HTML::AttributeNames::fetchpriority)).value_or(Fetch::Infrastructure::Request::Priority::Auto));
+        Fetch::Infrastructure::request_priority_from_string(attribute(HTML::AttributeNames::fetchpriority).value_or({})).value_or(Fetch::Infrastructure::Request::Priority::Auto));
 
     // 3. If el has an href attribute, then set options's href to the value of el's href attribute.
     if (auto maybe_href = get_attribute(AttributeNames::href); maybe_href.has_value())
-        options->href = maybe_href.value();
+        options->href = maybe_href.release_value();
 
     // 4. If el has an integrity attribute, then set options's integrity to the value of el's integrity content attribute.
     if (auto maybe_integrity = get_attribute(AttributeNames::integrity); maybe_integrity.has_value())
-        options->integrity = maybe_integrity.value();
+        options->integrity = maybe_integrity.release_value();
 
     // 5. If el has a type attribute, then set options's type to the value of el's type attribute.
     if (auto maybe_type = get_attribute(AttributeNames::type); maybe_type.has_value())
-        options->type = maybe_type.value();
+        options->type = maybe_type.release_value();
 
     // FIXME: 6. Assert: options's href is not the empty string, or options's source set is not null.
     //           A link element with neither an href or an imagesrcset does not represent a link.
@@ -373,14 +415,14 @@ GC::Ptr<Fetch::Infrastructure::Request> HTMLLinkElement::create_link_request(HTM
     // 3. Let url be the result of encoding-parsing a URL given options's href, relative to options's base URL.
     // FIXME: Spec issue: We should be parsing this URL relative to a document or environment settings object.
     //        https://github.com/whatwg/html/issues/9715
-    auto url = DOMURL::parse(options.href, options.base_url);
+    auto url = DOMURL::parse(options.href.utf16_view(), options.base_url);
 
     // 4. If url is failure, then return null.
     if (!url.has_value())
         return nullptr;
 
     // 5. Let request be the result of creating a potential-CORS request given url, options's destination, and options's crossorigin.
-    auto request = create_potential_CORS_request(vm(), *url, options.destination, options.crossorigin);
+    auto request = create_potential_CORS_request(*url, options.destination, options.crossorigin);
 
     // 6. Set request's policy container to options's policy container.
     request->set_policy_container(GC::Ref { *options.policy_container });
@@ -409,13 +451,17 @@ void HTMLLinkElement::fetch_and_process_linked_resource()
 {
     auto fetch_generation = ++m_current_fetch_generation;
 
+    cancel_pending_stylesheet_processing();
+
     if (m_fetch_controller) {
         m_fetch_controller->stop_fetch();
-        document().script_blocking_style_sheet_set().remove(*this);
+        document().remove_from_script_blocking_style_sheet_set(*this);
     }
 
-    if (m_relationship & ~(Relationship::DNSPrefetch | Relationship::Preconnect | Relationship::Preload))
+    if (m_relationship & ~(Relationship::DNSPrefetch | Relationship::Preconnect | Relationship::Preload | Relationship::ModulePreload))
         default_fetch_and_process_linked_resource(fetch_generation);
+    else if (m_relationship & Relationship::ModulePreload)
+        fetch_and_process_linked_modulepreload_resource();
     else if (m_relationship & Relationship::Preload)
         fetch_and_process_linked_preload_resource();
     else if (m_relationship & Relationship::Preconnect)
@@ -492,7 +538,7 @@ void HTMLLinkElement::default_fetch_and_process_linked_resource(u64 fetch_genera
         process_linked_resource(success, response, successful_body_bytes);
     };
 
-    m_fetch_controller = Fetch::Fetching::fetch(realm(), *request, Fetch::Infrastructure::FetchAlgorithms::create(vm(), move(fetch_algorithms_input)));
+    m_fetch_controller = Fetch::Fetching::fetch(HTML::relevant_realm(*this), *request, Fetch::Infrastructure::FetchAlgorithms::create(move(fetch_algorithms_input)));
 }
 
 // https://html.spec.whatwg.org/multipage/links.html#link-type-dns-prefetch:fetch-and-process-the-linked-resource-2
@@ -536,7 +582,7 @@ void HTMLLinkElement::fetch_and_process_linked_preload_resource()
     auto options = create_link_options();
 
     // 3. Let destination be the result of translating the keyword representing the state of el's as attribute.
-    auto destination = translate_a_preload_destination(get_attribute(HTML::AttributeNames::as));
+    auto destination = translate_a_preload_destination(attribute(HTML::AttributeNames::as).value_or({}));
 
     // 4. If destination is null, then return.
     if (destination.has<Empty>())
@@ -555,11 +601,150 @@ void HTMLLinkElement::fetch_and_process_linked_preload_resource()
                 return;
             link_element->m_fetch_controller = nullptr;
             if (response.is_network_error())
-                link_element->dispatch_event(DOM::Event::create(link_element->realm(), HTML::EventNames::error));
+                link_element->dispatch_event(create_event_for_element(*link_element, HTML::EventNames::error));
             else
-                link_element->dispatch_event(DOM::Event::create(link_element->realm(), HTML::EventNames::load));
+                link_element->dispatch_event(create_event_for_element(*link_element, HTML::EventNames::load));
         }
     });
+}
+
+static bool media_attribute_matches_environment(DOM::Document const& document, Utf16View media)
+{
+    if (media.is_empty())
+        return true;
+
+    auto media_queries = parse_media_query_list(media);
+    for (auto const& media_query : media_queries) {
+        if (media_query->evaluate(document))
+            return true;
+    }
+    return false;
+}
+
+static Optional<Fetch::Infrastructure::Request::Destination> module_preload_destination_from_as_attribute(Utf16View as_attribute)
+{
+    using Destination = Fetch::Infrastructure::Request::Destination;
+
+    // A module preload destination is "json", "style", "text", or a script-like destination.
+    if (as_attribute.equals_ignoring_ascii_case(u"audioworklet"sv))
+        return Destination::AudioWorklet;
+    if (as_attribute.equals_ignoring_ascii_case(u"paintworklet"sv))
+        return Destination::PaintWorklet;
+    if (as_attribute.equals_ignoring_ascii_case(u"script"sv))
+        return Destination::Script;
+    if (as_attribute.equals_ignoring_ascii_case(u"serviceworker"sv))
+        return Destination::ServiceWorker;
+    if (as_attribute.equals_ignoring_ascii_case(u"sharedworker"sv))
+        return Destination::SharedWorker;
+    if (as_attribute.equals_ignoring_ascii_case(u"worker"sv))
+        return Destination::Worker;
+    if (as_attribute.equals_ignoring_ascii_case(u"style"sv))
+        return Destination::Style;
+    if (as_attribute.equals_ignoring_ascii_case(u"json"sv))
+        return Destination::JSON;
+    if (as_attribute.equals_ignoring_ascii_case(u"text"sv))
+        return Destination::Text;
+
+    // NB: The as attribute is enumerated. Invalid and missing values are in no state, so step 2 uses "script".
+    if (as_attribute.is_empty()
+        || !as_attribute.is_one_of_ignoring_ascii_case(
+            u"audio"sv, u"document"sv, u"embed"sv, u"fetch"sv, u"font"sv, u"frame"sv,
+            u"iframe"sv, u"image"sv, u"manifest"sv, u"object"sv, u"report"sv,
+            u"track"sv, u"video"sv, u"webidentity"sv, u"xslt"sv))
+        return Destination::Script;
+
+    return {};
+}
+
+// https://html.spec.whatwg.org/multipage/links.html#link-type-modulepreload:fetch-and-process-the-linked-resource
+void HTMLLinkElement::fetch_and_process_linked_modulepreload_resource()
+{
+    // However, if the link is an external resource link, then the media attribute is prescriptive. The user agent must
+    // apply the external resource when the media attribute's value matches the environment and the other relevant
+    // conditions apply, and must not apply it otherwise.
+    if (!media_attribute_matches_environment(document(), attribute(AttributeNames::media).value_or({})))
+        return;
+
+    // 1. If el's href attribute's value is the empty string, then return.
+    auto href = attribute(AttributeNames::href).value_or({});
+    if (href.is_empty())
+        return;
+
+    // 2. Let destination be the current state of el's as attribute, or "script" if it is in no state.
+    auto destination = module_preload_destination_from_as_attribute(attribute(AttributeNames::as).value_or({}));
+
+    // 3. If destination is not a module preload destination, then queue an element task on the networking task source
+    //    given el to fire an event named error at el, and return.
+    if (!destination.has_value()) {
+        queue_an_element_task(Task::Source::Networking, [this, fetch_generation = m_current_fetch_generation] {
+            // NB: The fetch can be superseded before this task runs.
+            if (fetch_generation != m_current_fetch_generation)
+                return;
+            dispatch_event(create_event_for_element(*this, HTML::EventNames::error));
+        });
+        return;
+    }
+
+    // 4. Let url be the result of encoding-parsing a URL given el's href attribute's value, relative to el's node document.
+    auto url = document().encoding_parse_url(href);
+
+    // 5. If url is failure, then return.
+    if (!url.has_value())
+        return;
+
+    // 6. Let settings object be el's node document's relevant settings object.
+    auto& settings_object = document().relevant_settings_object();
+
+    // 7. Let credentials mode be the CORS settings attribute credentials mode for el's crossorigin attribute.
+    auto credentials_mode = cors_settings_attribute_credentials_mode(cors_setting_attribute_from_keyword(attribute(AttributeNames::crossorigin).map([](auto const& value) { return value.utf16_view(); })));
+
+    // 8. Let cryptographic nonce be el.[[CryptographicNonce]].
+    auto cryptographic_nonce = nonce();
+
+    // 9. Let integrity metadata be the value of el's integrity attribute, if it is specified, or the empty string otherwise.
+    auto integrity_metadata = attribute(AttributeNames::integrity).value_or({});
+
+    // 10. If el does not have an integrity attribute, then set integrity metadata to the result of resolving a module
+    //     integrity metadata with url and settings object.
+    if (!has_attribute(AttributeNames::integrity))
+        integrity_metadata = resolve_a_module_integrity_metadata(*url, settings_object);
+
+    // 11. Let referrer policy be the current state of el's referrerpolicy attribute.
+    auto referrer_policy = ReferrerPolicy::from_string(attribute(AttributeNames::referrerpolicy).value_or({})).value_or(ReferrerPolicy::ReferrerPolicy::EmptyString);
+
+    // 12. Let fetch priority be the current state of el's fetchpriority attribute.
+    auto fetch_priority = Fetch::Infrastructure::request_priority_from_string(attribute(AttributeNames::fetchpriority).value_or({})).value_or(Fetch::Infrastructure::Request::Priority::Auto);
+
+    // 13. Let options be a script fetch options whose cryptographic nonce is cryptographic nonce, integrity metadata is
+    //     integrity metadata, parser metadata is "not-parser-inserted", credentials mode is credentials mode, referrer
+    //     policy is referrer policy, and fetch priority is fetch priority.
+    ScriptFetchOptions options {
+        .cryptographic_nonce = move(cryptographic_nonce),
+        .integrity_metadata = move(integrity_metadata),
+        .parser_metadata = Fetch::Infrastructure::Request::ParserMetadata::NotParserInserted,
+        .credentials_mode = credentials_mode,
+        .referrer_policy = referrer_policy,
+        .fetch_priority = fetch_priority,
+    };
+
+    // 14. Fetch a modulepreload module script graph given url, destination, settings object, and options.
+    GC::Weak weak_this { *this };
+    auto fetch_generation = m_current_fetch_generation;
+    auto on_complete = create_on_fetch_script_complete(GC::Heap::the(), [weak_this, fetch_generation](auto result) {
+        auto link_element = weak_this.ptr();
+        if (!link_element || fetch_generation != link_element->m_current_fetch_generation)
+            return;
+
+        // 1. If result is null, then fire an event named error at el, and return.
+        if (!result) {
+            link_element->dispatch_event(create_event_for_element(*link_element, HTML::EventNames::error));
+            return;
+        }
+
+        // 2. Fire an event named load at el.
+        link_element->dispatch_event(create_event_for_element(*link_element, HTML::EventNames::load));
+    });
+    fetch_modulepreload_module_script_graph(relevant_realm(*this), *url, *destination, settings_object, options, on_complete);
 }
 
 // https://html.spec.whatwg.org/multipage/semantics.html#linked-resource-fetch-setup-steps
@@ -598,7 +783,7 @@ bool HTMLLinkElement::stylesheet_linked_resource_fetch_setup_steps(Fetch::Infras
     if (is_potentially_render_blocking())
         block_rendering();
 
-    m_document_load_event_delayer.emplace(document());
+    m_document_load_event_delayer.emplace(document(), DOM::DocumentLoadEventDelayerReason::StyleSheetRequest);
 
     // 4. If el is currently render-blocking, then set request's render-blocking to true.
     if (document().is_render_blocking_element(*this))
@@ -622,7 +807,7 @@ void HTMLLinkElement::preconnect(LinkProcessingOptions const& options)
     // 2. Let url be the result of encoding-parsing a URL given options's href, relative to options's base URL.
     // FIXME: Spec issue: We should be parsing this URL relative to a document or environment settings object.
     //        https://github.com/whatwg/html/issues/9715
-    auto url = DOMURL::parse(options.href, options.base_url);
+    auto url = DOMURL::parse(options.href.utf16_view(), options.base_url);
 
     // 3. If url is failure, then return.
     if (!url.has_value())
@@ -646,7 +831,7 @@ void HTMLLinkElement::preconnect(LinkProcessingOptions const& options)
 }
 
 // https://html.spec.whatwg.org/multipage/links.html#match-preload-type
-static bool type_matches_destination(StringView type, Optional<Fetch::Infrastructure::Request::Destination> destination)
+static bool type_matches_destination(Utf16View type, Optional<Fetch::Infrastructure::Request::Destination> destination)
 {
     using enum Fetch::Infrastructure::Request::Destination;
 
@@ -701,9 +886,7 @@ static bool type_matches_destination(StringView type, Optional<Fetch::Infrastruc
 // https://html.spec.whatwg.org/multipage/links.html#preload
 void HTMLLinkElement::preload(LinkProcessingOptions& options, Function<void(Fetch::Infrastructure::Response&)> process_response)
 {
-    auto& realm = this->realm();
-    auto& vm = realm.vm();
-
+    auto& realm = HTML::relevant_realm(*this);
     // 1. If options's type doesn't match options's destination, then return.
     if (!type_matches_destination(options.type, options.destination))
         return;
@@ -723,7 +906,7 @@ void HTMLLinkElement::preload(LinkProcessingOptions& options, Function<void(Fetc
     // FIXME: 5. Let unsafeEndTime be 0.
 
     // 6. Let entry be a new preload entry whose integrity metadata is options's integrity.
-    auto entry = realm.create<PreloadEntry>();
+    auto entry = PreloadEntry::create();
     entry->integrity_metadata = options.integrity;
 
     // 7. Let key be the result of creating a preload key given request.
@@ -734,10 +917,10 @@ void HTMLLinkElement::preload(LinkProcessingOptions& options, Function<void(Fetc
         request->set_initiator_type(Fetch::Infrastructure::Request::InitiatorType::EarlyHint);
 
     // 9. Let controller be null.
-    auto controller_holder = Fetch::Infrastructure::FetchControllerHolder::create(vm);
+    auto controller_holder = Fetch::Infrastructure::FetchControllerHolder::create();
 
     // 10. Let reportTiming given a Document document be to report timing for controller given document's relevant global object.
-    auto report_timing = GC::Function<void(DOM::Document const&)>::create(realm.heap(), [controller_holder](DOM::Document const& document) {
+    auto report_timing = GC::Function<void(DOM::Document const&)>::create(GC::Heap::the(), [controller_holder](DOM::Document const& document) {
         controller_holder->controller()->report_timing(relevant_global_object(document));
     });
 
@@ -754,7 +937,7 @@ void HTMLLinkElement::preload(LinkProcessingOptions& options, Function<void(Fetc
             response->set_body(Fetch::Infrastructure::byte_sequence_as_body(realm, byte_sequence->bytes()));
         // 2. Otherwise, set response to a network error.
         else
-            response = Fetch::Infrastructure::Response::network_error(realm.vm(), "Expected preload response to contain a body"_string);
+            response = Fetch::Infrastructure::Response::network_error("Expected preload response to contain a body"_string);
 
         // FIXME: 3. Set unsafeEndTime to the unsafe shared current time.
 
@@ -774,11 +957,12 @@ void HTMLLinkElement::preload(LinkProcessingOptions& options, Function<void(Fetc
             process_response(response);
     };
 
-    m_fetch_controller = Fetch::Fetching::fetch(realm, *request, Fetch::Infrastructure::FetchAlgorithms::create(vm, move(fetch_algorithms_input)));
+    m_fetch_controller = Fetch::Fetching::fetch(realm, *request, Fetch::Infrastructure::FetchAlgorithms::create(move(fetch_algorithms_input)));
     controller_holder->set_controller(*m_fetch_controller);
+    entry->controller = m_fetch_controller;
 
     // 12. Let commit be the following steps given a Document document:
-    auto commit = GC::Function<void(DOM::Document&)>::create(realm.heap(), [entry, report_timing, key = move(key)](DOM::Document& document) {
+    auto commit = GC::Function<void(DOM::Document&)>::create(GC::Heap::the(), [entry, report_timing, key = move(key)](DOM::Document& document) {
         // 1. If entry's response is not null, then call reportTiming given document.
         if (entry->response)
             report_timing->function()(document);
@@ -827,19 +1011,20 @@ void HTMLLinkElement::process_stylesheet_resource(bool success, Fetch::Infrastru
 {
     if (!document().is_fully_active())
         return;
+    auto fetch_generation = m_current_fetch_generation;
 
     // 1. If the resource's Content-Type metadata is not text/css, then set success to false.
     auto mime_type_string = m_mime_type;
-    Optional<String> mime_type_charset;
+    Optional<StringView> mime_type_charset;
     auto extracted_mime_type = Fetch::Infrastructure::extract_mime_type(response.header_list());
     if (extracted_mime_type.has_value()) {
         if (!mime_type_string.has_value())
-            mime_type_string = extracted_mime_type->essence();
+            mime_type_string = Utf16String::from_ascii_without_validation(extracted_mime_type->essence().bytes());
         if (auto charset = extracted_mime_type->parameters().get("charset"sv); charset.has_value())
-            mime_type_charset = charset.value();
+            mime_type_charset = charset->bytes_as_string_view();
     }
 
-    if (mime_type_string.has_value() && mime_type_string != "text/css"sv)
+    if (mime_type_string.has_value() && mime_type_string != u"text/css"sv)
         success = false;
 
     // 2. If el no longer creates an external resource link that contributes to the styling processing model, or
@@ -849,7 +1034,7 @@ void HTMLLinkElement::process_stylesheet_resource(bool success, Fetch::Infrastru
 
     // 3. If el has an associated CSS style sheet, remove the CSS style sheet.
     if (m_loaded_style_sheet) {
-        document_or_shadow_root_style_sheets().remove_a_css_style_sheet(*m_loaded_style_sheet);
+        document_or_shadow_root_style_scope().remove_a_css_style_sheet(*m_loaded_style_sheet);
         m_loaded_style_sheet = nullptr;
     }
 
@@ -883,55 +1068,104 @@ void HTMLLinkElement::process_stylesheet_resource(bool success, Fetch::Infrastru
         //     2. Otherwise, return the document's character encoding. [DOM]
         Optional<StringView> environment_encoding;
         if (auto charset = attribute(HTML::AttributeNames::charset); charset.has_value())
-            environment_encoding = TextCodec::get_standardized_encoding(charset.release_value());
+            environment_encoding = TextCodec::get_standardized_encoding(*charset);
 
         if (!environment_encoding.has_value() && document().encoding().has_value())
-            environment_encoding = document().encoding().value();
+            environment_encoding = TextCodec::get_standardized_encoding(document().encoding().value());
 
         auto maybe_decoded_string = css_decode_bytes(environment_encoding, mime_type_charset, body_bytes);
         if (maybe_decoded_string.is_error()) {
             dbgln("Failed to decode CSS file: {}", response.url().value_or(URL::URL()));
-            dispatch_event(*DOM::Event::create(realm(), HTML::EventNames::error));
+            dispatch_event(create_event_for_element(*this, HTML::EventNames::error));
         } else {
             VERIFY(!response.url_list().is_empty());
-            m_loaded_style_sheet = document_or_shadow_root_style_sheets().create_a_css_style_sheet(
-                maybe_decoded_string.release_value(),
-                "text/css"_string,
-                this,
-                attribute(HTML::AttributeNames::media).value_or({}),
-                in_a_document_tree() ? attribute(HTML::AttributeNames::title).value_or({}) : String {},
-                (m_relationship & Relationship::Alternate && !m_explicitly_enabled) ? CSS::StyleSheetList::Alternate::Yes : CSS::StyleSheetList::Alternate::No,
-                CSS::StyleSheetList::OriginClean::Yes,
-                response.url_list().first(),
-                nullptr,
-                nullptr);
+            m_stylesheet_processing_pending = true;
+            CSS::Parser::Parser::parse_stylesheet_off_thread(
+                CSS::Parser::ParsingParams { document() }, maybe_decoded_string.release_value(),
+                [link = GC::make_root(*this), loaded_document = GC::make_root(document()), fetch_generation = m_current_fetch_generation, location = response.url_list().first()](CSS::Parser::RustStyleSheetParse parsed) mutable {
+                    if (fetch_generation != link->m_current_fetch_generation || !link->m_stylesheet_processing_pending)
+                        return;
+                    // NB: An inactive document's element tasks cannot run. Release its result here.
+                    if (&link->document() != loaded_document.ptr() || !loaded_document->is_fully_active()) {
+                        loaded_document->remove_from_script_blocking_style_sheet_set(*link);
+                        link->cancel_pending_stylesheet_processing();
+                        return;
+                    }
+                    link->queue_an_element_task(Task::Source::Networking,
+                        [link = move(link), loaded_document = move(loaded_document), fetch_generation, location = move(location), parsed = move(parsed)] {
+                            if (fetch_generation != link->m_current_fetch_generation || !link->m_stylesheet_processing_pending)
+                                return;
+                            if (&link->document() != loaded_document.ptr() || !loaded_document->is_fully_active()
+                                || !link->is_browsing_context_connected() || !(link->m_relationship & Relationship::Stylesheet)) {
+                                loaded_document->remove_from_script_blocking_style_sheet_set(*link);
+                                link->finish_processing_stylesheet_resource(fetch_generation);
+                                return;
+                            }
 
-            // 2. Fire an event named load at el.
-            dispatch_event(*DOM::Event::create(realm(), HTML::EventNames::load));
+                            CSS::Parser::Parser parser { CSS::Parser::ParsingParams { *loaded_document } };
+                            auto sheet = parser.create_css_stylesheet(parsed, location);
+                            auto media = link->attribute(HTML::AttributeNames::media);
+                            auto title = link->in_a_document_tree() ? link->attribute(HTML::AttributeNames::title) : Optional<Utf16String> {};
+                            link->document_or_shadow_root_style_scope().initialize_a_css_style_sheet(
+                                *sheet, link.ptr(), media.has_value() ? media->utf16_view() : u""sv,
+                                title.has_value() ? title.release_value() : Utf16String {},
+                                (link->m_relationship & Relationship::Alternate && !link->m_explicitly_enabled) ? CSS::StyleScope::Alternate::Yes : CSS::StyleScope::Alternate::No,
+                                CSS::StyleScope::OriginClean::Yes, nullptr, nullptr);
+                            link->m_loaded_style_sheet = sheet;
+
+                            // NB: Removing disabled explicitly enables the sheet, even if its title would disable it.
+                            if (link->m_explicitly_enabled)
+                                sheet->set_disabled(false);
+
+                            // 2. Fire an event named load at el.
+                            link->dispatch_event(create_event_for_element(*link, HTML::EventNames::load));
+                            link->finish_processing_stylesheet_resource(fetch_generation);
+                        });
+                });
+            return;
         }
     }
     // 5. Otherwise, fire an event named error at el.
     else {
-        dispatch_event(*DOM::Event::create(realm(), HTML::EventNames::error));
+        dispatch_event(create_event_for_element(*this, HTML::EventNames::error));
     }
 
+    finish_processing_stylesheet_resource(fetch_generation);
+}
+
+void HTMLLinkElement::cancel_pending_stylesheet_processing()
+{
+    if (!m_stylesheet_processing_pending)
+        return;
+    m_stylesheet_processing_pending = false;
+    document().remove_from_script_blocking_style_sheet_set(*this);
+    unblock_rendering();
+    m_document_load_event_delayer.clear();
+}
+
+void HTMLLinkElement::finish_processing_stylesheet_resource(u64 fetch_generation)
+{
     // 6. If el contributes a script-blocking style sheet, then:
-    if (contributes_a_script_blocking_style_sheet()) {
+    if (document().script_blocking_style_sheet_set().contains(*this)) {
         // 1. Assert: el's node document's script-blocking style sheet set contains el.
         VERIFY(document().script_blocking_style_sheet_set().contains(*this));
 
         // 2. Remove el from its node document's script-blocking style sheet set.
-        document().script_blocking_style_sheet_set().remove(*this);
-        document().schedule_html_parser_end_check();
+        document().remove_from_script_blocking_style_sheet_set(*this);
     }
 
     // 7. Unblock rendering on el.
     unblock_rendering();
 
+    // NB: Loading completion is element-based, but a newer parse may already be pending after
+    //     event dispatch. Do not mark that worker result as canceled.
+    if (fetch_generation == m_current_fetch_generation)
+        m_stylesheet_processing_pending = false;
+
     if (m_loaded_style_sheet) {
         auto style_sheet_loading_state = m_loaded_style_sheet->loading_state();
-        if (style_sheet_loading_state == CSS::CSSStyleSheet::LoadingState::Loaded || style_sheet_loading_state == CSS::CSSStyleSheet::LoadingState::Error) {
-            finished_loading_critical_style_subresources(style_sheet_loading_state == CSS::CSSStyleSheet::LoadingState::Error ? AnyFailed::Yes : AnyFailed::No);
+        if (style_sheet_loading_state == CSS::StyleSheetState::LoadingState::Loaded || style_sheet_loading_state == CSS::StyleSheetState::LoadingState::Error) {
+            finished_loading_critical_style_subresources(style_sheet_loading_state == CSS::StyleSheetState::LoadingState::Error ? AnyFailed::Yes : AnyFailed::No);
         }
     } else {
         m_document_load_event_delayer.clear();
@@ -943,7 +1177,7 @@ static NonnullRefPtr<Core::Promise<NonnullRefPtr<Gfx::Bitmap const>>> decode_fav
     auto promise = Core::Promise<NonnullRefPtr<Gfx::Bitmap const>>::construct();
 
     if (favicon_url.basename().ends_with(".svg"sv)) {
-        auto result = SVG::SVGDecodedImageData::create(document->realm(), document->page(), favicon_url, favicon_data);
+        auto result = SVG::SVGDecodedImageData::create(document->page(), favicon_url, favicon_data);
         if (result.is_error()) {
             promise->reject(Error::from_string_view("Failed to decode SVG favicon"sv));
             return promise;
@@ -995,9 +1229,7 @@ RefPtr<Gfx::Bitmap const> HTMLLinkElement::load_favicon_if_window_is_active()
 // https://html.spec.whatwg.org/multipage/links.html#rel-icon:the-link-element-3
 void HTMLLinkElement::load_fallback_favicon_if_needed(GC::Ref<DOM::Document> document)
 {
-    auto& realm = document->realm();
-    auto& vm = realm.vm();
-
+    auto& realm = document->relevant_settings_object().realm();
     // In the absence of a link with the icon keyword, for Document objects whose URL's scheme is an HTTP(S) scheme,
     // user agents may instead run these steps in parallel:
     if (document->has_active_favicon())
@@ -1008,8 +1240,7 @@ void HTMLLinkElement::load_fallback_favicon_if_needed(GC::Ref<DOM::Document> doc
         if (!is<HTMLLinkElement>(element))
             return false;
 
-        return static_cast<HTMLLinkElement const&>(element).has_icon_keyword();
-    });
+        return static_cast<HTMLLinkElement const&>(element).has_icon_keyword(); }, DOM::HTMLCollection::AttributeInvalidationType::None);
     if (icon_link_elements->length() != 0)
         return;
 
@@ -1024,13 +1255,13 @@ void HTMLLinkElement::load_fallback_favicon_if_needed(GC::Ref<DOM::Document> doc
     //    the Document object's URL, client is the Document object's relevant settings object, destination is "image",
     //    synchronous flag is set, credentials mode is "include", and whose use-URL-credentials flag is set.
     // NOTE: Fetch requests no longer have a synchronous flag, see https://github.com/whatwg/fetch/pull/1165
-    auto favicon_url = document->encoding_parse_url("/favicon.ico"sv);
+    auto favicon_url = document->encoding_parse_url("/favicon.ico"_utf16);
 
     // It is possible for the URL parser to fail if the document's base URL is invalid.
     if (!favicon_url.has_value())
         return;
 
-    auto request = Fetch::Infrastructure::Request::create(vm);
+    auto request = Fetch::Infrastructure::Request::create();
     request->set_url(favicon_url.release_value());
     request->set_client(&document->relevant_settings_object());
     request->set_destination(Fetch::Infrastructure::Request::Destination::Image);
@@ -1040,17 +1271,17 @@ void HTMLLinkElement::load_fallback_favicon_if_needed(GC::Ref<DOM::Document> doc
     // 2. Let response be the result of fetching request.
     Fetch::Infrastructure::FetchAlgorithms::Input fetch_algorithms_input {};
     fetch_algorithms_input.process_response = [document, request](GC::Ref<Fetch::Infrastructure::Response> response) {
-        auto& realm = document->realm();
+        auto& realm = document->relevant_settings_object().realm();
         auto global = GC::Ref { realm.global_object() };
 
-        auto process_body = GC::create_function(realm.heap(), [document, request](ByteBuffer body) {
+        auto process_body = GC::create_function(GC::Heap::the(), [document, request](ByteBuffer body) {
             decode_favicon(body, request->url(), document)
                 ->when_resolved(GC::weak_callback(*document, [](DOM::Document& document, NonnullRefPtr<Gfx::Bitmap const>& favicon) {
                     if (auto navigable = document.navigable(); navigable && navigable->is_traversable())
-                        navigable->traversable_navigable()->page().client().page_did_change_favicon(*favicon);
+                        navigable->page().client().page_did_change_favicon(*favicon);
                 }));
         });
-        auto process_body_error = GC::create_function(realm.heap(), [](JS::Value) {
+        auto process_body_error = GC::create_function(GC::Heap::the(), [](JS::Value) {
         });
 
         // Check for failed favicon response
@@ -1063,7 +1294,7 @@ void HTMLLinkElement::load_fallback_favicon_if_needed(GC::Ref<DOM::Document> doc
             body->fully_read(realm, process_body, process_body_error, global);
     };
 
-    Fetch::Fetching::fetch(realm, request, Fetch::Infrastructure::FetchAlgorithms::create(vm, move(fetch_algorithms_input)));
+    Fetch::Fetching::fetch(realm, request, Fetch::Infrastructure::FetchAlgorithms::create(move(fetch_algorithms_input)));
 }
 
 bool HTMLLinkElement::should_fetch_and_process_resource_type() const
@@ -1072,7 +1303,8 @@ bool HTMLLinkElement::should_fetch_and_process_resource_type() const
     // https://html.spec.whatwg.org/multipage/links.html#link-type-preconnect:fetch-and-process-the-linked-resource
     // https://html.spec.whatwg.org/multipage/links.html#link-type-preload:fetch-and-process-the-linked-resource
     // https://html.spec.whatwg.org/multipage/links.html#link-type-stylesheet:fetch-and-process-the-linked-resource
-    if (m_relationship & (Relationship::DNSPrefetch | Relationship::Preconnect | Relationship::Preload | Relationship::Stylesheet))
+    // https://html.spec.whatwg.org/multipage/links.html#link-type-modulepreload:fetch-and-process-the-linked-resource
+    if (m_relationship & (Relationship::DNSPrefetch | Relationship::Preconnect | Relationship::Preload | Relationship::ModulePreload | Relationship::Stylesheet))
         return true;
 
     // AD-HOC: The spec is underspecified for fetching and processing rel="icon". See:
@@ -1088,7 +1320,7 @@ HTMLLinkElement::LinkProcessingOptions::LinkProcessingOptions(
     GC::Ref<HTML::EnvironmentSettingsObject> environment,
     GC::Ref<HTML::PolicyContainer> policy_container,
     GC::Ptr<Web::DOM::Document> document,
-    String cryptographic_nonce_metadata,
+    Utf16String cryptographic_nonce_metadata,
     Fetch::Infrastructure::Request::Priority fetch_priority)
     : cryptographic_nonce_metadata(move(cryptographic_nonce_metadata))
     , crossorigin(crossorigin)

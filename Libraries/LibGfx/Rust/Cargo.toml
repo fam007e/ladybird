@@ -4,10 +4,15 @@ version = "0.1.0"
 edition = "2024"
 
 [lib]
-crate-type = ["staticlib"]
+crate-type = ["staticlib", "rlib"]
+
+[features]
+default = []
+allocator = []
 
 [dependencies]
-yuv = "0.8"
+foldhash = "0.1"
+yuv = "0.8.17"
 
 [build-dependencies]
 cbindgen = "0.29"

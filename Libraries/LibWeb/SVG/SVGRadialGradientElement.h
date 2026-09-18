@@ -6,34 +6,41 @@
 
 #pragma once
 
-#include <LibWeb/SVG/AttributeParser.h>
-#include <LibWeb/SVG/SVGAnimatedLength.h>
 #include <LibWeb/SVG/SVGGradientElement.h>
 
 namespace Web::SVG {
 
 class SVGRadialGradientElement : public SVGGradientElement {
-    WEB_PLATFORM_OBJECT(SVGRadialGradientElement, SVGGradientElement);
+    WEB_WRAPPABLE(SVGRadialGradientElement, SVGGradientElement);
     GC_DECLARE_ALLOCATOR(SVGRadialGradientElement);
 
 public:
     virtual ~SVGRadialGradientElement() override = default;
 
-    virtual void attribute_changed(FlyString const& name, Optional<String> const& old_value, Optional<String> const& value, Optional<FlyString> const& namespace_) override;
+    virtual void attribute_changed(Utf16FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_) override;
 
-    virtual Optional<Painting::PaintStyle> to_gfx_paint_style(SVGPaintContext const&) const override;
+    virtual void push_paint_server_description(void* sink) const override;
 
-    GC::Ref<SVGAnimatedLength> cx() const;
-    GC::Ref<SVGAnimatedLength> cy() const;
-    GC::Ref<SVGAnimatedLength> fx() const;
-    GC::Ref<SVGAnimatedLength> fy() const;
-    GC::Ref<SVGAnimatedLength> fr() const;
-    GC::Ref<SVGAnimatedLength> r() const;
+    // https://w3c.github.io/svgwg/svg2-draft/pservers.html#__svg__SVGRadialGradientElement__cx
+    REFLECT_ANIMATED_LENGTH_ATTRIBUTE(cx, Horizontal, SVGLengthValue::percentage(50));
+
+    // https://w3c.github.io/svgwg/svg2-draft/pservers.html#__svg__SVGRadialGradientElement__cy
+    REFLECT_ANIMATED_LENGTH_ATTRIBUTE(cy, Vertical, SVGLengthValue::percentage(50));
+
+    // https://w3c.github.io/svgwg/svg2-draft/pservers.html#__svg__SVGRadialGradientElement__fx
+    REFLECT_ANIMATED_LENGTH_ATTRIBUTE(fx, Horizontal, SVGLengthValue::percentage(50));
+
+    // https://w3c.github.io/svgwg/svg2-draft/pservers.html#__svg__SVGRadialGradientElement__fy
+    REFLECT_ANIMATED_LENGTH_ATTRIBUTE(fy, Vertical, SVGLengthValue::percentage(50));
+
+    // https://w3c.github.io/svgwg/svg2-draft/pservers.html#__svg__SVGRadialGradientElement__fr
+    REFLECT_ANIMATED_LENGTH_ATTRIBUTE(fr, Unspecified, SVGLengthValue::percentage(0));
+
+    // https://w3c.github.io/svgwg/svg2-draft/pservers.html#__svg__SVGRadialGradientElement__r
+    REFLECT_ANIMATED_LENGTH_ATTRIBUTE(r, Unspecified, SVGLengthValue::percentage(50));
 
 protected:
     SVGRadialGradientElement(DOM::Document&, DOM::QualifiedName);
-
-    virtual void initialize(JS::Realm&) override;
 
 private:
     GC::Ptr<SVGRadialGradientElement const> linked_radial_gradient(GC::RootHashTable<SVGGradientElement const*>& seen_gradients) const

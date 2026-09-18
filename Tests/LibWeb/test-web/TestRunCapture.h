@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2026, The Ladybird Developers
+ * Copyright (c) 2026-present, the Ladybird developers.
  *
  * SPDX-License-Identifier: BSD-2-Clause
  */
@@ -40,6 +40,7 @@ public:
 private:
     struct ViewOutputCapture {
         CaptureFile output;
+        pid_t web_content_pid { -1 };
         RefPtr<Core::Notifier> stdout_notifier;
         RefPtr<Core::Notifier> stderr_notifier;
     };
@@ -52,8 +53,6 @@ private:
     struct HelperOutputCapture {
         WebView::ProcessType type;
         pid_t pid { 0 };
-        OwnPtr<Core::File> stdout_reader;
-        OwnPtr<Core::File> stderr_reader;
         RefPtr<Core::Notifier> stdout_notifier;
         RefPtr<Core::Notifier> stderr_notifier;
     };
@@ -69,7 +68,8 @@ private:
     void restore_stderr();
     void setup_output_capture_for_helper_process(WebView::Process&);
     void setup_output_capture_for_view(TestWebView&, ViewOutputCapture&);
-    void consume_helper_capture(pid_t pid);
+    void consume_helper_capture(WebView::Process&);
+    void consume_view_capture(WebView::Process&);
     void destroy_view_capture_of(TestWebView const& view);
 
     Function<void(WebView::Process&&, Optional<int> exit_status)> m_previous_on_process_exited;

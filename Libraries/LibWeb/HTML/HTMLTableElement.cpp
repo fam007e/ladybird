@@ -5,10 +5,9 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibWeb/Bindings/HTMLTableElement.h>
-#include <LibWeb/Bindings/Intrinsics.h>
-#include <LibWeb/CSS/ComputedProperties.h>
 #include <LibWeb/CSS/Parser/Parser.h>
+#include <LibWeb/CSS/PropertyID.h>
+#include <LibWeb/CSS/StyleComputer.h>
 #include <LibWeb/CSS/StyleValues/ColorStyleValue.h>
 #include <LibWeb/CSS/StyleValues/ImageStyleValue.h>
 #include <LibWeb/CSS/StyleValues/KeywordStyleValue.h>
@@ -36,12 +35,6 @@ HTMLTableElement::HTMLTableElement(DOM::Document& document, DOM::QualifiedName q
 
 HTMLTableElement::~HTMLTableElement() = default;
 
-void HTMLTableElement::initialize(JS::Realm& realm)
-{
-    WEB_SET_PROTOTYPE_FOR_INTERFACE(HTMLTableElement);
-    Base::initialize(realm);
-}
-
 void HTMLTableElement::visit_edges(Cell::Visitor& visitor)
 {
     Base::visit_edges(visitor);
@@ -49,23 +42,12 @@ void HTMLTableElement::visit_edges(Cell::Visitor& visitor)
     visitor.visit(m_t_bodies);
 }
 
-void HTMLTableElement::adjust_computed_style(CSS::ComputedProperties::Builder& style)
+static unsigned parse_border(Utf16View value)
 {
-    Base::adjust_computed_style(style);
-
-    // Tables must not inherit -libweb-* values for text-align.
-    // FIXME: Find the spec for this.
-    auto text_align = style.style().text_align();
-    if (text_align == CSS::TextAlign::LibwebLeft || text_align == CSS::TextAlign::LibwebCenter || text_align == CSS::TextAlign::LibwebRight)
-        style.set_property(CSS::PropertyID::TextAlign, CSS::KeywordStyleValue::create(CSS::Keyword::Start));
+    return parse_non_negative_integer(value).value_or(0);
 }
 
-static unsigned parse_border(StringView value)
-{
-    return value.to_number<unsigned>().value_or(0);
-}
-
-bool HTMLTableElement::is_presentational_hint(FlyString const& name) const
+bool HTMLTableElement::is_presentational_hint(Utf16FlyString const& name) const
 {
     if (Base::is_presentational_hint(name))
         return true;
@@ -85,7 +67,7 @@ bool HTMLTableElement::is_presentational_hint(FlyString const& name) const
 void HTMLTableElement::apply_presentational_hints(Vector<CSS::StyleProperty>& properties) const
 {
     Base::apply_presentational_hints(properties);
-    for_each_attribute([&](auto& name, auto& value) {
+    for_each_attribute([&](Utf16FlyString const& name, Utf16View value) {
         if (name == HTML::AttributeNames::width) {
             if (auto parsed_value = parse_nonzero_dimension_value(value))
                 properties.append({ .property_id = CSS::PropertyID::Width, .value = parsed_value.release_nonnull() });
@@ -97,7 +79,7 @@ void HTMLTableElement::apply_presentational_hints(Vector<CSS::StyleProperty>& pr
             return;
         }
         if (name == HTML::AttributeNames::align) {
-            if (value.equals_ignoring_ascii_case("center"sv)) {
+            if (value.equals_ignoring_ascii_case(u"center"sv)) {
                 properties.append({ .property_id = CSS::PropertyID::MarginLeft, .value = CSS::KeywordStyleValue::create(CSS::Keyword::Auto) });
                 properties.append({ .property_id = CSS::PropertyID::MarginRight, .value = CSS::KeywordStyleValue::create(CSS::Keyword::Auto) });
             } else if (auto parsed_value = parse_css_value(CSS::Parser::ParsingParams { document() }, value, CSS::PropertyID::Float)) {
@@ -127,16 +109,14 @@ void HTMLTableElement::apply_presentational_hints(Vector<CSS::StyleProperty>& pr
             auto border = parse_border(value);
             if (!border)
                 return;
-            auto apply_border_style = [&](CSS::PropertyID style_property, CSS::PropertyID width_property, CSS::PropertyID color_property) {
-                auto legacy_line_style = CSS::KeywordStyleValue::create(CSS::Keyword::Outset);
-                properties.append({ .property_id = style_property, .value = legacy_line_style });
+            auto apply_border_style = [&](CSS::PropertyID style_property, CSS::PropertyID width_property) {
+                properties.append({ .property_id = style_property, .value = CSS::KeywordStyleValue::create(CSS::Keyword::Outset) });
                 properties.append({ .property_id = width_property, .value = CSS::LengthStyleValue::create(CSS::Length::make_px(border)) });
-                properties.append({ .property_id = color_property, .value = CSS::ColorStyleValue::create_from_color(Color(128, 128, 128), CSS::ColorSyntax::Legacy) });
             };
-            apply_border_style(CSS::PropertyID::BorderLeftStyle, CSS::PropertyID::BorderLeftWidth, CSS::PropertyID::BorderLeftColor);
-            apply_border_style(CSS::PropertyID::BorderTopStyle, CSS::PropertyID::BorderTopWidth, CSS::PropertyID::BorderTopColor);
-            apply_border_style(CSS::PropertyID::BorderRightStyle, CSS::PropertyID::BorderRightWidth, CSS::PropertyID::BorderRightColor);
-            apply_border_style(CSS::PropertyID::BorderBottomStyle, CSS::PropertyID::BorderBottomWidth, CSS::PropertyID::BorderBottomColor);
+            apply_border_style(CSS::PropertyID::BorderLeftStyle, CSS::PropertyID::BorderLeftWidth);
+            apply_border_style(CSS::PropertyID::BorderTopStyle, CSS::PropertyID::BorderTopWidth);
+            apply_border_style(CSS::PropertyID::BorderRightStyle, CSS::PropertyID::BorderRightWidth);
+            apply_border_style(CSS::PropertyID::BorderBottomStyle, CSS::PropertyID::BorderBottomWidth);
         }
         if (name == HTML::AttributeNames::bordercolor) {
             // https://html.spec.whatwg.org/multipage/rendering.html#tables-2:attr-table-bordercolor
@@ -154,7 +134,7 @@ void HTMLTableElement::apply_presentational_hints(Vector<CSS::StyleProperty>& pr
     });
 }
 
-void HTMLTableElement::attribute_changed(FlyString const& name, Optional<String> const& old_value, Optional<String> const& value, Optional<FlyString> const& namespace_)
+void HTMLTableElement::attribute_changed(Utf16FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_)
 {
     Base::attribute_changed(name, old_value, value, namespace_);
 
@@ -169,7 +149,7 @@ void HTMLTableElement::attribute_changed(FlyString const& name, Optional<String>
         //       When it changes, we need new style for the cells.
         if (old_cellpadding != m_cellpadding) {
             for_each_in_subtree_of_type<HTMLTableCellElement>([&](auto& cell) {
-                cell.set_needs_style_update(true);
+                cell.document().style_computer().style_engine().record_element_style_input_change(cell.style_node_id());
                 return TraversalDecision::Continue;
             });
         }
@@ -240,7 +220,7 @@ WebIDL::ExceptionOr<void> HTMLTableElement::set_t_head(HTMLTableSectionElement* 
 {
     // If the new value is neither null nor a thead element, then a "HierarchyRequestError" DOMException must be thrown instead.
     if (thead && thead->local_name() != TagNames::thead)
-        return WebIDL::HierarchyRequestError::create(realm(), "Element is not thead"_utf16);
+        return WebIDL::HierarchyRequestError::create("Element is not thead"_utf16);
 
     // On setting, if the new value is null or a thead element, the first thead element child of the table element,
     // if any, must be removed,
@@ -335,7 +315,7 @@ WebIDL::ExceptionOr<void> HTMLTableElement::set_t_foot(HTMLTableSectionElement* 
 {
     // If the new value is neither null nor a tfoot element, then a "HierarchyRequestError" DOMException must be thrown instead.
     if (tfoot && tfoot->local_name() != TagNames::tfoot)
-        return WebIDL::HierarchyRequestError::create(realm(), "Element is not tfoot"_utf16);
+        return WebIDL::HierarchyRequestError::create("Element is not tfoot"_utf16);
 
     // On setting, if the new value is null or a tfoot element, the first tfoot element child of the table element,
     // if any, must be removed,
@@ -376,9 +356,7 @@ GC::Ref<DOM::HTMLCollection> HTMLTableElement::t_bodies()
     // The tBodies attribute must return an HTMLCollection rooted at the table node,
     // whose filter matches only tbody elements that are children of the table element.
     if (!m_t_bodies) {
-        m_t_bodies = DOM::HTMLCollection::create(*this, DOM::HTMLCollection::Scope::Children, [](DOM::Element const& element) {
-            return element.local_name() == TagNames::tbody;
-        });
+        m_t_bodies = DOM::HTMLCollection::create(*this, DOM::HTMLCollection::Scope::Children, [](DOM::Element const& element) { return element.local_name() == TagNames::tbody; }, DOM::HTMLCollection::AttributeInvalidationType::None);
     }
     return *m_t_bodies;
 }
@@ -425,13 +403,14 @@ GC::Ref<DOM::HTMLCollection> HTMLTableElement::rows()
             if (!is<HTMLTableRowElement>(element)) {
                 return false;
             }
-            if (element.parent_element() == table_node)
+            if (element.parent_element().ptr() == table_node)
                 return true;
 
             if (element.parent_element() && element.parent_element()->local_name().is_one_of(TagNames::thead, TagNames::tbody, TagNames::tfoot) && element.parent()->parent() == table_node)
                 return true;
 
             return false; },
+            DOM::HTMLCollection::AttributeInvalidationType::None,
             [](Element const& a, Element const& b) -> bool {
                 auto static sort_priority = [](Element const& element) {
                     auto const& parent_tag = element.parent_element()->local_name();
@@ -461,23 +440,45 @@ WebIDL::ExceptionOr<GC::Ref<HTMLTableRowElement>> HTMLTableElement::insert_row(W
     auto rows = this->rows();
     auto rows_length = rows->length();
 
+    // 1. If index is less than -1 or greater than the number of elements in the rows collection, then throw an
+    //    "IndexSizeError" DOMException.
     if (index < -1 || index > (long)rows_length) {
-        return WebIDL::IndexSizeError::create(realm(), "Index is negative or greater than the number of rows"_utf16);
+        return WebIDL::IndexSizeError::create("Index is negative or greater than the number of rows"_utf16);
     }
+
+    // 2. Let tr be the result of creating a table element given this and "tr".
     auto& tr = static_cast<HTMLTableRowElement&>(*TRY(DOM::create_element(document(), TagNames::tr, Namespace::HTML)));
-    if (rows_length == 0 && !has_child_of_type<HTMLTableRowElement>()) {
+
+    auto t_bodies = this->t_bodies();
+    auto t_bodies_length = t_bodies->length();
+
+    // 3. If the rows collection has zero elements in it, and this has no tbody elements in it:
+    if (rows_length == 0 && t_bodies_length == 0) {
+        // 1. Let tbody be the result of creating a table element given this and "tbody".
         auto tbody = TRY(DOM::create_element(document(), TagNames::tbody, Namespace::HTML));
+
+        // 2. Append tr to tbody.
         TRY(tbody->append_child(tr));
+
+        // 3. Append tbody to this.
         TRY(append_child(tbody));
-    } else if (rows_length == 0) {
-        auto tbody = last_child_of_type<HTMLTableRowElement>();
-        TRY(tbody->append_child(tr));
-    } else if (index == -1 || index == (long)rows_length) {
+    }
+    // 4. Otherwise, if the rows collection has zero elements in it, then append tr to the last tbody element in this.
+    else if (rows_length == 0) {
+        TRY(t_bodies->item(t_bodies_length - 1)->append_child(tr));
+    }
+    // 5. Otherwise, if index is -1 or equal to the number of items in the rows collection, then append tr to the
+    //    parent of the last tr element in the rows collection.
+    else if (index == -1 || index == (long)rows_length) {
         auto parent_of_last_tr = rows->item(rows_length - 1)->parent_element();
         TRY(parent_of_last_tr->append_child(tr));
-    } else {
+    }
+    // 6. Otherwise, insert tr immediately before the indexth tr element in the rows collection, in the same parent.
+    else {
         rows->item(index)->parent_element()->insert_before(tr, rows->item(index));
     }
+
+    // 7. Return tr.
     return GC::Ref(tr);
 }
 
@@ -489,7 +490,7 @@ WebIDL::ExceptionOr<void> HTMLTableElement::delete_row(WebIDL::Long index)
 
     // 1. If index is less than −1 or greater than or equal to the number of elements in the rows collection, then throw an "IndexSizeError" DOMException.
     if (index < -1 || index >= (long)rows_length)
-        return WebIDL::IndexSizeError::create(realm(), "Index is negative or greater than or equal to the number of rows"_utf16);
+        return WebIDL::IndexSizeError::create("Index is negative or greater than or equal to the number of rows"_utf16);
 
     // 2. If index is −1, then remove the last element in the rows collection from its parent, or do nothing if the rows collection is empty.
     if (index == -1) {
@@ -509,7 +510,7 @@ WebIDL::ExceptionOr<void> HTMLTableElement::delete_row(WebIDL::Long index)
 
 unsigned int HTMLTableElement::border() const
 {
-    return parse_border(get_attribute_value(HTML::AttributeNames::border));
+    return parse_border(attribute(HTML::AttributeNames::border).value_or({}));
 }
 
 Optional<u32> HTMLTableElement::cellpadding() const

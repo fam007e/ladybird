@@ -14,7 +14,7 @@ namespace Web::WebLocks {
 
 GC_DEFINE_ALLOCATOR(LockRequest);
 
-LockRequest::LockRequest(String client_id, GC::Ref<LockManager> manager, String name, Bindings::LockMode mode, GC::Ref<WebIDL::CallbackType> callback, GC::Ref<WebIDL::Promise> promise, GC::Ptr<DOM::AbortSignal> signal)
+LockRequest::LockRequest(Utf16String client_id, GC::Ref<LockManager> manager, Utf16String name, Bindings::LockMode mode, GC::Ref<WebIDL::CallbackType> callback, GC::Ref<WebIDL::Promise> promise, GC::Ptr<DOM::AbortSignal> signal)
     : m_client_id(move(client_id))
     , m_manager(manager)
     , m_name(move(name))
@@ -49,7 +49,7 @@ void LockRequest::abort_request()
 
     // 6. Remove request from queue.
     queue.remove_first_matching([&](GC::Ref<LockRequest> queued_request) {
-        return queued_request == this;
+        return queued_request == GC::Ref { *this };
     });
 
     // 7. Process the lock request queue queue.
@@ -60,12 +60,12 @@ void LockRequest::abort_request()
 void LockRequest::signal_to_abort_request(GC::Ref<DOM::AbortSignal> signal)
 {
     // 1. Enqueue the steps to abort the request request to the lock task queue.
-    queue_web_locks_task(signal->realm(), GC::create_function(heap(), [this]() {
+    queue_web_locks_task(m_manager->relevant_realm(), GC::create_function(heap(), [this]() {
         abort_request();
     }));
 
     // 2. Reject request’s promise with signal’s abort reason.
-    WebIDL::reject_promise(signal->realm(), m_promise, signal->reason());
+    WebIDL::reject_promise(m_manager->relevant_realm(), m_promise, signal->reason());
 }
 
 // https://w3c.github.io/web-locks/#grantable
@@ -84,7 +84,7 @@ bool LockRequest::is_grantable(LockRequestQueue const& queue) const
     // 6. Let mode be request’s mode
 
     // 7. If queue is not empty and request is not the first item in queue, then return false.
-    if (!queue.is_empty() && queue.first() != this)
+    if (!queue.is_empty() && queue.first() != GC::Ref { *this })
         return false;
 
     // 8. If mode is "exclusive", then return true if no lock in held has name equal to name, and false otherwise.

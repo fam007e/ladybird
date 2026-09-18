@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <LibGC/Heap.h>
 #include <LibWeb/IndexedDB/IDBDatabase.h>
 #include <LibWeb/IndexedDB/Inspection.h>
 #include <LibWeb/IndexedDB/Internal/Database.h>
@@ -18,9 +19,9 @@ GC_DEFINE_ALLOCATOR(MutationLog);
 
 MutationLog::MutationLog() = default;
 
-GC::Ref<MutationLog> MutationLog::create(JS::Realm& realm)
+GC::Ref<MutationLog> MutationLog::create()
 {
-    return realm.create<MutationLog>();
+    return GC::Heap::the().allocate<MutationLog>();
 }
 
 void MutationLog::visit_edges(Visitor& visitor)
@@ -77,7 +78,7 @@ void MutationLog::note_object_store_deleted()
     m_entries.append(ObjectStoreDeleted {});
 }
 
-void MutationLog::note_object_store_renamed(String old_name)
+void MutationLog::note_object_store_renamed(Utf16String old_name)
 {
     m_entries.append(ObjectStoreRenamed { move(old_name) });
 }
@@ -92,7 +93,7 @@ void MutationLog::note_index_deleted(GC::Ref<Index> index)
     m_entries.append(IndexDeleted { index });
 }
 
-void MutationLog::note_index_renamed(GC::Ref<Index> index, String old_name)
+void MutationLog::note_index_renamed(GC::Ref<Index> index, Utf16String old_name)
 {
     m_entries.append(IndexRenamed { index, move(old_name) });
 }
@@ -122,7 +123,7 @@ void MutationLog::note_index_record_stored(GC::Ref<Index> index, IndexRecord rec
     m_entries.append(IndexRecordStored { index, record });
 }
 
-void MutationLog::append_changes(String const& database_name, String const& object_store_name, TransactionChanges& changes) const
+void MutationLog::append_changes(Utf16String const& database_name, Utf16String const& object_store_name, TransactionChanges& changes) const
 {
     Vector<GC::Ref<Key>> stored_keys;
     Vector<GC::Ref<Key>> changed_keys;

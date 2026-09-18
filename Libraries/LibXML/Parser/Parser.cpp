@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2026, the Ladybird developers.
+ * Copyright (c) 2026-present, the Ladybird developers.
  *
  * SPDX-License-Identifier: BSD-2-Clause
  */
@@ -10,11 +10,14 @@
 #include <libxml/encoding.h>
 #include <libxml/parser.h>
 #include <libxml/parserInternals.h>
+#include <libxml/tree.h>
 #include <libxml/xmlerror.h>
 
 namespace XML {
 
 static constexpr int MAX_XML_TREE_DEPTH = 5000;
+static constexpr StringView XML_NAMESPACE = "http://www.w3.org/XML/1998/namespace"sv;
+static constexpr StringView XMLNS_NAMESPACE = "http://www.w3.org/2000/xmlns/"sv;
 
 struct ParserContext {
     Listener* listener { nullptr };
@@ -53,6 +56,35 @@ static StringView xml_char_to_string_view(xmlChar const* str)
     if (!str)
         return {};
     return StringView(reinterpret_cast<char const*>(str), strlen(reinterpret_cast<char const*>(str)));
+}
+
+static StringView xml_char_to_string_view(xmlChar const* str, int len)
+{
+    if (!str || len <= 0)
+        return {};
+    return StringView(reinterpret_cast<char const*>(str), static_cast<size_t>(len));
+}
+
+static Utf16FlyString xml_name_to_utf16_fly_string(xmlChar const* localname, xmlChar const* prefix)
+{
+    StringBuilder builder;
+    if (prefix) {
+        builder.append(xml_char_to_string_view(prefix));
+        builder.append(':');
+    }
+    builder.append(xml_char_to_string_view(localname));
+    return Utf16FlyString::from_utf8(builder.string_view());
+}
+
+static ByteString xml_name_to_byte_string(xmlChar const* localname, xmlChar const* prefix)
+{
+    StringBuilder builder;
+    if (prefix) {
+        builder.append(xml_char_to_string_view(prefix));
+        builder.append(':');
+    }
+    builder.append(xml_char_to_string_view(localname));
+    return builder.to_byte_string();
 }
 
 static bool is_known_xhtml_public_id(StringView public_id)
@@ -131,6 +163,38 @@ static xmlEntityPtr get_entity_handler(void* ctx, xmlChar const* name)
     return &s_xhtml_entity_result;
 }
 
+static LineTrackingLexer::Position current_position(xmlParserCtxtPtr parser_ctx)
+{
+    LineTrackingLexer::Position position;
+    auto* input = parser_ctx->input;
+    if (!input)
+        return position;
+    if (input->cur && input->base)
+        position.offset = static_cast<size_t>(input->cur - input->base);
+    if (input->line > 0)
+        position.line = static_cast<size_t>(input->line);
+    if (input->col > 0)
+        position.column = static_cast<size_t>(input->col);
+    return position;
+}
+
+// For errors the adapter finds on its own rather than libxml2 reporting them: records the error the way
+// structured_error_handler records libxml2's, tells the listener, and stops the parse — so nothing after the error
+// reaches the listener or the tree.
+static void report_error_and_stop(xmlParserCtxtPtr parser_ctx, ParserContext& context, ByteString message)
+{
+    ParseError parse_error {
+        .position = current_position(parser_ctx),
+        .error = move(message),
+    };
+    context.parse_errors.append(parse_error);
+    if (context.listener)
+        context.listener->error(parse_error);
+    if (!context.error.has_value())
+        context.error = move(parse_error);
+    xmlStopParser(parser_ctx);
+}
+
 static void start_document_handler(void* ctx)
 {
     auto* parser_ctx = static_cast<xmlParserCtxtPtr>(ctx);
@@ -162,43 +226,139 @@ static void end_document_handler(void* ctx)
         context->listener->document_end();
 }
 
+static bool is_ncname(xmlChar const* name)
+{
+    // NB: In libxml2 2.15 xmlValidateNCName scans with the same XML 1.0 fifth-edition name grammar the parser uses
+    // (xmlScanName). Through 2.13 it used the fourth-edition character tables instead, which reject names the parser
+    // accepts (an Ethiopic letter, e.g.) — so this check can't be used with a libxml2 that old.
+    return xmlValidateNCName(name, 0) == 0;
+}
+
+// The rules of Namespaces in XML 1.0 §3 (Reserved Prefixes and Namespace Names) and §6.2 (a prefix can't be bound to
+// an empty namespace name): what xmlParseStartTag2 checks for an explicit xmlns declaration and skips for a
+// DTD-defaulted one, and what expat's addBinding checks for both. Returns the error to report, if any.
+// NB: libxml2 never delivers a declaration of the xml prefix itself — xmlParserNsPush drops those, explicit or
+// defaulted — so the xml arm below only states the rule; a defaulted xmlns:xml with the wrong namespace name is
+// dropped before SAX sees it, with no diagnostic.
+static Optional<ByteString> reserved_binding_error(xmlChar const* prefix, xmlChar const* uri)
+{
+    auto prefix_view = xml_char_to_string_view(prefix);
+    auto uri_view = xml_char_to_string_view(uri);
+
+    if (!prefix) {
+        if (uri_view == XML_NAMESPACE)
+            return ByteString("The XML namespace must not be declared as the default namespace"sv);
+        if (uri_view == XMLNS_NAMESPACE)
+            return ByteString("The xmlns namespace must not be declared as the default namespace"sv);
+        return {};
+    }
+
+    if (prefix_view == "xml"sv) {
+        if (uri_view == XML_NAMESPACE)
+            return {};
+        return ByteString::formatted("Namespace prefix 'xml' must be bound to the XML namespace, not '{}'", uri_view);
+    }
+    if (prefix_view == "xmlns"sv)
+        return ByteString("The xmlns prefix must not be declared"sv);
+    if (uri_view.is_empty())
+        return ByteString::formatted("Namespace prefix '{}' must not be bound to an empty namespace name", prefix_view);
+    if (uri_view == XML_NAMESPACE)
+        return ByteString::formatted("Namespace prefix '{}' must not be bound to the XML namespace", prefix_view);
+    if (uri_view == XMLNS_NAMESPACE)
+        return ByteString::formatted("Namespace prefix '{}' must not be bound to the xmlns namespace", prefix_view);
+    return {};
+}
+
 static void start_element_ns_handler(void* ctx, xmlChar const* localname, xmlChar const* prefix,
     xmlChar const*, int nb_namespaces, xmlChar const** namespaces,
     int nb_attributes, int nb_defaulted, xmlChar const** attributes)
 {
-    (void)nb_defaulted;
-
     auto* parser_ctx = static_cast<xmlParserCtxtPtr>(ctx);
     auto* context = static_cast<ParserContext*>(parser_ctx->_private);
     if (!context)
         return;
 
     if (++context->depth > MAX_XML_TREE_DEPTH) {
-        size_t offset = 0;
-        if (parser_ctx->input && parser_ctx->input->cur && parser_ctx->input->base)
-            offset = static_cast<size_t>(parser_ctx->input->cur - parser_ctx->input->base);
-
-        ParseError parse_error {
-            .position = LineTrackingLexer::Position { .offset = offset },
-            .error = ByteString("Excessive node nesting."sv),
-        };
-        context->parse_errors.append(parse_error);
-
-        if (context->listener)
-            context->listener->error(parse_error);
-
-        xmlStopParser(parser_ctx);
+        report_error_and_stop(parser_ctx, *context, ByteString("Excessive node nesting."sv));
         return;
     }
 
-    StringBuilder name_builder;
-    if (prefix) {
-        name_builder.append(xml_char_to_string_view(prefix));
-        name_builder.append(':');
+    // An explicit attribute or namespace declaration arrives with NCName parts: libxml2 parses its name with
+    // xmlParseQName and reports a namespace error through serror when that fails. A DTD-defaulted one doesn't: an
+    // ATTLIST name is parsed with xmlParseName, which allows any number of colons, and xmlAddDefAttrs just splits it
+    // at the first one — so "a::b" is delivered as prefix "a" with local name ":b", and "xmlns:a::b" as a namespace
+    // declaration for the prefix "a::b". So check the defaulted attributes (libxml2 puts them last) and every
+    // namespace prefix (libxml2 doesn't say which of those were defaulted) before anything reaches the listener or
+    // the tree. That's the NCName grammar of Namespaces in XML, as Gecko applies it: its expat rejects such an ATTLIST
+    // outright, at the declaration. Blink and WebKit run the DOM's looser name validation on the delivered parts
+    // instead, which lets a local part like "1b" through; we don't.
+    for (int i = 0; i < nb_namespaces; i++) {
+        auto* ns_prefix = namespaces[i * 2];
+        auto* ns_uri = namespaces[i * 2 + 1];
+        if (ns_prefix && !is_ncname(ns_prefix)) {
+            report_error_and_stop(parser_ctx, *context, ByteString::formatted("Namespace prefix '{}' is not an NCName", xml_char_to_string_view(ns_prefix)));
+            return;
+        }
+        // Explicit declarations that break these rules never get here — libxml2 reports them and drops them — so this
+        // only ever fires for a DTD-defaulted declaration.
+        if (auto error = reserved_binding_error(ns_prefix, ns_uri); error.has_value()) {
+            report_error_and_stop(parser_ctx, *context, error.release_value());
+            return;
+        }
     }
-    name_builder.append(xml_char_to_string_view(localname));
-    auto name = name_builder.to_byte_string();
 
+    for (int i = nb_attributes - nb_defaulted; i < nb_attributes; i++) {
+        auto* attr_localname = attributes[i * 5 + 0];
+        auto* attr_prefix = attributes[i * 5 + 1];
+        // The prefix is the run before the name's first colon, so it's an NCName by construction; only the local name
+        // can be malformed.
+        if (is_ncname(attr_localname))
+            continue;
+        report_error_and_stop(parser_ctx, *context, ByteString::formatted("Attribute name '{}' is not a qualified name", xml_name_to_byte_string(attr_localname, attr_prefix)));
+        return;
+    }
+
+    if (context->listener) {
+        auto name = xml_name_to_utf16_fly_string(localname, prefix);
+        Vector<ListenerAttribute> attrs;
+        attrs.ensure_capacity(static_cast<size_t>(nb_namespaces + nb_attributes));
+
+        for (int i = 0; i < nb_namespaces; i++) {
+            auto* ns_prefix = namespaces[i * 2];
+            auto* ns_uri = namespaces[i * 2 + 1];
+
+            StringBuilder attr_name;
+            if (ns_prefix) {
+                attr_name.append("xmlns:"sv);
+                attr_name.append(xml_char_to_string_view(ns_prefix));
+            } else {
+                attr_name.append("xmlns"sv);
+            }
+
+            attrs.unchecked_append({
+                Utf16FlyString::from_utf8(attr_name.string_view()),
+                Utf16String::from_utf8(xml_char_to_string_view(ns_uri)),
+            });
+        }
+
+        for (int i = 0; i < nb_attributes; i++) {
+            auto* attr_localname = attributes[i * 5 + 0];
+            auto* attr_prefix = attributes[i * 5 + 1];
+            auto* value_begin = attributes[i * 5 + 3];
+            auto* value_end = attributes[i * 5 + 4];
+
+            auto value_len = static_cast<int>(value_end - value_begin);
+            attrs.unchecked_append({
+                xml_name_to_utf16_fly_string(attr_localname, attr_prefix),
+                Utf16String::from_utf8(xml_char_to_string_view(value_begin, value_len)),
+            });
+        }
+
+        context->listener->element_start(name, attrs);
+        return;
+    }
+
+    auto name = xml_name_to_byte_string(localname, prefix);
     OrderedHashMap<Name, ByteString> attrs;
 
     for (int i = 0; i < nb_namespaces; i++) {
@@ -233,26 +393,22 @@ static void start_element_ns_handler(void* ctx, xmlChar const* localname, xmlCha
         attrs.set(attr_name.to_byte_string(), value);
     }
 
-    if (context->listener) {
-        context->listener->element_start(name, attrs);
+    auto element = adopt_own(*new Node {
+        .offset = {},
+        .content = Node::Element { name, move(attrs), {} },
+        .parent = context->current_node,
+    });
+
+    auto* element_ptr = element.ptr();
+
+    if (context->current_node) {
+        VERIFY(context->current_node->is_element());
+        context->current_node->content.get<Node::Element>().children.append(move(element));
     } else {
-        auto element = adopt_own(*new Node {
-            .offset = {},
-            .content = Node::Element { name, move(attrs), {} },
-            .parent = context->current_node,
-        });
-
-        auto* element_ptr = element.ptr();
-
-        if (context->current_node) {
-            VERIFY(context->current_node->is_element());
-            context->current_node->content.get<Node::Element>().children.append(move(element));
-        } else {
-            context->root_node = move(element);
-        }
-
-        context->current_node = element_ptr;
+        context->root_node = move(element);
     }
+
+    context->current_node = element_ptr;
 }
 
 static void end_element_ns_handler(void* ctx, xmlChar const* localname, xmlChar const* prefix, xmlChar const*)
@@ -264,15 +420,8 @@ static void end_element_ns_handler(void* ctx, xmlChar const* localname, xmlChar 
 
     --context->depth;
 
-    StringBuilder name_builder;
-    if (prefix) {
-        name_builder.append(xml_char_to_string_view(prefix));
-        name_builder.append(':');
-    }
-    name_builder.append(xml_char_to_string_view(localname));
-    auto name = name_builder.to_byte_string();
-
     if (context->listener) {
+        auto name = xml_name_to_utf16_fly_string(localname, prefix);
         context->listener->element_end(name);
     } else if (context->current_node) {
         context->current_node = context->current_node->parent;
@@ -364,12 +513,13 @@ static void processing_instruction_handler(void* ctx, xmlChar const* target, xml
     if (parser_ctx->inSubset != 0)
         return;
 
-    auto target_str = xml_char_to_byte_string(target);
-    auto data_str = xml_char_to_byte_string(data);
-
     if (context->listener) {
+        auto target_str = Utf16FlyString::from_utf8(xml_char_to_string_view(target));
+        auto data_str = Utf16String::from_utf8(xml_char_to_string_view(data));
         context->listener->processing_instruction(target_str, data_str);
     } else {
+        auto target_str = xml_char_to_byte_string(target);
+        auto data_str = xml_char_to_byte_string(data);
         context->processing_instructions.set(target_str, data_str);
     }
 }

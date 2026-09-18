@@ -240,24 +240,24 @@ JS_DEFINE_NATIVE_FUNCTION(StringPrototype::at)
     if (Value(relative_index).is_infinity())
         return js_undefined();
 
-    Checked<size_t> index { 0 };
+    double index;
     // 4. If relativeIndex ≥ 0, then
     if (relative_index >= 0) {
         // a. Let k be relativeIndex.
-        index += relative_index;
+        index = relative_index;
     }
     // 5. Else,
     else {
         // a. Let k be len + relativeIndex.
-        index += length;
-        index -= -relative_index;
+        index = length + relative_index;
     }
+
     // 6. If k < 0 or k ≥ len, return undefined.
-    if (index.has_overflow() || index.value() >= length)
+    if (index < 0 || index >= length)
         return js_undefined();
 
     // 7. Return ? Get(O, ! ToString(𝔽(k))).
-    return PrimitiveString::create(vm, *string, index.value(), 1);
+    return PrimitiveString::create(vm, *string, static_cast<size_t>(index), 1);
 }
 
 // 22.1.3.2 String.prototype.charAt ( pos ), https://tc39.es/ecma262/#sec-string.prototype.charat
@@ -338,7 +338,7 @@ JS_DEFINE_NATIVE_FUNCTION(StringPrototype::concat)
         auto next_string = TRY(vm.argument(i).to_primitive_string(vm));
 
         // b. Set R to the string-concatenation of R and nextString.
-        result = PrimitiveString::create(vm, *result, *next_string);
+        result = TRY(PrimitiveString::create(vm, *result, *next_string));
     }
 
     // 5. Return R.
@@ -824,7 +824,7 @@ JS_DEFINE_NATIVE_FUNCTION(StringPrototype::repeat)
     if (string->is_empty())
         return PrimitiveString::create(vm, Utf16String {});
 
-    if (n > static_cast<double>(NumericLimits<size_t>::max()))
+    if (n > MAX_ARRAY_LIKE_INDEX)
         return vm.throw_completion<RangeError>(ErrorType::StringRepeatCountMustNotOverflow);
 
     auto count = static_cast<size_t>(n);
@@ -1366,7 +1366,8 @@ static ThrowCompletionOr<Utf16String> transform_case(VM& vm, Utf16String const& 
     auto match = Intl::lookup_matching_locale_by_prefix({ { requested_locale } });
 
     // 6. If match is not undefined, let locale be match.[[locale]]; else let locale be "und".
-    auto locale = match.has_value() ? match->locale.utf16_view().bytes() : "und"sv;
+    // NB: LibUnicode reads locale views as bytes, so keep the fallback in ASCII storage.
+    auto locale = match.has_value() ? match->locale.utf16_view() : Utf16View { "und"sv };
 
     // 7. Let codePoints be StringToCodePoints(S).
 
@@ -1571,7 +1572,7 @@ JS_DEFINE_NATIVE_FUNCTION(StringPrototype::substr)
     int_length = clamp(int_length, 0, size);
 
     // 10. Let intEnd be min(intStart + intLength, size).
-    auto int_end = min((i32)(int_start + int_length), size);
+    auto int_end = min(static_cast<size_t>(int_start + int_length), size);
 
     if (int_start >= int_end)
         return PrimitiveString::create(vm, Utf16String {});

@@ -14,19 +14,17 @@ namespace Web::MathML {
 class MathMLAnchorElement final
     : public MathMLElement
     , public HTML::HyperlinkElementUtils {
-    WEB_PLATFORM_OBJECT(MathMLAnchorElement, MathMLElement);
+    WEB_WRAPPABLE(MathMLAnchorElement, MathMLElement);
     GC_DECLARE_ALLOCATOR(MathMLAnchorElement);
 
 public:
     virtual ~MathMLAnchorElement() override;
 
-    String href() const;
-    void set_href(String);
+    Utf16String href() const;
+    void set_href(Utf16String const&);
 
 private:
     MathMLAnchorElement(DOM::Document&, DOM::QualifiedName);
-
-    virtual void initialize(JS::Realm&) override;
 
     // ^HTML::HTMLHyperlinkElementUtils
     virtual DOM::Element& hyperlink_element_utils_element() override { return *this; }

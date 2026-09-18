@@ -17,18 +17,18 @@
 
 #include <QAction>
 #include <QApplication>
+#include <QClipboard>
 #include <QEasingCurve>
 #include <QGraphicsDropShadowEffect>
 #include <QGuiApplication>
 #include <QKeyEvent>
+#include <QMenu>
 #include <QMouseEvent>
 #include <QPainter>
 #include <QPalette>
 #include <QResizeEvent>
 #include <QStyle>
-#if QT_VERSION >= QT_VERSION_CHECK(6, 5, 0)
-#    include <QStyleHints>
-#endif
+#include <QStyleHints>
 #include <QTextLayout>
 #include <QTimer>
 #include <QToolButton>
@@ -94,12 +94,13 @@ static constexpr int LOCATION_TRAILING_ACTION_HEIGHT = 23;
 static constexpr int LOCATION_PILL_HEIGHT = 22;
 static constexpr int LOCATION_PILL_HORIZONTAL_PADDING = 18;
 
-LocationEdit::LocationEdit(QWidget* parent)
+LocationEdit::LocationEdit(QWidget* parent, WebView::IsPrivate is_private)
     : QLineEdit(parent)
+    , m_omnibox(is_private)
     , m_autocomplete(new Autocomplete(this))
 {
     setObjectName("LadybirdLocationEdit");
-    setMinimumHeight(32);
+    setMinimumHeight(30);
     update_chrome_style();
 
     m_focus_glow_effect = new QGraphicsDropShadowEffect(this);
@@ -180,6 +181,7 @@ LocationEdit::LocationEdit(QWidget* parent)
     };
 
     m_omnibox.on_commit = [this](String const& input) {
+        auto destination_kind = m_omnibox.destination_kind_for_last_commit();
         auto input_text = qstring_from_ak_string(input);
         if (text() != input_text)
             setText(input_text);
@@ -190,17 +192,17 @@ LocationEdit::LocationEdit(QWidget* parent)
         auto append_tld = ctrl_held ? WebView::AppendTLD::Yes : WebView::AppendTLD::No;
 
         auto url = WebView::sanitize_url(input, WebView::Application::settings().search_engine(), append_tld);
-        set_url(AK::move(url));
+        auto classified_input = WebView::classify_user_input(input, append_tld);
+        if (destination_kind == WebView::OmniboxDestinationKind::Search
+            || classified_input.classification != WebView::UserInputClassification::ExternalURL)
+            set_url(url);
 
-        emit returnPressed();
+        if (on_navigation)
+            on_navigation(input, AK::move(url), destination_kind);
     };
 
     connect(m_autocomplete, &Autocomplete::suggestion_clicked, this, [this](int suggestion_index) {
         m_omnibox.suggestion_clicked(static_cast<size_t>(suggestion_index));
-    });
-
-    connect(m_autocomplete, &Autocomplete::suggestion_hovered, this, [this](int suggestion_index) {
-        m_omnibox.suggestion_hovered(static_cast<size_t>(suggestion_index));
     });
 
     connect(m_autocomplete, &Autocomplete::dismissed, this, [this] {
@@ -228,11 +230,9 @@ LocationEdit::LocationEdit(QWidget* parent)
         m_omnibox.cursor_moved(at_end);
     });
 
-#if QT_VERSION >= QT_VERSION_CHECK(6, 5, 0)
     connect(QGuiApplication::styleHints(), &QStyleHints::colorSchemeChanged, this, [this] {
         schedule_chrome_style_update();
     });
-#endif
 }
 
 void LocationEdit::set_trailing_action(QAction* action)
@@ -290,6 +290,50 @@ void LocationEdit::changeEvent(QEvent* event)
     if (event->type() == QEvent::PaletteChange || event->type() == QEvent::ApplicationPaletteChange || event->type() == QEvent::ThemeChange) {
         schedule_chrome_style_update();
     }
+}
+
+void LocationEdit::contextMenuEvent(QContextMenuEvent* event)
+{
+    QMenu* menu = createStandardContextMenu();
+
+    auto* paste_action = menu->findChild<QAction*>(QStringLiteral("edit-paste"), Qt::FindDirectChildrenOnly);
+
+    auto qt_clipboard_text = QGuiApplication::clipboard()->text();
+    auto clipboard_text = ak_string_from_qstring(qt_clipboard_text);
+
+    bool has_search_engine = WebView::Application::settings().search_engine().has_value();
+    auto paste_and_go_text = WebView::Omnibox::text_for_paste_and_go_action(clipboard_text, has_search_engine);
+    // Escape any &s so Qt doesn't treat them as mnemonics.
+    paste_and_go_text = MUST(paste_and_go_text.replace("&"sv, "&&"sv, ReplaceMode::All));
+
+    bool clipboard_holds_url = !has_search_engine || (!clipboard_text.is_empty() && WebView::location_looks_like_url(clipboard_text));
+    auto paste_and_go_icon = clipboard_holds_url
+        ? create_chrome_icon(ChromeIcon::Forward, palette())
+        : QIcon::fromTheme(QIcon::ThemeIcon::SystemSearch);
+
+    auto* paste_and_go_action = new QAction(paste_and_go_icon, qstring_from_ak_string(paste_and_go_text), menu);
+    paste_and_go_action->setEnabled(!isReadOnly() && !qt_clipboard_text.isEmpty());
+    connect(paste_and_go_action, &QAction::triggered, this, [this, clipboard_text, qt_clipboard_text] {
+        setText(qt_clipboard_text);
+        m_omnibox.navigate_directly_to_query(clipboard_text);
+    });
+
+    // Try to insert "Paste and Go" after the "Paste" action if we can find it.
+    bool added_paste_and_go_action = false;
+    if (paste_action) {
+        auto const& actions = menu->actions();
+        auto paste_index = actions.indexOf(paste_action);
+        if (paste_index >= 0 && paste_index + 1 < actions.size()) {
+            menu->insertAction(actions.at(paste_index + 1), paste_and_go_action);
+            added_paste_and_go_action = true;
+        }
+    }
+    // ...otherwise append it to the end.
+    if (!added_paste_and_go_action)
+        menu->addAction(paste_and_go_action);
+
+    menu->exec(event->globalPos());
+    delete menu;
 }
 
 void LocationEdit::focusInEvent(QFocusEvent* event)
@@ -380,6 +424,7 @@ void LocationEdit::keyPressEvent(QKeyEvent* event)
         if (m_url.has_value())
             setText(serialized_url());
         clearFocus();
+        emit focus_return_requested();
         return;
     }
 
@@ -391,6 +436,13 @@ void LocationEdit::keyPressEvent(QKeyEvent* event)
     if (event->key() == Qt::Key_Up) {
         if (m_omnibox.select_previous_suggestion())
             return;
+    }
+
+    if (event->key() == Qt::Key_Right || event->key() == Qt::Key_End) {
+        if (m_omnibox.accept_completion()) {
+            event->accept();
+            return;
+        }
     }
 
     if (event->key() == Qt::Key_Return || event->key() == Qt::Key_Enter) {
@@ -562,7 +614,7 @@ void LocationEdit::update_location_icon()
         && text() == display_url();
 
     if (text_matches_current_url() || is_showing_current_url_for_display) {
-        auto const& scheme = m_url->scheme();
+        auto scheme = m_url->scheme();
         if (scheme == "http"sv)
             show_not_secure_indicator();
         else
@@ -650,7 +702,7 @@ void LocationEdit::highlight_location()
             auto scheme_and_subdomain = url_parts->scheme_and_subdomain;
             auto remainder = url_parts->remainder;
 
-            auto scheme_prefix_length = m_url->scheme().bytes_as_string_view().length() + "://"sv.length();
+            auto scheme_prefix_length = m_url->scheme().length() + "://"sv.length();
             if (scheme_and_subdomain.length() >= scheme_prefix_length)
                 scheme_and_subdomain = scheme_and_subdomain.substring_view(scheme_prefix_length);
             if (scheme_and_subdomain.starts_with("www."sv, CaseSensitivity::CaseInsensitive))

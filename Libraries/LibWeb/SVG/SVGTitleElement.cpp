@@ -4,9 +4,8 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibWeb/Bindings/Intrinsics.h>
-#include <LibWeb/Bindings/SVGTitleElement.h>
 #include <LibWeb/DOM/Document.h>
+#include <LibWeb/HTML/LocalNavigable.h>
 #include <LibWeb/Layout/Node.h>
 #include <LibWeb/Page/Page.h>
 #include <LibWeb/SVG/SVGTitleElement.h>
@@ -20,13 +19,7 @@ SVGTitleElement::SVGTitleElement(DOM::Document& document, DOM::QualifiedName qua
 {
 }
 
-void SVGTitleElement::initialize(JS::Realm& realm)
-{
-    WEB_SET_PROTOTYPE_FOR_INTERFACE(SVGTitleElement);
-    Base::initialize(realm);
-}
-
-RefPtr<Layout::Node> SVGTitleElement::create_layout_node(CSS::ComputedProperties const&)
+Layout::Node* SVGTitleElement::create_layout_node(CSS::LayoutStyle)
 {
     return nullptr;
 }
@@ -35,14 +28,14 @@ void SVGTitleElement::children_changed(ChildrenChangedMetadata const& metadata)
 {
     Base::children_changed(metadata);
 
-    auto& page = document().page();
-    if (document().browsing_context() != &page.top_level_browsing_context())
+    auto navigable = document().navigable();
+    if (!navigable || !navigable->is_top_level_traversable())
         return;
 
     auto* document_element = document().document_element();
 
     if (document_element == parent() && is<SVGElement>(document_element))
-        page.client().page_did_change_title(document().title());
+        document().page().client().page_did_change_title(document().title());
 }
 
 }

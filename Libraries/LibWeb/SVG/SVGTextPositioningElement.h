@@ -49,10 +49,10 @@ struct TextPositioning {
 
 // https://svgwg.org/svg2-draft/text.html#InterfaceSVGTextPositioningElement
 class SVGTextPositioningElement : public SVGTextContentElement {
-    WEB_PLATFORM_OBJECT(SVGTextPositioningElement, SVGTextContentElement);
+    WEB_WRAPPABLE(SVGTextPositioningElement, SVGTextContentElement);
 
 public:
-    virtual void attribute_changed(FlyString const& name, Optional<String> const& old_value, Optional<String> const& value, Optional<FlyString> const& namespace_) override;
+    virtual void attribute_changed(Utf16FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_) override;
 
     TextPositioning text_positioning() const;
 
@@ -64,12 +64,10 @@ public:
 
 protected:
     SVGTextPositioningElement(DOM::Document&, DOM::QualifiedName);
-
-    virtual void initialize(JS::Realm&) override;
     virtual void visit_edges(Visitor&) override;
 
 private:
-    GC::Ref<SVGAnimatedLengthList> ensure_length_list(GC::Ptr<SVGAnimatedLengthList>&, FlyString const& attribute_name) const;
+    GC::Ref<SVGAnimatedLengthList> ensure_length_list(GC::Ptr<SVGAnimatedLengthList>&, Utf16FlyString const& attribute_name) const;
 
     GC::Ptr<SVGAnimatedLengthList> m_x;
     GC::Ptr<SVGAnimatedLengthList> m_y;

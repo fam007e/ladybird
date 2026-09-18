@@ -5,6 +5,7 @@
  */
 
 #include <LibGC/Heap.h>
+#include <LibGC/Weak.h>
 #include <LibJS/Runtime/VM.h>
 #include <LibRequests/Request.h>
 #include <LibWeb/Fetch/Fetching/PendingResponse.h>
@@ -21,15 +22,14 @@ GC_DEFINE_ALLOCATOR(FetchController);
 
 FetchController::FetchController() = default;
 
-GC::Ref<FetchController> FetchController::create(JS::VM& vm)
+GC::Ref<FetchController> FetchController::create()
 {
-    return vm.heap().allocate<FetchController>();
+    return GC::Heap::the().allocate<FetchController>();
 }
 
 void FetchController::visit_edges(JS::Cell::Visitor& visitor)
 {
     Base::visit_edges(visitor);
-    visitor.visit(m_full_timing_info);
     visitor.visit(m_report_timing_steps);
     visitor.visit(m_next_manual_redirect_steps);
     visitor.visit(m_fetch_params);
@@ -39,16 +39,22 @@ void FetchController::visit_edges(JS::Cell::Visitor& visitor)
 void FetchController::set_pending_request(RefPtr<Requests::Request> const& request)
 {
     m_pending_request = request;
+    m_has_started_request |= !!request;
+    if (request && m_fetch_params && m_fetch_params->request()->destination() == Request::Destination::Font) {
+        request->on_requires_network = GC::weak_callback(*this, [](auto& controller) {
+            controller.m_requires_network = true;
+        });
+    }
 }
 
 void FetchController::set_report_timing_steps(Function<void(JS::Object&)> report_timing_steps)
 {
-    m_report_timing_steps = GC::create_function(vm().heap(), move(report_timing_steps));
+    m_report_timing_steps = GC::create_function(GC::Heap::the(), move(report_timing_steps));
 }
 
 void FetchController::set_next_manual_redirect_steps(Function<void()> next_manual_redirect_steps)
 {
-    m_next_manual_redirect_steps = GC::create_function(vm().heap(), move(next_manual_redirect_steps));
+    m_next_manual_redirect_steps = GC::create_function(GC::Heap::the(), move(next_manual_redirect_steps));
 }
 
 // https://fetch.spec.whatwg.org/#finalize-and-report-timing
@@ -72,13 +78,20 @@ void FetchController::process_next_manual_redirect() const
 }
 
 // https://fetch.spec.whatwg.org/#extract-full-timing-info
-GC::Ref<FetchTimingInfo> FetchController::extract_full_timing_info() const
+NonnullRefPtr<FetchTimingInfo> FetchController::extract_full_timing_info() const
 {
     // 1. Assert: this’s full timing info is not null.
     VERIFY(m_full_timing_info);
 
     // 2. Return this’s full timing info.
     return *m_full_timing_info;
+}
+
+RefPtr<FetchTimingInfo> FetchController::timing_info() const
+{
+    if (!m_fetch_params)
+        return nullptr;
+    return m_fetch_params->timing_info();
 }
 
 // https://fetch.spec.whatwg.org/#fetch-controller-abort
@@ -88,43 +101,22 @@ void FetchController::abort(JS::Realm& realm, Optional<JS::Value> error)
     m_state = State::Aborted;
 
     // 2. Let fallbackError be an "AbortError" DOMException.
-    auto fallback_error = WebIDL::AbortError::create(realm, "Fetch was aborted"_utf16);
+    auto fallback_error = WebIDL::AbortError::create("Fetch was aborted"_utf16);
+    auto fallback_error_value = throw_completion(realm, fallback_error).value();
 
     // 3. Set error to fallbackError if it is not given.
     if (!error.has_value())
-        error = fallback_error;
+        error = fallback_error_value;
 
     // 4. Let serializedError be StructuredSerialize(error). If that threw an exception, catch it, and let serializedError be StructuredSerialize(fallbackError).
     // 5. Set controller’s serialized abort reason to serializedError
-    auto structured_serialize = [](JS::VM& vm, JS::Value error, JS::Value fallback_error) {
-        auto serialized_value_or_error = HTML::structured_serialize(vm, error);
+    auto structured_serialize = [&realm](JS::Value error, JS::Value fallback_error) {
+        auto serialized_value_or_error = HTML::structured_serialize(realm.vm(), error);
         return serialized_value_or_error.is_error()
-            ? HTML::structured_serialize(vm, fallback_error).value()
+            ? HTML::structured_serialize(realm.vm(), fallback_error).value()
             : serialized_value_or_error.value();
     };
-    m_serialized_abort_reason = structured_serialize(realm.vm(), error.value(), fallback_error);
-}
-
-// https://fetch.spec.whatwg.org/#deserialize-a-serialized-abort-reason
-JS::Value FetchController::deserialize_a_serialized_abort_reason(JS::Realm& realm)
-{
-    // 1. Let fallbackError be an "AbortError" DOMException.
-    auto fallback_error = WebIDL::AbortError::create(realm, "Fetch was aborted"_utf16);
-
-    // 2. Let deserializedError be fallbackError.
-    JS::Value deserialized_error = fallback_error;
-
-    // 3. If abortReason is non-null, then set deserializedError to StructuredDeserialize(abortReason, realm).
-    //    If that threw an exception or returned undefined, then set deserializedError to fallbackError.
-    if (m_serialized_abort_reason.has_value()) {
-        auto deserialized_error_or_exception = HTML::structured_deserialize(realm.vm(), m_serialized_abort_reason.value(), realm, {});
-        if (!deserialized_error_or_exception.is_exception() && !deserialized_error_or_exception.value().is_undefined()) {
-            deserialized_error = deserialized_error_or_exception.value();
-        }
-    }
-
-    // 4. Return deserializedError.
-    return deserialized_error;
+    m_serialized_abort_reason = structured_serialize(error.value(), fallback_error_value);
 }
 
 // https://fetch.spec.whatwg.org/#fetch-controller-terminate
@@ -141,8 +133,6 @@ void FetchController::stop_fetch()
 
     m_state = State::Stopped;
 
-    auto& vm = this->vm();
-
     // AD-HOC: Some HTML elements need to stop an ongoing fetching process without causing any network error to be raised
     //         (which abort() and terminate() will both do). This is tricky because the fetch process runs across several
     //         nested Platform::EventLoopPlugin::deferred_invoke() invocations. For now, we "stop" the fetch process by
@@ -156,7 +146,7 @@ void FetchController::stop_fetch()
     });
 
     if (m_fetch_params) {
-        auto fetch_algorithms = FetchAlgorithms::create(vm, {});
+        auto fetch_algorithms = FetchAlgorithms::create({});
         m_fetch_params->set_algorithms(fetch_algorithms);
     }
 
@@ -186,9 +176,9 @@ GC_DEFINE_ALLOCATOR(FetchControllerHolder);
 
 FetchControllerHolder::FetchControllerHolder() = default;
 
-GC::Ref<FetchControllerHolder> FetchControllerHolder::create(JS::VM& vm)
+GC::Ref<FetchControllerHolder> FetchControllerHolder::create()
 {
-    return vm.heap().allocate<FetchControllerHolder>();
+    return GC::Heap::the().allocate<FetchControllerHolder>();
 }
 
 void FetchControllerHolder::visit_edges(JS::Cell::Visitor& visitor)

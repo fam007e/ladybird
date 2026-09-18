@@ -19,31 +19,27 @@ public:
 
     virtual ~FontStyleStyleValue() override;
 
-    FontStyleKeyword font_style() const { return m_font_style; }
-    ValueComparingRefPtr<StyleValue const> angle() const { return m_angle_value; }
+    FontStyleKeyword font_style() const { return static_cast<FontStyleKeyword>(m_value->font_style.font_style); }
+    ValueComparingRefPtr<StyleValue const> angle() const { return wrap_rust_child_or_null(m_value->font_style.angle_value); }
 
     int to_font_slope() const;
 
-    virtual void serialize(StringBuilder&, SerializationMode) const override;
-    virtual ValueComparingNonnullRefPtr<StyleValue const> absolutized(ComputationContext const& computation_context) const override;
-
-    bool equals(StyleValue const& other) const override
-    {
-        if (type() != other.type())
-            return false;
-        auto const& other_font_style = other.as_font_style();
-        return m_font_style == other_font_style.m_font_style && m_angle_value == other_font_style.m_angle_value;
-    }
-
-    bool properties_equal(FontStyleStyleValue const& other) const { return m_font_style == other.m_font_style && m_angle_value == other.m_angle_value; }
-
-    virtual bool is_computationally_independent() const override { return !m_angle_value || m_angle_value->is_computationally_independent(); }
+    ValueComparingNonnullRefPtr<StyleValue const> absolutized(ComputationContext const& computation_context) const;
 
 private:
+    friend class StyleValue;
+
+    explicit FontStyleStyleValue(StyleValueFFI::StyleValueData const* data)
+        : StyleValueWithDefaultOperators(Type::FontStyle, data)
+    {
+    }
+
     FontStyleStyleValue(FontStyleKeyword, ValueComparingRefPtr<StyleValue const> angle_value);
 
-    FontStyleKeyword m_font_style;
-    ValueComparingRefPtr<StyleValue const> m_angle_value;
+    static StyleValueFFI::StyleValueData const* make_font_style_data(FontStyleKeyword font_style, ValueComparingRefPtr<StyleValue const> const& angle_value)
+    {
+        return StyleValueFFI::rust_style_value_create_font_style(to_underlying(font_style), angle_value ? StyleValueFFI::rust_style_value_retain(angle_value->rust_style_value_data()) : nullptr);
+    }
 };
 
 }

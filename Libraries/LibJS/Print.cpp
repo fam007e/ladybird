@@ -452,6 +452,7 @@ ErrorOr<void> print_async_generator(JS::PrintContext& print_context, JS::AsyncGe
 }
 
 template<Arithmetic T>
+
 ErrorOr<void> print_number(JS::PrintContext& print_context, T number)
 {
     TRY(js_out(print_context, "\033[35;1m"));
@@ -954,7 +955,7 @@ ErrorOr<void> print_value(JS::PrintContext& print_context, JS::Value value, GC::
         auto prototype_or_error = object.internal_get_prototype_of();
         if (prototype_or_error.has_value() && prototype_or_error.value() != nullptr) {
             auto& prototype = *prototype_or_error.value();
-            if (&prototype == prototype.shape().realm().intrinsics().error_prototype())
+            if (&prototype == prototype.shape().realm().intrinsics().error_prototype().ptr())
                 return print_error(print_context, object, seen_objects);
         }
 

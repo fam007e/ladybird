@@ -7,6 +7,8 @@
 
 #pragma once
 
+#include <LibGC/HeapVector.h>
+#include <LibWeb/Bindings/Wrappable.h>
 #include <LibWeb/SVG/SVGList.h>
 #include <LibWeb/SVG/SVGTransform.h>
 
@@ -14,21 +16,22 @@ namespace Web::SVG {
 
 // https://svgwg.org/svg2-draft/single-page.html#coords-InterfaceSVGTransformList
 class SVGTransformList final
-    : public Bindings::PlatformObject
+    : public Bindings::GCAllocatedWrappable
     , public SVGList<GC::Ref<SVGTransform>> {
-    WEB_PLATFORM_OBJECT(SVGTransformList, Bindings::PlatformObject);
+    WEB_WRAPPABLE(SVGTransformList, Bindings::GCAllocatedWrappable);
     GC_DECLARE_ALLOCATOR(SVGTransformList);
 
 public:
-    [[nodiscard]] static GC::Ref<SVGTransformList> create(JS::Realm& realm, Vector<GC::Ref<SVGTransform>>, ReadOnlyList);
-    [[nodiscard]] static GC::Ref<SVGTransformList> create(JS::Realm& realm, ReadOnlyList);
+    using List = GC::HeapVector<GC::Ref<SVGTransform>>;
+
+    [[nodiscard]] static GC::Ref<SVGTransformList> create(GC::Ref<List>, ReadOnlyList);
+    [[nodiscard]] static GC::Ref<SVGTransformList> create(ReadOnlyList);
     virtual ~SVGTransformList() override = default;
 
 private:
-    SVGTransformList(JS::Realm&, Vector<GC::Ref<SVGTransform>>, ReadOnlyList);
-    SVGTransformList(JS::Realm&, ReadOnlyList);
+    SVGTransformList(GC::Ref<List>, ReadOnlyList);
+    explicit SVGTransformList(ReadOnlyList);
 
-    virtual void initialize(JS::Realm&) override;
     virtual void visit_edges(Visitor&) override;
 };
 

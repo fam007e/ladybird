@@ -17,25 +17,22 @@ public:
     static ValueComparingNonnullRefPtr<ScrollbarColorStyleValue const> create(NonnullRefPtr<StyleValue const> thumb_color, NonnullRefPtr<StyleValue const> track_color);
     virtual ~ScrollbarColorStyleValue() override = default;
 
-    virtual void serialize(StringBuilder&, SerializationMode) const override;
-    bool properties_equal(ScrollbarColorStyleValue const& other) const { return m_thumb_color == other.m_thumb_color && m_track_color == other.m_track_color; }
-
-    virtual bool is_computationally_independent() const override { return m_thumb_color->is_computationally_independent() && m_track_color->is_computationally_independent(); }
-
-    NonnullRefPtr<StyleValue const> thumb_color() const { return m_thumb_color; }
-    NonnullRefPtr<StyleValue const> track_color() const { return m_track_color; }
+    ValueComparingNonnullRefPtr<StyleValue const> thumb_color() const { return wrap_rust_child(m_value->scrollbar_color.thumb_color); }
+    ValueComparingNonnullRefPtr<StyleValue const> track_color() const { return wrap_rust_child(m_value->scrollbar_color.track_color); }
 
 private:
-    virtual ValueComparingNonnullRefPtr<StyleValue const> absolutized(ComputationContext const&) const override;
+    // NB: StyleValue dispatches operations by type tag, so it may call private impls.
+    friend class StyleValue;
+    ValueComparingNonnullRefPtr<StyleValue const> absolutized(ComputationContext const&) const;
     explicit ScrollbarColorStyleValue(NonnullRefPtr<StyleValue const> thumb_color, NonnullRefPtr<StyleValue const> track_color)
-        : StyleValueWithDefaultOperators(Type::ScrollbarColor)
-        , m_thumb_color(move(thumb_color))
-        , m_track_color(move(track_color))
+        : StyleValueWithDefaultOperators(Type::ScrollbarColor, StyleValueFFI::rust_style_value_create_scrollbar_color(StyleValueFFI::rust_style_value_retain(thumb_color->rust_style_value_data()), StyleValueFFI::rust_style_value_retain(track_color->rust_style_value_data())))
     {
     }
 
-    ValueComparingNonnullRefPtr<StyleValue const> m_thumb_color;
-    ValueComparingNonnullRefPtr<StyleValue const> m_track_color;
+    explicit ScrollbarColorStyleValue(StyleValueFFI::StyleValueData const* data)
+        : StyleValueWithDefaultOperators(Type::ScrollbarColor, data)
+    {
+    }
 };
 
 }

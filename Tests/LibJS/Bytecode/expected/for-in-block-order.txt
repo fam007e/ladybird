@@ -1,14 +1,15 @@
-$100bdb91 for-in-block-order.js:5:1
+$916dd419 for-in-block-order.js:5:1
   Registers: 8
   Blocks:    1
   Constants:
     [0] = Undefined
 
 block0:
-  [   0] GetGlobal dst:reg6, `foo`
-  [  10] NewObject dst:reg7
-  [  20] Call dst:reg5, callee:reg6, this_value:Undefined, foo, arguments:[reg7]
-  [  48] End value:reg5
+  [   0] Enter
+  [   8] GetGlobal dst:reg6, `foo`
+  [  18] NewObject dst:reg7
+  [  28] Call dst:reg5, callee:reg6, this_value:Undefined, foo, arguments:[reg7]
+  [  50] End value:reg5
 
 
 foo$b9d28371 for-in-block-order.js:2:16
@@ -19,7 +20,8 @@ foo$b9d28371 for-in-block-order.js:2:16
     [0] = Undefined
 
 block0:
-  [   0] Mov dst:k~0, src:Undefined
+  [   0] Enter
+  [   8] MovSrcUndefined dst:k~0
   [  10] JumpNullish condition:arg0, true_target:block3, false_target:block4
 
 block1:

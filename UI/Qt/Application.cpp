@@ -6,27 +6,37 @@
 
 #include <LibCore/ArgsParser.h>
 #include <LibURL/InternalURLs.h>
-#include <LibWebView/HistoryStore.h>
+#include <LibWebView/SessionStore.h>
 #include <LibWebView/URL.h>
+#include <LibWebView/Utilities.h>
 #include <UI/Qt/Application.h>
+#include <UI/Qt/ChromeLayout.h>
 #include <UI/Qt/ChromeStyle.h>
 #include <UI/Qt/EventLoopImplementationQt.h>
 #include <UI/Qt/Menu.h>
+#include <UI/Qt/ProcessManagerWindow.h>
 #include <UI/Qt/Settings.h>
 #include <UI/Qt/StringUtils.h>
 #include <UI/Qt/WebContentView.h>
 
+#if defined(AK_OS_LINUX)
+#    include <UI/Qt/ExternalURLHandler.h>
+#endif
+
 #if defined(AK_OS_MACOS)
+#    include <UI/AppKit/Utilities/ExternalURLHandler.h>
 #    include <UI/Qt/MacWindow.h>
 #endif
 
 #include <QAction>
 #include <QClipboard>
+#include <QComboBox>
 #include <QDesktopServices>
 #include <QDialog>
 #include <QDialogButtonBox>
 #include <QFileDialog>
 #include <QFileOpenEvent>
+#include <QFont>
 #include <QFormLayout>
 #include <QKeySequence>
 #include <QLineEdit>
@@ -34,6 +44,10 @@
 #include <QMenuBar>
 #include <QMessageBox>
 #include <QMimeData>
+#include <QMimeDatabase>
+#include <QPointer>
+#include <QShortcut>
+#include <QSizePolicy>
 #include <QStandardPaths>
 #include <QTimer>
 
@@ -87,6 +101,7 @@ class LadybirdQApplication : public QApplication {
 public:
     explicit LadybirdQApplication(Main::Arguments& arguments)
         : QApplication(arguments.argc, arguments.argv)
+        , m_application_widget(make<QWidget>())
     {
 #if defined(AK_OS_MACOS)
         setQuitOnLastWindowClosed(false);
@@ -114,6 +129,12 @@ public:
                 break;
 
             auto const& open_event = *static_cast<QFileOpenEvent const*>(event);
+            auto const qurl = open_event.url();
+            if (!qurl.isEmpty()) {
+                application.on_open_file(ak_url_from_qurl(qurl));
+                break;
+            }
+
             auto file = ak_string_from_qstring(open_event.file());
 
             if (auto file_url = WebView::sanitize_url(file); file_url.has_value())
@@ -131,132 +152,197 @@ public:
 
 #if defined(AK_OS_MACOS)
         if (event_type == QEvent::ApplicationActivate && !has_visible_browser_window())
-            application.open_new_window();
+            application.open_new_window(WebView::IsPrivate::No);
 #endif
 
         return handled;
     }
 
+    void create_application_actions()
+    {
+        auto& application = WebView::Application::the();
+
+        m_new_tab_action = new QAction("New &Tab", m_application_widget);
+        m_new_tab_action->setShortcut(QKeySequence(Qt::CTRL | Qt::Key_T));
+        QObject::connect(m_new_tab_action, &QAction::triggered, this, []() { Application::the().open_new_tab(); });
+
+        m_new_window_action = new QAction("New &Window", m_application_widget);
+        m_new_window_action->setShortcuts(QKeySequence::keyBindings(QKeySequence::StandardKey::New));
+        QObject::connect(m_new_window_action, &QAction::triggered, this, []() { Application::the().open_new_window(WebView::IsPrivate::No); });
+
+        m_new_private_window_action = new QAction("New Pri&vate Window", m_application_widget);
+        m_new_private_window_action->setShortcut(QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_N));
+        QObject::connect(m_new_private_window_action, &QAction::triggered, this, []() { Application::the().open_new_window(WebView::IsPrivate::Yes); });
+
+        m_reopen_recently_closed_tab_action = new QAction("&Reopen Recently Closed Tab", m_application_widget);
+        m_reopen_recently_closed_tab_action->setShortcut(QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_T));
+        QObject::connect(m_reopen_recently_closed_tab_action, &QAction::triggered, this, []() { Application::the().reopen_recently_closed_tab(); });
+        update_reopen_recently_closed_action();
+
+        m_close_current_tab_action = new QAction("&Close Current Tab", m_application_widget);
+        m_close_current_tab_action->setShortcuts(QKeySequence::keyBindings(QKeySequence::StandardKey::Close));
+        QObject::connect(m_close_current_tab_action, &QAction::triggered, this, []() {
+            if (auto* tab = Application::the().active_tab())
+                tab->request_close();
+        });
+
+        m_open_next_tab_action = new QAction("Open &Next Tab", m_application_widget);
+        m_open_next_tab_action->setShortcuts({
+            QKeySequence(Qt::CTRL | Qt::Key_PageDown),
+            QKeySequence(Qt::CTRL | Qt::Key_Tab),
 #if defined(AK_OS_MACOS)
+            QKeySequence(Qt::META | Qt::Key_Tab),
+            QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_BracketRight),
+#endif
+        });
+        QObject::connect(m_open_next_tab_action, &QAction::triggered, this, []() {
+            if (auto* window = Application::the().active_window_if_any())
+                window->open_next_tab();
+        });
+
+        m_open_previous_tab_action = new QAction("Open &Previous Tab", m_application_widget);
+        m_open_previous_tab_action->setShortcuts({
+            QKeySequence(Qt::CTRL | Qt::Key_PageUp),
+            QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_Tab),
+#if defined(AK_OS_MACOS)
+            QKeySequence(Qt::META | Qt::SHIFT | Qt::Key_Tab),
+            QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_BracketLeft),
+#endif
+        });
+        QObject::connect(m_open_previous_tab_action, &QAction::triggered, this, []() {
+            if (auto* window = Application::the().active_window_if_any())
+                window->open_previous_tab();
+        });
+
+        m_open_file_action = new QAction("&Open File...", m_application_widget);
+        m_open_file_action->setShortcut(QKeySequence(QKeySequence::StandardKey::Open));
+        QObject::connect(m_open_file_action, &QAction::triggered, this, []() { Application::the().open_file(); });
+
+        m_open_downloads_action = create_application_action(*m_application_widget, application.open_downloads_page_action(), IncludeActionIcon::No);
+        m_open_settings_action = create_application_action(*m_application_widget, application.open_settings_page_action(), IncludeActionIcon::No);
+
+        m_find_in_page_action = new QAction("&Find in Page...", m_application_widget);
+        m_find_in_page_action->setShortcuts(QKeySequence::keyBindings(QKeySequence::StandardKey::Find));
+        QObject::connect(m_find_in_page_action, &QAction::triggered, this, []() {
+            if (auto* window = Application::the().active_window_if_any())
+                window->show_find_in_page();
+        });
+
+        m_quit_action = new QAction("&Quit", m_application_widget);
+        m_quit_action->setShortcuts(QKeySequence::keyBindings(QKeySequence::StandardKey::Quit));
+#if defined(AK_OS_MACOS)
+        QObject::connect(m_quit_action, &QAction::triggered, this, []() { Application::the().quit(); });
+#else
+        QObject::connect(m_quit_action, &QAction::triggered, this, []() {
+            // If there are no active windows, we are certainly already in the process of quitting.
+            if (auto* window = Application::the().active_window_if_any())
+                window->close();
+        });
+#endif
+
+        m_bookmarks_menu = create_application_menu(*m_application_widget, application.bookmarks_menu());
+
+        m_history_menu = create_application_menu(*m_application_widget, application.history_menu());
+        QObject::connect(m_history_menu, &QMenu::aboutToShow, this, [this]() {
+            auto* tab = Application::the().active_tab();
+            update_history_menu(*m_history_menu, tab ? &tab->view() : nullptr);
+        });
+
+        m_inspect_menu = create_application_menu(*m_application_widget, application.inspect_menu());
+        m_debug_menu = create_application_menu(*m_application_widget, application.debug_menu());
+        m_zoom_menu = create_application_menu(*m_application_widget, application.zoom_menu());
+
+        m_help_menu = new QMenu("Help", m_application_widget);
+        m_help_menu->addAction(create_application_action(*m_application_widget, application.open_about_page_action(), IncludeActionIcon::No));
+    }
+
+#if defined(AK_OS_MACOS)
+    void create_application_menu_bar()
+    {
+        m_menu_bar = Application::the().create_application_menu_bar(Application::ForBrowserWindow::No);
+    }
+
+    void create_dock_menu()
+    {
+        if (m_dock_menu)
+            return;
+
+        m_dock_menu = new QMenu(m_menu_bar);
+        QObject::connect(m_dock_menu, &QMenu::aboutToShow, this, [this] {
+            rebuild_dock_menu();
+        });
+        rebuild_dock_menu();
+        m_dock_menu->setAsDockMenu();
+    }
+#endif
+
     void update_reopen_recently_closed_action()
     {
         if (!m_reopen_recently_closed_tab_action)
             return;
 
-        auto recently_closed_entry = Application::history_store().most_recently_closed_entry();
         m_reopen_recently_closed_tab_action->setText("&Reopen Recently Closed Tab");
-        m_reopen_recently_closed_tab_action->setEnabled(recently_closed_entry.has_value());
-    }
-
-#endif
-
-#if defined(AK_OS_MACOS)
-    void create_application_menu_bar()
-    {
-        if (m_application_menu_bar)
-            return;
-
-        m_application_menu_bar = new QMenuBar;
-        auto& application = Application::the();
-
-        auto* file_menu = m_application_menu_bar->addMenu("&File");
-
-        auto* new_tab_action = add_application_menu_action(*file_menu, "New &Tab", QKeySequence::keyBindings(QKeySequence::StandardKey::AddTab));
-        QObject::connect(new_tab_action, &QAction::triggered, this, [] {
-            Application::the().open_new_tab();
-        });
-
-        auto* new_window_action = add_application_menu_action(*file_menu, "New &Window", QKeySequence::keyBindings(QKeySequence::StandardKey::New));
-        QObject::connect(new_window_action, &QAction::triggered, this, [] {
-            Application::the().open_new_window();
-        });
-
-        m_reopen_recently_closed_tab_action = add_application_menu_action(*file_menu, {}, { QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_T) });
-        QObject::connect(m_reopen_recently_closed_tab_action, &QAction::triggered, this, [] {
-            Application::the().reopen_recently_closed_tab();
-        });
-
-        auto* open_file_action = add_application_menu_action(*file_menu, "&Open File...", QKeySequence::keyBindings(QKeySequence::StandardKey::Open));
-        QObject::connect(open_file_action, &QAction::triggered, this, [] {
-            Application::the().open_file();
-        });
-
-        file_menu->addAction(create_application_action(*file_menu, application.open_downloads_page_action(), IncludeActionIcon::No));
-
-        auto* open_location_action = add_application_menu_action(*file_menu, "Open &Location", { QKeySequence("Ctrl+L"), QKeySequence("Alt+D") });
-        QObject::connect(open_location_action, &QAction::triggered, this, [] {
-            Application::the().focus_location_editor();
-        });
-
-        file_menu->addSeparator();
-
-        auto* quit_action = add_application_menu_action(*file_menu, "&Quit", QKeySequence::keyBindings(QKeySequence::StandardKey::Quit));
-        QObject::connect(quit_action, &QAction::triggered, this, [] {
-            Application::the().quit();
-        });
-
-        auto* edit_menu = m_application_menu_bar->addMenu("&Edit");
-        edit_menu->addAction(create_application_action(*edit_menu, application.cut_selection_action(), IncludeActionIcon::No));
-        edit_menu->addAction(create_application_action(*edit_menu, application.copy_selection_action(), IncludeActionIcon::No));
-        edit_menu->addAction(create_application_action(*edit_menu, application.paste_action(), IncludeActionIcon::No));
-        edit_menu->addAction(create_application_action(*edit_menu, application.select_all_action(), IncludeActionIcon::No));
-        edit_menu->addSeparator();
-        edit_menu->addAction(create_application_action(*edit_menu, application.open_settings_page_action(), IncludeActionIcon::No));
-
-        auto* view_menu = m_application_menu_bar->addMenu("&View");
-        view_menu->addMenu(create_application_menu(*view_menu, application.color_scheme_menu()));
-        view_menu->addMenu(create_application_menu(*view_menu, application.contrast_menu()));
-        view_menu->addMenu(create_application_menu(*view_menu, application.motion_menu()));
-
-        m_application_menu_bar->addMenu(bookmarks_menu());
-        m_application_menu_bar->addMenu(create_application_menu(*m_application_menu_bar, application.history_menu()));
-
-        auto* help_menu = m_application_menu_bar->addMenu("&Help");
-        help_menu->addAction(create_application_action(*help_menu, application.open_about_page_action(), IncludeActionIcon::No));
-
-        m_inspect_menu = create_application_menu(*m_application_menu_bar, application.inspect_menu());
-        m_application_menu_bar->insertMenu(help_menu->menuAction(), m_inspect_menu);
-
-        m_debug_menu = create_application_menu(*m_application_menu_bar, application.debug_menu());
-        m_application_menu_bar->insertMenu(help_menu->menuAction(), m_debug_menu);
-
-        update_reopen_recently_closed_action();
-        update_application_menu_bar_tab_menus();
-    }
-#endif
-
-#if defined(AK_OS_MACOS)
-    QMenu* bookmarks_menu()
-    {
-        if (!m_bookmarks_menu)
-            m_bookmarks_menu = create_application_menu(*m_application_menu_bar, Application::the().bookmarks_menu());
-        return m_bookmarks_menu;
+        auto* active_window = Application::the().active_window_if_any();
+        auto& session = active_window ? active_window->session() : WebView::Application::default_session();
+        m_reopen_recently_closed_tab_action->setEnabled(session.session_store->has_closed_units());
     }
 
     void rebuild_bookmarks_menu()
     {
         if (m_bookmarks_menu)
-            repopulate_application_menu(*m_bookmarks_menu, *m_application_menu_bar, Application::the().bookmarks_menu());
+            repopulate_application_menu(*m_bookmarks_menu, *m_application_widget, WebView::Application::the().bookmarks_menu());
     }
-
-    void update_application_menu_bar_tab_menus()
-    {
-        auto has_active_tab = Application::the().active_tab() != nullptr;
-        if (m_inspect_menu)
-            m_inspect_menu->menuAction()->setVisible(has_active_tab);
-        if (m_debug_menu)
-            m_debug_menu->menuAction()->setVisible(has_active_tab && Application::the().debug_menu().visible());
-    }
-#endif
 
 private:
+    friend Application;
+
 #if defined(AK_OS_MACOS)
-    QAction* add_application_menu_action(QMenu& menu, QString const& text, QList<QKeySequence> shortcuts)
+    void rebuild_dock_menu()
     {
-        auto* action = new QAction(text, m_application_menu_bar);
-        action->setShortcuts(shortcuts);
-        menu.addAction(action);
-        return action;
+        m_dock_menu->clear();
+
+        auto* new_window_action = m_dock_menu->addAction("New Window");
+        QObject::connect(new_window_action, &QAction::triggered, m_dock_menu, [] {
+            Application::the().open_new_window(WebView::IsPrivate::No);
+        });
+
+        auto* new_private_window_action = m_dock_menu->addAction("New Private Window");
+        QObject::connect(new_private_window_action, &QAction::triggered, m_dock_menu, [] {
+            Application::the().open_new_window(WebView::IsPrivate::Yes);
+        });
+
+        bool added_window_separator = false;
+        for (auto* widget : QApplication::topLevelWidgets()) {
+            auto* window = as_if<BrowserWindow>(widget);
+            if (!window)
+                continue;
+
+            if (!added_window_separator) {
+                m_dock_menu->addSeparator();
+                added_window_separator = true;
+            }
+
+            auto title = window->windowTitle();
+            title.replace("&", "&&");
+            auto* action = m_dock_menu->addAction(title);
+            action->setCheckable(true);
+            action->setChecked(window == Application::the().active_window_if_any());
+
+            QPointer<BrowserWindow> window_pointer = window;
+            QObject::connect(action, &QAction::triggered, m_dock_menu, [window = window_pointer] {
+                if (!window)
+                    return;
+
+                if (window->isMinimized())
+                    window->showNormal();
+                else
+                    window->show();
+
+                window->raise();
+                window->activateWindow();
+                Application::the().set_active_window(*window);
+            });
+        }
     }
 #endif
 
@@ -265,21 +351,68 @@ private:
         setStyleSheet(ChromeStyle::application_style_sheet(palette()));
     }
 
+    // The application actions require a QWidget owner, which we don't have at the time of creation. We use this dummy
+    // widget instead, which we also can't properly parent as it would need a QWidget owner as well.
+    OwnPtr<QWidget> m_application_widget { nullptr };
+
 #if defined(AK_OS_MACOS)
-    QMenuBar* m_application_menu_bar { nullptr };
+    QMenuBar* m_menu_bar { nullptr };
+    QMenu* m_dock_menu { nullptr };
+#endif
+
     QMenu* m_bookmarks_menu { nullptr };
+    QMenu* m_history_menu { nullptr };
     QMenu* m_inspect_menu { nullptr };
     QMenu* m_debug_menu { nullptr };
+    QMenu* m_zoom_menu { nullptr };
+    QMenu* m_help_menu { nullptr };
+
+    QAction* m_new_tab_action { nullptr };
+    QAction* m_new_window_action { nullptr };
+    QAction* m_new_private_window_action { nullptr };
     QAction* m_reopen_recently_closed_tab_action { nullptr };
-#endif
+    QAction* m_close_current_tab_action { nullptr };
+    QAction* m_open_next_tab_action { nullptr };
+    QAction* m_open_previous_tab_action { nullptr };
+    QAction* m_open_file_action { nullptr };
+    QAction* m_open_settings_action { nullptr };
+    QAction* m_open_downloads_action { nullptr };
+    QAction* m_find_in_page_action { nullptr };
+    QAction* m_quit_action { nullptr };
 };
 
 Application::Application() = default;
 Application::~Application() = default;
 
+void Application::show_process_manager()
+{
+    if (!m_process_manager_window)
+        m_process_manager_window = make<ProcessManagerWindow>(process_manager());
+    m_process_manager_window->show();
+    m_process_manager_window->raise();
+    m_process_manager_window->activateWindow();
+}
+
 void Application::create_platform_options(WebView::BrowserOptions&, WebView::RequestServerOptions&, WebView::WebContentOptions& web_content_options)
 {
+    Settings::initialize(profile().paths().config);
     web_content_options.config_path = Settings::the()->directory();
+}
+
+void Application::create_platform_actions()
+{
+    WebView::Application::inspect_menu().add_action(WebView::Action::create("Open Task Manager"sv, WebView::ActionID::OpenTaskManager, [this]() {
+        show_process_manager();
+    }));
+
+    if (m_application) {
+        auto& qapplication = static_cast<LadybirdQApplication&>(*m_application);
+        qapplication.create_application_actions();
+#if defined(AK_OS_MACOS)
+        qapplication.create_application_menu_bar();
+        qapplication.create_dock_menu();
+#endif
+    }
 }
 
 Core::EventLoop& Application::create_platform_event_loop()
@@ -287,25 +420,45 @@ Core::EventLoop& Application::create_platform_event_loop()
     if (!browser_options().headless_mode.has_value()) {
         Core::EventLoopManager::install(*new EventLoopManagerQt);
         m_application = make<LadybirdQApplication>(arguments());
+#if defined(AK_OS_LINUX)
+        QGuiApplication::setDesktopFileName(QStringLiteral("org.ladybird.Ladybird"));
+#endif
     }
 
     auto& event_loop = WebView::Application::create_platform_event_loop();
 
-    if (!browser_options().headless_mode.has_value())
+    if (!browser_options().headless_mode.has_value()) {
+#if defined(AK_OS_LINUX)
+        Ladybird::initialize_external_url_handler(event_loop);
+#endif
         static_cast<EventLoopImplementationQt&>(event_loop.impl()).set_main_loop();
+    }
 
     return event_loop;
 }
 
-BrowserWindow& Application::new_window(Vector<URL::URL> const& initial_urls, WindowConfiguration const& configuration, BrowserWindow::IsPopupWindow is_popup_window, Tab* parent_tab, Optional<u64> page_index)
+Optional<String> Application::ui_font_family() const
 {
-    auto* window = new BrowserWindow(initial_urls, is_popup_window, parent_tab, move(page_index));
+    if (!m_application)
+        return {};
+    return ak_string_from_qstring(QGuiApplication::font().family());
+}
+
+#if !defined(AK_OS_MACOS)
+// On macOS, WebContent resolves system-ui with CoreText, so the system font family is not sent there.
+Optional<String> Application::system_font_family() const
+{
+    return ui_font_family();
+}
+#endif
+
+BrowserWindow& Application::new_window(Vector<URL::URL> const& initial_urls, WindowConfiguration const& configuration, BrowserWindow::IsPopupWindow is_popup_window, WebView::IsPrivate is_private, Tab* parent_tab, Optional<Web::PageId> page_index, ShowWindow show_window)
+{
+    auto* window = new BrowserWindow(initial_urls, is_popup_window, is_private, parent_tab, move(page_index));
     set_active_window(*window);
     QObject::connect(window, &QObject::destroyed, m_application.ptr(), [this, window] {
-        if (m_active_window == window) {
+        if (m_active_window == window)
             m_active_window = nullptr;
-            update_macos_application_menu();
-        }
     });
 
     auto should_focus_location_editor = initial_urls.size() == 1 && initial_urls.first() == WebView::Application::settings().new_tab_page_url();
@@ -315,14 +468,23 @@ BrowserWindow& Application::new_window(Vector<URL::URL> const& initial_urls, Win
     }
 
     window->set_window_rect(configuration.x, configuration.y, configuration.width, configuration.height);
-    if (configuration.maximized == true)
-        window->showMaximized();
-    else
-        window->show();
+    if (show_window == ShowWindow::Yes) {
+        if (configuration.maximized == true)
+            window->showMaximized();
+        else
+            window->show();
 
-    window->activateWindow();
-    window->raise();
-    if (should_focus_location_editor) {
+        window->activateWindow();
+        window->raise();
+    }
+
+    size_t initial_url_index = 0;
+    window->for_each_tab([&](Tab& tab) {
+        if (initial_url_index < initial_urls.size())
+            tab.navigate(initial_urls[initial_url_index++]);
+    });
+
+    if (should_focus_location_editor && show_window == ShowWindow::Yes) {
         QTimer::singleShot(0, window, [window] {
             if (auto* tab = window->current_tab())
                 tab->focus_location_editor();
@@ -331,10 +493,17 @@ BrowserWindow& Application::new_window(Vector<URL::URL> const& initial_urls, Win
     return *window;
 }
 
-void Application::set_active_window(BrowserWindow& window)
+BrowserWindow* Application::non_private_window_if_any() const
 {
-    m_active_window = &window;
-    update_macos_application_menu();
+    if (m_active_window && m_active_window->is_private() == WebView::IsPrivate::No)
+        return m_active_window;
+
+    for (auto* widget : QApplication::topLevelWidgets()) {
+        if (auto* window = as_if<BrowserWindow>(widget); window && window->is_private() == WebView::IsPrivate::No)
+            return window;
+    }
+
+    return nullptr;
 }
 
 WindowConfiguration Application::configuration_for_new_window() const
@@ -369,14 +538,28 @@ void Application::open_new_tab()
         return;
     }
 
-    auto& tab = m_active_window->new_tab_from_url(WebView::Application::settings().new_tab_page_url(), Web::HTML::ActivateTab::Yes);
+    auto& tab = m_active_window->new_tab_from_url(WebView::Application::settings().new_tab_page_url(), Web::HTML::ActivateTab::Yes, BrowserWindow::TabLocation::end());
     tab.set_url_is_hidden(true);
     tab.focus_location_editor();
 }
 
-void Application::open_new_window()
+void Application::open_new_window(WebView::IsPrivate is_private)
 {
-    new_window({ WebView::Application::settings().new_tab_page_url() }, configuration_for_new_window());
+    // FIXME: Create a new tab page specific to private windows.
+    new_window({ WebView::Application::settings().new_tab_page_url() }, configuration_for_new_window(), BrowserWindow::IsPopupWindow::No, is_private);
+}
+
+void Application::restart_private_browsing_session()
+{
+    for (auto* widget : QApplication::topLevelWidgets()) {
+        if (auto* window = as_if<BrowserWindow>(widget); window && window->is_private() == WebView::IsPrivate::Yes) {
+            if (!window->close())
+                return;
+        }
+    }
+
+    WebView::Application::the().reset_private_browsing_session();
+    open_new_window(WebView::IsPrivate::Yes);
 }
 
 void Application::focus_location_editor()
@@ -392,18 +575,56 @@ void Application::focus_location_editor()
 
 void Application::reopen_recently_closed_tab()
 {
-    auto recently_closed_entry = Application::history_store().pop_most_recently_closed_entry();
-    if (recently_closed_entry.has_value()) {
-        if (recently_closed_entry->was_window) {
-            auto& window = new_window(recently_closed_entry->urls);
-            window.activate_tab(static_cast<int>(recently_closed_entry->active_tab_index));
-        } else if (!recently_closed_entry->urls.is_empty()) {
-            if (!m_active_window)
-                new_window({ recently_closed_entry->urls[0] });
-            else
-                m_active_window->new_tab_from_url(recently_closed_entry->urls[0], Web::HTML::ActivateTab::Yes);
+    auto is_private = m_active_window ? m_active_window->is_private() : WebView::IsPrivate::No;
+    auto& session = m_active_window ? m_active_window->session() : WebView::Application::default_session();
+    auto closed_unit = session.session_store->take_most_recently_closed();
+    if (closed_unit.is_error()) {
+        dbgln("Unable to reopen the most recently closed session unit: {}", closed_unit.error());
+        return;
+    }
+    if (!closed_unit.value().has_value())
+        return;
+
+    auto unit = closed_unit.value().release_value();
+
+    auto* window = m_active_window;
+    bool restoring_to_source_window = false;
+    if (!unit.was_window && unit.source_window_id.has_value()) {
+        for (auto* widget : QApplication::topLevelWidgets()) {
+            auto* candidate = as_if<BrowserWindow>(widget);
+            if (!candidate || candidate->is_private() != is_private || candidate->session_window_id() != unit.source_window_id)
+                continue;
+            window = candidate;
+            restoring_to_source_window = true;
+            break;
         }
     }
+    if (unit.was_window || !window)
+        window = &new_window({}, configuration_for_new_window(), BrowserWindow::IsPopupWindow::No, is_private);
+
+    Optional<int> next_insertion_index;
+    if (restoring_to_source_window && unit.source_tab_index.has_value())
+        next_insertion_index = static_cast<int>(clamp(*unit.source_tab_index, 0, static_cast<i64>(window->tab_count())));
+
+    Optional<int> tab_index_to_activate;
+    i64 restored_tab_index = 0;
+    for (auto& closed_tab : unit.tabs) {
+        auto location = next_insertion_index.has_value() ? BrowserWindow::TabLocation::at_index(*next_insertion_index) : BrowserWindow::TabLocation::end();
+        auto& tab = window->create_new_tab(Web::HTML::ActivateTab::No, location);
+        if (next_insertion_index.has_value())
+            ++*next_insertion_index;
+
+        if (restored_tab_index == unit.active_tab_index)
+            tab_index_to_activate = window->tab_index(&tab);
+
+        if (!closed_tab.history.has_value() || tab.view().restore_session_history_from_snapshot(closed_tab.history.release_value()).is_error())
+            tab.navigate(closed_tab.active_url);
+        ++restored_tab_index;
+    }
+
+    if (tab_index_to_activate.has_value())
+        window->activate_tab(*tab_index_to_activate);
+
     update_reopen_recently_closed_actions();
 }
 
@@ -421,65 +642,46 @@ void Application::open_file()
 
 void Application::quit()
 {
-    if (!confirm_cancel_active_downloads(active_window_if_any()))
+    if (!confirm_stop_active_downloads(active_window_if_any()))
         return;
+
+    WebView::Application::default_session().session_store->application_quitting();
 
     QApplication::closeAllWindows();
 
     for (auto* widget : QApplication::topLevelWidgets()) {
-        if (as_if<BrowserWindow>(widget) && widget->isVisible())
+        if (as_if<BrowserWindow>(widget) && widget->isVisible()) {
+            WebView::Application::default_session().session_store->application_quit_aborted();
             return;
+        }
     }
 
     QApplication::quit();
 }
 
-bool Application::confirm_cancel_active_downloads(QWidget* parent)
+bool Application::confirm_stop_active_downloads(QWidget* parent)
 {
     auto& downloader = file_downloader();
-    if (!downloader.has_active_downloads())
-        return true;
 
-    QMessageBox dialog(parent ? parent : active_window_if_any());
-    dialog.setWindowTitle("Ladybird");
-    dialog.setIcon(QMessageBox::Warning);
-    dialog.setText("Downloads are still in progress.");
-    dialog.setInformativeText("Quitting will cancel active downloads.");
-    auto* quit_button = dialog.addButton("Quit and Cancel Downloads", QMessageBox::DestructiveRole);
-    dialog.addButton(QMessageBox::Cancel);
-    dialog.setDefaultButton(QMessageBox::Cancel);
-    dialog.exec();
+    if (downloader.has_unresumable_downloads()) {
+        QMessageBox dialog(parent ? parent : active_window_if_any());
+        dialog.setWindowTitle("Ladybird");
+        dialog.setIcon(QMessageBox::Warning);
+        dialog.setText("Downloads are still in progress.");
+        dialog.setInformativeText("Quitting will cancel downloads that cannot be resumed.");
+        auto* quit_button = dialog.addButton("Quit and Cancel Downloads", QMessageBox::DestructiveRole);
+        dialog.addButton(QMessageBox::Cancel);
+        dialog.setDefaultButton(QMessageBox::Cancel);
+        dialog.exec();
 
-    if (dialog.clickedButton() != quit_button)
-        return false;
+        if (dialog.clickedButton() != quit_button)
+            return false;
 
-    downloader.cancel_active_downloads();
+        downloader.cancel_unresumable_downloads();
+    }
+
+    downloader.pause_active_downloads();
     return true;
-}
-
-void Application::initialize_macos_application_menu()
-{
-#if defined(AK_OS_MACOS)
-    if (m_application)
-        static_cast<LadybirdQApplication*>(m_application.ptr())->create_application_menu_bar();
-#endif
-}
-
-void Application::update_macos_application_menu() const
-{
-#if defined(AK_OS_MACOS)
-    if (m_application)
-        static_cast<LadybirdQApplication*>(m_application.ptr())->update_application_menu_bar_tab_menus();
-#endif
-}
-
-QMenu* Application::qt_bookmarks_menu() const
-{
-#if defined(AK_OS_MACOS)
-    if (m_application)
-        return static_cast<LadybirdQApplication*>(m_application.ptr())->bookmarks_menu();
-#endif
-    return nullptr;
 }
 
 Optional<WebView::ViewImplementation&> Application::active_web_view() const
@@ -487,6 +689,24 @@ Optional<WebView::ViewImplementation&> Application::active_web_view() const
     if (auto* active_tab = this->active_tab())
         return active_tab->view();
     return {};
+}
+
+Vector<WebView::ViewImplementation&> Application::active_window_web_views() const
+{
+    if (!m_active_window)
+        return {};
+
+    Vector<WebView::ViewImplementation&> web_views;
+    m_active_window->for_each_tab([&](Tab& tab) { web_views.append(tab.view()); });
+
+    return web_views;
+}
+
+bool Application::activate_tab_with_url(URL::URL const& url) const
+{
+    if (!m_active_window)
+        return false;
+    return m_active_window->activate_tab_with_url(url);
 }
 
 Optional<WebView::ViewImplementation&> Application::open_blank_new_tab(Web::HTML::ActivateTab activate_tab) const
@@ -498,7 +718,7 @@ Optional<WebView::ViewImplementation&> Application::open_blank_new_tab(Web::HTML
         return {};
     }
 
-    auto& tab = active_window().create_new_tab(activate_tab);
+    auto& tab = active_window().create_new_tab(activate_tab, BrowserWindow::TabLocation::end());
     return tab.view();
 }
 
@@ -509,19 +729,38 @@ void Application::open_url_in_new_tab(URL::URL const& url, Web::HTML::ActivateTa
         return;
     }
 
-    active_window().new_tab_from_url(url, activate_tab);
+    active_window().new_tab_from_url(url, activate_tab, BrowserWindow::TabLocation::after_current_tab());
 }
 
-bool Application::activate_tab_with_url(URL::URL const& url) const
+void Application::open_urls_in_new_tabs(ReadonlySpan<URL::URL> urls) const
 {
-    if (!m_active_window)
-        return false;
-    return m_active_window->activate_tab_with_url(url);
+    if (urls.is_empty())
+        return;
+
+    if (!m_active_window) {
+        Vector<URL::URL> initial_urls;
+        initial_urls.ensure_capacity(urls.size());
+        for (auto const& url : urls)
+            initial_urls.append(url);
+
+        const_cast<Application&>(*this).new_window(initial_urls);
+        return;
+    }
+
+    auto& window = active_window();
+    auto* previous_tab = window.current_tab();
+    for (auto const& url : urls) {
+        auto location = previous_tab
+            ? BrowserWindow::TabLocation::after_tab(*previous_tab)
+            : BrowserWindow::TabLocation::end();
+        auto& tab = window.new_tab_from_url(url, Web::HTML::ActivateTab::No, location);
+        previous_tab = &tab;
+    }
 }
 
-void Application::open_url_in_new_window(URL::URL const& url)
+void Application::open_url_in_new_window(URL::URL const& url, WebView::IsPrivate is_private)
 {
-    this->new_window({ url });
+    new_window({ url }, configuration_for_new_window(), BrowserWindow::IsPopupWindow::No, is_private);
 }
 
 Optional<ByteString> Application::ask_user_for_download_path(ByteString const& file) const
@@ -559,6 +798,11 @@ void Application::display_download_confirmation_dialog(StringView download_name,
 
 void Application::display_error_dialog(StringView error_message) const
 {
+    if (browser_options().headless_mode.has_value()) {
+        WebView::Application::display_error_dialog(error_message);
+        return;
+    }
+
     QMessageBox::warning(active_tab(), "Ladybird", qstring_from_ak_string(error_message));
 }
 
@@ -582,6 +826,23 @@ void Application::show_download_in_folder(WebView::FileDownloader::Download cons
     }
 
     QDesktopServices::openUrl(QUrl::fromLocalFile(qstring_from_ak_string(path.release_value())));
+}
+
+void Application::resolve_external_url_handler(URL::URL const& url, WebView::ExternalURLHandlerCallback callback) const
+{
+    if (browser_options().headless_mode.has_value()) {
+        WebView::Application::resolve_external_url_handler(url, move(callback));
+        return;
+    }
+
+#if defined(AK_OS_LINUX)
+    Ladybird::resolve_external_url_handler(url, ak_string_from_qstring(QGuiApplication::desktopFileName()), move(callback));
+#elif defined(AK_OS_MACOS)
+    Ladybird::resolve_external_url_handler(url, move(callback));
+#else
+    (void)url;
+    callback(nullptr);
+#endif
 }
 
 static QClipboard::Mode clipboard_mode(QClipboard const& clipboard, Application::ClipboardType type)
@@ -633,10 +894,10 @@ void Application::set_clipboard_text(String text, ClipboardType type)
     clipboard->setText(qstring_from_ak_string(text), mode);
 }
 
-Vector<Web::Clipboard::SystemClipboardRepresentation> Application::clipboard_entries() const
+Web::Clipboard::SystemClipboardItem Application::clipboard_item() const
 {
     if (browser_options().headless_mode.has_value())
-        return WebView::Application::clipboard_entries();
+        return WebView::Application::clipboard_item();
 
     Vector<Web::Clipboard::SystemClipboardRepresentation> representations;
     auto const* clipboard = QGuiApplication::clipboard();
@@ -645,28 +906,58 @@ Vector<Web::Clipboard::SystemClipboardRepresentation> Application::clipboard_ent
     if (!mime_data)
         return {};
 
-    for (auto const& format : mime_data->formats()) {
-        auto data = ak_byte_string_from_qbytearray(mime_data->data(format));
-        auto mime_type = ak_string_from_qstring(format);
+    if (mime_data->hasUrls()) {
+        QMimeDatabase mime_database;
 
-        representations.empend(move(data), move(mime_type));
+        for (auto const& url : mime_data->urls()) {
+            if (!url.isLocalFile())
+                continue;
+
+            auto file_path = url.toLocalFile();
+
+            if (auto file = WebView::create_selected_file(ak_byte_string_from_qstring(file_path)); file.is_error()) {
+                warnln("Unable to open clipboard file {}: {}", file_path, file.error());
+            } else {
+                auto mime_type = mime_database.mimeTypeForFile(file_path);
+                representations.empend(ak_string_from_qstring(mime_type.name()), file.release_value());
+            }
+        }
     }
 
-    return representations;
+    if (representations.is_empty()) {
+        for (auto const& format : mime_data->formats()) {
+            auto mime_type = ak_string_from_qstring(format);
+            if (mime_type == "text/uri-list"sv)
+                continue;
+
+            auto data = ak_byte_string_from_qbytearray(mime_data->data(format));
+            representations.empend(move(mime_type), move(data));
+        }
+    }
+
+    return { move(representations) };
 }
 
-void Application::insert_clipboard_entry(Web::Clipboard::SystemClipboardRepresentation entry)
+void Application::insert_clipboard_item(Web::Clipboard::SystemClipboardItem item)
 {
     if (browser_options().headless_mode.has_value()) {
-        WebView::Application::insert_clipboard_entry(move(entry));
+        WebView::Application::insert_clipboard_item(move(item));
         return;
     }
 
     auto* mime_data = new QMimeData();
-    mime_data->setData(qstring_from_ak_string(entry.mime_type), qbytearray_from_ak_string(entry.data));
+    for (auto const& entry : item.system_clipboard_representations) {
+        if (auto const* data = entry.data.get_pointer<ByteString>())
+            mime_data->setData(qstring_from_ak_string(entry.name), qbytearray_from_ak_string(*data));
+    }
 
     auto* clipboard = QGuiApplication::clipboard();
     clipboard->setMimeData(mime_data);
+}
+
+bool Application::supports_system_menu_bar() const
+{
+    return show_menu_bar_option_available();
 }
 
 void Application::update_tabs_display() const
@@ -679,10 +970,8 @@ void Application::update_tabs_display() const
 
 void Application::rebuild_bookmarks_menu() const
 {
-#if defined(AK_OS_MACOS)
     if (m_application)
         static_cast<LadybirdQApplication*>(m_application.ptr())->rebuild_bookmarks_menu();
-#endif
 
     for (auto* widget : QApplication::topLevelWidgets()) {
         if (auto* window = as_if<BrowserWindow>(widget))
@@ -692,15 +981,8 @@ void Application::rebuild_bookmarks_menu() const
 
 void Application::update_reopen_recently_closed_actions() const
 {
-#if defined(AK_OS_MACOS)
     if (m_application)
         static_cast<LadybirdQApplication*>(m_application.ptr())->update_reopen_recently_closed_action();
-#endif
-
-    for (auto* widget : QApplication::topLevelWidgets()) {
-        if (auto* window = as_if<BrowserWindow>(widget))
-            window->update_reopen_recently_closed_action();
-    }
 }
 
 void Application::show_bookmark_context_menu(Gfx::IntPoint content_position, Optional<WebView::BookmarkItem const&> item, Optional<String const&> target_folder_id)
@@ -725,38 +1007,77 @@ Optional<Application::BookmarkID> Application::bookmark_item_id_for_context_menu
     return {};
 }
 
-template<typename PromiseType>
+static void add_bookmark_folder_options(QComboBox& folder_combo, ReadonlySpan<WebView::BookmarkItem> items, QString const& prefix, Optional<String const&> selected_folder_id)
+{
+    for (auto const& item : items) {
+        if (!item.is_folder())
+            continue;
+
+        auto title = qstring_from_ak_string(item.folder().title.value_or("(no title)"_string));
+        auto path = prefix.isEmpty() ? title : QString("%1 / %2").arg(prefix, title);
+        folder_combo.addItem(path, qstring_from_ak_string(item.id));
+        if (selected_folder_id.has_value() && item.id == *selected_folder_id)
+            folder_combo.setCurrentIndex(folder_combo.count() - 1);
+
+        add_bookmark_folder_options(folder_combo, item.folder().children, path, selected_folder_id);
+    }
+}
+
+template<typename PromiseType, typename ResolveCallback>
 static NonnullRefPtr<PromiseType> display_add_or_edit_bookmark_dialog(
     QWidget* parent,
     QString const& dialog_title,
     Optional<URL::URL const&> current_url,
-    Optional<String const&> current_title)
+    Optional<String const&> current_title,
+    Optional<String> current_favicon_hash,
+    ResolveCallback resolve_bookmark,
+    bool show_folder_picker,
+    Optional<String const&> selected_folder_id = {})
 {
     auto promise = PromiseType::construct();
 
     auto* dialog = new QDialog(parent);
-    dialog->resize(400, dialog->height());
+    dialog->resize(500, dialog->height());
     dialog->setWindowTitle(dialog_title);
     dialog->setAttribute(Qt::WA_DeleteOnClose);
 
     auto* url_edit = new QLineEdit(dialog);
     auto* title_edit = new QLineEdit(dialog);
+    url_edit->setMinimumWidth(320);
+    url_edit->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+    title_edit->setMinimumWidth(320);
+    title_edit->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+    QComboBox* folder_combo = nullptr;
 
     if (current_url.has_value())
         url_edit->setText(qstring_from_ak_string(current_url->serialize()));
     if (current_title.has_value())
         title_edit->setText(qstring_from_ak_string(*current_title));
 
+    if (show_folder_picker) {
+        folder_combo = new QComboBox(dialog);
+        folder_combo->setMinimumWidth(320);
+        folder_combo->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+        folder_combo->addItem("Bookmarks", QString {});
+        add_bookmark_folder_options(*folder_combo, WebView::Application::bookmark_store().root_items(), {}, selected_folder_id);
+    }
+
     auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, dialog);
     QObject::connect(buttons, &QDialogButtonBox::accepted, dialog, &QDialog::accept);
     QObject::connect(buttons, &QDialogButtonBox::rejected, dialog, &QDialog::reject);
 
     auto* layout = new QFormLayout(dialog);
+    layout->setContentsMargins(32, 28, 32, 28);
+    layout->setFieldGrowthPolicy(QFormLayout::ExpandingFieldsGrow);
+    layout->setHorizontalSpacing(16);
+    layout->setVerticalSpacing(14);
     layout->addRow("URL:", url_edit);
     layout->addRow("Title:", title_edit);
+    if (folder_combo)
+        layout->addRow("Folder:", folder_combo);
     layout->addRow(buttons);
 
-    QObject::connect(dialog, &QDialog::finished, [promise, url_edit = QPointer { url_edit }, title_edit = QPointer { title_edit }](auto result) {
+    QObject::connect(dialog, &QDialog::finished, [promise, current_favicon_hash = move(current_favicon_hash), resolve_bookmark = move(resolve_bookmark), url_edit = QPointer { url_edit }, title_edit = QPointer { title_edit }, folder_combo = QPointer { folder_combo }](auto result) mutable {
         if (result != QDialog::Accepted || !url_edit || !title_edit) {
             promise->reject(Error::from_errno(ECANCELED));
             return;
@@ -772,33 +1093,56 @@ static NonnullRefPtr<PromiseType> display_add_or_edit_bookmark_dialog(
         if (auto title_text = ak_string_from_qstring(title_edit->text()); !title_text.is_empty())
             title = move(title_text);
 
-        promise->resolve(WebView::BookmarkItem::Bookmark {
+        Optional<String> target_folder_id;
+        if (folder_combo) {
+            auto target_folder_id_text = ak_string_from_qstring(folder_combo->currentData().toString());
+            if (!target_folder_id_text.is_empty())
+                target_folder_id = move(target_folder_id_text);
+        }
+
+        WebView::BookmarkItem::Bookmark bookmark {
             .url = url.release_value(),
             .title = move(title),
-            .favicon_base64_png = {},
-        });
+            .favicon_hash = move(current_favicon_hash),
+        };
+        resolve_bookmark(*promise, move(bookmark), move(target_folder_id));
     });
 
     dialog->open();
     return promise;
 }
 
-NonnullRefPtr<Application::BookmarkPromise> Application::display_add_bookmark_dialog() const
+NonnullRefPtr<Application::AddBookmarkPromise> Application::display_add_bookmark_dialog(Optional<String const&> target_folder_id) const
 {
     Optional<URL::URL> current_url;
     Optional<String> current_title;
+    Optional<String> current_favicon_hash;
 
     if (auto view = active_web_view(); view.has_value()) {
         current_url = view->url();
         current_title = view->title().to_utf8();
+        current_favicon_hash = view->favicon_hash();
     }
 
-    return display_add_or_edit_bookmark_dialog<BookmarkPromise>(active_tab(), "Add Bookmark", current_url, current_title);
+    return display_add_or_edit_bookmark_dialog<AddBookmarkPromise>(
+        active_tab(), "Add Bookmark", current_url, current_title, current_favicon_hash,
+        [](AddBookmarkPromise& promise, WebView::BookmarkItem::Bookmark bookmark, Optional<String> target_folder_id) {
+            promise.resolve(AddBookmarkDialogResult {
+                .bookmark = move(bookmark),
+                .target_folder_id = move(target_folder_id),
+            });
+        },
+        true, target_folder_id);
 }
 
 NonnullRefPtr<Application::BookmarkPromise> Application::display_edit_bookmark_dialog(WebView::BookmarkItem::Bookmark const& current_bookmark) const
 {
-    return display_add_or_edit_bookmark_dialog<BookmarkPromise>(active_tab(), "Edit Bookmark", current_bookmark.url, current_bookmark.title);
+    return display_add_or_edit_bookmark_dialog<BookmarkPromise>(
+        active_tab(), "Edit Bookmark", current_bookmark.url, current_bookmark.title, current_bookmark.favicon_hash,
+        [](BookmarkPromise& promise, WebView::BookmarkItem::Bookmark bookmark, Optional<String>) {
+            promise.resolve(move(bookmark));
+        },
+        false);
 }
 
 template<typename PromiseType>
@@ -815,6 +1159,8 @@ static NonnullRefPtr<PromiseType> display_add_or_edit_bookmark_folder_dialog(
     dialog->setAttribute(Qt::WA_DeleteOnClose);
 
     auto* title_edit = new QLineEdit(dialog);
+    title_edit->setMinimumWidth(320);
+    title_edit->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
     if (current_title.has_value())
         title_edit->setText(qstring_from_ak_string(*current_title));
 
@@ -823,6 +1169,10 @@ static NonnullRefPtr<PromiseType> display_add_or_edit_bookmark_folder_dialog(
     QObject::connect(buttons, &QDialogButtonBox::rejected, dialog, &QDialog::reject);
 
     auto* layout = new QFormLayout(dialog);
+    layout->setContentsMargins(32, 28, 32, 28);
+    layout->setFieldGrowthPolicy(QFormLayout::ExpandingFieldsGrow);
+    layout->setHorizontalSpacing(16);
+    layout->setVerticalSpacing(14);
     layout->addRow("Title:", title_edit);
     layout->addRow(buttons);
 
@@ -846,9 +1196,9 @@ static NonnullRefPtr<PromiseType> display_add_or_edit_bookmark_folder_dialog(
     return promise;
 }
 
-NonnullRefPtr<Application::BookmarkFolderPromise> Application::display_add_bookmark_folder_dialog() const
+NonnullRefPtr<Application::BookmarkFolderPromise> Application::display_add_bookmark_folder_dialog(Optional<String const&> default_title) const
 {
-    return display_add_or_edit_bookmark_folder_dialog<BookmarkFolderPromise>(active_tab(), "Add Folder", {});
+    return display_add_or_edit_bookmark_folder_dialog<BookmarkFolderPromise>(active_tab(), "Add Folder", default_title);
 }
 
 NonnullRefPtr<Application::BookmarkFolderPromise> Application::display_edit_bookmark_folder_dialog(WebView::BookmarkItem::Folder const& current_folder) const
@@ -876,5 +1226,95 @@ void Application::on_recently_closed_entries_changed() const
 {
     update_reopen_recently_closed_actions();
 }
+
+QMenuBar* Application::create_application_menu_bar(ForBrowserWindow for_browser_window)
+{
+    auto& application = WebView::Application::the();
+    auto* menu_bar = new QMenuBar();
+
+    auto* file_menu = menu_bar->addMenu("&File");
+    file_menu->addAction(new_tab_action());
+    file_menu->addAction(new_window_action());
+    file_menu->addAction(new_private_window_action());
+    file_menu->addAction(reopen_recently_closed_tab_action());
+    if (for_browser_window == ForBrowserWindow::Yes)
+        file_menu->addAction(close_current_tab_action());
+    file_menu->addSeparator();
+    file_menu->addAction(open_file_action());
+    file_menu->addAction(open_downloads_action());
+    file_menu->addSeparator();
+    file_menu->addAction(quit_action());
+
+    auto* edit_menu = menu_bar->addMenu("&Edit");
+    if (for_browser_window == ForBrowserWindow::Yes) {
+        edit_menu->addAction(create_application_action(*menu_bar, application.undo_action(), IncludeActionIcon::No));
+        edit_menu->addAction(create_application_action(*menu_bar, application.redo_action(), IncludeActionIcon::No));
+        edit_menu->addSeparator();
+    }
+    edit_menu->addAction(create_application_action(*menu_bar, application.cut_selection_action(), IncludeActionIcon::No));
+    edit_menu->addAction(create_application_action(*menu_bar, application.copy_selection_action(), IncludeActionIcon::No));
+    edit_menu->addAction(create_application_action(*menu_bar, application.paste_action(), IncludeActionIcon::No));
+    edit_menu->addAction(create_application_action(*menu_bar, application.select_all_action(), IncludeActionIcon::No));
+    edit_menu->addSeparator();
+    if (for_browser_window == ForBrowserWindow::Yes) {
+        edit_menu->addAction(find_in_page_action());
+        edit_menu->addSeparator();
+    }
+    edit_menu->addAction(open_settings_action());
+
+    auto* view_menu = menu_bar->addMenu("&View");
+    if (for_browser_window == ForBrowserWindow::Yes) {
+        view_menu->addAction(open_next_tab_action());
+        view_menu->addAction(open_previous_tab_action());
+        view_menu->addSeparator();
+        view_menu->addMenu(zoom_menu());
+        view_menu->addSeparator();
+    }
+    view_menu->addMenu(create_application_menu(*view_menu, application.color_scheme_menu()));
+    view_menu->addMenu(create_application_menu(*view_menu, application.contrast_menu()));
+    view_menu->addMenu(create_application_menu(*view_menu, application.motion_menu()));
+
+    if constexpr (show_menu_bar_option_available()) {
+        view_menu->addSeparator();
+        view_menu->addAction(create_application_action(*view_menu, application.toggle_menu_bar_action(), IncludeActionIcon::No));
+    }
+
+    menu_bar->addMenu(bookmarks_menu());
+    menu_bar->addMenu(history_menu());
+    if (for_browser_window == ForBrowserWindow::Yes) {
+        menu_bar->addMenu(inspect_menu());
+        menu_bar->addMenu(debug_menu());
+    }
+    menu_bar->addMenu(help_menu());
+
+    return menu_bar;
+}
+
+#define DEFINE_APP_MENU_GETTER(type, name)                                      \
+    type* Application::name()                                                   \
+    {                                                                           \
+        if (m_application)                                                      \
+            return static_cast<LadybirdQApplication&>(*m_application).m_##name; \
+        return nullptr;                                                         \
+    }
+
+DEFINE_APP_MENU_GETTER(QMenu, bookmarks_menu);
+DEFINE_APP_MENU_GETTER(QMenu, history_menu);
+DEFINE_APP_MENU_GETTER(QMenu, inspect_menu);
+DEFINE_APP_MENU_GETTER(QMenu, debug_menu);
+DEFINE_APP_MENU_GETTER(QMenu, zoom_menu);
+DEFINE_APP_MENU_GETTER(QMenu, help_menu);
+DEFINE_APP_MENU_GETTER(QAction, new_tab_action);
+DEFINE_APP_MENU_GETTER(QAction, new_window_action);
+DEFINE_APP_MENU_GETTER(QAction, new_private_window_action);
+DEFINE_APP_MENU_GETTER(QAction, reopen_recently_closed_tab_action);
+DEFINE_APP_MENU_GETTER(QAction, close_current_tab_action);
+DEFINE_APP_MENU_GETTER(QAction, open_next_tab_action);
+DEFINE_APP_MENU_GETTER(QAction, open_previous_tab_action);
+DEFINE_APP_MENU_GETTER(QAction, open_file_action);
+DEFINE_APP_MENU_GETTER(QAction, open_settings_action);
+DEFINE_APP_MENU_GETTER(QAction, open_downloads_action);
+DEFINE_APP_MENU_GETTER(QAction, find_in_page_action);
+DEFINE_APP_MENU_GETTER(QAction, quit_action);
 
 }

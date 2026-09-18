@@ -5,9 +5,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibWeb/Bindings/HTMLHeadingElement.h>
-#include <LibWeb/Bindings/Intrinsics.h>
-#include <LibWeb/CSS/ComputedProperties.h>
+#include <LibWeb/CSS/PropertyID.h>
 #include <LibWeb/CSS/StyleValues/KeywordStyleValue.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/HTML/HTMLHeadingElement.h>
@@ -23,13 +21,7 @@ HTMLHeadingElement::HTMLHeadingElement(DOM::Document& document, DOM::QualifiedNa
 
 HTMLHeadingElement::~HTMLHeadingElement() = default;
 
-void HTMLHeadingElement::initialize(JS::Realm& realm)
-{
-    WEB_SET_PROTOTYPE_FOR_INTERFACE(HTMLHeadingElement);
-    Base::initialize(realm);
-}
-
-bool HTMLHeadingElement::is_presentational_hint(FlyString const& name) const
+bool HTMLHeadingElement::is_presentational_hint(Utf16FlyString const& name) const
 {
     if (Base::is_presentational_hint(name))
         return true;
@@ -41,15 +33,15 @@ bool HTMLHeadingElement::is_presentational_hint(FlyString const& name) const
 void HTMLHeadingElement::apply_presentational_hints(Vector<CSS::StyleProperty>& properties) const
 {
     HTMLElement::apply_presentational_hints(properties);
-    for_each_attribute([&](auto& name, auto& value) {
+    for_each_attribute([&](Utf16FlyString const& name, Utf16View value) {
         if (name == HTML::AttributeNames::align) {
-            if (value == "left"sv)
+            if (value == u"left"sv)
                 properties.append({ .property_id = CSS::PropertyID::TextAlign, .value = CSS::KeywordStyleValue::create(CSS::Keyword::Left) });
-            else if (value == "right"sv)
+            else if (value == u"right"sv)
                 properties.append({ .property_id = CSS::PropertyID::TextAlign, .value = CSS::KeywordStyleValue::create(CSS::Keyword::Right) });
-            else if (value == "center"sv)
+            else if (value == u"center"sv)
                 properties.append({ .property_id = CSS::PropertyID::TextAlign, .value = CSS::KeywordStyleValue::create(CSS::Keyword::Center) });
-            else if (value == "justify"sv)
+            else if (value == u"justify"sv)
                 properties.append({ .property_id = CSS::PropertyID::TextAlign, .value = CSS::KeywordStyleValue::create(CSS::Keyword::Justify) });
         }
     });
@@ -59,8 +51,8 @@ void HTMLHeadingElement::apply_presentational_hints(Vector<CSS::StyleProperty>& 
 WebIDL::UnsignedLong HTMLHeadingElement::heading_level() const
 {
     // h1–h6 elements have a heading level, which is given by getting the element's computed heading level.
-    if (m_dom_tree_version_for_cached_heading_level < document().dom_tree_version()) {
-        m_dom_tree_version_for_cached_heading_level = document().dom_tree_version();
+    if (m_dom_tree_version_for_cached_heading_level != dom_tree_version()) {
+        m_dom_tree_version_for_cached_heading_level = dom_tree_version();
         m_cached_heading_level = computed_heading_level();
     }
     return m_cached_heading_level;

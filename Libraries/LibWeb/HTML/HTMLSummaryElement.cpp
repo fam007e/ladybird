@@ -4,7 +4,6 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibWeb/Bindings/Intrinsics.h>
 #include <LibWeb/HTML/HTMLDetailsElement.h>
 #include <LibWeb/HTML/HTMLSummaryElement.h>
 
@@ -37,7 +36,7 @@ void HTMLSummaryElement::activation_behavior(DOM::Event const&)
     if (parent->has_attribute(HTML::AttributeNames::open))
         parent->remove_attribute(HTML::AttributeNames::open);
     else
-        parent->set_attribute_value(HTML::AttributeNames::open, String {});
+        parent->set_attribute_value(HTML::AttributeNames::open, Utf16String {});
 }
 
 // https://html.spec.whatwg.org/multipage/interactive-elements.html#summary-for-its-parent-details
@@ -73,10 +72,5 @@ bool HTMLSummaryElement::is_focusable() const
 }
 
 HTMLSummaryElement::~HTMLSummaryElement() = default;
-
-void HTMLSummaryElement::initialize(JS::Realm& realm)
-{
-    Base::initialize(realm);
-}
 
 }

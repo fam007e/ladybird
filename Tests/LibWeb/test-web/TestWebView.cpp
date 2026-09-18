@@ -30,7 +30,19 @@ TestWebView::TestWebView(Core::AnonymousBuffer theme, Web::DevicePixelSize viewp
 
 void TestWebView::clear_content_blockers()
 {
-    client().async_set_content_blockers(m_client_state.page_index, MUST(Core::AnonymousBuffer::create_with_size(0)));
+    client().async_set_content_blockers(MUST(Core::AnonymousBuffer::create_with_size(0)));
+}
+
+// Force-dark rides on the navigable, so a test that turns it on leaves it on for whatever runs next in this view.
+void TestWebView::reset_force_dark()
+{
+    debug_request("set-force-dark"sv, "off"sv);
+}
+
+// Same story as force-dark above: the flag lives on the navigable and would otherwise outlive the test that set it.
+void TestWebView::reset_line_box_borders()
+{
+    debug_request("set-line-box-borders"sv, "off"sv);
 }
 
 NonnullRefPtr<Core::Promise<Empty>> TestWebView::reset_session_history()

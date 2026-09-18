@@ -1,7 +1,7 @@
 // https://url.spec.whatwg.org/#url
 [Exposed=*, LegacyWindowAlias=webkitURL, ImplementedAs=DOMURL]
 interface URL {
-    constructor(USVString url, optional USVString base);
+    [ImplementedAs=create_from_url] constructor(USVString url, optional USVString base);
 
     [ImplementedAs=parse_for_bindings] static URL? parse(USVString url, optional USVString base);
     static boolean canParse(USVString url, optional USVString base);
@@ -21,6 +21,6 @@ interface URL {
 
     USVString toJSON();
 
-    static Utf16DOMString createObjectURL((Blob or MediaSource) obj);
+    static DOMString createObjectURL((Blob or MediaSource) obj);
     static undefined revokeObjectURL(DOMString url);
 };

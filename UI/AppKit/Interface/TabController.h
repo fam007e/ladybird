@@ -8,6 +8,8 @@
 
 #include <AK/Forward.h>
 #include <LibURL/URL.h>
+#include <LibWeb/Page/PageId.h>
+#include <LibWebView/BrowsingSession.h>
 
 #import <Cocoa/Cocoa.h>
 
@@ -15,14 +17,18 @@
 
 @interface TabController : NSWindowController <NSWindowDelegate>
 
-- (instancetype)init;
+- (instancetype)init:(WebView::IsPrivate)is_private;
 - (instancetype)initAsChild:(Tab*)parent
-                  pageIndex:(u64)page_index;
+                  pageIndex:(Web::PageId)page_index;
+
+- (WebView::IsPrivate)isPrivate;
 
 - (void)loadURL:(URL::URL const&)url;
 
-- (void)onLoadStart:(URL::URL const&)url isRedirect:(BOOL)isRedirect;
-- (void)onLoadFinish:(URL::URL const&)url;
+- (void)updatePerformanceMonitor;
+
+- (void)onLoadStart;
+- (void)onLoadFinish;
 - (void)onFaviconChange:(NSImage*)favicon;
 
 - (void)onURLChange:(URL::URL const&)url;

@@ -12,7 +12,7 @@
 #include <LibWeb/Bindings/WebGL2RenderingContext.h>
 #include <LibWeb/HTML/HTMLCanvasElement.h>
 #include <LibWeb/Infra/Strings.h>
-#include <LibWeb/Painting/Paintable.h>
+#include <LibWeb/Layout/Node.h>
 #include <LibWeb/WebGL/EventNames.h>
 #include <LibWeb/WebGL/WebGL2RenderingContext.h>
 #include <LibWeb/WebGL/WebGLContextEvent.h>
@@ -52,12 +52,6 @@ WebGL2RenderingContext::WebGL2RenderingContext(JS::Realm& realm, HTML::HTMLCanva
 
 WebGL2RenderingContext::~WebGL2RenderingContext() = default;
 
-void WebGL2RenderingContext::initialize(JS::Realm& realm)
-{
-    WEB_SET_PROTOTYPE_FOR_INTERFACE(WebGL2RenderingContext);
-    Base::initialize(realm);
-}
-
 void WebGL2RenderingContext::visit_edges(Cell::Visitor& visitor)
 {
     Base::visit_edges(visitor);
@@ -84,7 +78,10 @@ void WebGL2RenderingContext::did_update_canvas_content()
 {
     m_canvas_element->set_canvas_content_dirty();
 
-    m_canvas_element->set_needs_repaint();
+    // NB: Don't request a display list recording here: the new content reaches the compositor through the canvas
+    //     surface registry when the canvas is presented, and the cached DrawCanvas command is invalidated when the
+    //     content generation moves in prepare_for_compositing.
+    m_canvas_element->set_needs_repaint(InvalidateDisplayList::No);
 }
 
 Optional<WebGLContextAttributes> WebGL2RenderingContext::get_context_attributes()

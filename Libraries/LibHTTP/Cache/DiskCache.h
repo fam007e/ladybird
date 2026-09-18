@@ -28,15 +28,11 @@ public:
     enum class Mode {
         Normal,
 
-        // In partitioned mode, the cache is enabled as normal, but each RequestServer process operates with a unique
-        // disk cache database.
-        Partitioned,
-
         // In test mode, we only enable caching of responses on a per-request basis, signified by a request header. The
         // response headers will include some status on how the request was handled.
         Testing,
     };
-    static ErrorOr<DiskCache> create(Mode);
+    static ErrorOr<Optional<DiskCache>> create(Mode, LexicalPath const& cache_root);
 
     DiskCache(DiskCache&&);
     DiskCache& operator=(DiskCache&&);
@@ -71,6 +67,10 @@ public:
 
     void cache_entry_closed(Badge<CacheEntry>, CacheEntry const&);
 
+    // The time when any request holding open a cache entry for this URL and method last made progress — or nothing, if
+    // no such request reports any. A request waiting on that entry reads it to judge whether the holder has stalled.
+    Optional<MonotonicTime> last_activity_time_of_open_entries(URL::URL const&, StringView method) const;
+
 private:
     DiskCache(Mode, NonnullRefPtr<Database::Database>, LexicalPath cache_directory, CacheIndex);
 
@@ -83,8 +83,6 @@ private:
     void delete_entry(u64 cache_key, u64 vary_key);
 
     Mode m_mode;
-    Optional<String> m_partitioned_cache_key;
-
     NonnullRefPtr<Database::Database> m_database;
 
     struct OpenCacheEntry {

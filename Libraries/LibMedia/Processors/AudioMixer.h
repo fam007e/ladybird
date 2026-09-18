@@ -8,6 +8,7 @@
 
 #include <AK/Atomic.h>
 #include <AK/HashMap.h>
+#include <AK/Mutex.h>
 #include <AK/NonnullRefPtr.h>
 #include <AK/RefPtr.h>
 #include <LibMedia/Audio/Forward.h>
@@ -18,7 +19,6 @@
 #include <LibMedia/PipelineStatus.h>
 #include <LibMedia/Processors/AudioProcessor.h>
 #include <LibMedia/Producers/AudioProducer.h>
-#include <LibSync/Mutex.h>
 
 namespace Media {
 
@@ -40,8 +40,8 @@ public:
 
     virtual void start() override;
 
-    virtual PipelineStatus status() const override;
-    virtual void pull(AudioBlock& into) override;
+    virtual AudioProducerOutput peek() override;
+    virtual void consume() override;
 
     virtual void set_wake_handler(PipelineWakeHandler) override;
 
@@ -52,23 +52,22 @@ private:
         PipelineStatus last_status { PipelineStatus::Pending };
     };
 
-    PipelineStatus combined_input_status() const;
+    PipelineStatus mix_into_output_block_while_locked();
     void dispatch_wake();
     AK::Duration mix_head_timestamp() const;
 
     void disconnect_input_while_locked(NonnullRefPtr<AudioProducer> const&);
 
-    mutable Sync::Mutex m_mutex;
+    mutable Mutex m_mutex;
     Audio::SampleSpecification m_sample_specification;
-    mutable HashMap<NonnullRefPtr<AudioProducer>, InputMixingData> m_inputs;
+    HashMap<NonnullRefPtr<AudioProducer>, InputMixingData> m_inputs;
     i64 m_next_frame_to_write { 0 };
     float m_playback_rate { 1.0f };
     bool m_started { false };
-    bool m_moved_position_pending { false };
 
+    AudioBlock m_output_block;
     PipelineWakeHandler m_wake_handler;
-    mutable PipelineStatus m_status { PipelineStatus::Pending };
-    mutable PipelineStatus m_last_returned_status { PipelineStatus::Pending };
+    bool m_downstream_needs_wake { true };
 };
 
 }

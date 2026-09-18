@@ -7,54 +7,183 @@
 
 #pragma once
 
+#include <AK/EnumBits.h>
+#include <AK/FixedBitmap.h>
 #include <AK/FlyString.h>
 #include <AK/HashMap.h>
 #include <AK/Optional.h>
+#include <AK/RefCounted.h>
+#include <AK/Span.h>
+#include <AK/Utf16FlyString.h>
 #include <LibGfx/FontCascadeList.h>
 #include <LibGfx/InterpolationColorSpace.h>
 #include <LibGfx/ScalingMode.h>
+#include <LibWeb/CSS/Angle.h>
 #include <LibWeb/CSS/Clip.h>
 #include <LibWeb/CSS/ColumnCount.h>
 #include <LibWeb/CSS/CounterStyle.h>
 #include <LibWeb/CSS/CountersSet.h>
 #include <LibWeb/CSS/Display.h>
+#include <LibWeb/CSS/EasingFunction.h>
 #include <LibWeb/CSS/Enums.h>
 #include <LibWeb/CSS/Filter.h>
-#include <LibWeb/CSS/GridTrackPlacement.h>
-#include <LibWeb/CSS/GridTrackSize.h>
+#include <LibWeb/CSS/FontFeatureData.h>
 #include <LibWeb/CSS/LengthBox.h>
 #include <LibWeb/CSS/PercentageOr.h>
 #include <LibWeb/CSS/PreferredColorScheme.h>
+#include <LibWeb/CSS/PropertyID.h>
+#include <LibWeb/CSS/PseudoElement.h>
 #include <LibWeb/CSS/Ratio.h>
+#include <LibWeb/CSS/ResolvedTransform.h>
 #include <LibWeb/CSS/Size.h>
+#include <LibWeb/CSS/StyleRecordID.h>
+#include <LibWeb/CSS/StyleStructRef.h>
 #include <LibWeb/CSS/StyleValues/AbstractImageStyleValue.h>
-#include <LibWeb/CSS/StyleValues/BasicShapeStyleValue.h>
+#include <LibWeb/CSS/StyleValues/CalculatedStyleValue.h>
 #include <LibWeb/CSS/StyleValues/CursorStyleValue.h>
+#include <LibWeb/CSS/StyleValues/FilterStyleValue.h>
 #include <LibWeb/CSS/StyleValues/ImageStyleValue.h>
+#include <LibWeb/CSS/StyleValues/RustStyleValueHandle.h>
 #include <LibWeb/CSS/StyleValues/ShadowStyleValue.h>
 #include <LibWeb/CSS/StyleValues/StyleValueList.h>
 #include <LibWeb/CSS/StyleValues/TransformationStyleValue.h>
 #include <LibWeb/CSS/StyleValues/URLStyleValue.h>
+#include <LibWeb/CSS/Time.h>
 #include <LibWeb/CSS/URL.h>
+#include <LibWeb/Export.h>
+#include <LibWeb/StyleEngineRustFFI.h>
+
+namespace Web::DOM {
+
+class Document;
+
+}
 
 namespace Web::CSS {
 
-using ClipRule = FillRule;
+class AnimatedProperties;
 
-struct FlexBasisContent { };
-using FlexBasis = Variant<FlexBasisContent, Size>;
+class ComputedFilterView {
+public:
+    explicit ComputedFilterView(ComputedValuesFFI::ComputedFilter const& filter)
+        : m_filter(filter)
+    {
+    }
+
+    bool has_filters() const { return m_filter.filter_list.pointer; }
+    bool is_none() const { return !has_filters(); }
+
+    template<typename Callback>
+    void for_each_operation(Callback callback) const
+    {
+        for (size_t index = 0; index < m_filter.operations.length; ++index) {
+            auto const& operation = m_filter.operations.pointer[index];
+            switch (operation.kind) {
+            case to_underlying(FilterStyleValue::Kind::Blur):
+                callback(Filter::FilterOperation { Filter::Blur { .resolved_radius = operation.amount } });
+                break;
+            case to_underlying(FilterStyleValue::Kind::DropShadow):
+                callback(Filter::FilterOperation { Filter::DropShadow {
+                    .offset_x = CSSPixels::from_raw(operation.shadow_offset_x),
+                    .offset_y = CSSPixels::from_raw(operation.shadow_offset_y),
+                    .radius = CSSPixels::from_raw(operation.shadow_radius),
+                    .color = Color::from_bgra(operation.shadow_color),
+                } });
+                break;
+            case to_underlying(FilterStyleValue::Kind::HueRotate):
+                callback(Filter::FilterOperation { Filter::HueRotate { .angle_degrees = operation.amount } });
+                break;
+            case to_underlying(FilterStyleValue::Kind::Color):
+                callback(Filter::FilterOperation { Filter::ColorOperation {
+                    .operation = static_cast<Gfx::ColorFilterType>(operation.color_operation),
+                    .resolved_amount = operation.amount,
+                } });
+                break;
+            case 4:
+                callback(Filter::FilterOperation { Filter::Url { url_fragment(operation.url_value) } });
+                break;
+            default:
+                VERIFY_NOT_REACHED();
+            }
+        }
+    }
+
+    static Utf16String url_fragment(ComputedValuesFFI::ComputedStyleValueHandle const& handle)
+    {
+        auto value = retained_style_value(handle);
+        VERIFY(value);
+        auto url = value->as_url().url();
+        auto const& url_string = url.url();
+        if (url_string.is_empty() || !url_string.starts_with('#'))
+            return {};
+        return Utf16String::from_utf16(url_string.substring_view(1));
+    }
+
+    Filter materialize() const
+    {
+        if (!has_filters())
+            return Filter::make_none();
+        Vector<Filter::FilterOperation> operations;
+        operations.ensure_capacity(m_filter.operations.length);
+        for_each_operation([&](auto operation) { operations.unchecked_append(move(operation)); });
+        auto filter_list = retained_style_value(m_filter.filter_list);
+        RefPtr<StyleValueList const> list = &filter_list->as_value_list();
+        return Filter::create_lowered(move(list), move(operations));
+    }
+
+private:
+    static RefPtr<StyleValue const> retained_style_value(ComputedValuesFFI::ComputedStyleValueHandle const& handle)
+    {
+        if (!handle.pointer)
+            return nullptr;
+        return StyleValue::adopt_rust_style_value_data(StyleValueFFI::rust_style_value_retain(
+            static_cast<StyleValueFFI::StyleValueData const*>(handle.pointer)));
+    }
+
+    ComputedValuesFFI::ComputedFilter const& m_filter;
+};
+
+class ComputedStyleWorkingSet;
+class ComputedStyleRecordView;
+class StyleComputer;
+class StyleScope;
+
+using ClipRule = FillRule;
 
 struct AspectRatio {
     bool use_natural_aspect_ratio_if_available;
     Optional<Ratio> preferred_ratio;
+    bool computed_use_natural_aspect_ratio_if_available;
+    Optional<Ratio> computed_ratio;
+
+    bool operator==(AspectRatio const& other) const
+    {
+        // NB: Ratio's own equality is proportional (1 / 2 equals 0.5 / 1), but these ratios are
+        //     observable through serialization, so compare the components exactly.
+        auto ratios_identical = [](Optional<Ratio> const& a, Optional<Ratio> const& b) {
+            if (a.has_value() != b.has_value())
+                return false;
+            if (!a.has_value())
+                return true;
+            return a->numerator() == b->numerator() && a->denominator() == b->denominator();
+        };
+        return use_natural_aspect_ratio_if_available == other.use_natural_aspect_ratio_if_available
+            && computed_use_natural_aspect_ratio_if_available == other.computed_use_natural_aspect_ratio_if_available
+            && ratios_identical(preferred_ratio, other.preferred_ratio)
+            && ratios_identical(computed_ratio, other.computed_ratio);
+    }
 };
 
 struct GridAutoFlow {
     bool row { true };
     bool dense { false };
+
+    bool operator==(GridAutoFlow const&) const = default;
 };
 
-struct NormalGap { };
+struct NormalGap {
+    bool operator==(NormalGap const&) const = default;
+};
 
 struct QuotesData {
     enum class Type {
@@ -62,7 +191,9 @@ struct QuotesData {
         Auto,
         Specified,
     } type;
-    Vector<Array<FlyString, 2>> strings {};
+    Vector<Array<Utf16FlyString, 2>> strings {};
+
+    bool operator==(QuotesData const&) const = default;
 };
 
 struct Position {
@@ -70,6 +201,8 @@ struct Position {
     LengthPercentage offset_x { Percentage(50) };
     PositionEdge edge_y { PositionEdge::Top };
     LengthPercentage offset_y { Percentage(50) };
+
+    bool operator==(Position const&) const = default;
 
     CSSPixelPoint resolved(CSSPixelRect const& rect) const
     {
@@ -83,6 +216,20 @@ struct Position {
     }
 };
 
+struct PositionAnchor {
+    enum class Type : u8 {
+        Normal,
+        None,
+        Auto,
+        Name,
+    };
+
+    Type type { Type::Normal };
+    Optional<Utf16FlyString> name;
+
+    bool operator==(PositionAnchor const&) const = default;
+};
+
 // https://drafts.csswg.org/css-contain-2/#containment-types
 struct Containment {
     bool size_containment : 1 { false };
@@ -92,6 +239,8 @@ struct Containment {
     bool paint_containment : 1 { false };
 
     bool is_empty() const { return !(size_containment || inline_size_containment || layout_containment || style_containment || paint_containment); }
+
+    bool operator==(Containment const&) const = default;
 };
 
 struct ContainerType {
@@ -99,23 +248,46 @@ struct ContainerType {
     bool is_inline_size_container : 1 { false };
     bool is_scroll_state_container : 1 { false };
 
+    bool operator==(ContainerType const&) const = default;
+
     bool is_empty() const { return !(is_size_container || is_inline_size_container || is_scroll_state_container); }
 };
 
 struct ScrollbarColorData {
     Color thumb_color { Color::Transparent };
     Color track_color { Color::Transparent };
+    bool is_auto { true };
+
+    bool operator==(ScrollbarColorData const&) const = default;
+};
+
+struct ScrollSnapType {
+    ScrollSnapAxis axis { ScrollSnapAxis::Both };
+    ScrollSnapStrictness strictness { ScrollSnapStrictness::None };
+
+    bool operator==(ScrollSnapType const&) const = default;
+};
+
+struct ScrollSnapAlignData {
+    ScrollSnapAlign block_alignment { ScrollSnapAlign::None };
+    ScrollSnapAlign inline_alignment { ScrollSnapAlign::None };
+
+    bool operator==(ScrollSnapAlignData const&) const = default;
 };
 
 struct TextIndentData {
     LengthPercentage length_percentage;
     bool each_line { false };
     bool hanging { false };
+
+    bool operator==(TextIndentData const&) const = default;
 };
 
 struct TextUnderlinePosition {
     TextUnderlinePositionHorizontal horizontal { TextUnderlinePositionHorizontal::Auto };
     TextUnderlinePositionVertical vertical { TextUnderlinePositionVertical::Auto };
+
+    bool operator==(TextUnderlinePosition const&) const = default;
 };
 
 struct WillChange {
@@ -133,9 +305,9 @@ struct WillChange {
     static WillChange make_auto() { return WillChange(); }
 
     bool is_auto() const { return m_value.is_empty(); }
-    bool has_contents() const { return m_value.contains_slow(Type::Contents); }
-    bool has_scroll_position() const { return m_value.contains_slow(Type::ScrollPosition); }
+    bool operator==(WillChange const&) const = default;
     bool has_property(PropertyID property_id) const { return m_value.contains_slow(property_id); }
+    Vector<WillChangeEntry> const& entries() const { return m_value; }
 
 private:
     WillChange()
@@ -144,8 +316,6 @@ private:
 
     Vector<WillChangeEntry> m_value;
 };
-
-using CursorData = Variant<NonnullRefPtr<CursorStyleValue const>, CursorPredefined>;
 
 struct OverflowClipMarginSide {
     Optional<BackgroundBox> visual_box {};
@@ -163,147 +333,38 @@ struct OverflowClipMarginData {
     bool operator==(OverflowClipMarginData const&) const = default;
 };
 
-using ListStyleType = Variant<Empty, RefPtr<CounterStyle const>, String>;
+struct ListStyleSymbols {
+    NonnullRefPtr<CounterStyle const> counter_style;
+    SymbolsType type;
+    Vector<Utf16FlyString> symbols;
+
+    bool operator==(ListStyleSymbols const&) const = default;
+};
+
+struct UnresolvedCounterStyleName {
+    Utf16FlyString name;
+
+    bool operator==(UnresolvedCounterStyleName const&) const = default;
+};
+
+using ListStyleType = Variant<Empty, RefPtr<CounterStyle const>, Utf16String, UnresolvedCounterStyleName, ListStyleSymbols>;
+
+bool marker_text_depends_on_list_item_counter_value(ListStyleType const&);
 
 class InitialValues {
 public:
-    static AspectRatio aspect_ratio() { return AspectRatio { true, {} }; }
     static CSSPixels font_size() { return 16; }
     static double font_weight() { return 400; }
     static CSSPixels line_height() { return 0; }
-    static Float float_() { return Float::None; }
-    static CSSPixels border_spacing() { return 0; }
     static CaptionSide caption_side() { return CaptionSide::Top; }
     static Color caret_color() { return Color::Black; }
-    static Clear clear() { return Clear::None; }
-    static Clip clip() { return Clip::make_auto(); }
-    static ColorInterpolation color_interpolation() { return ColorInterpolation::Auto; }
-    static ColorInterpolation color_interpolation_filters() { return ColorInterpolation::Linearrgb; }
-    static PreferredColorScheme color_scheme() { return PreferredColorScheme::Auto; }
-    static ContentVisibility content_visibility() { return ContentVisibility::Visible; }
-    static CursorData cursor() { return { CursorPredefined::Auto }; }
-    static WhiteSpaceCollapse white_space_collapse() { return WhiteSpaceCollapse::Collapse; }
-    static WordBreak word_break() { return WordBreak::Normal; }
-    static FontVariantEmoji font_variant_emoji() { return FontVariantEmoji::Normal; }
-    static CSSPixels word_spacing() { return 0; }
-    static CSSPixels letter_spacing() { return 0; }
-    static Variant<CSSPixels, double> tab_size() { return 8; }
-    static TextAlign text_align() { return TextAlign::Start; }
-    static TextJustify text_justify() { return TextJustify::Auto; }
-    static Positioning position() { return Positioning::Static; }
-    static Optional<FlyString> position_anchor() { return {}; }
-    static TextDecorationLine text_decoration_line() { return TextDecorationLine::None; }
-    static TextDecorationSkipInk text_decoration_skip_ink() { return TextDecorationSkipInk::Auto; }
-    static TextDecorationStyle text_decoration_style() { return TextDecorationStyle::Solid; }
-    static TextTransform text_transform() { return TextTransform::None; }
-    static TextOverflow text_overflow() { return TextOverflow::Clip; }
-    static TextIndentData text_indent() { return { Length::make_px(0) }; }
-    static TextWrapMode text_wrap_mode() { return TextWrapMode::Wrap; }
     static CSSPixels text_underline_offset() { return 2; }
-    static TextUnderlinePosition text_underline_position() { return { .horizontal = TextUnderlinePositionHorizontal::Auto, .vertical = TextUnderlinePositionVertical::Auto }; }
-    static Display display() { return Display { DisplayOutside::Inline, DisplayInside::Flow }; }
     static Color color() { return Color::Black; }
     static Color stop_color() { return Color::Black; }
-    static Filter backdrop_filter() { return Filter::make_none(); }
-    static Filter filter() { return Filter::make_none(); }
-    static Color background_color() { return Color::Transparent; }
-    static BackgroundBox background_color_clip() { return BackgroundBox::BorderBox; }
-    static ListStyleType list_style_type() { return RefPtr<CounterStyle const> { CounterStyle::disc() }; }
-    static ListStylePosition list_style_position() { return ListStylePosition::Outside; }
-    static Visibility visibility() { return Visibility::Visible; }
-    static FlexDirection flex_direction() { return FlexDirection::Row; }
-    static FlexWrap flex_wrap() { return FlexWrap::Nowrap; }
-    static FlexBasis flex_basis() { return Size::make_auto(); }
-    static ImageRendering image_rendering() { return ImageRendering::Auto; }
-    static JustifyContent justify_content() { return JustifyContent::FlexStart; }
-    static JustifyItems justify_items() { return JustifyItems::Legacy; }
-    static JustifySelf justify_self() { return JustifySelf::Auto; }
-    static AlignContent align_content() { return AlignContent::Stretch; }
-    static AlignItems align_items() { return AlignItems::Stretch; }
-    static AlignSelf align_self() { return AlignSelf::Auto; }
-    static Appearance appearance() { return Appearance::Auto; }
-    static Overflow overflow() { return Overflow::Visible; }
-    static BoxSizing box_sizing() { return BoxSizing::ContentBox; }
-    static PointerEvents pointer_events() { return PointerEvents::Auto; }
-    static float flex_grow() { return 0.0f; }
-    static float flex_shrink() { return 1.0f; }
-    static int order() { return 0; }
-    static float opacity() { return 1.0f; }
-    static float fill_opacity() { return 1.0f; }
-    static FillRule fill_rule() { return FillRule::Nonzero; }
-    static ClipRule clip_rule() { return ClipRule::Nonzero; }
-    static Color flood_color() { return Color::Black; }
-    static float flood_opacity() { return 1.0f; }
-    static LengthPercentage stroke_dashoffset() { return Length::make_px(0); }
-    static StrokeLinecap stroke_linecap() { return StrokeLinecap::Butt; }
-    static StrokeLinejoin stroke_linejoin() { return StrokeLinejoin::Miter; }
-    static float stroke_miterlimit() { return 4.0f; }
-    static float stroke_opacity() { return 1.0f; }
-    static LengthPercentage stroke_width() { return Length::make_px(1); }
-    static float stop_opacity() { return 1.0f; }
-    static TextAnchor text_anchor() { return TextAnchor::Start; }
-    static LengthPercentage border_radius() { return LengthPercentage { Length::make_px(0) }; }
-    static Variant<VerticalAlign, LengthPercentage> vertical_align() { return VerticalAlign::Baseline; }
-    static LengthBox inset() { return {}; }
-    static LengthBox margin() { return { Length::make_px(0), Length::make_px(0), Length::make_px(0), Length::make_px(0) }; }
-    static LengthBox padding() { return { Length::make_px(0), Length::make_px(0), Length::make_px(0), Length::make_px(0) }; }
-    static OverflowClipMarginData overflow_clip_margin() { return {}; }
-    static Size width() { return Size::make_auto(); }
-    static Size min_width() { return Size::make_auto(); }
-    static Size max_width() { return Size::make_none(); }
-    static Size height() { return Size::make_auto(); }
-    static Size min_height() { return Size::make_auto(); }
-    static Size max_height() { return Size::make_none(); }
-    static GridTrackSizeList grid_template_columns() { return GridTrackSizeList::make_none(); }
-    static GridTrackSizeList grid_template_rows() { return GridTrackSizeList::make_none(); }
-    static GridTrackPlacement grid_column_end() { return GridTrackPlacement::make_auto(); }
-    static GridTrackPlacement grid_column_start() { return GridTrackPlacement::make_auto(); }
-    static GridTrackPlacement grid_row_end() { return GridTrackPlacement::make_auto(); }
-    static GridTrackPlacement grid_row_start() { return GridTrackPlacement::make_auto(); }
-    static GridAutoFlow grid_auto_flow() { return GridAutoFlow {}; }
-    static ColumnCount column_count() { return ColumnCount::make_auto(); }
-    static Variant<LengthPercentage, NormalGap> column_gap() { return NormalGap {}; }
-    static ColumnSpan column_span() { return ColumnSpan::None; }
-    static Size column_width() { return Size::make_auto(); }
-    static Size column_height() { return Size::make_auto(); }
-    static Variant<LengthPercentage, NormalGap> row_gap() { return NormalGap {}; }
     static BorderCollapse border_collapse() { return BorderCollapse::Separate; }
     static EmptyCells empty_cells() { return EmptyCells::Show; }
-    static GridTemplateAreas grid_template_areas() { return {}; }
-    static ObjectFit object_fit() { return ObjectFit::Fill; }
-    static Position object_position() { return {}; }
-    static Color outline_color() { return Color::Black; }
-    static CSSPixels outline_offset() { return 0; }
-    static OutlineStyle outline_style() { return OutlineStyle::None; }
-    static CSSPixels outline_width() { return 3; }
-    static TableLayout table_layout() { return TableLayout::Auto; }
-    static QuotesData quotes() { return QuotesData { .type = QuotesData::Type::Auto }; }
-    static TransformBox transform_box() { return TransformBox::ViewBox; }
-    static TransformStyle transform_style() { return TransformStyle::Flat; }
-    static Direction direction() { return Direction::Ltr; }
-    static Optional<BaselineMetric> dominant_baseline() { return {}; }
-    static UnicodeBidi unicode_bidi() { return UnicodeBidi::Normal; }
-    static WritingMode writing_mode() { return WritingMode::HorizontalTb; }
-    static UserSelect user_select() { return UserSelect::Auto; }
-    static Isolation isolation() { return Isolation::Auto; }
-    static Containment contain() { return {}; }
-    static Vector<FlyString> container_name() { return {}; }
-    static ContainerType container_type() { return {}; }
-    static MixBlendMode mix_blend_mode() { return MixBlendMode::Normal; }
-    static Optional<int> z_index() { return OptionalNone(); }
 
     // https://www.w3.org/TR/SVG/geometry.html
-    static LengthPercentage cx() { return Length::make_px(0); }
-    static LengthPercentage cy() { return Length::make_px(0); }
-    static LengthPercentage r() { return Length::make_px(0); }
-    static LengthPercentageOrAuto rx() { return LengthPercentageOrAuto::make_auto(); }
-    static LengthPercentageOrAuto ry() { return LengthPercentageOrAuto::make_auto(); }
-    static LengthPercentage x() { return Length::make_px(0); }
-    static LengthPercentage y() { return Length::make_px(0); }
-
-    static MaskType mask_type() { return MaskType::Luminance; }
-    static MathShift math_shift() { return MathShift::Normal; }
-    static MathStyle math_style() { return MathStyle::Normal; }
     static int math_depth() { return 0; }
 
     static ScrollbarColorData scrollbar_color()
@@ -311,13 +372,10 @@ public:
         return ScrollbarColorData {
             .thumb_color = Color(Color::NamedColor::DarkGray).with_alpha(192),
             .track_color = Color(Color::NamedColor::WarmGray).with_alpha(192),
+            .is_auto = true,
         };
     }
-    static ScrollbarWidth scrollbar_width() { return ScrollbarWidth::Auto; }
-    static Resize resize() { return Resize::None; }
-    static ShapeRendering shape_rendering() { return ShapeRendering::Auto; }
     static PaintOrderList paint_order() { return { PaintOrder::Fill, PaintOrder::Stroke, PaintOrder::Markers }; }
-    static WillChange will_change() { return WillChange::make_auto(); }
 };
 
 enum class BackgroundSize {
@@ -332,7 +390,7 @@ public:
     static SVGPaint from_style_value(NonnullRefPtr<StyleValue const> const& style_value, ColorResolutionContext const& color_resolution_context)
     {
         if (style_value->has_color())
-            return style_value->to_color(color_resolution_context).value();
+            return { style_value->to_color(color_resolution_context).value(), style_value->to_keyword() == Keyword::Currentcolor };
 
         if (style_value->is_value_list()) {
             auto const& values = style_value->as_value_list().values();
@@ -342,19 +400,21 @@ public:
             if (values[1]->is_empty_optional())
                 return values[0]->as_url().url();
 
-            return { values[0]->as_url().url(), values[1]->to_color(color_resolution_context) };
+            return { values[0]->as_url().url(), values[1]->to_color(color_resolution_context), values[1]->to_keyword() == Keyword::Currentcolor };
         }
 
         VERIFY_NOT_REACHED();
     }
 
-    SVGPaint(Color color)
+    SVGPaint(Color color, bool color_is_currentcolor = false)
         : m_value(color)
+        , m_color_is_currentcolor(color_is_currentcolor)
     {
     }
-    SVGPaint(URL const& url, Optional<Color> fallback_color = {})
+    SVGPaint(URL const& url, Optional<Color> fallback_color = {}, bool fallback_color_is_currentcolor = false)
         : m_value(url)
         , m_fallback_color(fallback_color)
+        , m_color_is_currentcolor(fallback_color_is_currentcolor)
     {
     }
 
@@ -363,10 +423,15 @@ public:
     Color as_color() const { return m_value.get<Color>(); }
     URL const& as_url() const { return m_value.get<URL>(); }
     Optional<Color> const& fallback_color() const { return m_fallback_color; }
+    bool color_is_currentcolor() const { return m_color_is_currentcolor; }
+
+public:
+    bool operator==(SVGPaint const&) const = default;
 
 private:
     Variant<URL, Color> m_value;
     Optional<Color> m_fallback_color;
+    bool m_color_is_currentcolor { false };
 };
 
 // https://drafts.fxtf.org/css-masking-1/#typedef-mask-reference
@@ -380,68 +445,65 @@ public:
 
     URL const& url() const { return m_url; }
 
+    bool operator==(MaskReference const&) const = default;
+
 private:
     URL m_url;
 };
 
-// https://drafts.fxtf.org/css-masking/#the-clip-path
-// TODO: Support clip sources.
-class ClipPathReference {
-public:
-    ClipPathReference(URL const& url)
-        : m_clip_source(url)
-    {
-    }
-
-    ClipPathReference(BasicShapeStyleValue const& basic_shape)
-        : m_clip_source(basic_shape)
-    {
-    }
-
-    bool is_basic_shape() const { return m_clip_source.has<BasicShape>(); }
-
-    bool is_url() const { return m_clip_source.has<URL>(); }
-
-    URL const& url() const { return m_clip_source.get<URL>(); }
-
-    BasicShapeStyleValue const& basic_shape() const { return *m_clip_source.get<BasicShape>(); }
-
-private:
-    using BasicShape = NonnullRefPtr<BasicShapeStyleValue const>;
-
-    Variant<URL, BasicShape> m_clip_source;
-};
-
 struct BackgroundLayerData {
-    NonnullRefPtr<AbstractImageStyleValue const> background_image;
+    RefPtr<AbstractImageStyleValue const> background_image;
+    RefPtr<StyleValue const> image_style_value;
     BackgroundAttachment attachment { BackgroundAttachment::Scroll };
     BackgroundBox origin { BackgroundBox::PaddingBox };
     BackgroundBox clip { BackgroundBox::BorderBox };
-    LengthPercentage position_x { Length::make_px(0) };
-    LengthPercentage position_y { Length::make_px(0) };
+    LengthPercentage position_x { Percentage(0) };
+    LengthPercentage position_y { Percentage(0) };
     BackgroundSize size_type { BackgroundSize::LengthPercentage };
     LengthPercentageOrAuto size_x { LengthPercentageOrAuto::make_auto() };
     LengthPercentageOrAuto size_y { LengthPercentageOrAuto::make_auto() };
     Repetition repeat_x { Repetition::Repeat };
     Repetition repeat_y { Repetition::Repeat };
     MixBlendMode blend_mode { MixBlendMode::Normal };
+    bool mask_clip_is_no_clip { false };
+    CoordBox mask_clip { CoordBox::BorderBox };
+    CompositingOperator mask_composite { CompositingOperator::Add };
+    MaskingMode mask_mode { MaskingMode::MatchSource };
+    CoordBox mask_origin { CoordBox::BorderBox };
+
+    bool operator==(BackgroundLayerData const&) const = default;
 };
 
+struct BorderImageWidthAuto {
+    bool operator==(BorderImageWidthAuto const&) const = default;
+};
+
+using BorderImageSliceValue = Variant<double, Percentage, NonnullRefPtr<CalculatedStyleValue const>>;
+using BorderImageWidthValue = Variant<double, LengthPercentage, BorderImageWidthAuto>;
+using BorderImageOutsetValue = Variant<double, Length>;
+
+template<typename T>
 struct BorderImageSideValues {
-    NonnullRefPtr<StyleValue const> top;
-    NonnullRefPtr<StyleValue const> right;
-    NonnullRefPtr<StyleValue const> bottom;
-    NonnullRefPtr<StyleValue const> left;
+    T top;
+    T right;
+    T bottom;
+    T left;
+
+    bool operator==(BorderImageSideValues const&) const = default;
 };
 
 struct BorderImageData {
-    NonnullRefPtr<AbstractImageStyleValue const> source;
-    BorderImageSideValues slice;
-    BorderImageSideValues width;
-    BorderImageSideValues outset;
+    RefPtr<AbstractImageStyleValue const> source;
+    BorderImageSideValues<BorderImageSliceValue> slice { Percentage(100), Percentage(100), Percentage(100), Percentage(100) };
+    BorderImageSideValues<BorderImageWidthValue> width { 1.0, 1.0, 1.0, 1.0 };
+    BorderImageSideValues<BorderImageOutsetValue> outset { 0.0, 0.0, 0.0, 0.0 };
+    u8 width_value_count { 1 };
+    u8 outset_value_count { 1 };
     bool fill { false };
     BorderImageRepeat repeat_x { BorderImageRepeat::Stretch };
     BorderImageRepeat repeat_y { BorderImageRepeat::Stretch };
+
+    bool operator==(BorderImageData const&) const = default;
 };
 
 struct BorderData {
@@ -463,6 +525,8 @@ struct TouchActionData {
     // Other touch interactions which aren't pan or pinch to zoom. E.g.: Double tap to zoom.
     bool allow_other : 1 { true };
 
+    bool operator==(TouchActionData const&) const = default;
+
     static TouchActionData none()
     {
         return TouchActionData {
@@ -476,17 +540,13 @@ struct TouchActionData {
     }
 };
 
-struct WhiteSpaceTrimData {
-    bool discard_before : 1 { false };
-    bool discard_after : 1 { false };
-    bool discard_inner : 1 { false };
-};
-
 struct TransformOrigin {
     LengthPercentage x { Percentage(50) };
     LengthPercentage y { Percentage(50) };
     // FIXME: We can store this as a CSSPixels since we know it's always an absolute length
     LengthPercentage z { Percentage(0) };
+
+    bool operator==(TransformOrigin const&) const = default;
 };
 
 struct ShadowData {
@@ -495,7 +555,10 @@ struct ShadowData {
     CSSPixels blur_radius { 0 };
     CSSPixels spread_distance { 0 };
     Color color {};
+    ColorSyntax color_syntax { ColorSyntax::Legacy };
     ShadowPlacement placement { ShadowPlacement::Outer };
+
+    bool operator==(ShadowData const&) const = default;
 };
 
 struct ContentData {
@@ -505,32 +568,65 @@ struct ContentData {
         List,
     } type { Type::Normal };
 
-    Vector<Variant<String, NonnullRefPtr<ImageStyleValue>>> data;
+    Vector<Variant<Utf16String, NonnullRefPtr<AbstractImageStyleValue>>> data;
     Vector<ValueComparingRefPtr<CounterStyle const>> counter_style_dependencies;
-    Optional<String> alt_text {};
+    Optional<Utf16String> alt_text {};
+
+    bool operator==(ContentData const&) const = default;
+};
+
+struct ContentDataAndQuoteNestingLevel {
+    ContentData content_data;
+    u32 final_quote_nesting_level { 0 };
+};
+
+enum class NotifyListItemCounterRendered : u8 {
+    No,
+    Yes,
 };
 
 struct CounterData {
-    FlyString name;
+    Utf16FlyString name;
     bool is_reversed;
     Optional<CounterValue> value;
+
+    bool operator==(CounterData const&) const = default;
 };
 
-struct BorderRadiusData {
-    LengthPercentage horizontal_radius { InitialValues::border_radius() };
-    LengthPercentage vertical_radius { InitialValues::border_radius() };
+enum class ComputedAnimationNameSyntax {
+    None,
+    CustomIdent,
+    String,
+};
 
-    [[nodiscard]] bool is_initial() const
-    {
-        return horizontal_radius.is_length() && horizontal_radius.length().is_px() && horizontal_radius.length().absolute_length_to_px() == 0
-            && vertical_radius.is_length() && vertical_radius.length().is_px() && vertical_radius.length().absolute_length_to_px() == 0;
-    }
+struct ComputedAnimationName {
+    Utf16FlyString name;
+    ComputedAnimationNameSyntax syntax { ComputedAnimationNameSyntax::None };
+
+    bool operator==(ComputedAnimationName const&) const = default;
 };
 
 struct TextDecorationThickness {
-    struct Auto { };
-    struct FromFont { };
+    struct Auto {
+        bool operator==(Auto const&) const = default;
+    };
+    struct FromFont {
+        bool operator==(FromFont const&) const = default;
+    };
     Variant<Auto, FromFont, LengthPercentage> value;
+
+    bool operator==(TextDecorationThickness const&) const = default;
+};
+
+struct TextUnderlineOffset {
+    struct Auto {
+        bool operator==(Auto const&) const = default;
+    };
+
+    Variant<Auto, LengthPercentage> computed_value { Auto {} };
+    CSSPixels used_value { 2 };
+
+    bool operator==(TextUnderlineOffset const&) const = default;
 };
 
 // FIXME: Find a better place for this helper.
@@ -539,11 +635,13 @@ inline Gfx::ScalingMode to_gfx_scaling_mode(ImageRendering css_value, Gfx::IntSi
     switch (css_value) {
     case ImageRendering::Auto:
     case ImageRendering::HighQuality:
+    case ImageRendering::Optimizequality:
     case ImageRendering::Smooth:
         if (target.width() < source.width() && target.height() < source.height())
             return Gfx::ScalingMode::BilinearMipmap;
         return Gfx::ScalingMode::Bilinear;
     case ImageRendering::CrispEdges:
+    case ImageRendering::Optimizespeed:
     case ImageRendering::Pixelated:
         return Gfx::ScalingMode::NearestNeighbor;
     }
@@ -563,685 +661,1357 @@ inline Gfx::InterpolationColorSpace to_interpolation_color_space(ColorInterpolat
     VERIFY_NOT_REACHED();
 }
 
-class ComputedValues {
+// Every ComputedValues style value group, in vtable registration order:
+// G(enumerator, member path, sharing-info name, affects layout).
+// A group may be flagged as not affecting layout only when every one of its fields is
+// read exclusively at paint or display-list build time: background qualifies (paint;
+// resource-observer registration runs in apply_style regardless of layout), mask
+// qualifies (paint and hit-testing), and text_reset qualifies (text-decoration resolves
+// at display-list build; white-space-trim is unread by layout today, so implementing it
+// must revisit the flag). effects stays layout-affecting because filter/backdrop-filter
+// establish fixed-positioning containing blocks and re-parent abspos descendants.
+#define LIBWEB_ENUMERATE_COMPUTED_VALUE_STYLE_GROUPS(G)                 \
+    G(InheritedTableValues, m_inherited.table, "inheritedTable", true)  \
+    G(InheritedListValues, m_inherited.list, "inheritedList", true)     \
+    G(InheritedUIValues, m_inherited.ui, "inheritedUI", true)           \
+    G(InheritedSVGValues, m_inherited.svg, "inheritedSVG", true)        \
+    G(InheritedTextValues, m_inherited.text, "inheritedText", true)     \
+    G(InheritedBoxValues, m_inherited.box, "inheritedBox", true)        \
+    G(FontValues, m_inherited.font, "font", true)                       \
+    G(AnimationValues, m_noninherited.animation, "animation", true)     \
+    G(SVGResetValues, m_noninherited.svg_reset, "svgReset", true)       \
+    G(GridValues, m_noninherited.grid, "grid", true)                    \
+    G(AnchorValues, m_noninherited.anchor, "anchor", true)              \
+    G(EffectsValues, m_noninherited.effects, "effects", true)           \
+    G(MaskValues, m_noninherited.mask_data, "mask", false)              \
+    G(TextResetValues, m_noninherited.text_reset, "textReset", false)   \
+    G(ContentValues, m_noninherited.content_data, "content", true)      \
+    G(TransformValues, m_noninherited.transform, "transform", true)     \
+    G(BackgroundValues, m_noninherited.background, "background", false) \
+    G(BorderValues, m_noninherited.border, "border", true)              \
+    G(AlignmentValues, m_noninherited.alignment, "alignment", true)     \
+    G(MiscResetValues, m_noninherited.misc, "miscReset", true)          \
+    G(SizingValues, m_noninherited.sizing, "sizing", true)              \
+    G(SurroundValues, m_noninherited.surround, "surround", true)        \
+    G(BoxValues, m_noninherited.box, "box", true)
+
+class StyleEngine;
+
+enum class StyleGroupIndex : size_t {
+#define LIBWEB_STYLE_GROUP_ENUMERATOR(name, ...) name,
+    LIBWEB_ENUMERATE_COMPUTED_VALUE_STYLE_GROUPS(LIBWEB_STYLE_GROUP_ENUMERATOR)
+#undef LIBWEB_STYLE_GROUP_ENUMERATOR
+        Count,
+};
+
+// Bits of the dependency flags published alongside a style record's group payloads.
+enum class StyleRecordDependencyFlag : u8 {
+    DependsOnViewportMetrics = 1 << 0,
+    FontMetricsDependOnViewportMetrics = 1 << 1,
+    InDisplayNoneSubtree = 1 << 2,
+    // Bit 3 is the engine's publication-time inherited-group swap eligibility, never stored on a record.
+    // The record holds an <image> in a property whose images a layout node loads and observes.
+    HoldsImageValues = 1 << 4,
+    // A highlight pseudo-element whose color or background-color the author origin decided, on itself or up
+    // its highlight chain.
+    HighlightColorsAuthored = 1 << 5,
+    // A highlight pseudo-element whose color is currentColor: the layer below shows through.
+    HighlightColorIsCurrentColor = 1 << 6,
+};
+AK_ENUM_BITWISE_OPERATORS(StyleRecordDependencyFlag);
+
+// Whether a style record publishes display:none, read straight out of its box group payload. This
+// is the same value ComputedValues::display() exposes, without materializing a style record view.
+[[nodiscard]] bool style_record_display_is_none(StyleEngine const&, StyleRecordID);
+
+// The box group payload stores display values in the Rust-defined explicit
+// form; these pins keep the tag discriminants aligned with Display::Type.
+inline ComputedValuesFFI::FfiDisplay to_ffi_display(Display const& display)
+{
+    static_assert(to_underlying(Display::Type::OutsideAndInside) == 0);
+    static_assert(to_underlying(Display::Type::Internal) == 1);
+    static_assert(to_underlying(Display::Type::Box) == 2);
+
+    switch (display.type()) {
+    case Display::Type::OutsideAndInside:
+        return {
+            .tag = to_underlying(display.type()),
+            .outside = to_underlying(display.outside()),
+            .inside = to_underlying(display.inside()),
+            .list_item = display.is_list_item(),
+            .internal = 0,
+            .box_value = 0,
+        };
+    case Display::Type::Internal:
+        return {
+            .tag = to_underlying(display.type()),
+            .outside = 0,
+            .inside = 0,
+            .list_item = false,
+            .internal = to_underlying(display.internal()),
+            .box_value = 0,
+        };
+    case Display::Type::Box:
+        return {
+            .tag = to_underlying(display.type()),
+            .outside = 0,
+            .inside = 0,
+            .list_item = false,
+            .internal = 0,
+            .box_value = display.is_none() ? to_underlying(DisplayBox::None) : to_underlying(DisplayBox::Contents),
+        };
+    }
+    VERIFY_NOT_REACHED();
+}
+
+inline Display display_from_ffi_display(ComputedValuesFFI::FfiDisplay const& display)
+{
+    switch (static_cast<Display::Type>(display.tag)) {
+    case Display::Type::OutsideAndInside:
+        return Display {
+            static_cast<DisplayOutside>(display.outside),
+            static_cast<DisplayInside>(display.inside),
+            display.list_item ? Display::ListItem::Yes : Display::ListItem::No,
+        };
+    case Display::Type::Internal:
+        return Display { static_cast<DisplayInternal>(display.internal) };
+    case Display::Type::Box:
+        return Display { static_cast<DisplayBox>(display.box_value) };
+    }
+    VERIFY_NOT_REACHED();
+}
+inline ComputedValuesFFI::ComputedVerticalAlign to_ffi_vertical_align(Variant<VerticalAlign, LengthPercentage> const& value)
+{
+    if (value.has<VerticalAlign>())
+        return { .is_keyword = true, .keyword = to_underlying(value.get<VerticalAlign>()), .value = { nullptr } };
+    auto retained = value.get<LengthPercentage>();
+    return { .is_keyword = false, .keyword = 0, .value = { retained.leak_data() } };
+}
+
+class WEB_API ComputedValues final : public RefCounted<ComputedValues> {
     AK_MAKE_NONCOPYABLE(ComputedValues);
     AK_MAKE_NONMOVABLE(ComputedValues);
 
 public:
-    ComputedValues() = default;
-    ~ComputedValues() = default;
+    class Builder;
+    class Mutator;
 
-    AspectRatio aspect_ratio() const { return m_noninherited.aspect_ratio; }
-    BoxSizing box_sizing_for_aspect_ratio() const
+    enum class WithAnimationsApplied {
+        No,
+        Yes,
+    };
+
+    static NonnullRefPtr<ComputedValues const> create(ComputedStyleWorkingSet const&, DOM::Document const&, StyleScope const&, ColorResolutionContext, ComputedValues const* inherit_parent = nullptr);
+
+    // Build only the named groups; every other group keeps `base`'s payload untouched. The caller
+    // warrants that every property outside `groups_to_apply` computes to the same value in the
+    // given style as it did when `base` was built.
+    static constexpr u32 all_style_groups = (1u << to_underlying(StyleGroupIndex::Count)) - 1;
+    static NonnullRefPtr<ComputedValues const> create_over_base(ComputedStyleWorkingSet const&, DOM::Document const&, StyleScope const&, ColorResolutionContext, ComputedValues const& base, u32 groups_to_apply);
+
+    // The style group a longhand's computed value lives in, derived from the field descriptors the
+    // group payloads build from, plus explicit bindings for the bespoke-built groups. A longhand
+    // without a binding has no single known group and must be treated conservatively.
+    static Optional<StyleGroupIndex> style_group_of_property(PropertyID);
+    static u32 style_group_bit_of_property(PropertyID property_id)
     {
-        // https://drafts.csswg.org/css-sizing-4/#aspect-ratio
-        // For a preferred aspect ratio specified as `auto && <ratio>`, the ratio is applied to the content box.
-        if (aspect_ratio().use_natural_aspect_ratio_if_available)
-            return BoxSizing::ContentBox;
-        return box_sizing();
+        auto group = style_group_of_property(property_id);
+        return group.has_value() ? 1u << to_underlying(*group) : all_style_groups;
     }
 
-    Float float_() const { return m_noninherited.float_; }
-    CSSPixels border_spacing_horizontal() const { return m_inherited.border_spacing_horizontal; }
-    CSSPixels border_spacing_vertical() const { return m_inherited.border_spacing_vertical; }
-    CaptionSide caption_side() const { return m_inherited.caption_side; }
-    Color caret_color() const { return m_inherited.caret_color; }
-    Clear clear() const { return m_noninherited.clear; }
-    Clip clip() const { return m_noninherited.clip; }
-    ColorInterpolation color_interpolation() const { return m_inherited.color_interpolation; }
-    ColorInterpolation color_interpolation_filters() const { return m_inherited.color_interpolation_filters; }
-    PreferredColorScheme color_scheme() const { return m_inherited.color_scheme; }
-    ContentVisibility content_visibility() const { return m_inherited.content_visibility; }
-    Vector<CursorData> const& cursor() const { return m_inherited.cursor; }
-    Optional<ContentData> const& content() const { return m_noninherited.content; }
-    PointerEvents pointer_events() const { return m_inherited.pointer_events; }
-    Display display() const { return m_noninherited.display; }
-    Display display_before_box_type_transformation() const { return m_noninherited.display_before_box_type_transformation; }
-    Optional<int> const& z_index() const { return m_noninherited.z_index; }
-    Variant<CSSPixels, double> tab_size() const { return m_inherited.tab_size; }
-    TextAlign text_align() const { return m_inherited.text_align; }
-    TextJustify text_justify() const { return m_inherited.text_justify; }
-    TextIndentData const& text_indent() const { return m_inherited.text_indent; }
-    TextWrapMode text_wrap_mode() const { return m_inherited.text_wrap_mode; }
-    CSSPixels text_underline_offset() const { return m_inherited.text_underline_offset; }
-    TextUnderlinePosition text_underline_position() const { return m_inherited.text_underline_position; }
-    Vector<TextDecorationLine> const& text_decoration_line() const { return m_noninherited.text_decoration_line; }
-    TextDecorationThickness const& text_decoration_thickness() const { return m_noninherited.text_decoration_thickness; }
-    TextDecorationSkipInk text_decoration_skip_ink() const { return m_inherited.text_decoration_skip_ink; }
-    TextDecorationStyle text_decoration_style() const { return m_noninherited.text_decoration_style; }
-    Color text_decoration_color() const { return m_noninherited.text_decoration_color; }
-    TextTransform text_transform() const { return m_inherited.text_transform; }
-    TextOverflow text_overflow() const { return m_noninherited.text_overflow; }
-    Vector<ShadowData> const& text_shadow() const { return m_inherited.text_shadow; }
-    Positioning position() const { return m_noninherited.position; }
-    Optional<FlyString> const& position_anchor() const { return m_noninherited.position_anchor; }
-    WhiteSpaceCollapse white_space_collapse() const { return m_inherited.white_space_collapse; }
-    WhiteSpaceTrimData white_space_trim() const { return m_noninherited.white_space_trim; }
-    WordBreak word_break() const { return m_inherited.word_break; }
-    FontVariantEmoji font_variant_emoji() const { return m_inherited.font_variant_emoji; }
-    CSSPixels const& word_spacing() const { return m_inherited.word_spacing; }
-    CSSPixels letter_spacing() const { return m_inherited.letter_spacing; }
-    FlexDirection flex_direction() const { return m_noninherited.flex_direction; }
-    FlexWrap flex_wrap() const { return m_noninherited.flex_wrap; }
-    FlexBasis const& flex_basis() const { return m_noninherited.flex_basis; }
-    float flex_grow() const { return m_noninherited.flex_grow; }
-    float flex_shrink() const { return m_noninherited.flex_shrink; }
-    int order() const { return m_noninherited.order; }
-    Optional<Color> accent_color() const { return m_inherited.accent_color; }
-    AlignContent align_content() const { return m_noninherited.align_content; }
-    AlignItems align_items() const { return m_noninherited.align_items; }
-    AlignSelf align_self() const { return m_noninherited.align_self; }
-    Appearance appearance() const { return m_noninherited.appearance; }
-    float opacity() const { return m_noninherited.opacity; }
-    Visibility visibility() const { return m_inherited.visibility; }
-    ImageRendering image_rendering() const { return m_inherited.image_rendering; }
-    JustifyContent justify_content() const { return m_noninherited.justify_content; }
-    JustifySelf justify_self() const { return m_noninherited.justify_self; }
-    JustifyItems justify_items() const { return m_noninherited.justify_items; }
-    Filter const& backdrop_filter() const { return m_noninherited.backdrop_filter; }
-    Filter const& filter() const { return m_noninherited.filter; }
-    Vector<ShadowData> const& box_shadow() const { return m_noninherited.box_shadow; }
-    BoxSizing box_sizing() const { return m_noninherited.box_sizing; }
-    Size const& width() const { return m_noninherited.width; }
-    Size const& min_width() const { return m_noninherited.min_width; }
-    Size const& max_width() const { return m_noninherited.max_width; }
-    Size const& height() const { return m_noninherited.height; }
-    Size const& min_height() const { return m_noninherited.min_height; }
-    Size const& max_height() const { return m_noninherited.max_height; }
-    Variant<VerticalAlign, LengthPercentage> const& vertical_align() const { return m_noninherited.vertical_align; }
-    GridTrackSizeList const& grid_auto_columns() const { return m_noninherited.grid_auto_columns; }
-    GridTrackSizeList const& grid_auto_rows() const { return m_noninherited.grid_auto_rows; }
-    GridAutoFlow const& grid_auto_flow() const { return m_noninherited.grid_auto_flow; }
-    GridTrackSizeList const& grid_template_columns() const { return m_noninherited.grid_template_columns; }
-    GridTrackSizeList const& grid_template_rows() const { return m_noninherited.grid_template_rows; }
-    GridTrackPlacement const& grid_column_end() const { return m_noninherited.grid_column_end; }
-    GridTrackPlacement const& grid_column_start() const { return m_noninherited.grid_column_start; }
-    GridTrackPlacement const& grid_row_end() const { return m_noninherited.grid_row_end; }
-    GridTrackPlacement const& grid_row_start() const { return m_noninherited.grid_row_start; }
-    ColumnCount column_count() const { return m_noninherited.column_count; }
-    Variant<LengthPercentage, NormalGap> const& column_gap() const { return m_noninherited.column_gap; }
-    ColumnSpan const& column_span() const { return m_noninherited.column_span; }
-    Size const& column_width() const { return m_noninherited.column_width; }
-    Size const& column_height() const { return m_noninherited.column_height; }
-    Variant<LengthPercentage, NormalGap> const& row_gap() const { return m_noninherited.row_gap; }
-    BorderCollapse border_collapse() const { return m_inherited.border_collapse; }
-    EmptyCells empty_cells() const { return m_inherited.empty_cells; }
-    GridTemplateAreas const& grid_template_areas() const { return m_noninherited.grid_template_areas; }
-    ObjectFit object_fit() const { return m_noninherited.object_fit; }
-    Position object_position() const { return m_noninherited.object_position; }
-    Direction direction() const { return m_inherited.direction; }
-    Optional<BaselineMetric> dominant_baseline() const { return m_inherited.dominant_baseline; }
-    UnicodeBidi unicode_bidi() const { return m_noninherited.unicode_bidi; }
-    WritingMode writing_mode() const { return m_inherited.writing_mode; }
+    RefPtr<StyleValue const> computed_style_value(PropertyID, WithAnimationsApplied = WithAnimationsApplied::Yes) const;
 
-    bool inline_axis_is_reverse() const
+    // The stored Rust style value that IS the property's computed value, for the properties that
+    // keep one; null for every other property, and for a stored value that is currently absent.
+    // Callers can serialize straight from the returned handle without minting a wrapper.
+    RustStyleValueHandle const* stored_style_value_handle(PropertyID) const;
+
+    RefPtr<StyleValue const> color_style_value() const;
+    ComputedValues const& base_values() const { return m_borrowed_base_values ? *m_borrowed_base_values : m_base_values ? *m_base_values
+                                                                                                                        : *this; }
+    bool has_animated_values() const { return m_borrowed_base_values || m_base_values; }
+    AnimatedProperties const* animated_properties() const { return m_animated_properties.ptr(); }
+    RefPtr<AnimatedProperties const> animated_properties_snapshot() const;
+
+    // Animated values live outside the group payloads, so every group-based fast path or
+    // group-based diff must fall back to the slow path when either side carries them.
+    static bool either_carries_animated_overlay(ComputedValues const& a, ComputedValues const& b)
     {
-        switch (writing_mode()) {
-        case WritingMode::HorizontalTb:
-        case WritingMode::VerticalRl:
-        case WritingMode::VerticalLr:
-        case WritingMode::SidewaysRl:
-            return direction() == Direction::Rtl;
-        case WritingMode::SidewaysLr:
-            return direction() == Direction::Ltr;
+        return a.has_animated_values() || b.has_animated_values() || a.animated_properties() || b.animated_properties();
+    }
+
+    struct Statistics {
+        u64 live_instance_count { 0 };
+        u64 total_instances_created { 0 };
+    };
+    static Statistics const& statistics() { return s_statistics; }
+
+    // Shares group payloads with `previous` wherever the values compare equal. This changes no
+    // observable value, only the identity of the backing payloads, so it is safe on an otherwise
+    // immutable ComputedValues. It makes pointer-based diffing hit on the next restyle and lets a
+    // restyled element keep sharing storage across style generations. Returns true when every
+    // group ends up sharing its payload with `previous`.
+    bool adopt_identical_group_payloads(ComputedValues const& previous) const;
+    // The same question answered straight from two style records' group payload arrays, so a caller
+    // that only wants the answer does not have to materialize a ComputedValues for either record.
+    static bool layout_affecting_group_payloads_differ(void const* const* a, void const* const* b);
+
+    // Returns the Rust-owned payload for direct read-only layout access. The
+    // pointer is borrowed from this immutable ComputedValues instance.
+    void const* style_group_payload(StyleGroupIndex) const;
+
+    // The identity of the half a child inherits. Two styles whose inherited groups are pairwise the
+    // same payload answer the same question for a child, whatever their non-inherited halves say.
+    static constexpr size_t inherited_style_group_count = 7;
+    Array<void const*, inherited_style_group_count> inherited_style_group_identities() const
+    {
+        return Array<void const*, inherited_style_group_count> {
+            m_inherited.table.payload_identity(),
+            m_inherited.list.payload_identity(),
+            m_inherited.ui.payload_identity(),
+            m_inherited.svg.payload_identity(),
+            m_inherited.text.payload_identity(),
+            m_inherited.box.payload_identity(),
+            m_inherited.font.payload_identity(),
+        };
+    }
+
+    // Calls back with (name, shared_with_parent, is_default) for every style value group,
+    // for introspecting how well group sharing is working (see internals.styleGroupSharingInfo()).
+    template<typename Callback>
+    void for_each_style_group_sharing_state(ComputedValues const* parent, Callback callback) const
+    {
+#define LIBWEB_VISIT_STYLE_GROUP(name, path, sharing_name, affects_layout) \
+    callback(sharing_name##sv, parent ? path.ptr_equals(parent->path) : false, path.is_default());
+        LIBWEB_ENUMERATE_COMPUTED_VALUE_STYLE_GROUPS(LIBWEB_VISIT_STYLE_GROUP)
+#undef LIBWEB_VISIT_STYLE_GROUP
+    }
+
+    bool is_property_important(PropertyID property_id) const { return m_property_important.get(property_bitmap_index(property_id)); }
+    bool is_property_inherited(PropertyID property_id) const { return m_property_inherited.get(property_bitmap_index(property_id)); }
+    ReadonlyBytes property_importance_bitmap() const LIFETIME_BOUND { return m_property_important.bytes(); }
+    ReadonlyBytes property_inheritance_bitmap() const LIFETIME_BOUND { return m_property_inherited.bytes(); }
+
+    // True when every inherited longhand took its value by inheritance and no other longhand did:
+    // the element's cascade declared nothing that survives into its inherited half, and nothing
+    // explicitly inherited a property that does not inherit on its own. Such an element's inherited
+    // half is, by construction, exactly what its parent's inherited half was when this style was
+    // computed.
+    bool property_inheritance_is_standard() const;
+    bool depends_on_viewport_metrics() const { return m_depends_on_viewport_metrics; }
+    bool font_metrics_depend_on_viewport_metrics() const { return m_font_metrics_depend_on_viewport_metrics; }
+    bool in_display_none_subtree() const { return m_in_display_none_subtree; }
+    bool highlight_colors_authored() const { return m_highlight_colors_authored; }
+    bool highlight_color_is_current_color() const { return m_highlight_color_is_current_color; }
+    bool has_pseudo_element_style(PseudoElement pseudo_element) const { return m_pseudo_element_styles & (1ull << to_underlying(pseudo_element)); }
+    u64 pseudo_element_style_mask() const { return m_pseudo_element_styles; }
+    ReadonlySpan<ComputedValuesFFI::FfiTableInheritanceDependentValue const> inheritance_dependent_specified_values() const { return m_inheritance_dependent_specified_values; }
+    RefPtr<StyleValue const> raw_cascaded_font_size() const;
+
+    // The drive's frozen computed longhand table (a Rust ComputedLonghandTable), or null when
+    // this style holds only a borrowed span or no table at all.
+    void const* computed_longhand_table() const { return m_computed_longhand_table; }
+    // One stored data pointer per longhand (null slots where the drive stored no value); empty
+    // when this style carries no table. The pointers stay valid while this ComputedValues is
+    // live (or, for a borrowed record view, while the style engine retains the record's table).
+    ReadonlySpan<void const*> computed_longhand_values() const { return m_longhand_values; }
+
+    ~ComputedValues();
+
+private:
+    static NonnullRefPtr<ComputedValues const> create_internal(ComputedStyleWorkingSet const&, DOM::Document const&, StyleScope const&, ColorResolutionContext, ComputedValues const* inherit_parent, ComputedValues const* base, u32 groups_to_apply);
+
+public:
+    ReadonlySpan<Utf16FlyString> anchor_names() const { return m_noninherited.anchor->anchor_names_span(); }
+    PositionAnchor position_anchor_value() const { return m_noninherited.anchor->position_anchor_value(); }
+    Vector<ComputedAnimationName> animation_names() const { return m_noninherited.animation->animation_names_value(); }
+
+    Float float_() const { return static_cast<Float>(m_noninherited.box->float_); }
+    Clear clear() const { return static_cast<Clear>(m_noninherited.box->clear); }
+    Color caret_color() const { return m_inherited.ui->caret_color_value(); }
+    Clip clip() const { return m_noninherited.effects->clip_value(); }
+    ColorInterpolation color_interpolation() const { return m_inherited.svg->color_interpolation_value(); }
+    PreferredColorScheme color_scheme() const { return m_inherited.ui->color_scheme_value(); }
+    ContentVisibility content_visibility() const { return static_cast<ContentVisibility>(m_inherited.box->content_visibility); }
+    ReadonlySpan<ComputedValuesFFI::ComputedCursor> cursor() const { return m_inherited.ui->cursor_span(); }
+    NonnullRefPtr<StyleValue const> computed_content() const { return m_noninherited.content_data->computed_content_value(); }
+    bool content_is_normal() const { return m_noninherited.content_data->content_is_normal(); }
+    bool content_uses_list_item_counter() const { return m_noninherited.content_data->content_uses_list_item_counter(); }
+    ContentDataAndQuoteNestingLevel resolved_content(DOM::AbstractElement&, u32 initial_quote_nesting_level, NotifyListItemCounterRendered) const;
+    Vector<CounterData, 0> counter_increment() const { return m_noninherited.content_data->counter_increment_value(); }
+    Vector<CounterData, 0> counter_reset() const { return m_noninherited.content_data->counter_reset_value(); }
+    Vector<CounterData, 0> counter_set() const { return m_noninherited.content_data->counter_set_value(); }
+    Display display() const { return display_from_ffi_display(m_noninherited.box->display); }
+    Display display_before_box_type_transformation() const { return display_from_ffi_display(m_noninherited.box->display_before_box_type_transformation); }
+    Optional<int> z_index() const
+    {
+        if (!m_noninherited.box->has_z_index)
+            return {};
+        return m_noninherited.box->z_index;
+    }
+    TextAlign text_align() const { return m_inherited.text->text_align_value(); }
+    ReadonlySpan<TextDecorationLine> text_decoration_line() const { return m_noninherited.text_reset->decoration_lines(); }
+    TextDecorationThickness text_decoration_thickness() const { return m_noninherited.text_reset->decoration_thickness(); }
+    TextDecorationStyle text_decoration_style() const { return static_cast<TextDecorationStyle>(m_noninherited.text_reset->text_decoration_style); }
+    Color text_decoration_color() const { return Color::from_bgra(m_noninherited.text_reset->text_decoration_color); }
+    ReadonlySpan<ShadowData> text_shadow() const { return m_inherited.text->text_shadow_span(); }
+    Positioning position() const { return static_cast<Positioning>(m_noninherited.box->position); }
+    Vector<Optional<Utf16FlyString>> transition_properties() const { return m_noninherited.animation->transition_properties_value(); }
+    Vector<Time> transition_durations() const { return m_noninherited.animation->transition_durations_value(); }
+    Vector<EasingFunction> transition_timing_functions() const { return m_noninherited.animation->transition_timing_functions_value(); }
+    Vector<Time> transition_delays() const { return m_noninherited.animation->transition_delays_value(); }
+    Vector<TransitionBehavior> transition_behaviors() const { return m_noninherited.animation->transition_behaviors_value(); }
+    bool transition_delay_and_duration_are_single_zero() const { return m_noninherited.animation->transition_delay_and_duration_are_single_zero_value(); }
+    WhiteSpaceCollapse white_space_collapse() const { return m_inherited.text->white_space_collapse_value(); }
+    FlexDirection flex_direction() const { return static_cast<FlexDirection>(m_noninherited.alignment->flex_direction); }
+    AlignSelf align_self() const { return static_cast<AlignSelf>(m_noninherited.alignment->align_self); }
+    int order() const { return m_noninherited.alignment->order; }
+    Appearance appearance() const { return static_cast<Appearance>(m_noninherited.misc->appearance); }
+    float opacity() const { return m_noninherited.effects->opacity; }
+    Visibility visibility() const { return static_cast<Visibility>(m_inherited.box->visibility); }
+    JustifyContent justify_content() const { return static_cast<JustifyContent>(m_noninherited.alignment->justify_content); }
+    JustifySelf justify_self() const { return static_cast<JustifySelf>(m_noninherited.alignment->justify_self); }
+    ComputedFilterView backdrop_filter() const { return m_noninherited.effects->backdrop_filter_value(); }
+    ComputedFilterView filter() const { return m_noninherited.effects->filter_value(); }
+    ReadonlySpan<ShadowData> box_shadow() const { return m_noninherited.effects->box_shadow_span(); }
+    Size const& width() const { return Size::view(m_noninherited.sizing->width); }
+    Size const& height() const { return Size::view(m_noninherited.sizing->height); }
+    Variant<VerticalAlign, LengthPercentage> vertical_align() const
+    {
+        auto const& value = m_noninherited.box->vertical_align;
+        if (value.is_keyword)
+            return static_cast<VerticalAlign>(value.keyword);
+        return LengthPercentage::view(value.value);
+    }
+    Direction direction() const { return static_cast<Direction>(m_inherited.box->direction); }
+    WritingMode writing_mode() const { return static_cast<WritingMode>(m_inherited.box->writing_mode); }
+
+    Isolation isolation() const { return m_noninherited.effects->isolation_value(); }
+    Containment contain() const
+    {
+        auto const& box = *m_noninherited.box;
+        return Containment {
+            .size_containment = box.size_containment,
+            .inline_size_containment = box.inline_size_containment,
+            .layout_containment = box.layout_containment,
+            .style_containment = box.style_containment,
+            .paint_containment = box.paint_containment,
+        };
+    }
+    ContainerType container_type() const
+    {
+        auto const& box = *m_noninherited.box;
+        return ContainerType {
+            .is_size_container = box.is_size_container,
+            .is_inline_size_container = box.is_inline_size_container,
+            .is_scroll_state_container = box.is_scroll_state_container,
+        };
+    }
+    MixBlendMode mix_blend_mode() const { return m_noninherited.effects->mix_blend_mode_value(); }
+    Optional<Utf16FlyString> view_transition_name() const { return m_noninherited.misc->view_transition_name_value(); }
+    TouchActionData touch_action() const { return m_noninherited.misc->touch_action_value(); }
+
+    LengthBox inset() const { return length_box(m_noninherited.surround->inset); }
+    bool has_anchor_inset(PropertyID property_id) const
+    {
+        auto const* handle = anchor_inset_handle(property_id);
+        return handle && handle->pointer != nullptr;
+    }
+    RefPtr<StyleValue const> anchor_inset(PropertyID property_id) const
+    {
+        auto const* handle = anchor_inset_handle(property_id);
+        if (!handle)
+            return {};
+        static_assert(sizeof(RustStyleValueHandle) == sizeof(*handle));
+        return style_value_from_handle(property_id, reinterpret_cast<RustStyleValueHandle const&>(*handle));
+    }
+    LengthBox margin() const { return length_box(m_noninherited.surround->margin); }
+    LengthBox scroll_margin() const { return length_box(m_noninherited.misc->scroll_margin); }
+
+    BorderData const& border_left() const { return m_noninherited.border->border_left_value(); }
+    BorderData const& border_top() const { return m_noninherited.border->border_top_value(); }
+    BorderData const& border_right() const { return m_noninherited.border->border_right_value(); }
+    BorderData const& border_bottom() const { return m_noninherited.border->border_bottom_value(); }
+
+    Overflow overflow_x() const { return static_cast<Overflow>(m_noninherited.box->overflow_x); }
+    Overflow overflow_y() const { return static_cast<Overflow>(m_noninherited.box->overflow_y); }
+
+    Color color() const { return m_inherited.text->color_value(); }
+    Color background_color() const { return m_noninherited.background->background_color_value(); }
+    RefPtr<StyleValue const> background_color_style_value() const;
+    Vector<BackgroundLayerData> mask_layers() const { return m_noninherited.mask_data->mask_layers_value(); }
+
+    Color webkit_text_fill_color() const { return m_inherited.text->webkit_text_fill_color_value(); }
+
+    ListStyleType list_style_type(StyleScope const& style_scope) const { return m_inherited.list->list_style_type_value(style_scope); }
+    RefPtr<AbstractImageStyleValue const> list_style_image() const { return m_inherited.list->list_style_image_value(); }
+    bool list_style_type_depends_on_counter_style_environment() const { return m_inherited.list->list_style_type_depends_on_counter_style_environment(); }
+    bool list_style_type_uses_non_overridable_counter_style() const { return m_inherited.list->list_style_type_uses_non_overridable_counter_style(); }
+
+    RefPtr<AbstractImageStyleValue const> mask_image() const { return m_noninherited.mask_data->mask_image_value(); }
+    Optional<MaskReference> mask() const { return m_noninherited.mask_data->mask_value(); }
+    Optional<URL> clip_path() const { return m_noninherited.mask_data->clip_path_value(); }
+    Optional<SVGPaint> stroke() const { return m_inherited.svg->stroke_value(); }
+    Color flood_color() const { return Gfx::Color::from_bgra(m_noninherited.svg_reset->flood_color); }
+    float flood_opacity() const { return m_noninherited.svg_reset->flood_opacity; }
+
+    LengthPercentage const& cx() const { return LengthPercentage::view(m_noninherited.svg_reset->cx); }
+    LengthPercentage const& cy() const { return LengthPercentage::view(m_noninherited.svg_reset->cy); }
+    NonnullRefPtr<StyleValue const> d() const
+    {
+        auto const* handle = &m_noninherited.svg_reset->d;
+        static_assert(sizeof(RustStyleValueHandle) == sizeof(*handle));
+        return style_value_from_handle(PropertyID::D, reinterpret_cast<RustStyleValueHandle const&>(*handle)).release_nonnull();
+    }
+    LengthPercentage const& r() const { return LengthPercentage::view(m_noninherited.svg_reset->r); }
+    LengthPercentageOrAuto rx() const { return m_noninherited.svg_reset->rx.is_auto ? LengthPercentageOrAuto::make_auto() : LengthPercentage::view(m_noninherited.svg_reset->rx.value); }
+    LengthPercentageOrAuto ry() const { return m_noninherited.svg_reset->ry.is_auto ? LengthPercentageOrAuto::make_auto() : LengthPercentage::view(m_noninherited.svg_reset->ry.value); }
+    LengthPercentage const& x() const { return LengthPercentage::view(m_noninherited.svg_reset->x); }
+    LengthPercentage const& y() const { return LengthPercentage::view(m_noninherited.svg_reset->y); }
+
+    bool has_transformations() const { return m_noninherited.transform->has_transformations(); }
+    template<typename Callback>
+    void for_each_transformation(Callback callback) const
+    {
+        m_noninherited.transform->for_each_transformation(callback);
+    }
+    TransformOrigin transform_origin() const { return m_noninherited.transform->transform_origin_value(); }
+    TransformStyle transform_style() const { return m_noninherited.transform->transform_style_value(); }
+    BackfaceVisibility backface_visibility() const { return m_noninherited.transform->backface_visibility_value(); }
+    RefPtr<TransformationStyleValue const> rotate() const { return m_noninherited.transform->rotate_value(); }
+    RefPtr<TransformationStyleValue const> translate() const { return m_noninherited.transform->translate_value(); }
+    RefPtr<TransformationStyleValue const> scale() const { return m_noninherited.transform->scale_value(); }
+    bool has_rotate() const { return rotate() != nullptr; }
+    bool has_translate() const { return translate() != nullptr; }
+    bool has_scale() const { return scale() != nullptr; }
+    Optional<CSSPixels> perspective() const { return m_noninherited.transform->perspective_value(); }
+
+    Gfx::FontCascadeList const& font_list() const { return m_inherited.font->font_list_value(); }
+    CSSPixels font_size() const { return m_inherited.font->font_size; }
+    double font_weight() const { return m_inherited.font->font_weight; }
+    CSSPixels line_height() const { return m_inherited.font->line_height_used; }
+
+    Color outline_color() const { return Color::from_bgra(m_noninherited.misc->outline_color); }
+    Color column_rule_color() const { return Color::from_bgra(m_noninherited.misc->column_rule_color); }
+    OutlineStyle outline_style() const { return static_cast<OutlineStyle>(m_noninherited.misc->outline_style); }
+    CSSPixels outline_width() const { return m_noninherited.misc->outline_width; }
+
+    MathStyle math_style() const { return static_cast<MathStyle>(m_inherited.font->math_style); }
+    int math_depth() const { return m_inherited.font->math_depth; }
+
+    WillChange will_change() const { return m_noninherited.misc->will_change_value(); }
+
+private:
+    friend class ComputedStyleRecordView;
+    enum class BorrowedStyleRecord { Yes };
+    ComputedValues();
+
+public:
+    explicit ComputedValues(BorrowedStyleRecord);
+
+private:
+    void borrow_style_record_payloads(ReadonlySpan<void const*>);
+
+    RefPtr<StyleValue const> style_value_from_handle(PropertyID, RustStyleValueHandle const&) const;
+
+    ComputedValuesFFI::ComputedStyleValueHandle const* anchor_inset_handle(PropertyID property_id) const
+    {
+        switch (property_id) {
+        case PropertyID::Top:
+            return &m_noninherited.surround->top_anchor_inset;
+        case PropertyID::Right:
+            return &m_noninherited.surround->right_anchor_inset;
+        case PropertyID::Bottom:
+            return &m_noninherited.surround->bottom_anchor_inset;
+        case PropertyID::Left:
+            return &m_noninherited.surround->left_anchor_inset;
+        default:
+            return nullptr;
         }
-        VERIFY_NOT_REACHED();
     }
 
-    bool block_axis_is_reverse() const
+    static LengthPercentageOrAuto length_percentage_or_auto(ComputedValuesFFI::ComputedLengthPercentageOrAuto const& value)
     {
-        switch (writing_mode()) {
-        case WritingMode::HorizontalTb:
-        case WritingMode::VerticalLr:
-        case WritingMode::SidewaysLr:
-            return false;
-        case WritingMode::VerticalRl:
-        case WritingMode::SidewaysRl:
-            return true;
+        if (value.is_auto)
+            return LengthPercentageOrAuto::make_auto();
+        return LengthPercentage::view(value.value);
+    }
+
+    static LengthBox length_box(ComputedValuesFFI::ComputedLengthBox const& box)
+    {
+        return {
+            length_percentage_or_auto(box.top),
+            length_percentage_or_auto(box.right),
+            length_percentage_or_auto(box.bottom),
+            length_percentage_or_auto(box.left),
+        };
+    }
+
+    static Statistics s_statistics;
+
+    static size_t property_bitmap_index(PropertyID property_id)
+    {
+        VERIFY(property_id >= first_longhand_property_id && property_id <= last_longhand_property_id);
+        return to_underlying(property_id) - to_underlying(first_longhand_property_id);
+    }
+
+public:
+    // The layout and lifecycle of this group are defined in Rust (computed_values.rs).
+    struct InheritedTableValues : ComputedValuesFFI::InheritedTableValues {
+        static constexpr size_t style_group_index = to_underlying(StyleGroupIndex::InheritedTableValues);
+        static constexpr auto style_group_lifecycle = ComputedValuesFFI::StyleGroupLifecycle::InheritedTable;
+
+        bool operator==(InheritedTableValues const& other) const
+        {
+            return border_collapse == other.border_collapse
+                && caption_side == other.caption_side
+                && empty_cells == other.empty_cells
+                && border_spacing_horizontal == other.border_spacing_horizontal
+                && border_spacing_vertical == other.border_spacing_vertical;
         }
-        VERIFY_NOT_REACHED();
-    }
+    };
 
-    UserSelect user_select() const { return m_noninherited.user_select; }
-    Isolation isolation() const { return m_noninherited.isolation; }
-    Containment const& contain() const { return m_noninherited.contain; }
-    Vector<FlyString> const& container_name() const { return m_noninherited.container_name; }
-    ContainerType const& container_type() const { return m_noninherited.container_type; }
-    MixBlendMode mix_blend_mode() const { return m_noninherited.mix_blend_mode; }
-    Optional<FlyString> view_transition_name() const { return m_noninherited.view_transition_name; }
-    TouchActionData touch_action() const { return m_noninherited.touch_action; }
-    ShapeRendering shape_rendering() const { return m_noninherited.shape_rendering; }
+    struct InheritedListValues : ComputedValuesFFI::InheritedListValues {
+        static constexpr size_t style_group_index = to_underlying(StyleGroupIndex::InheritedListValues);
+        static constexpr auto style_group_lifecycle = ComputedValuesFFI::StyleGroupLifecycle::InheritedList;
 
-    LengthBox const& inset() const { return m_noninherited.inset; }
-    LengthBox const& margin() const { return m_noninherited.margin; }
-    LengthBox const& padding() const { return m_noninherited.padding; }
-    OverflowClipMarginData const& overflow_clip_margin() const { return m_noninherited.overflow_clip_margin; }
+        ListStyleType list_style_type_value(StyleScope const&) const;
+        bool list_style_type_depends_on_counter_style_environment() const;
+        bool list_style_type_uses_non_overridable_counter_style() const;
+        RefPtr<AbstractImageStyleValue const> list_style_image_value() const;
+        QuotesData quotes_value() const;
 
-    BorderData const& border_left() const { return m_noninherited.border_left; }
-    BorderData const& border_top() const { return m_noninherited.border_top; }
-    BorderData const& border_right() const { return m_noninherited.border_right; }
-    BorderData const& border_bottom() const { return m_noninherited.border_bottom; }
+        bool operator==(InheritedListValues const& other) const
+        {
+            return ComputedValuesFFI::rust_style_group_payloads_equal(style_group_index, this, &other);
+        }
+    };
 
-    bool has_noninitial_border_radii() const { return m_noninherited.has_noninitial_border_radii; }
-    BorderRadiusData const& border_bottom_left_radius() const { return m_noninherited.border_bottom_left_radius; }
-    BorderRadiusData const& border_bottom_right_radius() const { return m_noninherited.border_bottom_right_radius; }
-    BorderRadiusData const& border_top_left_radius() const { return m_noninherited.border_top_left_radius; }
-    BorderRadiusData const& border_top_right_radius() const { return m_noninherited.border_top_right_radius; }
+    struct InheritedUIValues : ComputedValuesFFI::InheritedUIValues {
+        static constexpr size_t style_group_index = to_underlying(StyleGroupIndex::InheritedUIValues);
+        static constexpr auto style_group_lifecycle = ComputedValuesFFI::StyleGroupLifecycle::InheritedUI;
 
-    Overflow overflow_x() const { return m_noninherited.overflow_x; }
-    Overflow overflow_y() const { return m_noninherited.overflow_y; }
+        Color caret_color_value() const { return Color::from_bgra(caret_color.used_color); }
+        Optional<Color> accent_color_value() const
+        {
+            if (accent_color.is_auto)
+                return {};
+            return Color::from_bgra(accent_color.used_color);
+        }
+        ReadonlySpan<ComputedValuesFFI::ComputedCursor> cursor_span() const { return { cursor.pointer, cursor.length }; }
+        static RefPtr<CursorStyleValue const> cursor_style_value(ComputedValuesFFI::ComputedCursor const& value)
+        {
+            if (!value.is_cursor_value)
+                return nullptr;
+            auto style_value = StyleValue::adopt_rust_style_value_data(StyleValueFFI::rust_style_value_retain(
+                static_cast<StyleValueFFI::StyleValueData const*>(value.cursor.pointer)));
+            return style_value->as_cursor();
+        }
+        PointerEvents pointer_events_value() const { return static_cast<PointerEvents>(pointer_events); }
+        PreferredColorScheme color_scheme_value() const { return static_cast<PreferredColorScheme>(color_scheme); }
+        ReadonlySpan<Utf16FlyString> color_schemes_span() const
+        {
+            static_assert(sizeof(Utf16FlyString) == sizeof(size_t));
+            static_assert(alignof(Utf16FlyString) == alignof(size_t));
+            return { reinterpret_cast<Utf16FlyString const*>(color_schemes.pointer), color_schemes.length };
+        }
 
-    Color color() const { return m_inherited.color; }
-    Color background_color() const { return m_noninherited.background_color; }
-    BackgroundBox background_color_clip() const { return m_noninherited.background_color_clip; }
-    Vector<BackgroundLayerData> const& background_layers() const { return m_noninherited.background_layers; }
-    Vector<BackgroundLayerData> const& mask_layers() const { return m_noninherited.mask_layers; }
-    Optional<BorderImageData> const& border_image() const { return m_noninherited.border_image; }
+        bool operator==(InheritedUIValues const& other) const
+        {
+            return ComputedValuesFFI::rust_style_group_payloads_equal(style_group_index, this, &other);
+        }
+    };
 
-    Color webkit_text_fill_color() const { return m_inherited.webkit_text_fill_color; }
+    struct InheritedSVGValues : ComputedValuesFFI::InheritedSVGValues {
+        static constexpr size_t style_group_index = to_underlying(StyleGroupIndex::InheritedSVGValues);
+        static constexpr auto style_group_lifecycle = ComputedValuesFFI::StyleGroupLifecycle::InheritedSVG;
 
-    ListStyleType const& list_style_type() const { return m_inherited.list_style_type; }
-    ListStylePosition list_style_position() const { return m_inherited.list_style_position; }
+        static Optional<SVGPaint> paint_value(ComputedValuesFFI::ComputedSvgPaint const& paint)
+        {
+            switch (paint.kind) {
+            case 0:
+                return {};
+            case 1:
+                return SVGPaint { Color::from_bgra(paint.color), paint.color_is_currentcolor };
+            case 2: {
+                auto style_value = StyleValue::adopt_rust_style_value_data(StyleValueFFI::rust_style_value_retain(
+                    static_cast<StyleValueFFI::StyleValueData const*>(paint.url.pointer)));
+                Optional<Color> fallback_color;
+                if (paint.has_color)
+                    fallback_color = Color::from_bgra(paint.color);
+                return SVGPaint { style_value->as_url().url(), fallback_color, paint.color_is_currentcolor };
+            }
+            default:
+                VERIFY_NOT_REACHED();
+            }
+        }
 
-    Optional<SVGPaint> const& fill() const { return m_inherited.fill; }
-    FillRule fill_rule() const { return m_inherited.fill_rule; }
-    Optional<SVGPaint> const& stroke() const { return m_inherited.stroke; }
-    float fill_opacity() const { return m_inherited.fill_opacity; }
-    Vector<Variant<LengthPercentage, float>> const& stroke_dasharray() const { return m_inherited.stroke_dasharray; }
-    LengthPercentage const& stroke_dashoffset() const { return m_inherited.stroke_dashoffset; }
-    StrokeLinecap stroke_linecap() const { return m_inherited.stroke_linecap; }
-    StrokeLinejoin stroke_linejoin() const { return m_inherited.stroke_linejoin; }
-    double stroke_miterlimit() const { return m_inherited.stroke_miterlimit; }
-    float stroke_opacity() const { return m_inherited.stroke_opacity; }
-    LengthPercentage const& stroke_width() const { return m_inherited.stroke_width; }
-    Color stop_color() const { return m_noninherited.stop_color; }
-    float stop_opacity() const { return m_noninherited.stop_opacity; }
-    TextAnchor text_anchor() const { return m_inherited.text_anchor; }
-    RefPtr<AbstractImageStyleValue const> mask_image() const { return m_noninherited.mask_image; }
-    Optional<MaskReference> const& mask() const { return m_noninherited.mask; }
-    MaskType mask_type() const { return m_noninherited.mask_type; }
-    Optional<ClipPathReference> const& clip_path() const { return m_noninherited.clip_path; }
-    ClipRule clip_rule() const { return m_inherited.clip_rule; }
-    Color flood_color() const { return m_noninherited.flood_color; }
-    float flood_opacity() const { return m_noninherited.flood_opacity; }
-    PaintOrderList paint_order() const { return m_inherited.paint_order; }
+        Optional<SVGPaint> fill_value() const { return paint_value(fill); }
+        Optional<SVGPaint> stroke_value() const { return paint_value(stroke); }
+        StrokeLinecap stroke_linecap_value() const { return static_cast<StrokeLinecap>(stroke_linecap); }
+        StrokeLinejoin stroke_linejoin_value() const { return static_cast<StrokeLinejoin>(stroke_linejoin); }
+        ColorInterpolation color_interpolation_value() const { return static_cast<ColorInterpolation>(color_interpolation); }
+        ColorInterpolation color_interpolation_filters_value() const { return static_cast<ColorInterpolation>(color_interpolation_filters); }
+        TextAnchor text_anchor_value() const { return static_cast<TextAnchor>(text_anchor); }
+        ReadonlySpan<ComputedValuesFFI::ComputedSvgDash> stroke_dasharray_span() const { return { stroke_dasharray.pointer, stroke_dasharray.length }; }
+        LengthPercentage const& stroke_dashoffset_value() const { return LengthPercentage::view(stroke_dashoffset); }
+        LengthPercentage const& stroke_width_value() const { return LengthPercentage::view(stroke_width); }
+        PaintOrderList paint_order_value() const
+        {
+            return {
+                static_cast<PaintOrder>(paint_order[0]),
+                static_cast<PaintOrder>(paint_order[1]),
+                static_cast<PaintOrder>(paint_order[2]),
+            };
+        }
+        Optional<BaselineMetric> dominant_baseline_value() const
+        {
+            if (!has_dominant_baseline)
+                return {};
+            return static_cast<BaselineMetric>(dominant_baseline);
+        }
 
-    LengthPercentage const& cx() const { return m_noninherited.cx; }
-    LengthPercentage const& cy() const { return m_noninherited.cy; }
-    LengthPercentage const& r() const { return m_noninherited.r; }
-    LengthPercentageOrAuto const& rx() const { return m_noninherited.ry; }
-    LengthPercentageOrAuto const& ry() const { return m_noninherited.ry; }
-    LengthPercentage const& x() const { return m_noninherited.x; }
-    LengthPercentage const& y() const { return m_noninherited.y; }
+        bool operator==(InheritedSVGValues const& other) const
+        {
+            return ComputedValuesFFI::rust_style_group_payloads_equal(style_group_index, this, &other);
+        }
+    };
 
-    Vector<NonnullRefPtr<TransformationStyleValue const>> const& transformations() const { return m_noninherited.transformations; }
-    TransformBox const& transform_box() const { return m_noninherited.transform_box; }
-    TransformOrigin const& transform_origin() const { return m_noninherited.transform_origin; }
-    TransformStyle const& transform_style() const { return m_noninherited.transform_style; }
-    RefPtr<TransformationStyleValue const> const& rotate() const { return m_noninherited.rotate; }
-    RefPtr<TransformationStyleValue const> const& translate() const { return m_noninherited.translate; }
-    RefPtr<TransformationStyleValue const> const& scale() const { return m_noninherited.scale; }
-    Optional<CSSPixels> const& perspective() const { return m_noninherited.perspective; }
-    Position const& perspective_origin() const { return m_noninherited.perspective_origin; }
+    struct InheritedTextValues : ComputedValuesFFI::InheritedTextValues {
+        static constexpr size_t style_group_index = to_underlying(StyleGroupIndex::InheritedTextValues);
+        static constexpr auto style_group_lifecycle = ComputedValuesFFI::StyleGroupLifecycle::InheritedText;
 
-    Gfx::FontCascadeList const& font_list() const { return *m_inherited.font_list; }
-    CSSPixels font_size() const { return m_inherited.font_size; }
-    double font_weight() const { return m_inherited.font_weight; }
-    Optional<FlyString> font_language_override() const { return m_inherited.font_language_override; }
-    HashMap<FlyString, double> font_variation_settings() const { return m_inherited.font_variation_settings; }
-    CSSPixels line_height() const { return m_inherited.line_height; }
+        TextAlign text_align_value() const { return static_cast<TextAlign>(text_align); }
+        WhiteSpaceCollapse white_space_collapse_value() const { return static_cast<WhiteSpaceCollapse>(white_space_collapse); }
+        CSSPixels letter_spacing_value() const { return letter_spacing; }
+        Color color_value() const { return Color::from_bgra(color); }
+        Color webkit_text_fill_color_value() const { return Color::from_bgra(webkit_text_fill_color); }
+        ReadonlySpan<ShadowData> text_shadow_span() const
+        {
+            static_assert(sizeof(ShadowData) == sizeof(ComputedValuesFFI::ComputedShadow));
+            return { reinterpret_cast<ShadowData const*>(text_shadow.pointer), text_shadow.length };
+        }
+        TextTransform text_transform_value() const { return static_cast<TextTransform>(text_transform); }
 
-    Color outline_color() const { return m_noninherited.outline_color; }
-    CSSPixels outline_offset() const { return m_noninherited.outline_offset; }
-    OutlineStyle outline_style() const { return m_noninherited.outline_style; }
-    CSSPixels outline_width() const { return m_noninherited.outline_width; }
+        bool operator==(InheritedTextValues const& other) const
+        {
+            return ComputedValuesFFI::rust_style_group_payloads_equal(style_group_index, this, &other);
+        }
+    };
 
-    TableLayout table_layout() const { return m_noninherited.table_layout; }
+    // The layout and lifecycle of this group are defined in Rust (computed_values.rs). The
+    // fields hold the underlying values of the corresponding C++ enums, and the lens getters
+    // and setters convert.
+    struct InheritedBoxValues : ComputedValuesFFI::InheritedBoxValues {
+        static constexpr size_t style_group_index = to_underlying(StyleGroupIndex::InheritedBoxValues);
+        static constexpr auto style_group_lifecycle = ComputedValuesFFI::StyleGroupLifecycle::InheritedBox;
 
-    QuotesData quotes() const { return m_inherited.quotes; }
+        Visibility visibility_value() const { return static_cast<Visibility>(visibility); }
+        Direction direction_value() const { return static_cast<Direction>(direction); }
+        WritingMode writing_mode_value() const { return static_cast<WritingMode>(writing_mode); }
+        ContentVisibility content_visibility_value() const { return static_cast<ContentVisibility>(content_visibility); }
 
-    MathShift math_shift() const { return m_inherited.math_shift; }
-    MathStyle math_style() const { return m_inherited.math_style; }
-    int math_depth() const { return m_inherited.math_depth; }
+        bool operator==(InheritedBoxValues const& other) const
+        {
+            return visibility == other.visibility
+                && direction == other.direction
+                && writing_mode == other.writing_mode
+                && content_visibility == other.content_visibility
+                && image_rendering == other.image_rendering;
+        }
+    };
 
-    ScrollbarColorData scrollbar_color() const { return m_inherited.scrollbar_color; }
-    ScrollbarWidth scrollbar_width() const { return m_noninherited.scrollbar_width; }
-    Resize resize() const { return m_noninherited.resize; }
-    WillChange const& will_change() const { return m_noninherited.will_change; }
+    // Rust owns the canonical font values and the derived layout-facing facts.
+    // The payload holds its own reference to the platform font cascade list.
+    struct FontValues : ComputedValuesFFI::FontValues {
+        static constexpr size_t style_group_index = to_underlying(StyleGroupIndex::FontValues);
+        static constexpr auto style_group_lifecycle = ComputedValuesFFI::StyleGroupLifecycle::Font;
 
-    NonnullOwnPtr<ComputedValues> clone_inherited_values() const
-    {
-        auto clone = make<ComputedValues>();
-        clone->m_inherited = m_inherited;
-        return clone;
-    }
+        WEB_API Gfx::FontCascadeList const& font_list_value() const;
+        RefPtr<StyleValue const> font_family_style_value() const;
 
-protected:
+        bool operator==(FontValues const& other) const
+        {
+            return ComputedValuesFFI::rust_style_group_payloads_equal(style_group_index, this, &other);
+        }
+    };
+
+private:
     struct InheritedValues {
-        Color caret_color { InitialValues::caret_color() };
-        CSSPixels font_size { InitialValues::font_size() };
-        RefPtr<Gfx::FontCascadeList const> font_list {};
-        double font_weight { InitialValues::font_weight() };
-        Optional<FlyString> font_language_override;
-        HashMap<FlyString, double> font_variation_settings;
-        CSSPixels line_height { InitialValues::line_height() };
-        BorderCollapse border_collapse { InitialValues::border_collapse() };
-        CaptionSide caption_side { InitialValues::caption_side() };
-        EmptyCells empty_cells { InitialValues::empty_cells() };
-        ContentVisibility content_visibility { InitialValues::content_visibility() };
-        CSSPixels border_spacing_horizontal { InitialValues::border_spacing() };
-        CSSPixels border_spacing_vertical { InitialValues::border_spacing() };
-        Color color { InitialValues::color() };
-        ColorInterpolation color_interpolation { InitialValues::color_interpolation() };
-        ColorInterpolation color_interpolation_filters { InitialValues::color_interpolation_filters() };
-
-        PreferredColorScheme color_scheme { InitialValues::color_scheme() };
-        Optional<Color> accent_color {};
-        Color webkit_text_fill_color { InitialValues::color() };
-        Vector<CursorData> cursor { InitialValues::cursor() };
-        ImageRendering image_rendering { InitialValues::image_rendering() };
-        PointerEvents pointer_events { InitialValues::pointer_events() };
-        TextAlign text_align { InitialValues::text_align() };
-        TextJustify text_justify { InitialValues::text_justify() };
-        TextTransform text_transform { InitialValues::text_transform() };
-        TextWrapMode text_wrap_mode { InitialValues::text_wrap_mode() };
-        TextDecorationSkipInk text_decoration_skip_ink { InitialValues::text_decoration_skip_ink() };
-        TextUnderlinePosition text_underline_position { InitialValues::text_underline_position() };
-        Variant<CSSPixels, double> tab_size { InitialValues::tab_size() };
-        TextIndentData text_indent { InitialValues::text_indent() };
-        CSSPixels text_underline_offset { InitialValues::text_underline_offset() };
-        WhiteSpaceCollapse white_space_collapse { InitialValues::white_space_collapse() };
-        WordBreak word_break { InitialValues::word_break() };
-        FontVariantEmoji font_variant_emoji { InitialValues::font_variant_emoji() };
-        ListStylePosition list_style_position { InitialValues::list_style_position() };
-        Visibility visibility { InitialValues::visibility() };
-        CSSPixels word_spacing { InitialValues::word_spacing() };
-        CSSPixels letter_spacing { InitialValues::letter_spacing() };
-        ListStyleType list_style_type { InitialValues::list_style_type() };
-        QuotesData quotes { InitialValues::quotes() };
-        Direction direction { InitialValues::direction() };
-        Optional<BaselineMetric> dominant_baseline { InitialValues::dominant_baseline() };
-        WritingMode writing_mode { InitialValues::writing_mode() };
-        FillRule fill_rule { InitialValues::fill_rule() };
-        StrokeLinecap stroke_linecap { InitialValues::stroke_linecap() };
-        float fill_opacity { InitialValues::fill_opacity() };
-        Optional<SVGPaint> fill;
-        Optional<SVGPaint> stroke;
-        PaintOrderList paint_order { InitialValues::paint_order() };
-        StrokeLinejoin stroke_linejoin { InitialValues::stroke_linejoin() };
-        TextAnchor text_anchor { InitialValues::text_anchor() };
-        ClipRule clip_rule { InitialValues::clip_rule() };
-        MathShift math_shift { InitialValues::math_shift() };
-        MathStyle math_style { InitialValues::math_style() };
-        Vector<Variant<LengthPercentage, float>> stroke_dasharray;
-        LengthPercentage stroke_dashoffset { InitialValues::stroke_dashoffset() };
-        double stroke_miterlimit { InitialValues::stroke_miterlimit() };
-        LengthPercentage stroke_width { InitialValues::stroke_width() };
-        Vector<ShadowData> text_shadow;
-        int math_depth { InitialValues::math_depth() };
-        ScrollbarColorData scrollbar_color { InitialValues::scrollbar_color() };
-        float stroke_opacity { InitialValues::stroke_opacity() };
+        StyleStructRef<InheritedTableValues> table;
+        StyleStructRef<InheritedListValues> list;
+        StyleStructRef<InheritedUIValues> ui;
+        StyleStructRef<InheritedSVGValues> svg;
+        StyleStructRef<InheritedTextValues> text;
+        StyleStructRef<InheritedBoxValues> box;
+        StyleStructRef<FontValues> font;
     };
 
     InheritedValues m_inherited;
 
-    struct NonInheritedValues {
-        AspectRatio aspect_ratio { InitialValues::aspect_ratio() };
-        Float float_ { InitialValues::float_() };
-        Clear clear { InitialValues::clear() };
-        TextOverflow text_overflow { InitialValues::text_overflow() };
-        Positioning position { InitialValues::position() };
-        Optional<FlyString> position_anchor { InitialValues::position_anchor() };
-        Optional<int> z_index;
-        Display display_before_box_type_transformation { InitialValues::display() };
-        Clip clip { InitialValues::clip() };
-        Display display { InitialValues::display() };
-        float opacity { InitialValues::opacity() };
-        // FIXME: Store this as flags in a u8.
-        Vector<TextDecorationLine> text_decoration_line { InitialValues::text_decoration_line() };
-        TextDecorationThickness text_decoration_thickness { TextDecorationThickness::Auto {} };
-        TextDecorationStyle text_decoration_style { InitialValues::text_decoration_style() };
-        bool has_noninitial_border_radii { false };
-        FlexWrap flex_wrap { InitialValues::flex_wrap() };
-        AlignContent align_content { InitialValues::align_content() };
-        Color text_decoration_color { InitialValues::color() };
-        Size width { InitialValues::width() };
-        Size min_width { InitialValues::min_width() };
-        Size max_width { InitialValues::max_width() };
-        Size height { InitialValues::height() };
-        Size min_height { InitialValues::min_height() };
-        Size max_height { InitialValues::max_height() };
-        LengthBox inset { InitialValues::inset() };
-        LengthBox margin { InitialValues::margin() };
-        LengthBox padding { InitialValues::padding() };
-        OverflowClipMarginData overflow_clip_margin { InitialValues::overflow_clip_margin() };
-        Filter backdrop_filter { InitialValues::backdrop_filter() };
-        Filter filter { InitialValues::filter() };
-        BorderData border_left;
-        BorderData border_top;
-        BorderData border_right;
-        BorderData border_bottom;
-        BorderRadiusData border_bottom_left_radius;
-        BorderRadiusData border_bottom_right_radius;
-        BorderRadiusData border_top_left_radius;
-        BorderRadiusData border_top_right_radius;
-        Color background_color { InitialValues::background_color() };
-        int order { InitialValues::order() };
-        Vector<BackgroundLayerData> background_layers;
-        Vector<BackgroundLayerData> mask_layers;
-        Optional<BorderImageData> border_image;
-        FlexDirection flex_direction { InitialValues::flex_direction() };
-        ColumnSpan column_span { InitialValues::column_span() };
-        BackgroundBox background_color_clip { InitialValues::background_color_clip() };
+public:
+    struct AnimationValues : ComputedValuesFFI::AnimationValues {
+        static constexpr size_t style_group_index = to_underlying(StyleGroupIndex::AnimationValues);
+        static constexpr auto style_group_lifecycle = ComputedValuesFFI::StyleGroupLifecycle::Animation;
 
-        Color flood_color { InitialValues::flood_color() };
-        FlexBasis flex_basis { InitialValues::flex_basis() };
-        float flex_grow { InitialValues::flex_grow() };
-        float flex_shrink { InitialValues::flex_shrink() };
-        AlignItems align_items { InitialValues::align_items() };
-        AlignSelf align_self { InitialValues::align_self() };
-        Appearance appearance { InitialValues::appearance() };
-        JustifyContent justify_content { InitialValues::justify_content() };
-        JustifyItems justify_items { InitialValues::justify_items() };
-        JustifySelf justify_self { InitialValues::justify_self() };
-        Overflow overflow_x { InitialValues::overflow() };
-        Overflow overflow_y { InitialValues::overflow() };
-        TransformBox transform_box { InitialValues::transform_box() };
-        TransformStyle transform_style { InitialValues::transform_style() };
-        BoxSizing box_sizing { InitialValues::box_sizing() };
-        Vector<ShadowData> box_shadow {};
-        Vector<NonnullRefPtr<TransformationStyleValue const>> transformations {};
-        TransformOrigin transform_origin {};
-        Optional<ContentData> content;
-        Variant<VerticalAlign, LengthPercentage> vertical_align { InitialValues::vertical_align() };
-        GridTrackSizeList grid_auto_columns;
-        GridTrackSizeList grid_auto_rows;
-        GridTrackSizeList grid_template_columns;
-        GridTrackSizeList grid_template_rows;
-        GridAutoFlow grid_auto_flow { InitialValues::grid_auto_flow() };
-        OutlineStyle outline_style { InitialValues::outline_style() };
-        ObjectFit object_fit { InitialValues::object_fit() };
-        ColumnCount column_count { InitialValues::column_count() };
-        GridTrackPlacement grid_column_end { InitialValues::grid_column_end() };
-        GridTrackPlacement grid_column_start { InitialValues::grid_column_start() };
-        GridTrackPlacement grid_row_end { InitialValues::grid_row_end() };
-        GridTrackPlacement grid_row_start { InitialValues::grid_row_start() };
-        Variant<LengthPercentage, NormalGap> column_gap { InitialValues::column_gap() };
-        Size column_width { InitialValues::column_width() };
-        Size column_height { InitialValues::column_height() };
-        Variant<LengthPercentage, NormalGap> row_gap { InitialValues::row_gap() };
-        GridTemplateAreas grid_template_areas { InitialValues::grid_template_areas() };
-        Gfx::Color stop_color { InitialValues::stop_color() };
-        float stop_opacity { InitialValues::stop_opacity() };
-        Color outline_color { InitialValues::outline_color() };
-        CSSPixels outline_width { InitialValues::outline_width() };
-        CSSPixels outline_offset { InitialValues::outline_offset() };
-        TableLayout table_layout { InitialValues::table_layout() };
-        UnicodeBidi unicode_bidi { InitialValues::unicode_bidi() };
-        UserSelect user_select { InitialValues::user_select() };
-        Isolation isolation { InitialValues::isolation() };
-        Containment contain { InitialValues::contain() };
-        Vector<FlyString> container_name { InitialValues::container_name() };
-        ContainerType container_type { InitialValues::container_type() };
-        MixBlendMode mix_blend_mode { InitialValues::mix_blend_mode() };
-        WhiteSpaceTrimData white_space_trim;
-        Position object_position { InitialValues::object_position() };
-        Optional<FlyString> view_transition_name;
-        TouchActionData touch_action;
-        MaskType mask_type { InitialValues::mask_type() };
-        ScrollbarWidth scrollbar_width { InitialValues::scrollbar_width() };
-        ShapeRendering shape_rendering { InitialValues::shape_rendering() };
-        float flood_opacity { InitialValues::flood_opacity() };
-        RefPtr<TransformationStyleValue const> rotate;
-        RefPtr<TransformationStyleValue const> translate;
-        RefPtr<TransformationStyleValue const> scale;
-        Optional<CSSPixels> perspective;
-        Position perspective_origin;
-        Optional<MaskReference> mask;
-        Optional<ClipPathReference> clip_path;
-        RefPtr<AbstractImageStyleValue const> mask_image;
-        LengthPercentage cx { InitialValues::cx() };
-        LengthPercentage cy { InitialValues::cy() };
-        LengthPercentage r { InitialValues::r() };
-        LengthPercentageOrAuto rx { InitialValues::rx() };
-        LengthPercentageOrAuto ry { InitialValues::ry() };
-        LengthPercentage x { InitialValues::x() };
-        LengthPercentage y { InitialValues::x() };
-        Vector<CounterData, 0> counter_increment;
-        Vector<CounterData, 0> counter_reset;
-        Vector<CounterData, 0> counter_set;
-        WillChange will_change { InitialValues::will_change() };
-        Resize resize { InitialValues::resize() };
+        Vector<ComputedAnimationName> animation_names_value() const;
+        Vector<Optional<Utf16FlyString>> transition_properties_value() const;
+        Vector<Time> transition_durations_value() const;
+        Vector<EasingFunction> transition_timing_functions_value() const;
+        Vector<Time> transition_delays_value() const;
+        Vector<TransitionBehavior> transition_behaviors_value() const;
+        bool transition_delay_and_duration_are_single_zero_value() const { return transition_delay_and_duration_are_single_zero; }
+
+        bool operator==(AnimationValues const& other) const
+        {
+            return ComputedValuesFFI::rust_style_group_payloads_equal(style_group_index, this, &other);
+        }
     };
 
+    // The layout and lifecycle of this group are defined in Rust (computed_values.rs).
+    struct SVGResetValues : ComputedValuesFFI::SVGResetValues {
+        static constexpr size_t style_group_index = to_underlying(StyleGroupIndex::SVGResetValues);
+        static constexpr auto style_group_lifecycle = ComputedValuesFFI::StyleGroupLifecycle::SVGReset;
+
+        bool operator==(SVGResetValues const& other) const
+        {
+            return ComputedValuesFFI::rust_style_group_payloads_equal(style_group_index, this, &other);
+        }
+    };
+
+    struct GridValues : ComputedValuesFFI::GridValues {
+        static constexpr size_t style_group_index = to_underlying(StyleGroupIndex::GridValues);
+        static constexpr auto style_group_lifecycle = ComputedValuesFFI::StyleGroupLifecycle::Grid;
+
+        bool operator==(GridValues const& other) const
+        {
+            return ComputedValuesFFI::rust_style_group_payloads_equal(style_group_index, this, &other);
+        }
+    };
+
+    struct AnchorValues : ComputedValuesFFI::AnchorValues {
+        static constexpr size_t style_group_index = to_underlying(StyleGroupIndex::AnchorValues);
+        static constexpr auto style_group_lifecycle = ComputedValuesFFI::StyleGroupLifecycle::Anchor;
+
+        ReadonlySpan<Utf16FlyString> anchor_names_span() const { return fly_strings(anchor_names); }
+        PositionAnchor position_anchor_value() const
+        {
+            PositionAnchor value {
+                .type = static_cast<PositionAnchor::Type>(position_anchor_type),
+                .name = {},
+            };
+            if (value.type == PositionAnchor::Type::Name)
+                value.name = Utf16FlyString::from_raw(position_anchor_name.raw);
+            return value;
+        }
+
+        bool operator==(AnchorValues const& other) const
+        {
+            return ComputedValuesFFI::rust_style_group_payloads_equal(style_group_index, this, &other);
+        }
+
+    private:
+        static ReadonlySpan<Utf16FlyString> fly_strings(ComputedValuesFFI::RetainedUtf16FlyStringList const& values)
+        {
+            static_assert(sizeof(Utf16FlyString) == sizeof(size_t));
+            static_assert(alignof(Utf16FlyString) == alignof(size_t));
+            return { reinterpret_cast<Utf16FlyString const*>(values.pointer), values.length };
+        }
+    };
+
+    struct EffectsValues : ComputedValuesFFI::EffectsValues {
+        static constexpr size_t style_group_index = to_underlying(StyleGroupIndex::EffectsValues);
+        static constexpr auto style_group_lifecycle = ComputedValuesFFI::StyleGroupLifecycle::Effects;
+
+        ComputedFilterView filter_value() const { return ComputedFilterView { filter }; }
+        ComputedFilterView backdrop_filter_value() const { return ComputedFilterView { backdrop_filter }; }
+        MixBlendMode mix_blend_mode_value() const { return static_cast<MixBlendMode>(mix_blend_mode); }
+        Isolation isolation_value() const { return static_cast<Isolation>(isolation); }
+        ReadonlySpan<ShadowData> box_shadow_span() const
+        {
+            static_assert(sizeof(ShadowData) == sizeof(ComputedValuesFFI::ComputedShadow));
+            static_assert(alignof(ShadowData) == alignof(ComputedValuesFFI::ComputedShadow));
+            return { reinterpret_cast<ShadowData const*>(box_shadows.pointer), box_shadows.length };
+        }
+        Clip clip_value() const
+        {
+            if (!clip_is_rect)
+                return Clip::make_auto();
+            auto edge = [](ComputedValuesFFI::ComputedClipEdge const& value) {
+                if (value.is_auto)
+                    return LengthOrAuto::make_auto();
+                return LengthOrAuto { Length { value.value, static_cast<LengthUnit>(value.unit) } };
+            };
+            return Clip { EdgeRect {
+                edge(clip_edges[0]),
+                edge(clip_edges[1]),
+                edge(clip_edges[2]),
+                edge(clip_edges[3]),
+            } };
+        }
+
+        bool operator==(EffectsValues const& other) const
+        {
+            return ComputedValuesFFI::rust_style_group_payloads_equal(style_group_index, this, &other);
+        }
+    };
+
+    struct MaskValues : ComputedValuesFFI::MaskValues {
+        static constexpr size_t style_group_index = to_underlying(StyleGroupIndex::MaskValues);
+        static constexpr auto style_group_lifecycle = ComputedValuesFFI::StyleGroupLifecycle::Mask;
+
+        Optional<MaskReference> mask_value() const;
+        MaskType mask_type_value() const;
+        RefPtr<AbstractImageStyleValue const> mask_image_value() const;
+        Vector<BackgroundLayerData> mask_layers_value() const;
+        // https://drafts.fxtf.org/css-masking/#the-clip-path
+        // TODO: Support basic shapes and geometry boxes.
+        Optional<URL> clip_path_value() const;
+
+        bool operator==(MaskValues const& other) const
+        {
+            return ComputedValuesFFI::rust_style_group_payloads_equal(style_group_index, this, &other);
+        }
+    };
+
+    struct TextResetValues : ComputedValuesFFI::TextResetValues {
+        static constexpr size_t style_group_index = to_underlying(StyleGroupIndex::TextResetValues);
+        static constexpr auto style_group_lifecycle = ComputedValuesFFI::StyleGroupLifecycle::TextReset;
+
+        ReadonlySpan<TextDecorationLine> decoration_lines() const
+        {
+            static_assert(sizeof(TextDecorationLine) == sizeof(u8));
+            return { reinterpret_cast<TextDecorationLine const*>(text_decoration_lines.pointer), text_decoration_lines.length };
+        }
+
+        TextDecorationThickness decoration_thickness() const
+        {
+            if (text_decoration_thickness_kind == 0)
+                return TextDecorationThickness { TextDecorationThickness::Auto {} };
+            if (text_decoration_thickness_kind == 1)
+                return TextDecorationThickness { TextDecorationThickness::FromFont {} };
+            return TextDecorationThickness { LengthPercentage::view(text_decoration_thickness) };
+        }
+
+        bool operator==(TextResetValues const& other) const
+        {
+            return ComputedValuesFFI::rust_style_group_payloads_equal(style_group_index, this, &other);
+        }
+    };
+
+    struct ContentValues : ComputedValuesFFI::ContentValues {
+        static constexpr size_t style_group_index = to_underlying(StyleGroupIndex::ContentValues);
+        static constexpr auto style_group_lifecycle = ComputedValuesFFI::StyleGroupLifecycle::Content;
+
+        NonnullRefPtr<StyleValue const> computed_content_value() const;
+        bool content_is_normal() const;
+        bool content_uses_list_item_counter() const;
+        Vector<CounterData, 0> counter_increment_value() const;
+        Vector<CounterData, 0> counter_reset_value() const;
+        Vector<CounterData, 0> counter_set_value() const;
+        // True when the property is the `none` keyword, which is the only form that yields no counters.
+        bool counter_increment_is_none() const;
+        bool counter_reset_is_none() const;
+        bool counter_set_is_none() const;
+        bool counter_reset_has_reversed_counter() const;
+        bool counter_increment_names_list_item() const;
+
+        bool operator==(ContentValues const& other) const
+        {
+            return ComputedValuesFFI::rust_style_group_payloads_equal(style_group_index, this, &other);
+        }
+    };
+
+    struct TransformValues : public ComputedValuesFFI::TransformValues {
+        static constexpr size_t style_group_index = to_underlying(StyleGroupIndex::TransformValues);
+        static constexpr auto style_group_lifecycle = ComputedValuesFFI::StyleGroupLifecycle::Transform;
+
+        static RefPtr<StyleValue const> style_value(ComputedValuesFFI::ComputedStyleValueHandle const& handle)
+        {
+            if (!handle.pointer)
+                return nullptr;
+            return StyleValue::adopt_rust_style_value_data(StyleValueFFI::rust_style_value_retain(
+                static_cast<StyleValueFFI::StyleValueData const*>(handle.pointer)));
+        }
+
+        bool has_transformations() const { return transformations.pointer; }
+        template<typename Callback>
+        void for_each_transformation(Callback callback) const
+        {
+            auto value = style_value(transformations);
+            if (!value)
+                return;
+            for (auto const& transformation : transformations_for_style_value(*value))
+                callback(*transformation);
+        }
+
+        template<typename Callback>
+        void for_each_resolved_transform(Callback callback) const
+        {
+            for (size_t index = 0; index < resolved_transforms.length; ++index) {
+                auto const& entry = resolved_transforms.pointer[index];
+                if (entry.is_translate) {
+                    callback(ResolvedTransform { ResolvedTransform::Translate {
+                        .x = { .px = entry.x_px, .percentage_value = style_value(entry.x_percentage) },
+                        .y = { .px = entry.y_px, .percentage_value = style_value(entry.y_percentage) },
+                        .z = entry.z_px,
+                    } });
+                    continue;
+                }
+                auto const& matrix = entry.matrix;
+                callback(ResolvedTransform { FloatMatrix4x4(
+                    matrix[0], matrix[1], matrix[2], matrix[3],
+                    matrix[4], matrix[5], matrix[6], matrix[7],
+                    matrix[8], matrix[9], matrix[10], matrix[11],
+                    matrix[12], matrix[13], matrix[14], matrix[15]) });
+            }
+        }
+
+        TransformOrigin transform_origin_value() const
+        {
+            return {
+                LengthPercentage::view(transform_origin_x),
+                LengthPercentage::view(transform_origin_y),
+                LengthPercentage::view(transform_origin_z),
+            };
+        }
+        TransformStyle transform_style_value() const { return static_cast<TransformStyle>(transform_style); }
+        BackfaceVisibility backface_visibility_value() const { return static_cast<BackfaceVisibility>(backface_visibility); }
+        RefPtr<TransformationStyleValue const> rotate_value() const { return transformation_value(rotate); }
+        RefPtr<TransformationStyleValue const> translate_value() const { return transformation_value(translate); }
+        RefPtr<TransformationStyleValue const> scale_value() const { return transformation_value(scale); }
+        static void set_transformation(ComputedValuesFFI::ComputedStyleValueHandle& handle, TransformationStyleValue const* value)
+        {
+            StyleValueFFI::rust_style_value_release(static_cast<StyleValueFFI::StyleValueData const*>(handle.pointer));
+            handle.pointer = value ? StyleValueFFI::rust_style_value_retain(value->rust_style_value_data()) : nullptr;
+        }
+        Optional<CSSPixels> perspective_value() const
+        {
+            if (!has_perspective)
+                return {};
+            return CSSPixels::from_raw(perspective_px);
+        }
+        bool operator==(TransformValues const& other) const
+        {
+            return ComputedValuesFFI::rust_style_group_payloads_equal(style_group_index, this, &other);
+        }
+
+    private:
+        static RefPtr<TransformationStyleValue const> transformation_value(ComputedValuesFFI::ComputedStyleValueHandle const& handle)
+        {
+            auto value = style_value(handle);
+            if (!value)
+                return nullptr;
+            return value->as_transformation();
+        }
+    };
+
+    struct BackgroundValues : ComputedValuesFFI::BackgroundValues {
+        static constexpr size_t style_group_index = to_underlying(StyleGroupIndex::BackgroundValues);
+        static constexpr auto style_group_lifecycle = ComputedValuesFFI::StyleGroupLifecycle::Background;
+
+        Color background_color_value() const { return Color::from_bgra(background_color); }
+        Vector<BackgroundLayerData> background_layers_value() const;
+
+        bool operator==(BackgroundValues const& other) const
+        {
+            return ComputedValuesFFI::rust_style_group_payloads_equal(style_group_index, this, &other);
+        }
+    };
+
+    struct BorderValues : ComputedValuesFFI::BorderValues {
+        static constexpr size_t style_group_index = to_underlying(StyleGroupIndex::BorderValues);
+        static constexpr auto style_group_lifecycle = ComputedValuesFFI::StyleGroupLifecycle::Border;
+
+        BorderData const& border_left_value() const { return reinterpret_cast<BorderData const&>(border_left); }
+        BorderData const& border_top_value() const { return reinterpret_cast<BorderData const&>(border_top); }
+        BorderData const& border_right_value() const { return reinterpret_cast<BorderData const&>(border_right); }
+        BorderData const& border_bottom_value() const { return reinterpret_cast<BorderData const&>(border_bottom); }
+        BorderImageData border_image_value() const;
+
+        bool operator==(BorderValues const& other) const
+        {
+            return ComputedValuesFFI::rust_style_group_payloads_equal(style_group_index, this, &other);
+        }
+    };
+
+    struct AlignmentValues : ComputedValuesFFI::AlignmentValues {
+        static constexpr size_t style_group_index = to_underlying(StyleGroupIndex::AlignmentValues);
+        static constexpr auto style_group_lifecycle = ComputedValuesFFI::StyleGroupLifecycle::Alignment;
+
+        bool operator==(AlignmentValues const& other) const
+        {
+            auto gaps_equal = [](auto const& first, auto const& second) {
+                if (first.is_normal || second.is_normal)
+                    return first.is_normal == second.is_normal;
+                return LengthPercentage::view(first.value) == LengthPercentage::view(second.value);
+            };
+            return webkit_box_orient == other.webkit_box_orient
+                && flex_direction == other.flex_direction
+                && flex_wrap == other.flex_wrap
+                && flex_basis.is_content == other.flex_basis.is_content
+                && Size::view(flex_basis.size) == Size::view(other.flex_basis.size)
+                && flex_grow == other.flex_grow
+                && flex_shrink == other.flex_shrink
+                && order == other.order
+                && align_content == other.align_content
+                && align_items == other.align_items
+                && align_self == other.align_self
+                && justify_content == other.justify_content
+                && justify_items == other.justify_items
+                && justify_self == other.justify_self
+                && gaps_equal(column_gap, other.column_gap)
+                && gaps_equal(row_gap, other.row_gap);
+        }
+    };
+
+    struct MiscResetValues : ComputedValuesFFI::MiscResetValues {
+        static constexpr size_t style_group_index = to_underlying(StyleGroupIndex::MiscResetValues);
+        static constexpr auto style_group_lifecycle = ComputedValuesFFI::StyleGroupLifecycle::MiscReset;
+
+        Optional<Utf16FlyString> view_transition_name_value() const;
+        TouchActionData touch_action_value() const;
+        ScrollSnapAlignData scroll_snap_align_value() const;
+        ScrollSnapType scroll_snap_type_value() const;
+        WillChange will_change_value() const;
+
+        bool operator==(MiscResetValues const& other) const
+        {
+            return ComputedValuesFFI::rust_style_group_payloads_equal(style_group_index, this, &other);
+        }
+    };
+
+    struct SizingValues : ComputedValuesFFI::SizingValues {
+        static constexpr size_t style_group_index = to_underlying(StyleGroupIndex::SizingValues);
+        static constexpr auto style_group_lifecycle = ComputedValuesFFI::StyleGroupLifecycle::Sizing;
+
+        bool operator==(SizingValues const& other) const
+        {
+            return Size::view(width) == Size::view(other.width)
+                && Size::view(min_width) == Size::view(other.min_width)
+                && Size::view(max_width) == Size::view(other.max_width)
+                && Size::view(height) == Size::view(other.height)
+                && Size::view(min_height) == Size::view(other.min_height)
+                && Size::view(max_height) == Size::view(other.max_height);
+        }
+    };
+
+    struct SurroundValues : ComputedValuesFFI::SurroundValues {
+        static constexpr size_t style_group_index = to_underlying(StyleGroupIndex::SurroundValues);
+        static constexpr auto style_group_lifecycle = ComputedValuesFFI::StyleGroupLifecycle::Surround;
+
+        bool operator==(SurroundValues const& other) const
+        {
+            return ComputedValuesFFI::rust_style_group_payloads_equal(style_group_index, this, &other);
+        }
+    };
+
+    struct BoxValues : ComputedValuesFFI::BoxValues {
+        static constexpr size_t style_group_index = to_underlying(StyleGroupIndex::BoxValues);
+        static constexpr auto style_group_lifecycle = ComputedValuesFFI::StyleGroupLifecycle::Box;
+
+        Display display_value() const { return display_from_ffi_display(display); }
+        Display display_before_box_type_transformation_value() const { return display_from_ffi_display(display_before_box_type_transformation); }
+        Float float_value() const { return static_cast<Float>(float_); }
+        Clear clear_value() const { return static_cast<Clear>(clear); }
+        Positioning position_value() const { return static_cast<Positioning>(position); }
+
+        bool operator==(BoxValues const& other) const
+        {
+            return ComputedValuesFFI::rust_style_group_payloads_equal(style_group_index, this, &other);
+        }
+    };
+
+    // Resolves the content property straight from the two groups it reads, for a caller holding a
+    // style record's payloads rather than a whole style.
+    static ContentDataAndQuoteNestingLevel resolved_content(ContentValues const&, InheritedListValues const&, DOM::AbstractElement&, u32 initial_quote_nesting_level, NotifyListItemCounterRendered);
+
+private:
+    struct NonInheritedValues {
+        StyleStructRef<AnimationValues> animation;
+        StyleStructRef<BoxValues> box;
+        StyleStructRef<SurroundValues> surround;
+        StyleStructRef<SizingValues> sizing;
+        StyleStructRef<MiscResetValues> misc;
+        StyleStructRef<AlignmentValues> alignment;
+        StyleStructRef<BorderValues> border;
+        StyleStructRef<BackgroundValues> background;
+        StyleStructRef<TransformValues> transform;
+        StyleStructRef<EffectsValues> effects;
+        StyleStructRef<MaskValues> mask_data;
+        StyleStructRef<TextResetValues> text_reset;
+        StyleStructRef<ContentValues> content_data;
+        StyleStructRef<AnchorValues> anchor;
+        StyleStructRef<GridValues> grid;
+        StyleStructRef<SVGResetValues> svg_reset;
+    };
+
+    // Retains `table` (releasing any table held before) and points the value span at it.
+    void adopt_computed_longhand_table(void const* table);
+    void refresh_computed_longhand_table_views();
+    // Takes `previous`'s table when every slot and the inheritance inventory hold equal values,
+    // so the next publication interns the same pointers and keeps the style-record identity.
+    void adopt_identical_computed_longhand_table(ComputedValues const& previous) const;
+    void clear_computed_longhand_table();
+    // Takes `other`'s table by reference count, or materializes an owned table from `other`'s
+    // borrowed record span, so the copy never outlives its source's storage.
+    void copy_computed_longhand_table_from(ComputedValues const& other);
+
     NonInheritedValues m_noninherited;
+    AK::FixedBitmap<number_of_longhand_properties> m_property_important { false };
+    AK::FixedBitmap<number_of_longhand_properties> m_property_inherited { false };
+    ReadonlySpan<ComputedValuesFFI::FfiTableInheritanceDependentValue const> m_inheritance_dependent_specified_values;
+    mutable OwnPtr<HashMap<PropertyID, NonnullRefPtr<StyleValue const>>> m_style_value_cache;
+    // The drive's frozen computed longhand table, retained when this style owns a reference;
+    // null for borrowed style-record views and for styles built without a drive.
+    void const* m_computed_longhand_table { nullptr };
+    // One stored data pointer per longhand (null where the drive stored none): the owned table's
+    // span, or the span borrowed from the style record's interned table. Empty without a table.
+    ReadonlySpan<void const*> m_longhand_values;
+    RefPtr<ComputedValues const> m_base_values;
+    ComputedValues const* m_borrowed_base_values { nullptr };
+    RefPtr<AnimatedProperties const> m_animated_properties;
+    u64 m_pseudo_element_styles { 0 };
+    bool m_depends_on_viewport_metrics { false };
+    bool m_font_metrics_depend_on_viewport_metrics { false };
+    bool m_in_display_none_subtree { false };
+    bool m_highlight_colors_authored { false };
+    bool m_highlight_color_is_current_color { false };
+    bool m_is_style_record_view { false };
 };
 
-class ImmutableComputedValues final : public ComputedValues {
-};
+// Reads one group out of a style record's payload array, for a caller that already holds the array
+// and wants more than one group out of it.
+template<typename StyleGroup>
+StyleGroup const* style_group_from_payloads(void const* payloads)
+{
+    if (!payloads)
+        return nullptr;
+    auto const* payload = static_cast<void const* const*>(payloads)[StyleGroup::style_group_index];
+    VERIFY(payload);
+    return static_cast<StyleGroup const*>(payload);
+}
 
-class MutableComputedValues final : public ComputedValues {
+// A synchronous, allocation-free compatibility surface over the payloads of
+// one authoritative StyleRecord. It owns no group or metadata payload.
+class WEB_API ComputedStyleRecordView {
+    AK_MAKE_NONCOPYABLE(ComputedStyleRecordView);
+    AK_MAKE_NONMOVABLE(ComputedStyleRecordView);
+
 public:
-    void inherit_from(ComputedValues const& other)
+    ComputedStyleRecordView() = default;
+    ComputedStyleRecordView(StyleEngineFFI::FfiStyleRecordView const&, StyleComputer const&, StyleRecordID, bool owns_style_record_pin);
+    ~ComputedStyleRecordView();
+
+    explicit operator bool() const { return m_present; }
+    ComputedValues const* operator->() const
     {
-        m_inherited = static_cast<MutableComputedValues const&>(other).m_inherited;
+        if (!m_present)
+            return nullptr;
+        return &m_values;
+    }
+    ComputedValues const& operator*() const
+    {
+        VERIFY(m_present);
+        return m_values;
     }
 
-    void set_aspect_ratio(AspectRatio aspect_ratio) { m_noninherited.aspect_ratio = move(aspect_ratio); }
-    void set_caret_color(Color caret_color) { m_inherited.caret_color = caret_color; }
-    void set_font_list(NonnullRefPtr<Gfx::FontCascadeList const> font_list) { m_inherited.font_list = move(font_list); }
-    void set_font_size(CSSPixels font_size) { m_inherited.font_size = font_size; }
-    void set_font_weight(double font_weight) { m_inherited.font_weight = font_weight; }
-    void set_font_language_override(Optional<FlyString> font_language_override) { m_inherited.font_language_override = move(font_language_override); }
-    void set_font_variation_settings(HashMap<FlyString, double> value) { m_inherited.font_variation_settings = move(value); }
-    void set_line_height(CSSPixels line_height) { m_inherited.line_height = line_height; }
-    void set_border_spacing_horizontal(CSSPixels border_spacing_horizontal) { m_inherited.border_spacing_horizontal = move(border_spacing_horizontal); }
-    void set_border_spacing_vertical(CSSPixels border_spacing_vertical) { m_inherited.border_spacing_vertical = move(border_spacing_vertical); }
-    void set_caption_side(CaptionSide caption_side) { m_inherited.caption_side = caption_side; }
-    void set_color(Color color) { m_inherited.color = color; }
-    void set_color_interpolation(ColorInterpolation color_interpolation) { m_inherited.color_interpolation = color_interpolation; }
-    void set_color_interpolation_filters(ColorInterpolation color_interpolation_filters) { m_inherited.color_interpolation_filters = color_interpolation_filters; }
-    void set_color_scheme(PreferredColorScheme color_scheme) { m_inherited.color_scheme = color_scheme; }
-    void set_clip(Clip const& clip) { m_noninherited.clip = clip; }
-    void set_content(ContentData const& content) { m_noninherited.content = content; }
-    void set_content_visibility(ContentVisibility content_visibility) { m_inherited.content_visibility = content_visibility; }
-    void set_cursor(Vector<CursorData> cursor) { m_inherited.cursor = move(cursor); }
-    void set_image_rendering(ImageRendering value) { m_inherited.image_rendering = value; }
-    void set_pointer_events(PointerEvents value) { m_inherited.pointer_events = value; }
-    void set_background_color(Color color) { m_noninherited.background_color = color; }
-    void set_background_color_clip(BackgroundBox box) { m_noninherited.background_color_clip = box; }
-    void set_background_layers(Vector<BackgroundLayerData>&& layers) { m_noninherited.background_layers = move(layers); }
-    void set_mask_layers(Vector<BackgroundLayerData>&& layers) { m_noninherited.mask_layers = move(layers); }
-    void set_border_image(Optional<BorderImageData> border_image) { m_noninherited.border_image = move(border_image); }
-    void set_float(Float value) { m_noninherited.float_ = value; }
-    void set_clear(Clear value) { m_noninherited.clear = value; }
-    void set_z_index(Optional<int> value) { m_noninherited.z_index = move(value); }
-    void set_tab_size(Variant<CSSPixels, double> value) { m_inherited.tab_size = move(value); }
-    void set_text_align(TextAlign text_align) { m_inherited.text_align = text_align; }
-    void set_text_justify(TextJustify text_justify) { m_inherited.text_justify = text_justify; }
-    void set_text_decoration_line(Vector<TextDecorationLine> value) { m_noninherited.text_decoration_line = move(value); }
-    void set_text_decoration_thickness(TextDecorationThickness value) { m_noninherited.text_decoration_thickness = move(value); }
-    void set_text_decoration_skip_ink(TextDecorationSkipInk value) { m_inherited.text_decoration_skip_ink = value; }
-    void set_text_decoration_style(TextDecorationStyle value) { m_noninherited.text_decoration_style = value; }
-    void set_text_decoration_color(Color value) { m_noninherited.text_decoration_color = value; }
-    void set_text_transform(TextTransform value) { m_inherited.text_transform = value; }
-    void set_text_shadow(Vector<ShadowData>&& value) { m_inherited.text_shadow = move(value); }
-    void set_text_indent(TextIndentData value) { m_inherited.text_indent = move(value); }
-    void set_text_wrap_mode(TextWrapMode value) { m_inherited.text_wrap_mode = value; }
-    void set_text_overflow(TextOverflow value) { m_noninherited.text_overflow = value; }
-    void set_text_underline_offset(CSSPixels value) { m_inherited.text_underline_offset = value; }
-    void set_text_underline_position(TextUnderlinePosition value) { m_inherited.text_underline_position = value; }
-    void set_webkit_text_fill_color(Color value) { m_inherited.webkit_text_fill_color = value; }
-    void set_position(Positioning position) { m_noninherited.position = position; }
-    void set_position_anchor(Optional<FlyString> value) { m_noninherited.position_anchor = move(value); }
-    void set_white_space_collapse(WhiteSpaceCollapse value) { m_inherited.white_space_collapse = value; }
-    void set_white_space_trim(WhiteSpaceTrimData value) { m_noninherited.white_space_trim = value; }
-    void set_word_spacing(CSSPixels value) { m_inherited.word_spacing = value; }
-    void set_word_break(WordBreak value) { m_inherited.word_break = value; }
-    void set_font_variant_emoji(FontVariantEmoji value) { m_inherited.font_variant_emoji = value; }
-    void set_letter_spacing(CSSPixels value) { m_inherited.letter_spacing = value; }
-    void set_width(Size const& width) { m_noninherited.width = width; }
-    void set_min_width(Size const& width) { m_noninherited.min_width = width; }
-    void set_max_width(Size const& width) { m_noninherited.max_width = width; }
-    void set_height(Size const& height) { m_noninherited.height = height; }
-    void set_min_height(Size const& height) { m_noninherited.min_height = height; }
-    void set_max_height(Size const& height) { m_noninherited.max_height = height; }
-    void set_inset(LengthBox const& inset) { m_noninherited.inset = inset; }
-    void set_margin(LengthBox const& margin) { m_noninherited.margin = margin; }
-    void set_padding(LengthBox const& padding) { m_noninherited.padding = padding; }
-    void set_overflow_clip_margin(OverflowClipMarginData const& overflow_clip_margin) { m_noninherited.overflow_clip_margin = overflow_clip_margin; }
-    void set_overflow_x(Overflow value) { m_noninherited.overflow_x = value; }
-    void set_overflow_y(Overflow value) { m_noninherited.overflow_y = value; }
-    void set_list_style_type(ListStyleType value) { m_inherited.list_style_type = move(value); }
-    void set_list_style_position(ListStylePosition value) { m_inherited.list_style_position = move(value); }
-    void set_display(Display value) { m_noninherited.display = value; }
-    void set_display_before_box_type_transformation(Display value) { m_noninherited.display_before_box_type_transformation = value; }
-    void set_backdrop_filter(Filter const& backdrop_filter) { m_noninherited.backdrop_filter = backdrop_filter; }
-    void set_filter(Filter const& filter) { m_noninherited.filter = filter; }
-    void set_border_bottom_left_radius(BorderRadiusData value)
+private:
+    Optional<ComputedValues> m_base_values;
+    ComputedValues m_values { ComputedValues::BorrowedStyleRecord::Yes };
+    GC::Ptr<StyleComputer const> m_style_computer;
+    StyleRecordID m_style_record_identity;
+    bool m_owns_style_record_pin { false };
+    bool m_present { false };
+};
+
+// The input to layout-node construction is either an authoritative style
+// record for a DOM style target or an owned style for an anonymous box.
+class LayoutStyle {
+public:
+    LayoutStyle() = default;
+    LayoutStyle(StyleRecordID style_record_identity)
+        : m_style_record_identity(style_record_identity)
     {
-        if (value.is_initial() && !m_noninherited.has_noninitial_border_radii)
+        VERIFY(style_record_identity);
+    }
+    LayoutStyle(NonnullRefPtr<ComputedValues const> values)
+        : m_values(move(values))
+    {
+    }
+    LayoutStyle(RefPtr<ComputedValues const> values)
+        : m_values(move(values))
+    {
+    }
+
+    explicit operator bool() const { return !!m_style_record_identity || m_values; }
+    [[nodiscard]] StyleRecordID style_record_identity() const { return m_style_record_identity; }
+    [[nodiscard]] RefPtr<ComputedValues const> const& values() const { return m_values; }
+
+private:
+    RefPtr<ComputedValues const> m_values;
+    StyleRecordID m_style_record_identity;
+};
+
+class ComputedValues::Mutator final {
+private:
+    friend class Builder;
+
+    explicit Mutator(ComputedValues& values)
+        : m_values(values)
+    {
+    }
+
+public:
+    void set_property_important(PropertyID property_id, bool value) { m_values.m_property_important.set(ComputedValues::property_bitmap_index(property_id), value); }
+    void set_property_inherited(PropertyID property_id, bool value) { m_values.m_property_inherited.set(ComputedValues::property_bitmap_index(property_id), value); }
+    void set_property_flag_bitmaps(ReadonlyBytes importance, ReadonlyBytes inheritance)
+    {
+        m_values.m_property_important.copy_from(importance);
+        m_values.m_property_inherited.copy_from(inheritance);
+    }
+    void set_depends_on_viewport_metrics(bool value) { m_values.m_depends_on_viewport_metrics = value; }
+    void set_font_metrics_depend_on_viewport_metrics(bool value) { m_values.m_font_metrics_depend_on_viewport_metrics = value; }
+    void set_in_display_none_subtree(bool value) { m_values.m_in_display_none_subtree = value; }
+    void set_highlight_colors_authored(bool value) { m_values.m_highlight_colors_authored = value; }
+    void set_highlight_color_is_current_color(bool value) { m_values.m_highlight_color_is_current_color = value; }
+    void set_pseudo_element_styles(u64 value) { m_values.m_pseudo_element_styles = value; }
+    void set_computed_longhand_table(void const* table) { m_values.adopt_computed_longhand_table(table); }
+    void set_base_values(NonnullRefPtr<ComputedValues const> value)
+    {
+        m_values.m_base_values = move(value);
+        m_values.m_borrowed_base_values = nullptr;
+    }
+    void set_animated_properties(AnimatedProperties const*);
+
+    // Rust-built payloads arrive in StyleGroupIndex order carrying this reference.
+    void adopt_style_group_payloads(ReadonlySpan<void const*> payloads)
+    {
+        VERIFY(payloads.size() == to_underlying(StyleGroupIndex::Count));
+        size_t index = 0;
+#define LIBWEB_ADOPT_STYLE_GROUP(name, path, sharing_name, affects_layout) \
+    if (payloads[index])                                                   \
+        m_values.path.adopt(const_cast<void*>(payloads[index]));           \
+    ++index;
+        LIBWEB_ENUMERATE_COMPUTED_VALUE_STYLE_GROUPS(LIBWEB_ADOPT_STYLE_GROUP)
+#undef LIBWEB_ADOPT_STYLE_GROUP
+    }
+    void set_color(Color color)
+    {
+        if (m_values.m_inherited.text->color_value() == color)
             return;
-        m_noninherited.has_noninitial_border_radii = true;
-        m_noninherited.border_bottom_left_radius = move(value);
+        m_values.m_inherited.text.access().color = color.value();
     }
-    void set_border_bottom_right_radius(BorderRadiusData value)
+    void set_color_scheme(PreferredColorScheme color_scheme)
     {
-        if (value.is_initial() && !m_noninherited.has_noninitial_border_radii)
+        if (m_values.m_inherited.ui->color_scheme_value() == color_scheme)
             return;
-        m_noninherited.has_noninitial_border_radii = true;
-        m_noninherited.border_bottom_right_radius = move(value);
+        m_values.m_inherited.ui.access().color_scheme = to_underlying(color_scheme);
     }
-    void set_border_top_left_radius(BorderRadiusData value)
+    void set_text_align(TextAlign text_align)
     {
-        if (value.is_initial() && !m_noninherited.has_noninitial_border_radii)
+        if (m_values.m_inherited.text->text_align_value() == text_align)
             return;
-        m_noninherited.has_noninitial_border_radii = true;
-        m_noninherited.border_top_left_radius = move(value);
+        m_values.m_inherited.text.access().text_align = to_underlying(text_align);
     }
-    void set_border_top_right_radius(BorderRadiusData value)
+    void set_letter_spacing(CSSPixels value)
     {
-        if (value.is_initial() && !m_noninherited.has_noninitial_border_radii)
+        if (m_values.m_inherited.text->letter_spacing_value() == value)
             return;
-        m_noninherited.has_noninitial_border_radii = true;
-        m_noninherited.border_top_right_radius = move(value);
+        m_values.m_inherited.text.access().letter_spacing = value;
     }
-    BorderData& border_left() { return m_noninherited.border_left; }
-    BorderData& border_top() { return m_noninherited.border_top; }
-    BorderData& border_right() { return m_noninherited.border_right; }
-    BorderData& border_bottom() { return m_noninherited.border_bottom; }
-    void set_flex_direction(FlexDirection value) { m_noninherited.flex_direction = value; }
-    void set_flex_wrap(FlexWrap value) { m_noninherited.flex_wrap = value; }
-    void set_flex_basis(FlexBasis value) { m_noninherited.flex_basis = move(value); }
-    void set_flex_grow(float value) { m_noninherited.flex_grow = value; }
-    void set_flex_shrink(float value) { m_noninherited.flex_shrink = value; }
-    void set_order(int value) { m_noninherited.order = value; }
-    void set_accent_color(Color value) { m_inherited.accent_color = value; }
-    void set_align_content(AlignContent value) { m_noninherited.align_content = value; }
-    void set_align_items(AlignItems value) { m_noninherited.align_items = value; }
-    void set_align_self(AlignSelf value) { m_noninherited.align_self = value; }
-    void set_appearance(Appearance value) { m_noninherited.appearance = value; }
-    void set_opacity(float value) { m_noninherited.opacity = value; }
-    void set_justify_content(JustifyContent value) { m_noninherited.justify_content = value; }
-    void set_justify_items(JustifyItems value) { m_noninherited.justify_items = value; }
-    void set_justify_self(JustifySelf value) { m_noninherited.justify_self = value; }
-    void set_box_shadow(Vector<ShadowData>&& value) { m_noninherited.box_shadow = move(value); }
-    void set_rotate(RefPtr<TransformationStyleValue const> value) { m_noninherited.rotate = move(value); }
-    void set_scale(RefPtr<TransformationStyleValue const> value) { m_noninherited.scale = move(value); }
-    void set_perspective(Optional<CSSPixels> value) { m_noninherited.perspective = move(value); }
-    void set_perspective_origin(Position value) { m_noninherited.perspective_origin = move(value); }
-    void set_transformations(Vector<NonnullRefPtr<TransformationStyleValue const>> value) { m_noninherited.transformations = move(value); }
-    void set_transform_box(TransformBox value) { m_noninherited.transform_box = value; }
-    void set_transform_origin(TransformOrigin value) { m_noninherited.transform_origin = value; }
-    void set_transform_style(TransformStyle value) { m_noninherited.transform_style = value; }
-    void set_translate(RefPtr<TransformationStyleValue const> value) { m_noninherited.translate = move(value); }
-    void set_box_sizing(BoxSizing value) { m_noninherited.box_sizing = value; }
-    void set_vertical_align(Variant<VerticalAlign, LengthPercentage> value) { m_noninherited.vertical_align = move(value); }
-    void set_visibility(Visibility value) { m_inherited.visibility = value; }
-    void set_grid_auto_columns(GridTrackSizeList value) { m_noninherited.grid_auto_columns = move(value); }
-    void set_grid_auto_rows(GridTrackSizeList value) { m_noninherited.grid_auto_rows = move(value); }
-    void set_grid_template_columns(GridTrackSizeList value) { m_noninherited.grid_template_columns = move(value); }
-    void set_grid_template_rows(GridTrackSizeList value) { m_noninherited.grid_template_rows = move(value); }
-    void set_grid_column_end(GridTrackPlacement value) { m_noninherited.grid_column_end = move(value); }
-    void set_grid_column_start(GridTrackPlacement value) { m_noninherited.grid_column_start = move(value); }
-    void set_grid_row_end(GridTrackPlacement value) { m_noninherited.grid_row_end = move(value); }
-    void set_grid_row_start(GridTrackPlacement value) { m_noninherited.grid_row_start = move(value); }
-    void set_column_count(ColumnCount value) { m_noninherited.column_count = value; }
-    void set_column_gap(Variant<LengthPercentage, NormalGap> const& column_gap) { m_noninherited.column_gap = column_gap; }
-    void set_column_span(ColumnSpan const column_span) { m_noninherited.column_span = column_span; }
-    void set_column_width(Size const& column_width) { m_noninherited.column_width = column_width; }
-    void set_column_height(Size const& column_height) { m_noninherited.column_height = column_height; }
-    void set_row_gap(Variant<LengthPercentage, NormalGap> const& row_gap) { m_noninherited.row_gap = row_gap; }
-    void set_border_collapse(BorderCollapse const border_collapse) { m_inherited.border_collapse = border_collapse; }
-    void set_empty_cells(EmptyCells const empty_cells) { m_inherited.empty_cells = empty_cells; }
-    void set_grid_template_areas(GridTemplateAreas grid_template_areas) { m_noninherited.grid_template_areas = move(grid_template_areas); }
-    void set_grid_auto_flow(GridAutoFlow grid_auto_flow) { m_noninherited.grid_auto_flow = grid_auto_flow; }
-    void set_table_layout(TableLayout value) { m_noninherited.table_layout = value; }
-    void set_quotes(QuotesData value) { m_inherited.quotes = move(value); }
-    void set_object_fit(ObjectFit value) { m_noninherited.object_fit = value; }
-    void set_object_position(Position value) { m_noninherited.object_position = move(value); }
-    void set_direction(Direction value) { m_inherited.direction = value; }
-    void set_dominant_baseline(Optional<BaselineMetric> value) { m_inherited.dominant_baseline = value; }
-    void set_unicode_bidi(UnicodeBidi value) { m_noninherited.unicode_bidi = value; }
-    void set_writing_mode(WritingMode value) { m_inherited.writing_mode = value; }
-    void set_user_select(UserSelect value) { m_noninherited.user_select = value; }
-    void set_isolation(Isolation value) { m_noninherited.isolation = value; }
-    void set_contain(Containment value) { m_noninherited.contain = move(value); }
-    void set_container_name(Vector<FlyString> value) { m_noninherited.container_name = move(value); }
-    void set_container_type(ContainerType value) { m_noninherited.container_type = move(value); }
-    void set_mix_blend_mode(MixBlendMode value) { m_noninherited.mix_blend_mode = value; }
-    void set_view_transition_name(Optional<FlyString> value) { m_noninherited.view_transition_name = move(value); }
-    void set_touch_action(TouchActionData value) { m_noninherited.touch_action = value; }
+    void set_width(Size value) { set_size(&ComputedValuesFFI::SizingValues::width, move(value)); }
+    void set_overflow_x(Overflow value)
+    {
+        if (m_values.m_noninherited.box->overflow_x == to_underlying(value))
+            return;
+        m_values.m_noninherited.box.access().overflow_x = to_underlying(value);
+    }
+    void set_overflow_y(Overflow value)
+    {
+        if (m_values.m_noninherited.box->overflow_y == to_underlying(value))
+            return;
+        m_values.m_noninherited.box.access().overflow_y = to_underlying(value);
+    }
+    void set_display(Display value)
+    {
+        if (m_values.display() == value)
+            return;
+        m_values.m_noninherited.box.access().display = to_ffi_display(value);
+    }
+    void set_display_before_box_type_transformation(Display value)
+    {
+        if (m_values.display_before_box_type_transformation() == value)
+            return;
+        m_values.m_noninherited.box.access().display_before_box_type_transformation = to_ffi_display(value);
+    }
+    void set_rotate(RefPtr<TransformationStyleValue const> value)
+    {
+        if (m_values.rotate() == value)
+            return;
+        TransformValues::set_transformation(m_values.m_noninherited.transform.access().rotate, value.ptr());
+    }
+    void set_scale(RefPtr<TransformationStyleValue const> value)
+    {
+        if (m_values.scale() == value)
+            return;
+        TransformValues::set_transformation(m_values.m_noninherited.transform.access().scale, value.ptr());
+    }
+    void set_translate(RefPtr<TransformationStyleValue const> value)
+    {
+        if (m_values.translate() == value)
+            return;
+        TransformValues::set_transformation(m_values.m_noninherited.transform.access().translate, value.ptr());
+    }
 
-    void set_fill(Optional<SVGPaint> value) { m_inherited.fill = move(value); }
-    void set_stroke(Optional<SVGPaint> value) { m_inherited.stroke = move(value); }
-    void set_fill_rule(FillRule value) { m_inherited.fill_rule = value; }
-    void set_fill_opacity(float value) { m_inherited.fill_opacity = value; }
-    void set_stroke_dasharray(Vector<Variant<LengthPercentage, float>> value) { m_inherited.stroke_dasharray = move(value); }
-    void set_stroke_dashoffset(LengthPercentage value) { m_inherited.stroke_dashoffset = move(value); }
-    void set_stroke_linecap(StrokeLinecap value) { m_inherited.stroke_linecap = move(value); }
-    void set_stroke_linejoin(StrokeLinejoin value) { m_inherited.stroke_linejoin = move(value); }
-    void set_stroke_miterlimit(double value) { m_inherited.stroke_miterlimit = value; }
-    void set_stroke_opacity(float value) { m_inherited.stroke_opacity = value; }
-    void set_stroke_width(LengthPercentage value) { m_inherited.stroke_width = move(value); }
-    void set_stop_color(Color value) { m_noninherited.stop_color = value; }
-    void set_stop_opacity(float value) { m_noninherited.stop_opacity = value; }
-    void set_text_anchor(TextAnchor value) { m_inherited.text_anchor = value; }
-    void set_outline_color(Color value) { m_noninherited.outline_color = value; }
-    void set_outline_offset(CSSPixels value) { m_noninherited.outline_offset = move(value); }
-    void set_outline_style(OutlineStyle value) { m_noninherited.outline_style = value; }
-    void set_outline_width(CSSPixels value) { m_noninherited.outline_width = value; }
-    void set_mask(MaskReference value) { m_noninherited.mask = value; }
-    void set_mask_type(MaskType value) { m_noninherited.mask_type = value; }
-    void set_mask_image(AbstractImageStyleValue const& value) { m_noninherited.mask_image = value; }
-    void set_clip_path(ClipPathReference value) { m_noninherited.clip_path = move(value); }
-    void set_clip_rule(ClipRule value) { m_inherited.clip_rule = value; }
-    void set_flood_color(Color value) { m_noninherited.flood_color = value; }
-    void set_flood_opacity(float value) { m_noninherited.flood_opacity = value; }
-    void set_shape_rendering(ShapeRendering value) { m_noninherited.shape_rendering = value; }
-    void set_paint_order(PaintOrderList value) { m_inherited.paint_order = value; }
+private:
+    void set_size(ComputedValuesFFI::ComputedSize ComputedValuesFFI::SizingValues::* member, Size value)
+    {
+        if (Size::view(m_values.m_noninherited.sizing.operator->()->*member) == value)
+            return;
+        Size::replace(m_values.m_noninherited.sizing.access().*member, move(value));
+    }
 
-    void set_cx(LengthPercentage cx) { m_noninherited.cx = move(cx); }
-    void set_cy(LengthPercentage cy) { m_noninherited.cy = move(cy); }
-    void set_r(LengthPercentage r) { m_noninherited.r = move(r); }
-    void set_rx(LengthPercentageOrAuto rx) { m_noninherited.rx = move(rx); }
-    void set_ry(LengthPercentageOrAuto ry) { m_noninherited.ry = move(ry); }
-    void set_x(LengthPercentage x) { m_noninherited.x = move(x); }
-    void set_y(LengthPercentage y) { m_noninherited.y = move(y); }
+    ComputedValues& m_values;
+};
 
-    void set_math_shift(MathShift value) { m_inherited.math_shift = value; }
-    void set_math_style(MathStyle value) { m_inherited.math_style = value; }
-    void set_math_depth(int value) { m_inherited.math_depth = value; }
+class ComputedValues::Builder {
+public:
+    Builder()
+        : m_values(adopt_ref(*new ComputedValues))
+        , m_mutator(*m_values)
+    {
+    }
 
-    void set_scrollbar_color(ScrollbarColorData value) { m_inherited.scrollbar_color = move(value); }
-    void set_scrollbar_width(ScrollbarWidth value) { m_noninherited.scrollbar_width = value; }
-    void set_resize(Resize value) { m_noninherited.resize = value; }
+    explicit Builder(ComputedValues const& values)
+        : Builder()
+    {
+        m_values->m_inherited = values.m_inherited;
+        m_values->m_noninherited = values.m_noninherited;
+        m_values->m_property_important = values.m_property_important;
+        m_values->m_property_inherited = values.m_property_inherited;
+        m_values->copy_computed_longhand_table_from(values);
+        if (values.m_borrowed_base_values)
+            m_values->m_base_values = Builder { *values.m_borrowed_base_values }.build();
+        else
+            m_values->m_base_values = values.m_base_values;
+        m_mutator.set_animated_properties(values.m_animated_properties.ptr());
+        m_values->m_pseudo_element_styles = values.m_pseudo_element_styles;
+        m_values->m_depends_on_viewport_metrics = values.m_depends_on_viewport_metrics;
+        m_values->m_font_metrics_depend_on_viewport_metrics = values.m_font_metrics_depend_on_viewport_metrics;
+        m_values->m_in_display_none_subtree = values.m_in_display_none_subtree;
+        m_values->m_highlight_colors_authored = values.m_highlight_colors_authored;
+        m_values->m_highlight_color_is_current_color = values.m_highlight_color_is_current_color;
+    }
 
-    void set_counter_increment(Vector<CounterData> value) { m_noninherited.counter_increment = move(value); }
-    void set_counter_reset(Vector<CounterData> value) { m_noninherited.counter_reset = move(value); }
-    void set_counter_set(Vector<CounterData> value) { m_noninherited.counter_set = move(value); }
+    Mutator* operator->() { return &m_mutator; }
+    Mutator const* operator->() const { return &m_mutator; }
 
-    void set_will_change(WillChange value) { m_noninherited.will_change = move(value); }
+    NonnullRefPtr<ComputedValues const> build() && { return move(m_values); }
+
+private:
+    NonnullRefPtr<ComputedValues> m_values;
+    Mutator m_mutator;
 };
 
 }

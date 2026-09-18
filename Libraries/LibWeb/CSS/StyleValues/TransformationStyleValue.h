@@ -23,39 +23,61 @@ public:
     }
     virtual ~TransformationStyleValue() override = default;
 
-    static ValueComparingNonnullRefPtr<TransformationStyleValue const> identity_transformation(TransformFunction);
-
-    TransformFunction transform_function() const { return m_properties.transform_function; }
-    StyleValueVector const& values() const { return m_properties.values; }
+    TransformFunction transform_function() const { return static_cast<TransformFunction>(m_value->transformation.transform_function); }
+    StyleValueVector values() const
+    {
+        auto const& values = m_value->transformation.values;
+        StyleValueVector result;
+        result.ensure_capacity(values.length);
+        for (size_t i = 0; i < values.length; ++i) {
+            auto* child_data = static_cast<StyleValueFFI::StyleValueData const*>(values.pointer[i].pointer);
+            result.unchecked_append(StyleValue::adopt_rust_style_value_data(StyleValueFFI::rust_style_value_retain(child_data)));
+        }
+        return result;
+    }
 
     bool can_be_converted_to_matrix_without_reference_box() const;
-    FloatMatrix4x4 to_matrix(Optional<Painting::PaintableBox const&>) const;
+    FloatMatrix4x4 to_matrix(Layout::Node const*) const;
 
-    virtual void serialize(StringBuilder&, SerializationMode) const override;
-    GC::Ptr<CSSTransformComponent> reify_a_transform_function(JS::Realm&) const;
+    GC::Ptr<CSSTransformComponent> reify_a_transform_function() const;
 
-    virtual ValueComparingNonnullRefPtr<StyleValue const> absolutized(ComputationContext const&) const override;
-
-    bool properties_equal(TransformationStyleValue const& other) const { return m_properties == other.m_properties; }
-
-    virtual bool is_computationally_independent() const override
-    {
-        return all_of(m_properties.values, [](auto& value) { return value->is_computationally_independent(); });
-    }
+    ValueComparingNonnullRefPtr<StyleValue const> absolutized(ComputationContext const&) const;
 
 private:
-    TransformationStyleValue(PropertyID property, TransformFunction transform_function, StyleValueVector&& values)
-        : StyleValueWithDefaultOperators(Type::Transformation)
-        , m_properties { .property = property, .transform_function = transform_function, .values = move(values) }
+    friend class StyleValue;
+
+    explicit TransformationStyleValue(StyleValueFFI::StyleValueData const* data)
+        : StyleValueWithDefaultOperators(Type::Transformation, data)
     {
     }
 
-    struct Properties {
-        PropertyID property;
-        TransformFunction transform_function;
-        StyleValueVector values;
-        bool operator==(Properties const& other) const;
-    } m_properties;
+    TransformationStyleValue(PropertyID property, TransformFunction transform_function, StyleValueVector&& values)
+        : StyleValueWithDefaultOperators(Type::Transformation, make_transformation_data(property, transform_function, values))
+    {
+    }
+
+    static StyleValueFFI::StyleValueData const* make_transformation_data(PropertyID property, TransformFunction transform_function, StyleValueVector const& values)
+    {
+        Vector<StyleValueFFI::StyleValueData const*> pointers;
+        pointers.ensure_capacity(values.size());
+        for (auto const& value : values)
+            pointers.unchecked_append(StyleValueFFI::rust_style_value_retain(value->rust_style_value_data()));
+        return StyleValueFFI::rust_style_value_create_transformation(to_underlying(property), static_cast<u8>(to_underlying(transform_function)), pointers.data(), pointers.size());
+    }
+
+    size_t size() const { return m_value->transformation.values.length; }
+
+    ValueComparingNonnullRefPtr<StyleValue const> value_at(size_t i) const
+    {
+        auto* child_data = static_cast<StyleValueFFI::StyleValueData const*>(m_value->transformation.values.pointer[i].pointer);
+        return StyleValue::adopt_rust_style_value_data(StyleValueFFI::rust_style_value_retain(child_data));
+    }
+
+    PropertyID property() const { return static_cast<PropertyID>(m_value->transformation.property); }
 };
+
+// The transform functions of a computed or freshly parsed transform value:
+// empty for the none keyword, the transformation elements otherwise.
+Vector<NonnullRefPtr<TransformationStyleValue const>> transformations_for_style_value(StyleValue const&);
 
 }

@@ -7,29 +7,29 @@
 
 #pragma once
 
-#include <AK/FlyString.h>
+#include <AK/Utf16FlyString.h>
+#include <AK/Utf16String.h>
 #include <LibWeb/DOM/Event.h>
+#include <LibWeb/HighResolutionTime/DOMHighResTimeStamp.h>
 
 namespace Web::WebGL {
 
 class WebGLContextEvent final : public DOM::Event {
-    WEB_PLATFORM_OBJECT(WebGLContextEvent, DOM::Event);
+    WEB_WRAPPABLE(WebGLContextEvent, DOM::Event);
     GC_DECLARE_ALLOCATOR(WebGLContextEvent);
 
 public:
-    [[nodiscard]] static GC::Ref<WebGLContextEvent> create(JS::Realm&, FlyString const& type, Bindings::WebGLContextEventInit const&);
-    static WebIDL::ExceptionOr<GC::Ref<WebGLContextEvent>> construct_impl(JS::Realm&, FlyString const& type, Bindings::WebGLContextEventInit const&);
+    [[nodiscard]] static GC::Ref<WebGLContextEvent> create(Utf16FlyString const& type, Bindings::WebGLContextEventInit const&, HighResolutionTime::DOMHighResTimeStamp);
+    static WebIDL::ExceptionOr<GC::Ref<WebGLContextEvent>> create_for_constructor(Utf16FlyString const& type, Bindings::WebGLContextEventInit const&, HighResolutionTime::DOMHighResTimeStamp);
 
     virtual ~WebGLContextEvent() override;
 
-    String const& status_message() const { return m_status_message; }
+    Utf16String const& status_message() const { return m_status_message; }
 
 private:
-    WebGLContextEvent(JS::Realm&, FlyString const& type, Bindings::WebGLContextEventInit const&);
+    WebGLContextEvent(Utf16FlyString const& type, Bindings::WebGLContextEventInit const&, HighResolutionTime::DOMHighResTimeStamp);
 
-    virtual void initialize(JS::Realm&) override;
-
-    String m_status_message;
+    Utf16String m_status_message;
 };
 
 }

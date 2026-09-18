@@ -12,13 +12,13 @@
 namespace Web::HTML {
 
 class HTMLParagraphElement final : public HTMLElement {
-    WEB_PLATFORM_OBJECT(HTMLParagraphElement, HTMLElement);
+    WEB_WRAPPABLE(HTMLParagraphElement, HTMLElement);
     GC_DECLARE_ALLOCATOR(HTMLParagraphElement);
 
 public:
     virtual ~HTMLParagraphElement() override;
 
-    virtual bool is_presentational_hint(FlyString const&) const override;
+    virtual bool is_presentational_hint(Utf16FlyString const&) const override;
     virtual void apply_presentational_hints(Vector<CSS::StyleProperty>&) const override;
 
     // https://www.w3.org/TR/html-aria/#el-p
@@ -26,8 +26,6 @@ public:
 
 private:
     HTMLParagraphElement(DOM::Document&, DOM::QualifiedName);
-
-    virtual void initialize(JS::Realm&) override;
 };
 
 }

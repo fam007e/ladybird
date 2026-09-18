@@ -19,14 +19,14 @@ namespace Web::WebGL {
 
 GC_DEFINE_ALLOCATOR(OESVertexArrayObject);
 
-JS::ThrowCompletionOr<GC::Ref<JS::Object>> OESVertexArrayObject::create(JS::Realm& realm, GC::Ref<WebGLRenderingContextBase> context)
+GC::Ref<Bindings::Wrappable> OESVertexArrayObject::create(GC::Ref<WebGLRenderingContextBase> context)
 {
+    auto& realm = context->realm();
     return realm.create<OESVertexArrayObject>(realm, context);
 }
 
-OESVertexArrayObject::OESVertexArrayObject(JS::Realm& realm, GC::Ref<WebGLRenderingContextBase> context)
-    : PlatformObject(realm)
-    , m_context(context)
+OESVertexArrayObject::OESVertexArrayObject(JS::Realm&, GC::Ref<WebGLRenderingContextBase> context)
+    : m_context(context)
 {
 }
 
@@ -36,7 +36,7 @@ GC::Ref<WebGLVertexArrayObjectOES> OESVertexArrayObject::create_vertex_array_oes
 
     GLuint handle = 0;
     m_context->context().gen_vertex_arrays_oes(1, &handle);
-    return WebGLVertexArrayObjectOES::create(realm(), m_context, handle);
+    return WebGLVertexArrayObjectOES::create(m_context, handle);
 }
 
 void OESVertexArrayObject::delete_vertex_array_oes(GC::Ptr<WebGLVertexArrayObjectOES> array_object)
@@ -57,6 +57,8 @@ void OESVertexArrayObject::delete_vertex_array_oes(GC::Ptr<WebGLVertexArrayObjec
 
     auto handle = vertex_array_handle.value();
     m_context->context().delete_vertex_arrays_oes(1, &handle);
+    if (m_context->current_vertex_array_binding() == array_object)
+        m_context->set_current_vertex_array_binding(nullptr);
 }
 
 bool OESVertexArrayObject::is_vertex_array_oes(GC::Ptr<WebGLVertexArrayObjectOES> array_object)
@@ -92,12 +94,7 @@ void OESVertexArrayObject::bind_vertex_array_oes(GC::Ptr<WebGLVertexArrayObjectO
     }
 
     m_context->context().bind_vertex_array_oes(vertex_array_handle);
-}
-
-void OESVertexArrayObject::initialize(JS::Realm& realm)
-{
-    WEB_SET_PROTOTYPE_FOR_INTERFACE(OESVertexArrayObject);
-    Base::initialize(realm);
+    m_context->set_current_vertex_array_binding(array_object);
 }
 
 void OESVertexArrayObject::visit_edges(Visitor& visitor)

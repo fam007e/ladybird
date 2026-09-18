@@ -7,6 +7,10 @@
 
 #pragma once
 
+#include <AK/Atomic.h>
+#include <AK/ConditionVariable.h>
+#include <AK/Mutex.h>
+#include <AK/Platform.h>
 #include <AK/Queue.h>
 #include <AK/SinglyLinkedList.h>
 #include <AK/SinglyLinkedListSizePolicy.h>
@@ -16,16 +20,20 @@
 #include <LibIPC/Forward.h>
 #include <LibIPC/ReceivedMessageBytes.h>
 #include <LibIPC/TransportHandle.h>
-#include <LibSync/ConditionVariable.h>
-#include <LibSync/Mutex.h>
 #include <LibThreading/Forward.h>
+
+// A descriptor is closed once written, as the kernel then holds its own reference to the file for the message in
+// flight. However, the macOS kernel may collect it while it is still in the remote message queue
+// (https://openradar.me/9477351), so we must use TransportMachPort there.
+#if defined(AK_OS_MACOS) || defined(AK_OS_IOS)
+#    error "TransportSocket must not be used on Darwin"
+#endif
 
 namespace IPC {
 
 struct SocketMessageHeader {
     enum class Type : u8 {
         Payload = 0,
-        FileDescriptorAcknowledgement = 1,
     };
     Type type { Type::Payload };
     u32 payload_size { 0 };
@@ -34,19 +42,22 @@ struct SocketMessageHeader {
 
 class SendQueue : public AtomicRefCounted<SendQueue> {
 public:
-    void enqueue_message(SocketMessageHeader, MessageDataType payload, Vector<int>&& fds);
+    void enqueue_message(SocketMessageHeader, MessageDataType payload, Vector<NonnullRefPtr<AutoCloseFileDescriptor>>&& fds);
     struct BytesAndFds {
         Vector<u8> bytes;
         Vector<int> fds;
     };
     BytesAndFds peek(size_t max_bytes);
     void discard(size_t bytes_count, size_t fds_count);
+    void wait_until_drained();
+    // Called when the IO thread stops, so that a waiter is not left waiting for a write that will never happen.
+    void release_drain_waiters();
 
 private:
     struct QueuedMessage {
         SocketMessageHeader header;
         MessageDataType payload;
-        size_t unsent_fd_count { 0 };
+        Vector<NonnullRefPtr<AutoCloseFileDescriptor>> unsent_fds;
         size_t start_offset { 0 };
 
         size_t size() const { return sizeof(SocketMessageHeader) + payload.size(); }
@@ -54,8 +65,9 @@ private:
 
     SinglyLinkedList<QueuedMessage, AK::DefaultSizeCalculationPolicy> m_queued_messages;
     size_t m_queued_byte_count { 0 };
-    Vector<int> m_fds;
-    Sync::Mutex m_mutex;
+    Mutex m_mutex;
+    ConditionVariable m_drained_cv { m_mutex };
+    bool m_drain_waiters_released { false };
 };
 
 class TransportSocket {
@@ -83,7 +95,13 @@ public:
 
     void wait_until_readable();
 
-    void post_message(MessageDataType, Vector<Attachment>& attachments);
+    // Wait until everything posted so far has been written to the socket.
+    void flush();
+
+    // Wait until everything the peer has already written has been parsed into the incoming queue.
+    void wait_until_incoming_is_current();
+
+    ErrorOr<void> post_message(MessageDataType, Vector<Attachment>& attachments);
 
     enum class ShouldShutdown {
         No,
@@ -127,14 +145,10 @@ private:
     void wake_io_thread();
     void read_incoming_messages();
     void notify_read_available();
+    bool incoming_is_behind_socket() const;
 
     NonnullOwnPtr<Core::LocalSocket> m_socket;
-
-    // After file descriptor is sent, it is moved to the wait queue until an acknowledgement is received from the peer.
-    // This is necessary to handle a specific behavior of the macOS kernel, which may prematurely garbage-collect the file
-    // descriptor contained in the message before the peer receives it. https://openradar.me/9477351
-    Queue<NonnullRefPtr<AutoCloseFileDescriptor>> m_fds_retained_until_received_by_peer;
-    Sync::Mutex m_fds_retained_until_received_by_peer_mutex;
+    Atomic<bool> m_socket_is_open { true };
 
     RefPtr<Threading::Thread> m_io_thread;
     RefPtr<SendQueue> m_send_queue;
@@ -143,12 +157,15 @@ private:
     Atomic<bool> m_peer_eof { false };
     ByteBuffer m_unprocessed_bytes;
     Queue<Attachment> m_unprocessed_attachments;
-    Sync::Mutex m_incoming_mutex;
-    Sync::ConditionVariable m_incoming_cv { m_incoming_mutex };
+    Mutex m_incoming_mutex;
+    ConditionVariable m_incoming_cv { m_incoming_mutex };
     Vector<NonnullOwnPtr<Message>> m_incoming_messages;
+    // True while the IO thread is between reading the socket and appending what it read.
+    bool m_read_in_progress { false };
     // Consumer-visible EOF, guarded by m_incoming_mutex. Distinct from m_peer_eof. This is set only after the final
     // batch of messages have been parsed and appended to m_incoming_messages under the same lock.
     bool m_incoming_eof { false };
+    bool m_receive_loop_finished { false };
 
     static Atomic<u32> s_eof_drain_window_for_test_ms;
     static Atomic<bool> s_skip_inloop_read_for_test;

@@ -29,7 +29,7 @@ download_exclude_list = {
     # Modified to use a relative path, which the importer can't rewrite.
     "/fonts/ahem.css",
 }
-visited_paths = set()
+visited_destinations = set()
 
 
 class TestType(Enum):
@@ -202,9 +202,7 @@ def is_crash_test(url_string):
         return True
     file_name = path_segments[-1]
     file_name_parts = file_name.split(".")
-    if len(file_name_parts) > 1 and any([part.endswith("-crash") for part in file_name_parts[:-1]]):
-        return True
-    return False
+    return len(file_name_parts) > 1 and any(part.endswith("-crash") for part in file_name_parts[:-1])
 
 
 def modify_sources(files, resources: list[ResourceAndType]) -> None:
@@ -229,7 +227,7 @@ def modify_sources(files, resources: list[ResourceAndType]) -> None:
             page_source = f.read()
 
         # Iterate all scripts and overwrite the src attribute
-        for resource in map(lambda r: r.resource, resources):
+        for resource in dict.fromkeys(r.resource for r in resources):
             if resource.startswith("/"):
                 new_src_value = parent_folder_path + resource[1::]
                 page_source = page_source.replace(resource.encode(), new_src_value.encode())
@@ -261,22 +259,22 @@ def download_files(filepaths, wpt_base_url, skip_existing):
     for file in filepaths:
         normalized_path = remove_repeated_url_slashes(file.source)
         print(f"Source {normalized_path}, Destination {file.destination}")
-        if normalized_path in visited_paths:
-            continue
         if normalized_path in download_exclude_list:
             print(f"Skipping {file.source} as it is in the exclude list")
-            visited_paths.add(normalized_path)
             continue
 
         source = urljoin(wpt_base_url, normalized_path)
         destination = Path(os.path.normpath(file.destination))
 
+        # A test and its reference page can share a relative resource, which then has to exist next to each of
+        # them, so what has been downloaded is tracked by destination rather than by source.
+        if destination in visited_destinations:
+            continue
+        visited_destinations.add(destination)
+
         if skip_existing and destination.exists():
             print(f"Skipping {destination} as it already exists")
-            visited_paths.add(normalized_path)
             continue
-
-        visited_paths.add(normalized_path)
 
         print(f"Downloading {source} to {destination}")
 
@@ -299,19 +297,16 @@ def download_headers_files(filepaths, wpt_base_url, skip_existing):
     for file in filepaths:
         normalized_path = remove_repeated_url_slashes(file.source)
         headers_path = normalized_path + ".headers"
-
-        if headers_path in visited_paths:
-            continue
-
         source = urljoin(wpt_base_url, headers_path)
         destination = Path(os.path.normpath(str(file.destination) + ".headers"))
 
+        if destination in visited_destinations:
+            continue
+        visited_destinations.add(destination)
+
         if skip_existing and destination.exists():
             print(f"Skipping {destination} as it already exists")
-            visited_paths.add(headers_path)
             continue
-
-        visited_paths.add(headers_path)
 
         try:
             connection = urlopen(source)
@@ -366,7 +361,7 @@ def main():
         # replacing undecodable bytes with U+FFFD is safe and avoids a UnicodeDecodeError.
         page = response.read().decode("utf-8", errors="replace")
 
-    global test_type, reference_paths, raw_reference_paths
+    global test_type, raw_reference_paths
     if is_crash_test(url_to_import):
         test_type = TestType.CRASH
     else:
@@ -408,7 +403,7 @@ def main():
 
     input_parser = LinkedResourceFinder()
     input_parser.feed(page)
-    additional_resources = list(map(lambda s: ResourceAndType(s, ResourceType.INPUT), input_parser.resources))
+    additional_resources = [ResourceAndType(s, ResourceType.INPUT) for s in input_parser.resources]
 
     expected_parser = LinkedResourceFinder()
     for path in main_paths[1:]:
@@ -418,9 +413,7 @@ def main():
             # replacing undecodable bytes with U+FFFD is safe and avoids a UnicodeDecodeError.
             page = response.read().decode("utf-8", errors="replace")
             expected_parser.feed(page)
-    additional_resources.extend(
-        list(map(lambda s: ResourceAndType(s, ResourceType.EXPECTED), expected_parser.resources))
-    )
+    additional_resources.extend(ResourceAndType(s, ResourceType.EXPECTED) for s in expected_parser.resources)
 
     modify_sources(files_to_modify, additional_resources)
     script_paths = map_to_path(additional_resources, wpt_base_url, True, resource_path)

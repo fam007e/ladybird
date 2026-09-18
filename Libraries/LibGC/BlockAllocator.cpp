@@ -6,18 +6,17 @@
  */
 
 #include <AK/Assertions.h>
+#include <AK/Checked.h>
 #include <AK/NeverDestroyed.h>
 #include <AK/Platform.h>
+#include <AK/Try.h>
 #include <AK/Vector.h>
+#include <LibCore/System.h>
 #include <LibGC/BlockAllocator.h>
 #include <LibGC/HeapBlock.h>
+#include <LibGC/HeapRegion.h>
 #include <LibThreading/Thread.h>
 #include <sys/mman.h>
-
-#if defined(AK_OS_MACOS)
-#    include <mach/mach.h>
-#    include <mach/mach_vm.h>
-#endif
 
 #ifdef HAS_ADDRESS_SANITIZER
 #    include <sanitizer/asan_interface.h>
@@ -32,12 +31,14 @@
 #    include <unistd.h>
 #endif
 
+extern "C" {
+GC_API FlatPtr js_heap_region_base = 0;
+}
+
 namespace GC {
 
-// Each BlockAllocator carves its 16 KiB HeapBlock slots out of 2 MiB
-// chunks. Chunks are owned exclusively by a single BlockAllocator and are
-// never released back to the OS or shared across allocators -- the heap's
-// VM is permanently type-isolated.
+// Each BlockAllocator gets type-isolated 2 MiB chunks from one process-wide
+// reserved region and carves its 16 KiB HeapBlock slots out of those chunks.
 //
 // Per-block madvise() is deferred to a single global background "decommit
 // worker" so it never costs us GC pause time, and slots that are recycled
@@ -48,53 +49,66 @@ static_assert((HeapBlock::BLOCK_SIZE & (HeapBlock::BLOCK_SIZE - 1)) == 0);
 static_assert(CHUNK_SIZE % HeapBlock::BLOCK_SIZE == 0);
 static_assert(BLOCKS_PER_CHUNK == 128);
 
-#if !defined(AK_OS_MACOS) && !defined(AK_OS_WINDOWS)
-static auto const s_page_size = [] {
-    auto page_size_result = sysconf(_SC_PAGESIZE);
-    VERIFY(page_size_result > 0);
-    return static_cast<size_t>(page_size_result);
-}();
+class HeapRegion {
+public:
+    static constexpr size_t size = HEAP_REGION_SIZE;
 
-static void* allocate_chunk_with_aligned_heap_blocks()
-{
-    auto const page_size = s_page_size;
-    VERIFY((page_size & (page_size - 1)) == 0);
-    VERIFY(HeapBlock::BLOCK_SIZE % page_size == 0 || page_size % HeapBlock::BLOCK_SIZE == 0);
-    VERIFY(CHUNK_SIZE % page_size == 0);
+    HeapRegion()
+    {
+        static_assert(sizeof(FlatPtr) >= sizeof(u64));
+        Checked<size_t> reservation_size = size;
+        reservation_size += size;
+        VERIFY(!reservation_size.has_overflow());
 
-    auto const extra_size = page_size < HeapBlock::BLOCK_SIZE ? HeapBlock::BLOCK_SIZE - page_size : 0;
-    auto* mapped = mmap(nullptr, CHUNK_SIZE + extra_size, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
-    VERIFY(mapped != MAP_FAILED);
+        auto* reservation = MUST(Core::System::reserve_address_space(reservation_size.value(), Core::System::MemoryTag::GarbageCollector));
+        auto reservation_start = reinterpret_cast<FlatPtr>(reservation);
+        auto aligned_start = align_up_to(reservation_start, size);
+        auto reservation_end = reservation_start + reservation_size.value();
+        auto head_size = aligned_start - reservation_start;
+        auto tail_size = reservation_end - (aligned_start + size);
 
-    auto const mapped_address = reinterpret_cast<FlatPtr>(mapped);
-    auto const aligned_address = align_up_to(mapped_address, HeapBlock::BLOCK_SIZE);
-    VERIFY(aligned_address % HeapBlock::BLOCK_SIZE == 0);
-
-    auto const left_padding = aligned_address - mapped_address;
-    if (left_padding > 0) {
-        VERIFY(left_padding % page_size == 0);
-        if (munmap(mapped, left_padding) < 0) {
-            perror("munmap");
-            VERIFY_NOT_REACHED();
-        }
-    }
-
-    auto const mapped_end = mapped_address + CHUNK_SIZE + extra_size;
-    auto const chunk_end = aligned_address + CHUNK_SIZE;
-    VERIFY(chunk_end <= mapped_end);
-
-    auto const right_padding = mapped_end - chunk_end;
-    if (right_padding > 0) {
-        VERIFY(right_padding % page_size == 0);
-        if (munmap(reinterpret_cast<void*>(chunk_end), right_padding) < 0) {
-            perror("munmap");
-            VERIFY_NOT_REACHED();
-        }
-    }
-
-    return reinterpret_cast<void*>(aligned_address);
-}
+#if !defined(AK_OS_WINDOWS)
+        if (head_size != 0)
+            MUST(Core::System::release_address_space(reservation, head_size));
+        if (tail_size != 0)
+            MUST(Core::System::release_address_space(reinterpret_cast<void*>(aligned_start + size), tail_size));
+#else
+        // VirtualFree with MEM_RELEASE can only release the complete
+        // reservation, so keep the inaccessible head and tail on Windows.
+        (void)head_size;
+        (void)tail_size;
 #endif
+
+        m_base = reinterpret_cast<u8*>(aligned_start);
+        VERIFY(reinterpret_cast<FlatPtr>(m_base) % size == 0);
+        js_heap_region_base = reinterpret_cast<FlatPtr>(m_base);
+    }
+
+    void* allocate_chunk()
+    {
+        // This process-global region is shared by every Heap. GC block allocation is single-threaded
+        // per process, so m_next_chunk_offset intentionally needs no lock. Supporting another allocating
+        // thread would require synchronization here or per-thread regions.
+        VERIFY(m_next_chunk_offset <= size - CHUNK_SIZE);
+        auto* chunk = m_base + m_next_chunk_offset;
+        MUST(Core::System::commit_memory(chunk, CHUNK_SIZE, Core::System::MemoryTag::GarbageCollector));
+        m_next_chunk_offset += CHUNK_SIZE;
+        return chunk;
+    }
+
+    FlatPtr start() const { return reinterpret_cast<FlatPtr>(m_base); }
+    FlatPtr end() const { return start() + size; }
+
+private:
+    u8* m_base { nullptr };
+    size_t m_next_chunk_offset { 0 };
+};
+
+static HeapRegion& heap_region()
+{
+    static AK::NeverDestroyed<HeapRegion> region;
+    return *region;
+}
 
 static void madvise_block_for_decommit(void* block)
 {
@@ -111,17 +125,15 @@ static void madvise_block_for_decommit(void* block)
         perror("madvise(MADV_FREE_REUSABLE)");
         VERIFY_NOT_REACHED();
     }
-#elif defined(MADV_DONTNEED)
-    // Prefer DONTNEED over FREE on Linux: FREE is lazy and only releases pages
-    // under memory pressure, which leaves freed blocks counted in RSS for
-    // arbitrarily long after a busy page goes idle.
-    if (madvise(block, HeapBlock::BLOCK_SIZE, MADV_DONTNEED) < 0) {
-        perror("madvise(MADV_DONTNEED)");
-        VERIFY_NOT_REACHED();
-    }
 #elif defined(MADV_FREE)
+    // MADV_FREE keeps the pages mapped until the kernel needs them, so a block reused before then takes no page fault.
     if (madvise(block, HeapBlock::BLOCK_SIZE, MADV_FREE) < 0) {
         perror("madvise(MADV_FREE)");
+        VERIFY_NOT_REACHED();
+    }
+#elif defined(MADV_DONTNEED)
+    if (madvise(block, HeapBlock::BLOCK_SIZE, MADV_DONTNEED) < 0) {
+        perror("madvise(MADV_DONTNEED)");
         VERIFY_NOT_REACHED();
     }
 #endif
@@ -159,8 +171,8 @@ private:
     void run();
     void process_one(BlockAllocator&);
 
-    Sync::Mutex m_mutex;
-    Sync::ConditionVariable m_cv { m_mutex };
+    Mutex m_mutex;
+    ConditionVariable m_cv { m_mutex };
     RefPtr<Threading::Thread> m_thread;
     Vector<BlockAllocator*> m_pending;
     bool m_kicked { false };
@@ -184,20 +196,20 @@ DecommitWorker::DecommitWorker()
 
 void DecommitWorker::register_pending(BlockAllocator& a)
 {
-    Sync::MutexLocker locker(m_mutex);
+    MutexLocker locker(m_mutex);
     m_pending.append(&a);
 }
 
 void DecommitWorker::deregister(BlockAllocator& a)
 {
-    Sync::MutexLocker locker(m_mutex);
+    MutexLocker locker(m_mutex);
     m_pending.remove_first_matching([&](auto* p) { return p == &a; });
 }
 
 void DecommitWorker::kick()
 {
     {
-        Sync::MutexLocker locker(m_mutex);
+        MutexLocker locker(m_mutex);
         m_kicked = true;
     }
     m_cv.signal();
@@ -208,7 +220,7 @@ void DecommitWorker::run()
     while (true) {
         Vector<BlockAllocator*> snapshot;
         {
-            Sync::MutexLocker locker(m_mutex);
+            MutexLocker locker(m_mutex);
             while (!m_kicked)
                 m_cv.wait();
             m_kicked = false;
@@ -231,7 +243,7 @@ void DecommitWorker::run()
             process_one(*a);
             int prev_refcount = a->m_worker_refcount.fetch_sub(1);
             if (prev_refcount == 1) {
-                Sync::MutexLocker locker(a->m_mutex);
+                MutexLocker locker(a->m_mutex);
                 a->m_worker_cv.broadcast();
             }
         }
@@ -242,7 +254,7 @@ void DecommitWorker::process_one(BlockAllocator& a)
 {
     Vector<void*> to_process;
     {
-        Sync::MutexLocker locker(a.m_mutex);
+        MutexLocker locker(a.m_mutex);
         a.m_in_decommit_registry = false;
         to_process = move(a.m_freshly_freed);
     }
@@ -258,7 +270,7 @@ void DecommitWorker::process_one(BlockAllocator& a)
     }
 
     {
-        Sync::MutexLocker locker(a.m_mutex);
+        MutexLocker locker(a.m_mutex);
         for (auto* slot : to_process)
             a.m_blocks.append(slot);
     }
@@ -281,15 +293,25 @@ BlockAllocator::~BlockAllocator()
     // in-flight processing of *this before our storage goes away.
     DecommitWorker::the().deregister(*this);
 
-    Sync::MutexLocker locker(m_mutex);
+    MutexLocker locker(m_mutex);
     while (m_worker_refcount.load() != 0)
         m_worker_cv.wait();
 }
 
 size_t BlockAllocator::block_count()
 {
-    Sync::MutexLocker locker(m_mutex);
+    MutexLocker locker(m_mutex);
     return m_blocks.size();
+}
+
+FlatPtr BlockAllocator::heap_region_start()
+{
+    return heap_region().start();
+}
+
+FlatPtr BlockAllocator::heap_region_end()
+{
+    return heap_region().end();
 }
 
 void* BlockAllocator::allocate_block([[maybe_unused]] char const* name)
@@ -298,7 +320,7 @@ void* BlockAllocator::allocate_block([[maybe_unused]] char const* name)
     bool needs_madvise_reuse = false;
 
     {
-        Sync::MutexLocker locker(m_mutex);
+        MutexLocker locker(m_mutex);
 
         // Prefer m_freshly_freed: those slots were never madvised, so we
         // can hand them back out with zero syscalls. This is the deferred-
@@ -313,30 +335,8 @@ void* BlockAllocator::allocate_block([[maybe_unused]] char const* name)
     }
 
     if (block == nullptr) {
-        // Both pools empty: allocate a fresh 2 MiB chunk and slice it.
-        void* chunk_base = nullptr;
-#if defined(AK_OS_MACOS)
-        mach_vm_address_t address = 0;
-        kern_return_t kr = mach_vm_map(
-            mach_task_self(),
-            &address,
-            CHUNK_SIZE,
-            HeapBlock::BLOCK_SIZE - 1,
-            VM_FLAGS_ANYWHERE,
-            MEMORY_OBJECT_NULL,
-            0,
-            false,
-            VM_PROT_READ | VM_PROT_WRITE,
-            VM_PROT_READ | VM_PROT_WRITE,
-            VM_INHERIT_DEFAULT);
-        VERIFY(kr == KERN_SUCCESS);
-        chunk_base = reinterpret_cast<void*>(address);
-#elif defined(AK_OS_WINDOWS)
-        chunk_base = VirtualAlloc(nullptr, CHUNK_SIZE, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-        VERIFY(chunk_base);
-#else
-        chunk_base = allocate_chunk_with_aligned_heap_blocks();
-#endif
+        // Both pools empty: commit a fresh 2 MiB chunk and slice it.
+        auto* chunk_base = heap_region().allocate_chunk();
 
 #if defined(MADV_FREE_REUSE) && defined(MADV_FREE_REUSABLE)
         // Mark the whole chunk reusable upfront so MADV_FREE_REUSE pairs
@@ -350,7 +350,7 @@ void* BlockAllocator::allocate_block([[maybe_unused]] char const* name)
 
         ASAN_POISON_MEMORY_REGION(chunk_base, CHUNK_SIZE);
 
-        Sync::MutexLocker locker(m_mutex);
+        MutexLocker locker(m_mutex);
         for (size_t i = 0; i < BLOCKS_PER_CHUNK; ++i)
             m_blocks.append(static_cast<u8*>(chunk_base) + i * HeapBlock::BLOCK_SIZE);
         block = m_blocks.take_last();
@@ -383,7 +383,7 @@ void BlockAllocator::deallocate_block(void* block, DeferDecommit defer_decommit)
 
     bool need_to_register = false;
     {
-        Sync::MutexLocker locker(m_mutex);
+        MutexLocker locker(m_mutex);
         m_freshly_freed.append(block);
         if (defer_decommit == DeferDecommit::Yes && !m_in_decommit_registry) {
             m_in_decommit_registry = true;

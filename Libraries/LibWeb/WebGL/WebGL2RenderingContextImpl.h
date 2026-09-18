@@ -8,6 +8,7 @@
 #pragma once
 
 #include <AK/NonnullOwnPtr.h>
+#include <AK/Utf16String.h>
 #include <LibGC/Ptr.h>
 #include <LibWeb/Bindings/PlatformObject.h>
 #include <LibWeb/Forward.h>
@@ -21,7 +22,7 @@ namespace Web::WebGL {
 using namespace Web::HTML;
 
 class WebGL2RenderingContextImpl : public WebGLRenderingContextImpl {
-    WEB_NON_IDL_PLATFORM_OBJECT(WebGL2RenderingContextImpl, WebGLRenderingContextImpl);
+    WEB_NON_IDL_WRAPPABLE(WebGL2RenderingContextImpl, WebGLRenderingContextImpl);
 
 public:
     WebGL2RenderingContextImpl(JS::Realm&, NonnullOwnPtr<WebGLContextProxy>);
@@ -91,16 +92,16 @@ public:
     void bind_transform_feedback(WebIDL::UnsignedLong target, GC::Ptr<WebGLTransformFeedback>);
     void begin_transform_feedback(WebIDL::UnsignedLong primitive_mode);
     void end_transform_feedback();
-    void transform_feedback_varyings(GC::Ref<WebGLProgram> program, Vector<String> const& varyings, WebIDL::UnsignedLong buffer_mode);
+    void transform_feedback_varyings(GC::Ref<WebGLProgram> program, Vector<Utf16String> const& varyings, WebIDL::UnsignedLong buffer_mode);
     void pause_transform_feedback();
     void resume_transform_feedback();
     void bind_buffer_base(WebIDL::UnsignedLong target, WebIDL::UnsignedLong index, GC::Ptr<WebGLBuffer> buffer);
     void bind_buffer_range(WebIDL::UnsignedLong target, WebIDL::UnsignedLong index, GC::Ptr<WebGLBuffer> buffer, WebIDL::LongLong offset, WebIDL::LongLong size);
-    Optional<Vector<WebIDL::UnsignedLong>> get_uniform_indices(GC::Ref<WebGLProgram> program, Vector<String> const& uniform_names);
+    Optional<Vector<WebIDL::UnsignedLong>> get_uniform_indices(GC::Ref<WebGLProgram> program, Vector<Utf16String> const& uniform_names);
     JS::Value get_active_uniforms(GC::Ref<WebGLProgram> program, Vector<WebIDL::UnsignedLong> uniform_indices, WebIDL::UnsignedLong pname);
-    WebIDL::UnsignedLong get_uniform_block_index(GC::Ref<WebGLProgram> program, String uniform_block_name);
+    WebIDL::UnsignedLong get_uniform_block_index(GC::Ref<WebGLProgram> program, Utf16String uniform_block_name);
     JS::Value get_active_uniform_block_parameter(GC::Ref<WebGLProgram> program, WebIDL::UnsignedLong uniform_block_index, WebIDL::UnsignedLong pname);
-    Optional<String> get_active_uniform_block_name(GC::Ref<WebGLProgram> program, WebIDL::UnsignedLong uniform_block_index);
+    Optional<Utf16String> get_active_uniform_block_name(GC::Ref<WebGLProgram> program, WebIDL::UnsignedLong uniform_block_index);
     void uniform_block_binding(GC::Ref<WebGLProgram> program, WebIDL::UnsignedLong uniform_block_index, WebIDL::UnsignedLong uniform_block_binding);
     GC::Ref<WebGLVertexArrayObject> create_vertex_array();
     void delete_vertex_array(GC::Ptr<WebGLVertexArrayObject> vertex_array);

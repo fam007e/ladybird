@@ -5,6 +5,7 @@
  */
 
 #include <AK/GenericLexer.h>
+#include <AK/NumericLimits.h>
 #include <AK/QuickSort.h>
 #include <AK/StringBuilder.h>
 #include <AK/StringConversions.h>
@@ -25,7 +26,7 @@ static Optional<UnixDateTime> parse_http_date(Optional<ByteString const&> date)
     return {};
 }
 
-u64 compute_maximum_disk_cache_size(u64 free_bytes, u64 limit_maximum_disk_cache_size)
+i64 compute_maximum_disk_cache_size(u64 free_bytes, u64 limit_maximum_disk_cache_size)
 {
     auto cache_size = [&]() {
         if (free_bytes <= 100 * MiB)
@@ -39,12 +40,17 @@ u64 compute_maximum_disk_cache_size(u64 free_bytes, u64 limit_maximum_disk_cache
         return limit_maximum_disk_cache_size;
     }();
 
-    return min(cache_size, limit_maximum_disk_cache_size);
+    // The index accounts for sizes in SQLite's signed integer domain, so the limit lives there too.
+    static constexpr u64 MAXIMUM_REPRESENTABLE_DISK_CACHE_SIZE = NumericLimits<i64>::max();
+
+    cache_size = min(cache_size, limit_maximum_disk_cache_size);
+    cache_size = min(cache_size, MAXIMUM_REPRESENTABLE_DISK_CACHE_SIZE);
+    return static_cast<i64>(cache_size);
 }
 
-u64 compute_maximum_disk_cache_entry_size(u64 maximum_disk_cache_size)
+i64 compute_maximum_disk_cache_entry_size(i64 maximum_disk_cache_size)
 {
-    static constexpr u64 MAXIMUM_DISK_CACHE_ENTRY_SIZE = 256 * MiB;
+    static constexpr i64 MAXIMUM_DISK_CACHE_ENTRY_SIZE = 256 * MiB;
 
     return min(maximum_disk_cache_size / 8, MAXIMUM_DISK_CACHE_ENTRY_SIZE);
 }
@@ -72,14 +78,11 @@ static u64 serialize_hash(Crypto::Hash::SHA1& hasher)
     return result;
 }
 
-u64 create_cache_key(StringView url, StringView method, Optional<String const&> extra_cache_key)
+u64 create_cache_key(StringView url, StringView method)
 {
     auto hasher = Crypto::Hash::SHA1::create();
     hasher->update(url);
     hasher->update(method);
-
-    if (extra_cache_key.has_value())
-        hasher->update(*extra_cache_key);
 
     return serialize_hash(*hasher);
 }
@@ -428,8 +431,15 @@ AK::Duration calculate_freshness_lifetime(u32 status_code, HeaderList const& hea
         heuristics_allowed = true;
     }
 
-    if (heuristics_allowed)
+    if (heuristics_allowed) {
+        // INTEROP: Chromium treats 301 and 308 responses without explicit freshness as indefinitely fresh, while
+        //          WebKit assigns 301 responses a one-year lifetime. Use the more conservative one-year lifetime for
+        //          both permanent redirect status codes.
+        if (status_code == 301 || status_code == 308)
+            return AK::Duration::from_seconds(365 * 24 * 60 * 60);
+
         return calculate_heuristic_freshness_lifetime(headers, current_time_offset_for_testing);
+    }
 
     // No explicit expiration time, and heuristics not allowed or not applicable.
     return {};
@@ -443,8 +453,11 @@ AK::Duration calculate_age(HeaderList const& headers, UnixDateTime request_time,
     AK::Duration age_value;
 
     if (auto age = headers.get("Age"sv); age.has_value()) {
-        if (auto seconds = age->to_number<i64>(); seconds.has_value())
-            age_value = AK::Duration::from_seconds(*seconds);
+        if (!age->is_empty() && all_of(*age, is_ascii_digit)) {
+            static constexpr u64 maximum_age_value = 2'147'483'648;
+            auto seconds = min(age->to_number<u64>().value_or(maximum_age_value), maximum_age_value);
+            age_value = AK::Duration::from_seconds(static_cast<i64>(seconds));
+        }
     }
 
     // The term "now" means the current value of this implementation's clock (Section 5.6.7 of [HTTP]).
@@ -509,10 +522,16 @@ CacheLifetimeStatus cache_lifetime_status(HeaderList const& request_headers, Hea
 
         // https://httpwg.org/specs/rfc9111.html#cache-request-directive.max-age
         // The max-age request directive indicates that the client prefers a response whose age is less than or equal to
-        // the specified number of seconds.
+        // the specified number of seconds. Unless the max-stale request directive is also present, the client doesn't
+        // wish to receive a stale response.
+        //
+        // NB: This doesn't preclude validating the stored response: per Section 4, a stored response may also be reused
+        //     if it's "successfully validated (see Section 4.3)". Clients send "Cache-Control: max-age=0" to request
+        //     exactly that. Notably, Fetch attaches it to requests whose cache mode is "no-cache" — which is how a
+        //     browser reload forces revalidation of the document.
         if (auto max_age = extract_cache_control_duration_directive(*request_cache_control, "max-age"sv); max_age.has_value()) {
             if (*max_age <= current_age)
-                return CacheLifetimeStatus::Expired;
+                return revalidation_status(CacheLifetimeStatus::MustRevalidate);
         }
 
         // https://httpwg.org/specs/rfc9111.html#cache-request-directive.min-fresh

@@ -9,6 +9,7 @@
 
 #pragma once
 
+#include <AK/Utf16View.h>
 #include <LibWeb/Export.h>
 #include <LibWeb/HTML/AutocompleteElement.h>
 #include <LibWeb/HTML/HTMLElement.h>
@@ -21,7 +22,7 @@ namespace Web::HTML {
 class WEB_API HTMLSelectElement final
     : public HTMLElement
     , public AutocompleteElement {
-    WEB_PLATFORM_OBJECT(HTMLSelectElement, HTMLElement);
+    WEB_WRAPPABLE(HTMLSelectElement, HTMLElement);
     GC_DECLARE_ALLOCATOR(HTMLSelectElement);
     AUTOCOMPLETE_ELEMENT(HTMLElement, HTMLSelectElement);
 
@@ -29,8 +30,6 @@ public:
     virtual ~HTMLSelectElement() override;
 
     virtual bool is_html_select_element() const final { return true; }
-
-    virtual void adjust_computed_style(CSS::ComputedProperties::Builder&) override;
 
     WebIDL::UnsignedLong size() const;
     void set_size(WebIDL::UnsignedLong);
@@ -40,10 +39,9 @@ public:
     WebIDL::UnsignedLong length();
     WebIDL::ExceptionOr<void> set_length(WebIDL::UnsignedLong);
     HTMLOptionElement* item(WebIDL::UnsignedLong index);
-    virtual Optional<JS::Value> item_value(size_t index) const override;
-    HTMLOptionElement* named_item(FlyString const& name);
+    HTMLOptionElement* named_item(Utf16String const& name);
     WebIDL::ExceptionOr<void> add(HTMLOptionOrOptGroupElement element, NullableHTMLElementOrElementIndex before = { Empty {} });
-    virtual WebIDL::ExceptionOr<void> set_value_of_indexed_property(u32, JS::Value) override;
+    WebIDL::ExceptionOr<void> set_value_of_indexed_property(u32, Optional<GC::Ref<DOM::Element>>);
     void remove();
     void remove(WebIDL::Long);
 
@@ -55,7 +53,7 @@ public:
 
     Utf16String value() const;
     virtual Utf16String form_value() const override { return value(); }
-    WebIDL::ExceptionOr<void> set_value(Utf16String const&);
+    WebIDL::ExceptionOr<void> set_value(Utf16View);
 
     bool is_open() const { return m_is_open; }
     void set_is_open(bool);
@@ -92,7 +90,7 @@ public:
 
     virtual void reset_algorithm() override;
 
-    String const& type() const;
+    Utf16FlyString type() const;
 
     virtual Optional<ARIA::Role> default_role() const override;
 
@@ -100,7 +98,7 @@ public:
     virtual void activation_behavior(DOM::Event const&) override;
 
     virtual void form_associated_element_was_inserted() override;
-    virtual void form_associated_element_attribute_changed(FlyString const& name, Optional<String> const& old_value, Optional<String> const& value, Optional<FlyString> const& namespace_) override;
+    virtual void form_associated_element_attribute_changed(Utf16FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_) override;
 
     void did_select_item(Optional<u32> const& id);
 
@@ -111,7 +109,7 @@ public:
     bool can_skip_selectedness_update_for_inserted_option(HTMLOptionElement const&) const;
 
     bool user_validity() const { return m_user_validity; }
-    void set_user_validity(bool flag) { m_user_validity = flag; }
+    void set_user_validity(bool);
 
     // https://html.spec.whatwg.org/multipage/form-elements.html#placeholder-label-option
     HTMLOptionElement* placeholder_label_option() const;
@@ -132,8 +130,6 @@ public:
 
 private:
     HTMLSelectElement(DOM::Document&, DOM::QualifiedName);
-
-    virtual void initialize(JS::Realm&) override;
     virtual void visit_edges(Cell::Visitor&) override;
 
     // ^DOM::Element

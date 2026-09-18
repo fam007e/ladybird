@@ -1,8 +1,8 @@
 Harness status: OK
 
-Found 306 tests
+Found 324 tests
 
-302 Pass
+320 Pass
 4 Fail
 Pass	accent-color
 Pass	border-collapse
@@ -64,7 +64,6 @@ Pass	stroke-width
 Pass	tab-size
 Pass	text-align
 Pass	text-anchor
-Pass	text-decoration-line
 Pass	text-decoration-skip-ink
 Pass	text-indent
 Pass	text-justify
@@ -96,6 +95,7 @@ Pass	animation-timing-function
 Pass	appearance
 Pass	aspect-ratio
 Pass	backdrop-filter
+Pass	backface-visibility
 Pass	background-attachment
 Pass	background-blend-mode
 Pass	background-clip
@@ -143,16 +143,28 @@ Pass	border-top-right-radius
 Pass	border-top-style
 Pass	border-top-width
 Pass	bottom
+Pass	box-decoration-break
 Pass	box-shadow
 Pass	box-sizing
+Pass	break-after
+Pass	break-before
+Pass	break-inside
 Pass	clear
 Pass	clip
 Pass	clip-path
 Pass	column-count
+Pass	column-fill
 Pass	column-gap
+Pass	column-rule-color
+Pass	column-rule-style
+Pass	column-rule-width
 Pass	column-span
 Pass	column-width
 Pass	contain
+Pass	contain-intrinsic-block-size
+Pass	contain-intrinsic-height
+Pass	contain-intrinsic-inline-size
+Pass	contain-intrinsic-width
 Pass	container-name
 Pass	container-type
 Pass	content
@@ -162,6 +174,7 @@ Pass	counter-reset
 Pass	counter-set
 Pass	cx
 Pass	cy
+Pass	d
 Pass	display
 Pass	filter
 Pass	flex-basis
@@ -270,6 +283,9 @@ Pass	scroll-padding-inline-start
 Pass	scroll-padding-left
 Pass	scroll-padding-right
 Pass	scroll-padding-top
+Pass	scroll-snap-align
+Pass	scroll-snap-stop
+Pass	scroll-snap-type
 Pass	scroll-timeline-axis
 Pass	scroll-timeline-name
 Pass	scrollbar-gutter
@@ -281,6 +297,7 @@ Pass	stop-color
 Pass	stop-opacity
 Pass	table-layout
 Pass	text-decoration-color
+Pass	text-decoration-line
 Pass	text-decoration-style
 Pass	text-decoration-thickness
 Pass	text-overflow
@@ -299,6 +316,7 @@ Pass	transition-timing-function
 Pass	translate
 Pass	unicode-bidi
 Pass	user-select
+Pass	vector-effect
 Pass	vertical-align
 Pass	view-timeline-axis
 Pass	view-timeline-inset

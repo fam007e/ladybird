@@ -23,13 +23,14 @@ class DevToolsConsoleClient final : public WebContentConsoleClient {
 
 public:
     static GC::Ref<DevToolsConsoleClient> create(JS::Realm&, JS::Console&, PageClient&);
+    static JsonValue serialize_value(JS::Realm&, JS::Value);
     virtual ~DevToolsConsoleClient() override;
 
 private:
-    DevToolsConsoleClient(JS::Realm&, JS::Console&, PageClient&, ConsoleGlobalEnvironmentExtensions&);
+    DevToolsConsoleClient(JS::Console&, PageClient&, ConsoleGlobalEnvironmentExtensions&);
 
     virtual void handle_result(JS::Value) override;
-    virtual void report_exception(String const& name, String const& message, JS::ErrorData const&, bool) override;
+    virtual void report_exception(Utf16View name, Utf16View message, JS::ErrorData const&, bool) override;
     virtual void end_group() override { }
     virtual void clear() override { }
 

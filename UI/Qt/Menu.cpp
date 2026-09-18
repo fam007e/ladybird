@@ -4,10 +4,14 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <LibURL/Parser.h>
 #include <LibWebView/Application.h>
+#include <LibWebView/HistoryStore.h>
+#include <UI/Qt/Application.h>
 #include <UI/Qt/Icon.h>
 #include <UI/Qt/Menu.h>
 #include <UI/Qt/StringUtils.h>
+#include <UI/Qt/Tab.h>
 #include <UI/Qt/WebContentView.h>
 
 #include <QAction>
@@ -17,6 +21,9 @@
 #include <QWidget>
 
 namespace Ladybird {
+
+static constexpr auto DYNAMIC_HISTORY_MENU_ITEM_PROPERTY = "LadybirdDynamicHistoryMenuItem";
+static constexpr size_t RECENT_HISTORY_MENU_ITEM_LIMIT = 15;
 
 class ActionObserver final : public WebView::Action::Observer {
 public:
@@ -103,6 +110,11 @@ private:
                 if (action->is_checkable())
                     action->set_checked(checked);
                 action->activate();
+
+                if (action->id() == WebView::ActionID::BookmarkItem) {
+                    if (auto* active_tab = Application::the().active_tab())
+                        active_tab->view().setFocus();
+                }
             }
         });
         QObject::connect(m_action->parent(), &QObject::destroyed, [this, weak_action = action.make_weak_ptr()]() {
@@ -170,6 +182,12 @@ static void initialize_native_control(WebView::Action& action, QAction& qaction,
         qaction.setShortcut(QKeySequence(Qt::CTRL | Qt::Key_J));
         break;
 
+    case WebView::ActionID::Undo:
+        qaction.setShortcut(QKeySequence::StandardKey::Undo);
+        break;
+    case WebView::ActionID::Redo:
+        qaction.setShortcuts(QKeySequence::keyBindings(QKeySequence::StandardKey::Redo));
+        break;
     case WebView::ActionID::CopySelection:
         qaction.setShortcut(QKeySequence::StandardKey::Copy);
         break;
@@ -192,12 +210,15 @@ static void initialize_native_control(WebView::Action& action, QAction& qaction,
         if (include_action_icon == IncludeActionIcon::Yes)
             qaction.setIcon(create_chrome_icon(action.engaged() ? ChromeIcon::StarFilled : ChromeIcon::Star, palette));
         break;
+    case WebView::ActionID::AddBookmarkAllTabs:
+        qaction.setShortcut(QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_D));
+        break;
     case WebView::ActionID::ToggleBookmarksBar:
         qaction.setShortcut(QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_B));
         break;
     case WebView::ActionID::BookmarkItem:
-        if (auto icon = action.base64_png_icon(); icon.has_value())
-            qaction.setIcon(icon_from_base64_png(*icon, MENU_ICON_SIZE));
+        if (auto icon = action.png_icon(); icon.has_value())
+            qaction.setIcon(icon_from_png(icon->bytes(), MENU_ICON_SIZE));
         else
             qaction.setIcon(create_chrome_icon(ChromeIcon::Globe, palette));
         break;
@@ -216,7 +237,7 @@ static void initialize_native_control(WebView::Action& action, QAction& qaction,
         qaction.setShortcut(QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_Delete));
 #endif
         break;
-    case WebView::ActionID::OpenProcessesPage:
+    case WebView::ActionID::OpenTaskManager:
         qaction.setShortcut(QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_M));
         break;
     case WebView::ActionID::OpenSettingsPage:
@@ -290,6 +311,48 @@ static void add_items_to_menu(QMenu& qmenu, QWidget& parent, WebView::Menu& menu
                 qmenu.addSeparator();
             });
     }
+
+#if defined(AK_OS_MACOS)
+    enable_menu_icons(qmenu);
+#endif
+}
+
+static QAction* create_session_history_traversal_menu_action(QMenu& menu, WebContentView& view, WebView::ViewImplementation::SessionHistoryTraversalMenuItem const& item)
+{
+    static constexpr int const MENU_ICON_SIZE = 16;
+
+    auto* action = new QAction(qstring_from_ak_string(item.title), &menu);
+    action->setToolTip(qstring_from_ak_string(item.url));
+    if (item.favicon_png.has_value())
+        action->setIcon(icon_from_png(item.favicon_png->bytes(), MENU_ICON_SIZE));
+    else
+        action->setIcon(create_chrome_icon(ChromeIcon::Globe, menu.palette()));
+    QObject::connect(action, &QAction::triggered, &view, [&view, step = item.step] {
+        view.traverse_the_history_to_step(step);
+    });
+    return action;
+}
+
+static bool append_session_history_traversal_menu_items(QMenu& menu, WebContentView& view, int direction)
+{
+    auto items = view.session_history_traversal_menu_items(direction);
+    if (items.is_empty())
+        return false;
+
+    for (auto const& item : items)
+        menu.addAction(create_session_history_traversal_menu_action(menu, view, item));
+
+#if defined(AK_OS_MACOS)
+    enable_menu_icons(menu);
+#endif
+
+    return true;
+}
+
+void populate_session_history_traversal_menu(QMenu& menu, WebContentView& view, int direction)
+{
+    menu.clear();
+    append_session_history_traversal_menu_items(menu, view, direction);
 }
 
 QMenu* create_application_menu(QWidget& parent, WebView::Menu& menu)
@@ -303,6 +366,85 @@ void repopulate_application_menu(QMenu& menu, QWidget& parent, WebView::Menu& so
 {
     menu.clear();
     add_items_to_menu(menu, parent, source);
+}
+
+static void insert_dynamic_history_action(QMenu& menu, QAction* before, QAction& action)
+{
+    action.setProperty(DYNAMIC_HISTORY_MENU_ITEM_PROPERTY, true);
+    menu.insertAction(before, &action);
+}
+
+static QAction* create_dynamic_history_separator(QMenu& menu)
+{
+    auto* separator = new QAction(&menu);
+    separator->setSeparator(true);
+    return separator;
+}
+
+static QAction* create_history_navigation_action(QMenu& menu, WebContentView& view, WebView::Action& source_action, QKeySequence::StandardKey shortcut)
+{
+    auto* action = new QAction(qstring_from_ak_string(source_action.text()), &menu);
+    action->setEnabled(source_action.enabled());
+    action->setShortcuts(QKeySequence::keyBindings(shortcut));
+    QObject::connect(action, &QAction::triggered, &view, [&source_action] {
+        source_action.activate();
+    });
+    return action;
+}
+
+static QAction* create_recent_history_menu_action(QMenu& menu, WebContentView& view, WebView::HistoryEntry const& entry)
+{
+    static constexpr int const MENU_ICON_SIZE = 16;
+
+    auto title = entry.title.has_value() && !entry.title->is_empty() ? *entry.title : entry.url;
+    auto* action = new QAction(qstring_from_ak_string(title), &menu);
+    action->setToolTip(qstring_from_ak_string(entry.url));
+    if (entry.favicon_png.has_value())
+        action->setIcon(icon_from_png(entry.favicon_png->bytes(), MENU_ICON_SIZE));
+    else
+        action->setIcon(create_chrome_icon(ChromeIcon::Globe, menu.palette()));
+
+    auto url = URL::Parser::basic_parse(entry.url);
+    if (url.has_value()) {
+        QObject::connect(action, &QAction::triggered, &view, [&view, url = url.release_value()] {
+            view.load_from_user_input(url);
+        });
+    } else {
+        action->setEnabled(false);
+    }
+
+    return action;
+}
+
+void update_history_menu(QMenu& menu, WebContentView* view)
+{
+    for (auto* action : menu.actions()) {
+        if (action->property(DYNAMIC_HISTORY_MENU_ITEM_PROPERTY).toBool()) {
+            menu.removeAction(action);
+            action->deleteLater();
+        }
+    }
+
+    if (!view)
+        return;
+
+    auto* insertion_point = menu.actions().isEmpty() ? nullptr : menu.actions().first();
+    insert_dynamic_history_action(menu, insertion_point, *create_history_navigation_action(menu, *view, view->navigate_back_action(), QKeySequence::StandardKey::Back));
+    insert_dynamic_history_action(menu, insertion_point, *create_history_navigation_action(menu, *view, view->navigate_forward_action(), QKeySequence::StandardKey::Forward));
+    insert_dynamic_history_action(menu, insertion_point, *create_dynamic_history_separator(menu));
+
+    auto entries = view->session().history_store->list_entries({}, 0, RECENT_HISTORY_MENU_ITEM_LIMIT);
+    for (auto const& entry : entries) {
+        auto* action = create_recent_history_menu_action(menu, *view, entry);
+        insert_dynamic_history_action(menu, insertion_point, *action);
+    }
+
+    if (!entries.is_empty())
+        insert_dynamic_history_action(menu, insertion_point, *create_dynamic_history_separator(menu));
+
+#if defined(AK_OS_MACOS)
+    enable_menu_icons(menu);
+#endif
 }
 
 QMenu* create_context_menu(QWidget& parent, WebContentView& view, WebView::Menu& menu)

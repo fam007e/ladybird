@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2026, Ladybird contributors
+ * Copyright (c) 2026-present, the Ladybird developers.
  *
  * SPDX-License-Identifier: BSD-2-Clause
  */
@@ -8,6 +8,7 @@
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/HTML/LocalNavigable.h>
 #include <LibWeb/HTML/NavigableContainer.h>
+#include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/Scripting/TemporaryExecutionContext.h>
 #include <LibWeb/HTML/StructuredSerialize.h>
 #include <LibWeb/IndexedDB/IDBKeyRange.h>
@@ -37,7 +38,7 @@ JsonValue serialize_key_for_inspection(Key& key)
     case Key::Date:
         return key.value_as_double();
     case Key::String:
-        return key.value_as_string();
+        return key.value_as_string().to_utf8();
     case Key::Binary:
         return key.dump();
     case Key::Array: {
@@ -54,18 +55,18 @@ JsonValue serialize_key_for_inspection(Key& key)
 static String serialize_key_path(KeyPath const& key_path)
 {
     return key_path.visit(
-        [](String const& value) {
-            return value;
+        [](Utf16String const& value) {
+            return value.to_utf8();
         },
-        [](Vector<String> const& values) {
+        [](Vector<Utf16String> const& values) {
             JsonArray array;
             for (auto const& value : values)
-                array.must_append(value);
+                array.must_append(value.to_utf8());
             return array.serialized();
         });
 }
 
-static String serialize_record_value(JS::Realm& realm, HTML::SerializationRecord const& record)
+static String serialize_record_value(JS::Realm& realm, HTML::StorageSerializationRecord const& record)
 {
     HTML::TemporaryExecutionContext context(realm, HTML::TemporaryExecutionContext::CallbacksEnabled::Yes);
 
@@ -73,7 +74,7 @@ static String serialize_record_value(JS::Realm& realm, HTML::SerializationRecord
     if (value.is_exception())
         return "<unserializable>"_string;
 
-    auto serialized = Infra::serialize_javascript_value_to_json_string(realm.vm(), value.release_value());
+    auto serialized = Infra::serialize_javascript_value_to_json_string(realm, value.release_value());
     if (serialized.is_exception())
         return "<unserializable>"_string;
 
@@ -98,7 +99,11 @@ static Vector<IndexedDatabaseDocument> indexed_database_documents_for_inspection
         if (!content_navigable)
             return TraversalDecision::Continue;
 
-        auto content_document = content_navigable->active_document();
+        // FIXME: Inspect a document hosted by another process.
+        auto* local_navigable = as_if<HTML::LocalNavigable>(*content_navigable);
+        if (!local_navigable)
+            return TraversalDecision::Continue;
+        auto content_document = local_navigable->active_document();
         if (!content_document)
             return TraversalDecision::Continue;
 
@@ -132,9 +137,9 @@ Vector<InspectionStorageHost> inspect_indexed_database_storage(DOM::Document& do
 
             Vector<String> object_store_names;
             for (auto const& object_store : database->object_stores())
-                object_store_names.append(object_store->name());
+                object_store_names.append(object_store->name().to_utf8());
 
-            databases.append({ database->name(), database->version(), move(object_store_names) });
+            databases.append({ database->name().to_utf8(), database->version(), move(object_store_names) });
         }
 
         hosts.append({ entry.url, move(databases) });
@@ -147,14 +152,14 @@ static InspectionObjectStore inspect_object_store(ObjectStore& object_store)
     Vector<InspectionIndex> indexes;
     for (auto const& entry : object_store.index_set()) {
         auto const& index = *entry.value;
-        indexes.append({ index.name(), serialize_key_path(index.key_path()), index.unique(), index.multi_entry() });
+        indexes.append({ index.name().to_utf8(), serialize_key_path(index.key_path()), index.unique(), index.multi_entry() });
     }
 
     Optional<String> key_path;
     if (auto value = object_store.key_path(); value.has_value())
         key_path = serialize_key_path(*value);
 
-    return { object_store.name(), move(key_path), object_store.uses_a_key_generator(), move(indexes) };
+    return { object_store.name().to_utf8(), move(key_path), object_store.uses_a_key_generator(), move(indexes) };
 }
 
 static void append_database_rows(Vector<InspectionObject>& rows, StorageAPI::StorageKey const& storage_key)
@@ -163,13 +168,13 @@ static void append_database_rows(Vector<InspectionObject>& rows, StorageAPI::Sto
         if (!database || database->version() == 0)
             continue;
 
-        rows.append(InspectionDatabaseRow { database->name(), database->version(), database->object_stores().size() });
+        rows.append(InspectionDatabaseRow { database->name().to_utf8(), database->version(), database->object_stores().size() });
     }
 }
 
 static void append_object_store_rows(Vector<InspectionObject>& rows, StorageAPI::StorageKey const& storage_key, String const& database_name)
 {
-    auto database = Database::for_key_and_name(storage_key, database_name);
+    auto database = Database::for_key_and_name(storage_key, Utf16String::from_utf8(database_name));
     if (!database.has_value())
         return;
 
@@ -182,11 +187,11 @@ static void append_record_rows(Vector<InspectionObject>& rows, DOM::Document& do
     if (!path.object_store_name.has_value())
         return;
 
-    auto database = Database::for_key_and_name(storage_key, path.database_name);
+    auto database = Database::for_key_and_name(storage_key, Utf16String::from_utf8(path.database_name));
     if (!database.has_value())
         return;
 
-    auto object_store = database->object_store_with_name(*path.object_store_name);
+    auto object_store = database->object_store_with_name(Utf16String::from_utf8(*path.object_store_name));
     if (!object_store)
         return;
 
@@ -194,7 +199,7 @@ static void append_record_rows(Vector<InspectionObject>& rows, DOM::Document& do
         auto serialized_record_key = serialize_key_for_inspection(*record.key);
         if (path.key.has_value() && serialized_record_key.serialized() != path.key->serialized())
             continue;
-        rows.append(InspectionRecord { serialized_record_key, serialize_record_value(document.realm(), *record.value) });
+        rows.append(InspectionRecord { serialized_record_key, serialize_record_value(HTML::relevant_realm(document), *record.value) });
     }
 }
 
@@ -227,11 +232,11 @@ ErrorOr<bool> delete_indexed_database_for_inspection(DOM::Document& document, Fu
     if (!entry.has_value())
         return Error::from_string_literal("Unable to find IndexedDB host");
 
-    auto database = Database::for_key_and_name(entry->storage_key, database_name);
+    auto database = Database::for_key_and_name(entry->storage_key, Utf16String::from_utf8(database_name));
     if (database.has_value() && !database->associated_connections_as_root_vector().is_empty())
         return true;
 
-    TRY(Database::delete_for_key_and_name(entry->storage_key, database_name));
+    TRY(Database::delete_for_key_and_name(entry->storage_key, Utf16String::from_utf8(database_name)));
     return false;
 }
 
@@ -241,11 +246,11 @@ ErrorOr<void> clear_indexed_database_object_store_for_inspection(DOM::Document& 
     if (!entry.has_value())
         return Error::from_string_literal("Unable to find IndexedDB host");
 
-    auto database = Database::for_key_and_name(entry->storage_key, database_name);
+    auto database = Database::for_key_and_name(entry->storage_key, Utf16String::from_utf8(database_name));
     if (!database.has_value())
         return Error::from_string_literal("Unable to find IndexedDB database");
 
-    auto object_store = database->object_store_with_name(object_store_name);
+    auto object_store = database->object_store_with_name(Utf16String::from_utf8(object_store_name));
     if (!object_store)
         return Error::from_string_literal("Unable to find IndexedDB object store");
 
@@ -259,11 +264,11 @@ ErrorOr<void> delete_indexed_database_record_for_inspection(DOM::Document& docum
     if (!entry.has_value())
         return Error::from_string_literal("Unable to find IndexedDB host");
 
-    auto database = Database::for_key_and_name(entry->storage_key, database_name);
+    auto database = Database::for_key_and_name(entry->storage_key, Utf16String::from_utf8(database_name));
     if (!database.has_value())
         return Error::from_string_literal("Unable to find IndexedDB database");
 
-    auto object_store = database->object_store_with_name(object_store_name);
+    auto object_store = database->object_store_with_name(Utf16String::from_utf8(object_store_name));
     if (!object_store)
         return Error::from_string_literal("Unable to find IndexedDB object store");
 
@@ -271,7 +276,7 @@ ErrorOr<void> delete_indexed_database_record_for_inspection(DOM::Document& docum
         if (serialize_key_for_inspection(*record.key).serialized() != key.serialized())
             continue;
 
-        auto range = IDBKeyRange::create(entry->document->realm(), record.key, record.key, IDBKeyRange::LowerOpen::No, IDBKeyRange::UpperOpen::No);
+        auto range = IDBKeyRange::create(record.key, record.key, IDBKeyRange::LowerOpen::No, IDBKeyRange::UpperOpen::No);
         delete_records_from_an_object_store(*object_store, range);
         return {};
     }

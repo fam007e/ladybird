@@ -4,13 +4,14 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibWeb/Bindings/HTMLBodyElement.h>
-#include <LibWeb/CSS/ComputedProperties.h>
+#include <LibWeb/CSS/PropertyID.h>
+#include <LibWeb/CSS/StyleEngineInput.h>
 #include <LibWeb/CSS/StyleValues/ColorStyleValue.h>
 #include <LibWeb/CSS/StyleValues/ImageStyleValue.h>
 #include <LibWeb/CSS/StyleValues/LengthStyleValue.h>
 #include <LibWeb/CSS/StyleValues/StyleValueList.h>
 #include <LibWeb/DOM/Document.h>
+#include <LibWeb/DOM/HTMLCollection.h>
 #include <LibWeb/Gamepad/EventNames.h>
 #include <LibWeb/HTML/HTMLBodyElement.h>
 #include <LibWeb/HTML/LocalNavigable.h>
@@ -19,7 +20,6 @@
 #include <LibWeb/HTML/Parser/HTMLParser.h>
 #include <LibWeb/HTML/Window.h>
 #include <LibWeb/Layout/Node.h>
-#include <LibWeb/Painting/Paintable.h>
 
 namespace Web::HTML {
 
@@ -32,18 +32,7 @@ HTMLBodyElement::HTMLBodyElement(DOM::Document& document, DOM::QualifiedName qua
 
 HTMLBodyElement::~HTMLBodyElement() = default;
 
-void HTMLBodyElement::visit_edges(Visitor& visitor)
-{
-    Base::visit_edges(visitor);
-}
-
-void HTMLBodyElement::initialize(JS::Realm& realm)
-{
-    WEB_SET_PROTOTYPE_FOR_INTERFACE(HTMLBodyElement);
-    Base::initialize(realm);
-}
-
-bool HTMLBodyElement::is_presentational_hint(FlyString const& name) const
+bool HTMLBodyElement::is_presentational_hint(Utf16FlyString const& name) const
 {
     if (Base::is_presentational_hint(name))
         return true;
@@ -63,7 +52,7 @@ bool HTMLBodyElement::is_presentational_hint(FlyString const& name) const
 void HTMLBodyElement::apply_presentational_hints(Vector<CSS::StyleProperty>& properties) const
 {
     Base::apply_presentational_hints(properties);
-    for_each_attribute([&](auto& name, auto& value) {
+    for_each_attribute([&](Utf16FlyString const& name, Utf16View value) {
         if (name == HTML::AttributeNames::bgcolor) {
             // https://html.spec.whatwg.org/multipage/rendering.html#the-page:rules-for-parsing-a-legacy-colour-value
             auto color = parse_legacy_color_value(value);
@@ -80,11 +69,11 @@ void HTMLBodyElement::apply_presentational_hints(Vector<CSS::StyleProperty>& pro
         }
     });
 
-    auto get_margin_value = [&](auto const& first_body_attr_name, auto const& second_body_attr_name, auto const& container_frame_attr_name) -> Optional<String> {
+    auto get_margin_value = [&](auto const& first_body_attr_name, auto const& second_body_attr_name, auto const& container_frame_attr_name) -> Optional<Utf16String> {
         if (auto value = get_attribute(first_body_attr_name); value.has_value())
-            return value.value();
+            return value.release_value();
         if (auto value = get_attribute(second_body_attr_name); value.has_value())
-            return value.value();
+            return value.release_value();
         auto navigable = document().navigable();
         if (!navigable)
             return {};
@@ -92,7 +81,7 @@ void HTMLBodyElement::apply_presentational_hints(Vector<CSS::StyleProperty>& pro
         if (!container)
             return {};
         if (auto value = container->get_attribute(container_frame_attr_name); value.has_value())
-            return value;
+            return value.release_value();
         return {};
     };
     auto margin_top_value = get_margin_value(HTML::AttributeNames::marginheight, HTML::AttributeNames::topmargin, HTML::AttributeNames::marginheight);
@@ -100,7 +89,7 @@ void HTMLBodyElement::apply_presentational_hints(Vector<CSS::StyleProperty>& pro
     auto margin_left_value = get_margin_value(HTML::AttributeNames::marginwidth, HTML::AttributeNames::leftmargin, HTML::AttributeNames::marginwidth);
     auto margin_right_value = get_margin_value(HTML::AttributeNames::marginwidth, HTML::AttributeNames::rightmargin, HTML::AttributeNames::marginwidth);
 
-    auto apply_margin_value = [&](CSS::PropertyID property_id, Optional<String> const& value) {
+    auto apply_margin_value = [&](CSS::PropertyID property_id, Optional<Utf16String> const& value) {
         if (!value.has_value())
             return;
         if (auto parsed_value = parse_non_negative_integer(value.value()); parsed_value.has_value())
@@ -113,43 +102,50 @@ void HTMLBodyElement::apply_presentational_hints(Vector<CSS::StyleProperty>& pro
     apply_margin_value(CSS::PropertyID::MarginRight, margin_right_value);
 }
 
-void HTMLBodyElement::attribute_changed(FlyString const& name, Optional<String> const& old_value, Optional<String> const& value, Optional<FlyString> const& namespace_)
+void HTMLBodyElement::attribute_changed(Utf16FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_)
 {
     Base::attribute_changed(name, old_value, value, namespace_);
 
+    // The link colors are presentational hints on every link of the document, which the style
+    // engine has to know each link carries.
+    auto refresh_link_style_facts = [&] {
+        auto links = document().links();
+        for (size_t index = 0; index < links->length(); ++index)
+            CSS::record_element_adjustment_facts(*links->item(index));
+    };
     if (name == HTML::AttributeNames::link) {
         // https://html.spec.whatwg.org/multipage/rendering.html#the-page:rules-for-parsing-a-legacy-colour-value-3
-        auto color = parse_legacy_color_value(value.value_or(String {}));
-        if (color.has_value())
-            document().set_normal_link_color(color.value());
+        auto color = parse_legacy_color_value(value.has_value() ? value->utf16_view() : u""sv);
+        document().set_normal_link_color(color);
+        refresh_link_style_facts();
     } else if (name == HTML::AttributeNames::alink) {
         // https://html.spec.whatwg.org/multipage/rendering.html#the-page:rules-for-parsing-a-legacy-colour-value-5
-        auto color = parse_legacy_color_value(value.value_or(String {}));
-        if (color.has_value())
-            document().set_active_link_color(color.value());
+        auto color = parse_legacy_color_value(value.has_value() ? value->utf16_view() : u""sv);
+        document().set_active_link_color(color);
+        refresh_link_style_facts();
     } else if (name == HTML::AttributeNames::vlink) {
         // https://html.spec.whatwg.org/multipage/rendering.html#the-page:rules-for-parsing-a-legacy-colour-value-4
-        auto color = parse_legacy_color_value(value.value_or(String {}));
-        if (color.has_value())
-            document().set_visited_link_color(color.value());
+        auto color = parse_legacy_color_value(value.has_value() ? value->utf16_view() : u""sv);
+        document().set_visited_link_color(color);
+        refresh_link_style_facts();
     } else if (name == HTML::AttributeNames::background) {
         // https://html.spec.whatwg.org/multipage/rendering.html#the-page:attr-background
         m_background_style_value = nullptr;
-        if (auto maybe_background_url = document().encoding_parse_url(value.value_or(String {})); maybe_background_url.has_value()) {
+        if (auto maybe_background_url = document().encoding_parse_url(value.has_value() ? value->utf16_view() : u""sv); maybe_background_url.has_value()) {
             m_background_style_value = CSS::ImageStyleValue::create(maybe_background_url.value());
         }
     }
 
 #undef __ENUMERATE
-#define __ENUMERATE(attribute_name, event_name)                     \
-    if (name == HTML::AttributeNames::attribute_name) {             \
-        element_event_handler_attribute_changed(event_name, value); \
+#define __ENUMERATE(attribute_name, event_name)               \
+    if (name == HTML::AttributeNames::attribute_name) {       \
+        element_event_handler_attribute_changed(name, value); \
     }
     ENUMERATE_WINDOW_EVENT_HANDLERS(__ENUMERATE)
 #undef __ENUMERATE
 }
 
-GC::Ptr<DOM::EventTarget> HTMLBodyElement::global_event_handlers_to_event_target(FlyString const& event_name)
+GC::Ptr<DOM::EventTarget> HTMLBodyElement::global_event_handlers_to_event_target(Utf16FlyString const& event_name)
 {
     // NOTE: This is a little weird, but IIUC document.body.onload actually refers to window.onload
     // NOTE: document.body can return either a HTMLBodyElement or HTMLFrameSetElement, so both these elements must support this mapping.

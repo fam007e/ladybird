@@ -42,6 +42,7 @@ private:
     virtual void showEvent(QShowEvent*) override;
     virtual void hideEvent(QHideEvent*) override;
 
+    void close_bar();
     void find_text_changed();
     void update_chrome_style();
 
@@ -55,6 +56,7 @@ private:
     QCheckBox* m_match_case { nullptr };
     QLabel* m_result_label { nullptr };
     bool m_is_updating_chrome_style { false };
+    u64 m_selected_text_request_id { 0 };
 };
 
 }

@@ -5,12 +5,10 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <LibGC/Heap.h>
 #include <LibWeb/Animations/DocumentTimeline.h>
-#include <LibWeb/Bindings/CSSTransition.h>
-#include <LibWeb/Bindings/Intrinsics.h>
 #include <LibWeb/CSS/CSSStyleDeclaration.h>
 #include <LibWeb/CSS/CSSTransition.h>
-#include <LibWeb/CSS/Interpolation.h>
 #include <LibWeb/CSS/PropertyID.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/Element.h>
@@ -30,10 +28,11 @@ GC::Ref<CSSTransition> CSSTransition::start_a_transition(
     NonnullRefPtr<StyleValue const> start_value,
     NonnullRefPtr<StyleValue const> end_value,
     NonnullRefPtr<StyleValue const> reversing_adjusted_start_value,
-    double reversing_shortening_factor)
+    double reversing_shortening_factor,
+    Publication publication)
 {
-    auto& realm = abstract_element.element().realm();
-    return realm.create<CSSTransition>(realm, abstract_element, property_id, transition_generation, delay, start_time, end_time, start_value, end_value, reversing_adjusted_start_value, reversing_shortening_factor);
+    auto& environment = abstract_element.document().relevant_settings_object();
+    return GC::Heap::the().allocate<CSSTransition>(environment, abstract_element, property_id, transition_generation, delay, start_time, end_time, start_value, end_value, reversing_adjusted_start_value, reversing_shortening_factor, publication);
 }
 
 Utf16FlyString const& CSSTransition::transition_property() const
@@ -89,7 +88,7 @@ int CSSTransition::class_specific_composite_order(GC::Ref<Animations::Animation>
 }
 
 CSSTransition::CSSTransition(
-    JS::Realm& realm,
+    HTML::EnvironmentSettingsObject& environment,
     DOM::AbstractElement abstract_element,
     PropertyID property_id,
     size_t transition_generation,
@@ -99,8 +98,9 @@ CSSTransition::CSSTransition(
     NonnullRefPtr<StyleValue const> start_value,
     NonnullRefPtr<StyleValue const> end_value,
     NonnullRefPtr<StyleValue const> reversing_adjusted_start_value,
-    double reversing_shortening_factor)
-    : Animations::Animation(realm)
+    double reversing_shortening_factor,
+    Publication publication)
+    : Animations::Animation(environment)
     , m_transition_property(property_id)
     , m_transition_generation(transition_generation)
     , m_start_time(start_time + delay)
@@ -109,7 +109,8 @@ CSSTransition::CSSTransition(
     , m_end_value(move(end_value))
     , m_reversing_adjusted_start_value(move(reversing_adjusted_start_value))
     , m_reversing_shortening_factor(reversing_shortening_factor)
-    , m_keyframe_effect(Animations::KeyframeEffect::create(realm))
+    , m_keyframe_effect(Animations::KeyframeEffect::create())
+    , m_is_provisional(publication == Publication::Provisional)
 {
     // FIXME:
     // Transitions generated using the markup defined in this specification are not added to the global animation list
@@ -118,13 +119,15 @@ CSSTransition::CSSTransition(
     // that have been disassociated from their owning element but are still idle do not have a defined composite order.
 
     // Construct a KeyframesEffect for our animation
-    m_keyframe_effect->set_target(abstract_element);
+    // NB: The current style computation collects this effect before publishing its result, so scheduling a second
+    //     animated style update here would evaluate the same transition twice.
+    m_keyframe_effect->set_target(abstract_element, Animations::KeyframeEffect::InvalidateEffect::No);
     m_keyframe_effect->set_specified_start_delay(delay);
     m_keyframe_effect->set_specified_iteration_duration(end_time - start_time);
     // AD-HOC: CSS Transitions require the start value to apply during transition-delay. A default KeyframeEffect does
     //         not fill in the before phase, so use backwards fill to keep the transition value in the cascade until
     //         the active interval starts.
-    m_keyframe_effect->set_fill_mode(Bindings::FillMode::Backwards);
+    m_keyframe_effect->set_fill_mode(Animations::FillMode::Backwards);
     // https://drafts.csswg.org/web-animations-2/#updating-animationeffect-timing
     // Timing properties may also be updated due to a style change. Any change to a CSS animation property that affects
     // timing requires rerunning the procedure to normalize specified timing.
@@ -133,10 +136,10 @@ CSSTransition::CSSTransition(
 
     auto key_frame_set = adopt_ref(*new Animations::KeyframeEffect::KeyFrameSet);
     Animations::KeyframeEffect::KeyFrameSet::ResolvedKeyFrame initial_keyframe;
-    initial_keyframe.properties.set(property_id, m_start_value);
+    initial_keyframe.properties.set(PropertyNameAndID::from_id(property_id), RustStyleValueHandle::retained(m_start_value->rust_style_value_data()));
 
     Animations::KeyframeEffect::KeyFrameSet::ResolvedKeyFrame final_keyframe;
-    final_keyframe.properties.set(property_id, m_end_value);
+    final_keyframe.properties.set(PropertyNameAndID::from_id(property_id), RustStyleValueHandle::retained(m_end_value->rust_style_value_data()));
 
     key_frame_set->keyframes_by_key.insert(0, initial_keyframe);
     key_frame_set->keyframes_by_key.insert(100 * Animations::KeyframeEffect::AnimationKeyFrameKeyScaleFactor, final_keyframe);
@@ -144,17 +147,35 @@ CSSTransition::CSSTransition(
     m_keyframe_effect->set_key_frame_set(key_frame_set);
     set_timeline(abstract_element.document().timeline());
     set_owning_element(abstract_element);
-    set_effect(m_keyframe_effect);
-    abstract_element.element().set_transition(abstract_element.pseudo_element(), m_transition_property, *this);
+    if (m_is_provisional) {
+        set_provisional_effect(m_keyframe_effect);
+    } else {
+        set_effect(m_keyframe_effect, Animations::Animation::ShouldInvalidate::No);
+        abstract_element.element().set_transition(abstract_element.pseudo_element(), m_transition_property, *this);
+    }
 
-    HTML::TemporaryExecutionContext context(realm);
-    play().release_value_but_fixme_should_propagate_errors();
+    HTML::TemporaryExecutionContext context(environment);
+    play(Animations::Animation::ShouldInvalidate::No).release_value_but_fixme_should_propagate_errors();
 }
 
-void CSSTransition::initialize(JS::Realm& realm)
+void CSSTransition::commit_provisional_transition()
 {
-    WEB_SET_PROTOTYPE_FOR_INTERFACE(CSSTransition);
-    Base::initialize(realm);
+    VERIFY(m_is_provisional);
+    auto target = m_keyframe_effect->target();
+    VERIFY(target);
+    auto owner = owning_element();
+    VERIFY(owner.has_value());
+    target->associate_with_animation(*this);
+    target->set_transition(owner->pseudo_element(), m_transition_property, *this);
+    m_is_provisional = false;
+}
+
+void CSSTransition::discard_provisional_transition()
+{
+    VERIFY(m_is_provisional);
+    set_timeline({});
+    discard_provisional_effect();
+    m_is_provisional = false;
 }
 
 void CSSTransition::visit_edges(Cell::Visitor& visitor)

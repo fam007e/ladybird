@@ -9,8 +9,6 @@
 
 #pragma once
 
-#include <LibWeb/CSS/Length.h>
-#include <LibWeb/CSS/PercentageOr.h>
 #include <LibWeb/CSS/StyleValues/StyleValue.h>
 
 namespace Web::CSS {
@@ -24,24 +22,20 @@ public:
     }
     virtual ~BackgroundSizeStyleValue() override;
 
-    ValueComparingNonnullRefPtr<StyleValue const> size_x() const { return m_properties.size_x; }
-    ValueComparingNonnullRefPtr<StyleValue const> size_y() const { return m_properties.size_y; }
+    ValueComparingNonnullRefPtr<StyleValue const> size_x() const { return wrap_rust_child(m_value->background_size.size_x); }
+    ValueComparingNonnullRefPtr<StyleValue const> size_y() const { return wrap_rust_child(m_value->background_size.size_y); }
 
-    virtual void serialize(StringBuilder&, SerializationMode) const override;
-    virtual ValueComparingNonnullRefPtr<StyleValue const> absolutized(ComputationContext const&) const override;
-
-    bool properties_equal(BackgroundSizeStyleValue const& other) const { return m_properties == other.m_properties; }
-
-    virtual bool is_computationally_independent() const override { return m_properties.size_x->is_computationally_independent() && m_properties.size_y->is_computationally_independent(); }
+    ValueComparingNonnullRefPtr<StyleValue const> absolutized(ComputationContext const&) const;
 
 private:
-    BackgroundSizeStyleValue(ValueComparingNonnullRefPtr<StyleValue const> size_x, ValueComparingNonnullRefPtr<StyleValue const> size_y);
+    friend class StyleValue;
 
-    struct Properties {
-        ValueComparingNonnullRefPtr<StyleValue const> size_x;
-        ValueComparingNonnullRefPtr<StyleValue const> size_y;
-        bool operator==(Properties const&) const = default;
-    } m_properties;
+    explicit BackgroundSizeStyleValue(StyleValueFFI::StyleValueData const* data)
+        : StyleValueWithDefaultOperators(Type::BackgroundSize, data)
+    {
+    }
+
+    BackgroundSizeStyleValue(ValueComparingNonnullRefPtr<StyleValue const> size_x, ValueComparingNonnullRefPtr<StyleValue const> size_y);
 };
 
 }

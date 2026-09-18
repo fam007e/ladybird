@@ -2,7 +2,10 @@
 
 ## Build Prerequisites
 
-Qt6 development packages, nasm, additional build tools, and a C++23 capable compiler are required.
+Qt6.9+ development packages, nasm, additional build tools, and a C++23 capable compiler are required.
+
+> [!NOTE]
+> Some distributions still package a Qt6 older than 6.9; for example, Debian 13 (trixie) ships Qt 6.8 — so configuring against it fails. If your Qt6 is older than 6.9, install a newer one from a newer distribution release, or directly from the [Qt online installer](https://www.qt.io/download-open-source), and then point the build to it using `CMAKE_PREFIX_PATH`.
 
 A Rust toolchain is also required. You can install it via [rustup](https://rustup.rs/).
 
@@ -17,7 +20,7 @@ CMake 3.30 or newer must be available in $PATH.
 
 <!-- Note: If you change something here, please also change it in the `devcontainer/devcontainer.json` file. -->
 ```bash
-sudo apt install autoconf autoconf-archive automake build-essential ccache cmake curl fonts-liberation2 git glslang-tools libdrm-dev libgl1-mesa-dev libncurses-dev libtool nasm ninja-build pkg-config python3-venv qt6-base-dev qt6-tools-dev-tools qt6-wayland tar unzip zip
+sudo apt install autoconf autoconf-archive automake build-essential ccache cmake curl fonts-liberation2 git glslang-tools libdrm-dev libgl1-mesa-dev libncurses-dev libpulse-dev libtool nasm ninja-build pkg-config python3-venv qt6-base-private-dev qt6-positioning-dev qt6-tools-dev-tools qt6-wayland tar unzip zip
 ```
 
 #### CMake 3.30 or newer:
@@ -25,7 +28,7 @@ sudo apt install autoconf autoconf-archive automake build-essential ccache cmake
 - Recommendation: Install `CMake 3.30` or newer from [Kitware's apt repository](https://apt.kitware.com/):
 
 > [!NOTE]
-> This repository is Ubuntu-only
+> Kitware’s apt repository is Ubuntu-only.
 
 ```bash
 # Add Kitware GPG signing key
@@ -64,36 +67,22 @@ sudo add-apt-repository ppa:ubuntu-toolchain-r/test
 sudo apt update && sudo apt install g++-14 libstdc++-14-dev
 ```
 
-#### Audio support:
-
-- Install PulseAudio development package:
-
-```bash
-sudo apt install libpulse-dev
-```
-
 ### Arch Linux/Manjaro:
 
 ```
-sudo pacman -S --needed autoconf-archive base-devel ccache cmake curl git less libgl nasm ninja python qt6-base qt6-tools ttf-liberation tar unzip zip
-```
-
-Optionally, install the PulseAudio headers for audio playback support:
-
-```
-sudo pacman -S libpulse
+sudo pacman -S --needed autoconf-archive base-devel ccache cmake curl git less libgl libpulse nasm ninja python qt6-base qt6-positioning qt6-tools ttf-liberation tar unzip zip
 ```
 
 ### Fedora or derivatives:
 
 ```
-sudo dnf install autoconf-archive automake ccache cmake curl git libdrm-devel liberation-sans-fonts libglvnd-devel libtool nasm ncurses-devel ninja-build patchelf perl-FindBin perl-IPC-Cmd perl-lib perl-Time-Piece qt6-qtbase-devel qt6-qttools-devel qt6-qtwayland-devel tar unzip zip zlib-ng-compat-static
+sudo dnf install autoconf-archive automake ccache cmake curl git libdrm-devel liberation-sans-fonts libglvnd-devel libtool nasm ncurses-devel ninja-build patchelf perl-FindBin perl-IPC-Cmd perl-lib perl-Time-Piece pulseaudio-libs-devel qt6-qtbase-private-devel qt6-qtpositioning-devel qt6-qttools-devel qt6-qtwayland-devel tar unzip zip zlib-ng-compat-static
 ```
 
 ### openSUSE:
 
 ```
-sudo zypper install autoconf-archive automake ccache cmake curl gcc14 gcc14-c++ git liberation-fonts libglvnd-devel libtool nasm ncurses-devel ninja qt6-base-devel qt6-tools-devel qt6-wayland-devel tar unzip zip
+sudo zypper install autoconf-archive automake ccache cmake curl gcc14 gcc14-c++ git liberation-fonts libglvnd-devel libpulse-devel libtool nasm ncurses-devel ninja qt6-base-private-devel qt6-positioning-devel qt6-tools-devel qt6-wayland-devel tar unzip zip
 ```
 
 If one or more of the base repository packages are flagged as having an out-of-date version during the build process, you may need add the `devel:tools:building` repository. For example, on Leap 15.6, the `autoconf` package might be version 2.69, whereas the `gperf` package requires 2.70 to build.
@@ -118,12 +107,6 @@ Nothing to do.
 > sudo zypper install autoconf-2.72-80.d_t_b.1.noarch
 ```
 
-It is necessary to install the `libpulse-devel` package to enable audio playback:
-
-```
-sudo zypper install libpulse-devel
-```
-
 The build process requires at least python3.7; openSUSE Leap only features Python 3.6 as default, so it is recommendable to install the package `python312` and create a virtual environment (venv) in this case.
 
 A virtual environment can be created in your home directory and once the `source` command is issued `python3 --version` will show that the current version is python 3.12 within the virtual environment shell session.
@@ -139,7 +122,7 @@ This virtual environment can be created once and reused in future shell sessions
 
 ```
 sudo xbps-install -Su # (optional) ensure packages are up to date to avoid "Transaction aborted due to unresolved dependencies."
-sudo xbps-install -S git bash gcc python3 curl cmake libtool zip unzip linux-headers make pkg-config autoconf automake autoconf-archive nasm ncurses-devel MesaLib-devel ninja qt6-base-devel qt6-tools-devel qt6-wayland-devel
+sudo xbps-install -S git bash gcc python3 curl cmake libtool zip unzip linux-headers make pkg-config autoconf automake autoconf-archive nasm ncurses-devel MesaLib-devel ninja pulseaudio-devel qt6-base-private-devel qt6-position-devel qt6-tools-devel qt6-wayland-devel
 ```
 
 ### NixOS or with Nix:
@@ -211,7 +194,7 @@ Or, download a version of Gradle >= 8.0.0, and run the ``gradlew`` program in ``
 ### FreeBSD
 
 ```
-pkg install autoconf-archive automake autoconf bash cmake ccache curl gmake gn libdrm libtool libxcb libxkbcommon libX11 libXrender libXi nasm ninja patchelf pkgconf python3 qt6-base tar unzip zip
+pkg install autoconf-archive automake autoconf bash cmake ccache curl gmake gn libdrm libtool libxcb libxkbcommon libX11 libXrender libXi nasm ninja patchelf pkgconf pulseaudio python3 qt6-base qt6-positioning tar unzip zip
 ```
 > [!NOTE]
 > `zip`, `unzip`, and `tar` are required by the vcpkg bootstrap step. If any of these are missing,
@@ -250,12 +233,23 @@ Note that debug symbols are available in both Release and Debug builds.
 If you want to run other applications, such as the JS REPL or the WebAssembly REPL, specify an executable with
 `./Meta/ladybird.py run <executable_name>`.
 
+To launch an existing binary without configuring, preparing dependencies, or building, use `--no-build`:
+
+```bash
+./Meta/ladybird.py run --no-build
+./Meta/ladybird.py run --no-build js --evaluate 'console.log(1 + 1)'
+./Meta/ladybird.py run --no-build --preset Debug js
+```
+
+Put `--no-build` before the executable name; arguments after the name are passed to the executable.
+The command uses the selected preset's existing build and retains the usual runtime environment,
+including sanitizer options. It does not update the binary or change its build configuration.
+
 ### The User Interfaces
 
 Ladybird will be built with one of the following browser frontends, depending on the platform:
 * [AppKit](https://developer.apple.com/documentation/appkit?language=objc) - The native UI on macOS.
 * [Qt](https://doc.qt.io/qt-6/) - The UI used on all other platforms.
-* [GTK 4](https://docs.gtk.org/gtk4/) - An alternative UI on Linux (experimental).
 * [Android UI](https://developer.android.com/develop/ui) - The native UI on Android.
 
 You can pick the UI using the `LADYBIRD_GUI_FRAMEWORK` option, or the `--gui` argument to ladybird.py.
@@ -266,26 +260,6 @@ For example, to force building with the Qt UI:
 cmake --preset Release -DLADYBIRD_GUI_FRAMEWORK=Qt
 # Or
 ./Meta/ladybird.py run --gui=Qt
-```
-
-#### Additional prerequisites for the GTK UI
-
-Building with `LADYBIRD_GUI_FRAMEWORK=Gtk` requires additional system packages, as some vcpkg
-dependencies (e.g. gettext) need to be rebuilt from source:
-
-**Debian/Ubuntu:**
-```bash
-sudo apt install bison libxkbcommon-dev
-```
-
-**Arch Linux/Manjaro:**
-```bash
-sudo pacman -S bison
-```
-
-**Fedora:**
-```bash
-sudo dnf install bison
 ```
 
 ### Build error messages you may encounter
@@ -393,14 +367,9 @@ Now breakpoints, stepping and variable inspection will work.
 
 If all you want to do is use Instruments, then an Xcode project is not required.
 
-Simply run the `ladybird.py` script as normal, and then make sure to codesign the Ladybird binary with the proper entitlements to allow Instruments to attach to it.
-
-```
-./Meta/ladybird.py build
- ninja -C Build/release apply-debug-entitlements
- # or
- codesign -s - -v -f --entitlements Meta/debug.plist Build/release/bin/Ladybird.app
-```
+Simply run the `ladybird.py` script as normal with a debug-style build. The build automatically signs the app bundle
+with the entitlements from `Meta/DebugEntitlements.plist`, which includes `get-task-allow` for debugger and Instruments
+attachment.
 
 Now you can open the Instruments app and point it to the Ladybird app bundle.
 

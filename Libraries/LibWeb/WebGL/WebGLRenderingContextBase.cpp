@@ -13,6 +13,7 @@ extern "C" {
 
 #include <LibGfx/DecodedImageFrame.h>
 #include <LibJS/Runtime/Object.h>
+#include <LibWeb/Bindings/WrapperWorld.h>
 #include <LibWeb/HTML/DecodedImageData.h>
 #include <LibWeb/HTML/EventLoop/Task.h>
 #include <LibWeb/HTML/HTMLCanvasElement.h>
@@ -21,7 +22,8 @@ extern "C" {
 #include <LibWeb/HTML/ImageBitmap.h>
 #include <LibWeb/HTML/ImageData.h>
 #include <LibWeb/HTML/Scripting/TemporaryExecutionContext.h>
-#include <LibWeb/HTML/UniversalGlobalScope.h>
+#include <LibWeb/HTML/Window.h>
+#include <LibWeb/HTML/WindowOrWorkerGlobalScope.h>
 #include <LibWeb/Platform/EventLoopPlugin.h>
 #include <LibWeb/WebGL/EventNames.h>
 #include <LibWeb/WebGL/Extensions/ANGLEInstancedArrays.h>
@@ -39,28 +41,28 @@ extern "C" {
 #include <LibWeb/WebGL/Extensions/WebGLDrawBuffers.h>
 #include <LibWeb/WebGL/TextureUpload.h>
 #include <LibWeb/WebGL/WebGLContextProxy.h>
+#include <LibWeb/WebGL/WebGLObject.h>
 #include <LibWeb/WebGL/WebGLRenderingContext.h>
 #include <LibWeb/WebGL/WebGLRenderingContextBase.h>
 
 namespace Web::WebGL {
 
 WebGLRenderingContextBase::WebGLRenderingContextBase(JS::Realm& realm)
-    : Bindings::PlatformObject(realm)
+    : m_realm(realm)
 {
+}
+
+GC::Ptr<Bindings::Wrappable> WebGLRenderingContextBase::relevant_global_impl() const
+{
+    return canvas_for_binding()->document().window();
 }
 
 struct Extension {
     Vector<StringView> required_angle_extensions;
-    JS::ThrowCompletionOr<GC::Ref<JS::Object>> (*factory)(JS::Realm&, GC::Ref<WebGLRenderingContextBase>);
+    GC::Ref<Bindings::Wrappable> (*factory)(GC::Ref<WebGLRenderingContextBase>) { nullptr };
     Optional<WebGLVersion> only_for_webgl_version { OptionalNone {} };
+    bool creates_empty_object { false };
 };
-
-static JS::ThrowCompletionOr<GC::Ref<JS::Object>> create_empty_extension_object(JS::Realm& realm, GC::Ref<WebGLRenderingContextBase>)
-{
-    // WebGL 1.0: "A returned object may have no constants or functions if the extension does not define any, but a unique
-    //            object must still be returned. That object is used to indicate that the extension has been enabled."
-    return JS::Object::create(realm, realm.intrinsics().object_prototype());
-}
 
 static HashMap<String, Extension, AK::ASCIICaseInsensitiveStringTraits> const& available_webgl_extensions()
 {
@@ -74,7 +76,7 @@ static HashMap<String, Extension, AK::ASCIICaseInsensitiveStringTraits> const& a
         { "OES_element_index_uint"_string, { { "GL_OES_element_index_uint"sv }, OESElementIndexUint::create, WebGLVersion::WebGL1 } },
         { "OES_standard_derivatives"_string, { { "GL_OES_standard_derivatives"sv }, OESStandardDerivatives::create, WebGLVersion::WebGL1 } },
         { "OES_texture_float"_string, { { "GL_OES_texture_float"sv }, nullptr, WebGLVersion::WebGL1 } },
-        { "OES_texture_float_linear"_string, { { "GL_OES_texture_float_linear"sv }, create_empty_extension_object } },
+        { "OES_texture_float_linear"_string, { { "GL_OES_texture_float_linear"sv }, nullptr, OptionalNone {}, true } },
         { "OES_texture_half_float"_string, { { "GL_OES_texture_half_float"sv }, nullptr, WebGLVersion::WebGL1 } },
         { "OES_texture_half_float_linear"_string, { { "GL_OES_texture_half_float_linear"sv }, nullptr, WebGLVersion::WebGL1 } },
         { "OES_vertex_array_object"_string, { { "GL_OES_vertex_array_object"sv }, OESVertexArrayObject::create, WebGLVersion::WebGL1 } },
@@ -93,7 +95,7 @@ static HashMap<String, Extension, AK::ASCIICaseInsensitiveStringTraits> const& a
         { "EXT_depth_clamp"_string, { { "GL_EXT_depth_clamp"sv }, nullptr } },
         { "EXT_disjoint_timer_query"_string, { { "GL_EXT_disjoint_timer_query"sv }, nullptr, WebGLVersion::WebGL1 } },
         { "EXT_disjoint_timer_query_webgl2"_string, { { "GL_EXT_disjoint_timer_query"sv }, nullptr, WebGLVersion::WebGL2 } },
-        { "EXT_float_blend"_string, { { "GL_EXT_float_blend"sv }, create_empty_extension_object } },
+        { "EXT_float_blend"_string, { { "GL_EXT_float_blend"sv }, nullptr, OptionalNone {}, true } },
         { "EXT_polygon_offset_clamp"_string, { { "GL_EXT_polygon_offset_clamp"sv }, nullptr } },
         { "EXT_render_snorm"_string, { { "GL_EXT_render_snorm"sv }, EXTRenderSnorm::create, WebGLVersion::WebGL2 } },
         { "EXT_sRGB"_string, { { "GL_EXT_sRGB"sv }, nullptr, WebGLVersion::WebGL1 } },
@@ -125,16 +127,16 @@ static HashMap<String, Extension, AK::ASCIICaseInsensitiveStringTraits> const& a
     return extensions;
 }
 
-Optional<Vector<String>> WebGLRenderingContextBase::get_supported_extensions()
+Optional<Vector<Utf16String>> WebGLRenderingContextBase::get_supported_extensions()
 {
     auto const& opengl_extensions = context().get_supported_opengl_extensions();
-    Vector<String> webgl_extensions;
+    Vector<Utf16String> webgl_extensions;
 
     for (auto const& [available_extension_name, available_extension_info] : available_webgl_extensions()) {
         bool supported = !available_extension_info.only_for_webgl_version.has_value()
             || context().webgl_version() == available_extension_info.only_for_webgl_version;
 
-        if (!available_extension_info.factory && !HTML::UniversalGlobalScopeMixin::expose_experimental_interfaces()) {
+        if (!available_extension_info.factory && !available_extension_info.creates_empty_object && !HTML::WindowOrWorkerGlobalScopeMixin::expose_experimental_interfaces()) {
             supported = false;
         }
 
@@ -148,43 +150,62 @@ Optional<Vector<String>> WebGLRenderingContextBase::get_supported_extensions()
         }
 
         if (supported)
-            webgl_extensions.append(available_extension_name);
+            webgl_extensions.append(Utf16String::from_ascii_without_validation(available_extension_name.bytes_as_string_view().bytes()));
     }
 
     return webgl_extensions;
 }
 
-JS::Object* WebGLRenderingContextBase::get_extension(String const& name)
+GC::Ptr<JS::Object> WebGLRenderingContextBase::get_extension(JS::Realm& caller_realm, Utf16String const& name)
 {
     // Returns an object if, and only if, name is an ASCII case-insensitive match [HTML] for one of the names returned
     // from getSupportedExtensions; otherwise, returns null. The object returned from getExtension contains any constants
     // or functions provided by the extension. A returned object may have no constants or functions if the extension does
     // not define any, but a unique object must still be returned. That object is used to indicate that the extension has
     // been enabled.
+    if (!name.is_ascii())
+        return nullptr;
+
+    auto name_string = MUST(String::from_byte_string(name.to_byte_string()));
     auto supported_extensions = get_supported_extensions();
-    auto supported_extension_iterator = supported_extensions->find_if([&name](String const& supported_extension) {
+    auto supported_extension_iterator = supported_extensions->find_if([&name](Utf16String const& supported_extension) {
         return supported_extension.equals_ignoring_ascii_case(name);
     });
     if (supported_extension_iterator == supported_extensions->end())
         return nullptr;
 
-    auto maybe_extension = m_enabled_extensions.get(name);
+    auto maybe_extension = m_enabled_extensions.get(name_string);
     if (maybe_extension.has_value())
-        return maybe_extension.release_value();
+        return Bindings::wrap(Bindings::host_defined_wrapper_world(caller_realm), caller_realm, maybe_extension.release_value()).ptr();
+
+    auto& wrapper_world = Bindings::host_defined_wrapper_world(caller_realm);
+    if (auto maybe_empty_extension_cache = m_enabled_empty_extensions.get(name_string); maybe_empty_extension_cache.has_value()) {
+        if (auto extension = maybe_empty_extension_cache.value()->get(wrapper_world))
+            return extension;
+    }
 
     // If we pass the check above this will always return a value
-    auto const& extension_info = available_webgl_extensions().get(name).release_value();
+    auto const& extension_info = available_webgl_extensions().get(name_string).release_value();
 
-    if (!extension_info.factory)
+    if (!extension_info.factory && !extension_info.creates_empty_object)
         return nullptr;
 
     for (auto const& required_extension : extension_info.required_angle_extensions) {
         context().request_extension_angle(null_terminated_string(required_extension).data());
     }
 
-    auto extension = MUST(extension_info.factory(realm(), *this));
-    m_enabled_extensions.set(name, extension);
-    return extension;
+    if (extension_info.creates_empty_object) {
+        auto extension = JS::Object::create(caller_realm, caller_realm.intrinsics().object_prototype());
+        auto& cache = m_enabled_empty_extensions.ensure(move(name_string), [] {
+            return make<Bindings::WrapperWorldWeakValueCache<JS::Object>>();
+        });
+        cache->set(wrapper_world, extension);
+        return extension;
+    }
+
+    auto extension = extension_info.factory(*this);
+    m_enabled_extensions.set(move(name_string), extension);
+    return Bindings::wrap(Bindings::host_defined_wrapper_world(caller_realm), caller_realm, extension);
 }
 
 void WebGLRenderingContextBase::enable_compressed_texture_format(WebIDL::UnsignedLong format)
@@ -195,17 +216,29 @@ void WebGLRenderingContextBase::enable_compressed_texture_format(WebIDL::Unsigne
 void WebGLRenderingContextBase::visit_edges(Cell::Visitor& visitor)
 {
     Base::visit_edges(visitor);
+    visitor.visit(m_realm);
+    visitor.visit(m_current_vertex_array);
     visitor.visit(m_enabled_extensions);
 }
 
 bool WebGLRenderingContextBase::extension_enabled(StringView extension) const
 {
-    return m_enabled_extensions.contains(MUST(String::from_utf8(extension)));
+    auto extension_name = MUST(String::from_utf8(extension));
+    return m_enabled_extensions.contains(extension_name) || m_enabled_empty_extensions.contains(extension_name);
 }
 
 ReadonlySpan<WebIDL::UnsignedLong> WebGLRenderingContextBase::enabled_compressed_texture_formats() const
 {
     return m_enabled_compressed_texture_formats;
+}
+
+ErrorOr<ReadonlyBytes> WebGLRenderingContextBase::texture_data_for_2d_upload(ReadonlyBytes bytes, GLsizei width, GLsizei height, GLenum format, GLenum type) const
+{
+    if (!is_valid_2d_pixel_unpack_state(width, m_unpack_state))
+        return Error::from_errno(EINVAL);
+    if (auto size = required_2d_texture_data_size(width, height, format, type, m_unpack_state); size.has_value() && *size <= bytes.size())
+        return bytes.slice(0, *size);
+    return bytes;
 }
 
 Optional<WebGLRenderingContextBase::TexImageSourceFrame> WebGLRenderingContextBase::read_texture_image_source(TexImageSource const& source, WebIDL::UnsignedLong format, WebIDL::UnsignedLong type)
@@ -236,6 +269,17 @@ Optional<WebGLRenderingContextBase::TexImageSourceFrame> WebGLRenderingContextBa
             return Gfx::DecodedImageFrame { *source->bitmap() };
         },
         [this](GC::Ref<HTML::ImageData> source) -> Optional<Gfx::DecodedImageFrame> {
+            // ImageData keeps a cached bitmap for ordinary use, but its data
+            // attribute can be detached independently. WebGL must reject that
+            // source instead of uploading the stale cached pixels.
+            auto data = source->data();
+            if (!data)
+                return OptionalNone {};
+            auto data_record = JS::make_typed_array_with_buffer_witness_record(*data, JS::ArrayBuffer::Order::SeqCst);
+            if (JS::is_typed_array_out_of_bounds(data_record)) {
+                set_error(GL_INVALID_VALUE);
+                return OptionalNone {};
+            }
             auto bitmap = source->bitmap();
             if (bitmap.is_error()) {
                 set_error(GL_INVALID_VALUE);
@@ -340,6 +384,7 @@ void WebGLRenderingContextBase::restore_context_after_compositor_reconnect()
 void WebGLRenderingContextBase::reset_context_state_after_loss()
 {
     ++m_context_generation;
+    m_unpack_state = {};
     m_unpack_flip_y = false;
     m_unpack_premultiply_alpha = false;
     m_unpack_colorspace_conversion = BROWSER_DEFAULT_WEBGL;
@@ -355,7 +400,7 @@ GC::Ref<WebIDL::Promise> WebGLRenderingContextBase::make_xr_compatible()
 
     // 2. Let promise be a new Promise created in the Realm of this WebGLRenderingContextBase.
     auto& realm = this->realm();
-    auto promise = WebIDL::create_promise(realm);
+    auto promise = WebIDL::create_promise_for(*canvas_for_binding());
 
     // 3. Let context be this.
     auto context = this;
@@ -373,7 +418,7 @@ GC::Ref<WebIDL::Promise> WebGLRenderingContextBase::make_xr_compatible()
             HTML::queue_a_task(HTML::Task::Source::Unspecified, nullptr, nullptr, GC::create_function(realm.heap(), [&realm, promise, context]() {
                 context->set_xr_compatible(false);
                 HTML::TemporaryExecutionContext execution_context { realm, HTML::TemporaryExecutionContext::CallbacksEnabled::Yes };
-                WebIDL::reject_promise(realm, promise, WebIDL::InvalidStateError::create(realm, "The WebGL context has been lost."_utf16));
+                WebIDL::reject_promise(promise, WebIDL::InvalidStateError::create("The WebGL context has been lost."_utf16));
             }));
         }
         // -> If device is null:
@@ -382,7 +427,7 @@ GC::Ref<WebIDL::Promise> WebGLRenderingContextBase::make_xr_compatible()
             HTML::queue_a_task(HTML::Task::Source::Unspecified, nullptr, nullptr, GC::create_function(realm.heap(), [&realm, promise, context]() {
                 context->set_xr_compatible(false);
                 HTML::TemporaryExecutionContext execution_context { realm, HTML::TemporaryExecutionContext::CallbacksEnabled::Yes };
-                WebIDL::reject_promise(realm, promise, WebIDL::InvalidStateError::create(realm, "Could not select an immersive XR device."_utf16));
+                WebIDL::reject_promise(promise, WebIDL::InvalidStateError::create("Could not select an immersive XR device."_utf16));
             }));
         }
         // -> If context’s XR compatible boolean is true:
@@ -390,7 +435,7 @@ GC::Ref<WebIDL::Promise> WebGLRenderingContextBase::make_xr_compatible()
             // Queue a task to resolve promise.
             HTML::queue_a_task(HTML::Task::Source::Unspecified, nullptr, nullptr, GC::create_function(realm.heap(), [&realm, promise]() {
                 HTML::TemporaryExecutionContext execution_context { realm, HTML::TemporaryExecutionContext::CallbacksEnabled::Yes };
-                WebIDL::resolve_promise(realm, promise);
+                WebIDL::resolve_promise(promise);
             }));
         }
         // -> If context was created on a compatible graphics adapter for device:
@@ -400,7 +445,7 @@ GC::Ref<WebIDL::Promise> WebGLRenderingContextBase::make_xr_compatible()
             HTML::queue_a_task(HTML::Task::Source::Unspecified, nullptr, nullptr, GC::create_function(realm.heap(), [&realm, promise, context]() {
                 context->set_xr_compatible(true);
                 HTML::TemporaryExecutionContext execution_context { realm, HTML::TemporaryExecutionContext::CallbacksEnabled::Yes };
-                WebIDL::resolve_promise(realm, promise);
+                WebIDL::resolve_promise(promise);
             }));
         }
         // -> Otherwise:

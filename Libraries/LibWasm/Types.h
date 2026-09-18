@@ -9,10 +9,12 @@
 #include <AK/AtomicRefCounted.h>
 #include <AK/Badge.h>
 #include <AK/ByteString.h>
+#include <AK/ConditionVariable.h>
 #include <AK/DistinctNumeric.h>
 #include <AK/FixedArray.h>
 #include <AK/Function.h>
 #include <AK/LEB128.h>
+#include <AK/Mutex.h>
 #include <AK/NumericLimits.h>
 #include <AK/Optional.h>
 #include <AK/OwnPtr.h>
@@ -22,8 +24,7 @@
 #include <AK/UFixedBigInt.h>
 #include <AK/Variant.h>
 #include <AK/WeakPtr.h>
-#include <LibSync/ConditionVariable.h>
-#include <LibSync/Mutex.h>
+#include <LibCore/AnonymousBuffer.h>
 #include <LibWasm/Constants.h>
 #include <LibWasm/Export.h>
 #include <LibWasm/Forward.h>
@@ -693,6 +694,66 @@ public:
         MemoryIndex memory_index { 0 };
     };
 
+    // Proposal "threads"
+    struct AtomicMemoryArgument {
+        enum class Width : u8 {
+            I32,
+            I64,
+            I8As32, // i8 stack, memory accessed zero-extended to i32.
+            I16As32,
+            I8As64,
+            I16As64,
+            I32As64,
+        };
+        enum class Op : u8 {
+            None,
+            Add,
+            Sub,
+            And,
+            Or,
+            Xor,
+            Xchg,
+        };
+
+        MemoryArgument memory;
+        Width width;
+        Op op { Op::None };
+
+        size_t access_size() const
+        {
+            switch (width) {
+            case Width::I8As32:
+            case Width::I8As64:
+                return 1;
+            case Width::I16As32:
+            case Width::I16As64:
+                return 2;
+            case Width::I32:
+            case Width::I32As64:
+                return 4;
+            case Width::I64:
+                return 8;
+            }
+            VERIFY_NOT_REACHED();
+        }
+
+        ValueType value_type() const
+        {
+            switch (width) {
+            case Width::I32:
+            case Width::I8As32:
+            case Width::I16As32:
+                return ValueType { ValueType::I32 };
+            case Width::I64:
+            case Width::I8As64:
+            case Width::I16As64:
+            case Width::I32As64:
+                return ValueType { ValueType::I64 };
+            }
+            VERIFY_NOT_REACHED();
+        }
+    };
+
     struct MemoryAndLaneArgument {
         MemoryArgument memory;
         u8 lane;
@@ -854,6 +915,7 @@ private:
         ArrayDataArgs,
         ArrayElemArgs,
         ArrayNewFixedArgs,
+        AtomicMemoryArgument,
         BlockType,
         BranchArgs,
         BranchOnCastArgs,
@@ -987,6 +1049,8 @@ struct CompiledInstructions {
     Vector<SourcesAndDestination> src_dst_mappings;
     InstructionStorage extra_instruction_storage;
 
+    Vector<u8> cranelift_local_types;
+
     // Pointer/size_t-sized members first, then the u32, then the bools, so the trailing scalars pack
     // into one word instead of scattering padding between them.
 
@@ -1004,7 +1068,11 @@ struct CompiledInstructions {
     size_t max_call_arg_count = 0;
     size_t max_call_rec_size = 0;
 
-    u32 cranelift_result_arity = 0; // result count to hand to try_cranelift_compile(); only meaningful when cranelift_eligible.
+    u32 cranelift_result_arity = 0;   // result count to hand to try_cranelift_compile(); only meaningful when cranelift_eligible.
+    u32 cranelift_local_count = 0;    // total locals (params + declared + inlined); lets Cranelift promote locals to SSA instead of memory. Only meaningful when cranelift_eligible.
+    u32 cranelift_param_count = 0;    // leading locals that are parameters; the compiled entry block zero-initializes everything past them. Only meaningful when cranelift_eligible.
+    u32 cranelift_inlined_locals = 0; // extra locals appended for inlined callee bodies (see try_compile_instructions); the frame is grown by this much in both interpreter and JIT paths.
+    u32 max_label_depth = 0;          // max concurrent labels (incl. the function-level label) the compiled stream can push.
 
     bool direct = false;                  // true if all dispatches contain handler_ptr, otherwise false and all contain instruction_opcode.
     bool cranelift_eligible = false;      // true if this expression cleared the Cranelift type/shape checks during validation.
@@ -1263,15 +1331,12 @@ public:
 
     void set_stack_usage_hint(size_t value) const { m_stack_usage_hint = value; }
     auto stack_usage_hint() const { return m_stack_usage_hint; }
-    void set_frame_usage_hint(size_t value) const { m_frame_usage_hint = value; }
-    auto frame_usage_hint() const { return m_frame_usage_hint; }
 
     mutable CompiledInstructions compiled_instructions;
 
 private:
     Vector<Instruction> m_instructions;
     mutable Optional<size_t> m_stack_usage_hint;
-    mutable Optional<size_t> m_frame_usage_hint;
 };
 
 class TableSection {
@@ -1722,7 +1787,7 @@ public:
     }
     void finish_cranelift_compilation() const
     {
-        Sync::MutexLocker locker(m_cranelift_compilation_mutex);
+        MutexLocker locker(m_cranelift_compilation_mutex);
         m_cranelift_compilation_state.store(2, AK::MemoryOrder::memory_order_release);
         m_cranelift_compilation_state_changed.broadcast();
     }
@@ -1731,7 +1796,7 @@ public:
         if (m_cranelift_compilation_state.load(AK::MemoryOrder::memory_order_acquire) != 1)
             return;
 
-        Sync::MutexLocker locker(m_cranelift_compilation_mutex);
+        MutexLocker locker(m_cranelift_compilation_mutex);
         m_cranelift_compilation_state_changed.wait_while([this] {
             return m_cranelift_compilation_state.load(AK::MemoryOrder::memory_order_acquire) == 1;
         });
@@ -1777,8 +1842,8 @@ private:
     ValidationStatus m_validation_status { ValidationStatus::Unchecked };
     Optional<ByteString> m_validation_error;
     mutable Atomic<u8> m_cranelift_compilation_state { 0 };
-    mutable Sync::Mutex m_cranelift_compilation_mutex;
-    mutable Sync::ConditionVariable m_cranelift_compilation_state_changed { m_cranelift_compilation_mutex };
+    mutable Mutex m_cranelift_compilation_mutex;
+    mutable ConditionVariable m_cranelift_compilation_state_changed { m_cranelift_compilation_mutex };
     Optional<CompileCacheConfig> m_cranelift_cache_config;
     Optional<ModuleStats> m_compile_stats;
 
@@ -1787,7 +1852,7 @@ private:
     size_t m_minimum_call_record_allocation_size { 0 };
 };
 
-CompiledInstructions try_compile_instructions(Expression const&, Span<FunctionType const> functions);
+CompiledInstructions try_compile_instructions(Expression const&, Span<FunctionType const> functions, Span<CodeSection::Func const* const> callee_bodies = {}, size_t current_function_index = 0, size_t caller_local_count = 0, size_t imported_function_count = 0);
 ErrorOr<void, ValidationError> ensure_cranelift_compiled(Module&);
 WASM_API void start_cranelift_compilation(Module&);
 bool try_cranelift_compile(CompiledInstructions& compiled, u32 result_arity = 0);
@@ -1795,6 +1860,12 @@ void flush_cranelift_batch();
 void discard_cranelift_batch();
 
 void compile_module_to_native(Module&);
+
+WASM_API ByteString const& cranelift_compiler_path();
+WASM_API ErrorOr<Core::AnonymousBuffer> compile_cranelift_buffer(Core::AnonymousBuffer const&);
+
+using CraneliftCompileCallback = Function<Core::AnonymousBuffer(Core::AnonymousBuffer const&)>;
+WASM_API void set_cranelift_compile_callback(CraneliftCompileCallback);
 
 WASM_API void record_module_stats(ModuleStats);
 WASM_API void dump_module_stats();

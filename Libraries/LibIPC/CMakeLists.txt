@@ -9,12 +9,15 @@ set(SOURCES
     TransportHandle.cpp
 )
 
-if (APPLE AND NOT IOS)
+if (APPLE)
     list(APPEND SOURCES
         AttachmentMachPort.cpp
-        MachBootstrapListener.cpp
-        TransportBootstrapMach.cpp
         TransportMachPort.cpp)
+    if (NOT IOS)
+        list(APPEND SOURCES
+            MachBootstrapListener.cpp
+            TransportBootstrapMach.cpp)
+    endif()
 elseif (UNIX)
     list(APPEND SOURCES
         Attachment.cpp
@@ -26,4 +29,4 @@ else()
 endif()
 
 ladybird_lib(LibIPC ipc)
-target_link_libraries(LibIPC PRIVATE LibCore LibSync LibThreading LibURL)
+target_link_libraries(LibIPC PRIVATE LibCore LibThreading LibURL)

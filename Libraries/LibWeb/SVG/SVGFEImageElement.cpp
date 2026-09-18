@@ -8,11 +8,13 @@
 #include <LibCore/Timer.h>
 #include <LibGfx/DecodedImageFrame.h>
 #include <LibWeb/Bindings/SVGFEImageElement.h>
+#include <LibWeb/CSS/ComputedValues.h>
+#include <LibWeb/CSS/StyleComputer.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/HTML/DecodedImageData.h>
 #include <LibWeb/HTML/PotentialCORSRequest.h>
+#include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/SharedResourceRequest.h>
-#include <LibWeb/Layout/SVGImageBox.h>
 #include <LibWeb/Namespace.h>
 
 namespace Web::SVG {
@@ -24,12 +26,6 @@ SVGFEImageElement::SVGFEImageElement(DOM::Document& document, DOM::QualifiedName
 {
 }
 
-void SVGFEImageElement::initialize(JS::Realm& realm)
-{
-    WEB_SET_PROTOTYPE_FOR_INTERFACE(SVGFEImageElement);
-    Base::initialize(realm);
-}
-
 void SVGFEImageElement::visit_edges(Cell::Visitor& visitor)
 {
     Base::visit_edges(visitor);
@@ -38,23 +34,23 @@ void SVGFEImageElement::visit_edges(Cell::Visitor& visitor)
     visitor.visit(m_resource_request);
 }
 
-void SVGFEImageElement::attribute_changed(FlyString const& name, Optional<String> const& old_value, Optional<String> const& value, Optional<FlyString> const& namespace_)
+void SVGFEImageElement::attribute_changed(Utf16FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_)
 {
     Base::attribute_changed(name, old_value, value, namespace_);
 
     if (name == SVG::AttributeNames::href) {
-        if (namespace_ == Namespace::XLink && has_attribute_ns({}, name))
+        if (namespace_ == Namespace::XLink && has_attribute_ns(Optional<Utf16FlyString> {}, name))
             return;
 
         auto href = value;
         if (!namespace_.has_value() && !href.has_value())
-            href = get_attribute_ns(SVG::AttributeNames::href, Namespace::XLink);
+            href = get_attribute_ns(Namespace::XLink, SVG::AttributeNames::href);
 
         process_href(href);
     }
 }
 
-void SVGFEImageElement::process_href(Optional<String> const& href)
+void SVGFEImageElement::process_href(Optional<Utf16String> const& href)
 {
     if (!href.has_value()) {
         m_href = {};
@@ -65,18 +61,20 @@ void SVGFEImageElement::process_href(Optional<String> const& href)
     if (!m_href.has_value())
         return;
 
-    m_resource_request = HTML::SharedResourceRequest::get_or_create(realm(), document().page(), *m_href);
+    m_resource_request = HTML::SharedResourceRequest::get_or_create(document(), *m_href);
     m_resource_request->add_callbacks(
         [this, resource_request = GC::Root { m_resource_request }] {
-            set_needs_style_update(true);
-            set_needs_layout_update(DOM::SetNeedsLayoutReason::SVGImageFilterFetch);
+            document().style_computer().style_engine().record_element_style_input_change(style_node_id());
+            document().note_svg_paint_resources_changed();
+            document().schedule_full_accumulated_visual_context_rebuild(Layout::RustFFI::FfiVisualContextGlobalRebuildReason::FilterResourcesChanged);
+            document().set_needs_repaint(Badge<SVGFEImageElement> {}, InvalidateDisplayList::PaintCommands);
         },
         nullptr);
 
     if (m_resource_request->needs_fetching()) {
-        auto request = HTML::create_potential_CORS_request(vm(), *m_href, Fetch::Infrastructure::Request::Destination::Image, HTML::CORSSettingAttribute::NoCORS);
+        auto request = HTML::create_potential_CORS_request(*m_href, Fetch::Infrastructure::Request::Destination::Image, HTML::CORSSettingAttribute::NoCORS);
         request->set_client(&document().relevant_settings_object());
-        m_resource_request->fetch_resource(realm(), request);
+        m_resource_request->fetch_resource(request);
     }
 }
 
@@ -99,20 +97,19 @@ Optional<Gfx::IntRect> SVGFEImageElement::content_rect() const
     auto bitmap = current_image_frame();
     if (!bitmap.has_value())
         return {};
-    // NB: Called during painting.
-    auto layout_node = this->unsafe_layout_node();
-    if (!layout_node)
+    auto computed_style = this->computed_style();
+    if (!computed_style)
         return {};
-    auto width = layout_node->computed_values().width().to_px(0);
+    auto width = computed_style->width().to_px(0);
     if (width == 0)
         width = bitmap->width();
 
-    auto height = layout_node->computed_values().height().to_px(0);
+    auto height = computed_style->height().to_px(0);
     if (height == 0)
         height = bitmap->height();
 
-    auto x = layout_node->computed_values().x().to_px(0);
-    auto y = layout_node->computed_values().y().to_px(0);
+    auto x = computed_style->x().to_px(0);
+    auto y = computed_style->y().to_px(0);
     return Gfx::enclosing_int_rect({ x, y, width, height });
 }
 

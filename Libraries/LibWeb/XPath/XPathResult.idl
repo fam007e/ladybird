@@ -24,4 +24,3 @@ interface XPathResult {
     Node? snapshotItem(unsigned long index);
 };
 
-

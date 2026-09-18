@@ -4,8 +4,6 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibWeb/Bindings/Intrinsics.h>
-#include <LibWeb/Bindings/SVGMetadataElement.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/Layout/Node.h>
 #include <LibWeb/Page/Page.h>
@@ -20,13 +18,7 @@ SVGMetadataElement::SVGMetadataElement(DOM::Document& document, DOM::QualifiedNa
 {
 }
 
-void SVGMetadataElement::initialize(JS::Realm& realm)
-{
-    WEB_SET_PROTOTYPE_FOR_INTERFACE(SVGMetadataElement);
-    Base::initialize(realm);
-}
-
-RefPtr<Layout::Node> SVGMetadataElement::create_layout_node(CSS::ComputedProperties const&)
+Layout::Node* SVGMetadataElement::create_layout_node(CSS::LayoutStyle)
 {
     return nullptr;
 }

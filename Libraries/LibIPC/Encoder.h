@@ -11,8 +11,10 @@
 #include <AK/HashMap.h>
 #include <AK/IPv4Address.h>
 #include <AK/StdLibExtras.h>
+#include <AK/Utf16FlyString.h>
 #include <AK/Variant.h>
 #include <LibCore/Forward.h>
+#include <LibCore/SharedCircularQueue.h>
 #include <LibIPC/Attachment.h>
 #include <LibIPC/Concepts.h>
 #include <LibIPC/File.h>
@@ -98,6 +100,9 @@ template<>
 ErrorOr<void> encode(Encoder&, Utf16String const&);
 
 template<>
+ErrorOr<void> encode(Encoder&, Utf16FlyString const&);
+
+template<>
 ErrorOr<void> encode(Encoder&, Utf16View const&);
 
 template<>
@@ -131,6 +136,9 @@ template<>
 ErrorOr<void> encode(Encoder&, URL::Host const&);
 
 template<>
+ErrorOr<void> encode(Encoder&, URL::OpaqueHost const&);
+
+template<>
 ErrorOr<void> encode(Encoder&, File const&);
 
 template<>
@@ -143,13 +151,7 @@ template<>
 ErrorOr<void> encode(Encoder&, Core::AnonymousBuffer const&);
 
 template<>
-ErrorOr<void> encode(Encoder&, Core::ProxyData const&);
-
-template<>
-ErrorOr<void> encode(Encoder&, URL::BlobURLEntry::Blob const&);
-
-template<>
-ErrorOr<void> encode(Encoder&, URL::BlobURLEntry::MediaSource const&);
+ErrorOr<void> encode(Encoder&, URL::BlobURLEntry const&);
 
 template<Concepts::Span T>
 requires(!IsArithmetic<typename T::ElementType>)
@@ -197,6 +199,13 @@ ErrorOr<void> encode(Encoder& encoder, T const& hashmap)
         TRY(encoder.encode(it.value));
     }
 
+    return {};
+}
+
+template<Concepts::SharedSingleProducerCircularQueue T>
+ErrorOr<void> encode(Encoder& encoder, T const& queue)
+{
+    TRY(encoder.encode(TRY(IPC::File::clone_fd(queue.fd()))));
     return {};
 }
 

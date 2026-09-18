@@ -6,8 +6,8 @@
 
 #pragma once
 
-#include <AK/FlyString.h>
-#include <AK/String.h>
+#include <AK/Utf16FlyString.h>
+#include <AK/Utf16String.h>
 #include <AK/Variant.h>
 #include <LibGC/Ptr.h>
 #include <LibWeb/CSS/ComputedValues.h>
@@ -16,8 +16,16 @@
 
 namespace Web::CSS {
 
+struct TransitionProperties {
+    Vector<PropertyID> properties;
+    double duration;
+    EasingFunction timing_function;
+    double delay;
+    TransitionBehavior transition_behavior;
+};
+
 struct AnimationProperties {
-    Variant<double, String> duration;
+    Variant<double, Utf16String> duration;
     EasingFunction timing_function;
     double iteration_count;
     AnimationDirection direction;
@@ -25,7 +33,7 @@ struct AnimationProperties {
     double delay;
     AnimationFillMode fill_mode;
     AnimationComposition composition;
-    FlyString name;
+    Utf16FlyString name;
     GC::Ptr<Animations::AnimationTimeline> timeline;
 };
 

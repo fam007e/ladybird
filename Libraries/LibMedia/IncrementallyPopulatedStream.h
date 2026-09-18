@@ -8,8 +8,10 @@
 
 #include <AK/Atomic.h>
 #include <AK/AtomicRefCounted.h>
+#include <AK/ConditionVariable.h>
 #include <AK/Forward.h>
 #include <AK/Function.h>
+#include <AK/Mutex.h>
 #include <AK/RedBlackTree.h>
 #include <AK/RefPtr.h>
 #include <AK/Time.h>
@@ -18,8 +20,6 @@
 #include <LibMedia/DecoderError.h>
 #include <LibMedia/Export.h>
 #include <LibMedia/MediaStream.h>
-#include <LibSync/ConditionVariable.h>
-#include <LibSync/Mutex.h>
 
 namespace Media {
 
@@ -43,8 +43,11 @@ public:
     u64 next_chunk_start() const { return m_last_chunk_end; }
 
     void close();
+    virtual bool is_closed() const override;
 
     virtual Vector<ByteRange> available_byte_ranges() const override;
+
+    virtual void set_available_ranges_change_observer(Function<void()>) override;
 
     u64 size();
     void set_expected_size(u64);
@@ -58,6 +61,7 @@ public:
 
         virtual DecoderErrorOr<void> seek(i64 offset, AK::SeekMode mode) override;
         virtual DecoderErrorOr<size_t> read_into(Bytes bytes) override;
+        virtual DecoderErrorOr<FixedArray<u8>> read_bytes(size_t size) override;
 
         virtual size_t position() const override { return m_position; }
         virtual size_t size() const override { return m_stream->size(); }
@@ -66,7 +70,7 @@ public:
         virtual void reset_abort() override { m_aborted = false; }
         virtual bool is_aborted() const override { return m_aborted; }
 
-        virtual bool is_blocked() const override { return m_blocked; }
+        virtual void set_blocked_change_handler(ReadBlockedChangeHandler) override;
 
     private:
         friend class IncrementallyPopulatedStream;
@@ -77,7 +81,8 @@ public:
         bool m_is_blocking { true };
         size_t m_position { 0 };
         bool m_aborted { false };
-        Atomic<bool> m_blocked { false };
+        bool m_blocked { false };
+        ReadBlockedChangeHandler m_read_blocked_change_handler;
         MonotonicTime m_active_timeout { MonotonicTime::now_coarse() };
     };
 
@@ -114,14 +119,17 @@ private:
     void begin_new_request_while_locked(u64 position);
     bool check_if_data_is_available_or_begin_request_while_locked(Cursor&, u64 position, u64 length);
     size_t read_from_chunks_while_locked(u64 position, Bytes& bytes) const;
+    void notify_available_ranges_changed_while_locked();
 
-    mutable Sync::Mutex m_mutex;
+    mutable Mutex m_mutex;
     Vector<Cursor&> m_cursors;
-    Sync::ConditionVariable m_state_changed { m_mutex };
+    ConditionVariable m_state_changed { m_mutex };
 
     Chunks m_chunks;
     Optional<u64> m_expected_size;
     bool m_closed { false };
+
+    Function<void()> m_available_ranges_change_observer;
 
     RefPtr<Core::WeakEventLoopReference> m_callback_event_loop;
     DataRequestCallback m_data_request_callback;

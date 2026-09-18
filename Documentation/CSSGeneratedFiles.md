@@ -183,23 +183,25 @@ Each at-rule object has the following fields. Both are required.
 
 Each descriptor object can have the following fields:
 
-| Field                                    | Default | Required | Description                                                                |
-|------------------------------------------|---------|----------|----------------------------------------------------------------------------|
-| `allow-arbitrary-substitution-functions` | `false` | No       | Boolean. Whether this descriptor supports arbitrary substitution functions |
-| `initial`                                | Nothing | No       | String. The descriptor's initial value if none is provided.                |
-| `legacy-alias-for`                       | Nothing | No       | String. The name of a different descriptor that this is an alias for.      |
-| `syntax`                                 | N/A     | Yes      | Array of strings. Each string is one option, taken from the spec.          |
-| `FIXME` or `NOTE`                        | Nothing | No       | Strings, for when you want to leave a note.                                |
+| Field                                    | Default | Required | Description                                                                                            |
+|------------------------------------------|---------|----------|--------------------------------------------------------------------------------------------------------|
+| `allow-arbitrary-substitution-functions` | `false` | No       | Boolean. Whether this descriptor supports arbitrary substitution functions                             |
+| `allow-css-wide-keywords`                | `false` | No       | Boolean. Whether PropertyID based parsing should include CSS-wide keywords (e.g. `initial`, `inherit`) |
+| `initial`                                | Nothing | No       | String. The descriptor's initial value if none is provided.                                            |
+| `legacy-alias-for`                       | Nothing | No       | String. The name of a different descriptor that this is an alias for.                                  |
+| `syntax`                                 | N/A     | Yes      | Array of strings. Each string is one option, taken from the spec.                                      |
+| `FIXME` or `NOTE`                        | Nothing | No       | Strings, for when you want to leave a note.                                                            |
 
 ### Custom descriptor fields
 
 Each custom descriptor object has the following fields
 
-| Field                                    | Default | Required | Description                                                                |
-|------------------------------------------|---------|----------|----------------------------------------------------------------------------|
-| `allow-arbitrary-substitution-functions` | `false` | No       | Boolean. Whether this descriptor supports arbitrary substitution functions |
-| `syntax`                                 | N/A     | Yes      | Array of strings. Each string is one option.                               |
-| `FIXME` or `NOTE`                        | Nothing | No       | Strings, for when you want to leave a note.                                |
+| Field                                    | Default | Required | Description                                                                                            |
+|------------------------------------------|---------|----------|--------------------------------------------------------------------------------------------------------|
+| `allow-arbitrary-substitution-functions` | `false` | No       | Boolean. Whether this descriptor supports arbitrary substitution functions                             |
+| `allow-css-wide-keywords`                | `false` | No       | Boolean. Whether PropertyID based parsing should include CSS-wide keywords (e.g. `initial`, `inherit`) |
+| `syntax`                                 | N/A     | Yes      | Array of strings. Each string is one option.                                                           |
+| `FIXME` or `NOTE`                        | Nothing | No       | Strings, for when you want to leave a note.                                                            |
 
 ## Keywords.json
 
@@ -234,7 +236,7 @@ The generated code provides these for each enum, using "foo" as an example:
 ## PseudoClasses.json
 
 This is a single JSON object, with selector pseudo-class names as keys and the values being objects with fields for the pseudo-class.
-This generates `PseudoClass.h` and `PseudoClass.cpp`.
+This generates `PseudoClass.h`.
 
 Each entry has the following properties:
 
@@ -245,10 +247,6 @@ Each entry has the following properties:
 
 The generated code provides:
 - A `PseudoClass` enum listing every pseudo-class name
-- `Optional<PseudoClass> pseudo_class_from_string(StringView)` to parse a string as a `PseudoClass` name
-- `StringView pseudo_class_name(PseudoClass)` to convert a `PseudoClass` back into a string
-- The `PseudoClassMetadata` struct which holds a representation of the data from the JSON file
-- `PseudoClassMetadata pseudo_class_metadata(PseudoClass)` to retrieve that data
 
 ## PseudoElements.json
 
@@ -264,6 +262,7 @@ Each entry has the following properties:
 | `implementation`     | Unless `type` is "function | Nothing        | How this pseudo-element is implemented, either `"synthetic"` or `"element-reference"` - see below.                                                                     |
 | `is-allowed-in-has`  | No                         | `false`        | Whether this is a [`:has`-allowed pseudo-element](https://drafts.csswg.org/selectors/#has-allowed-pseudo-element).                                                     |
 | `is-element-backed`  | No                         | `false`        | Whether this is an [element-backed pseudo-element](https://drafts.csswg.org/css-pseudo-4/#element-backed).                                                             |
+| `is-highlight`       | No                         | `false`        | Whether this is a [highlight pseudo-element](https://drafts.csswg.org/css-pseudo-4/#highlight-pseudos).                                                                |
 | `is-pseudo-root`     | No                         | `false`        | Whether this is a [pseudo-element root](https://drafts.csswg.org/css-view-transitions/#pseudo-element-root).                                                           |
 | `is-tree-abiding`    | No                         | `false`        | Whether this is a [tree-abiding pseudo-element](https://drafts.csswg.org/css-pseudo-4/#tree-abiding).                                                                  |
 | `property-whitelist` | No                         | Nothing        | Some pseudo-elements only permit certain properties. If so, name them in an array here. Some special values are allowed here for categories of properties - see below. |
@@ -272,20 +271,18 @@ Each entry has the following properties:
 
 The generated code provides:
 - A `PseudoElement` enum listing every pseudo-element name
-- `Optional<PseudoElement> pseudo_element_from_string(StringView)` to parse a string as a `PseudoElement` name
-- `Optional<PseudoElement> aliased_pseudo_element_from_string(StringView)` is similar, but returns the `PseudoElement` this name is an alias for
 - `StringView pseudo_element_name(PseudoElement)` to convert a `PseudoElement` back into a string
-- `bool is_has_allowed_pseudo_element(PseudoElement)` returns whether the pseudo-element is valid inside `:has()`
-- `bool is_element_backed_pseudo_element(PseudoElement)` returns whether the pseudo-element is element-backed
 - `bool is_tree_abiding_pseudo_element(PseudoElement)` returns whether the pseudo-element is tree-abiding
 - `bool is_pseudo_element_root(PseudoElement)` returns whether the pseudo-element is a [pseudo-element root](https://drafts.csswg.org/css-view-transitions/#pseudo-element-root)
-- `bool pseudo_element_supports_property(PseudoElement, PropertyID)` returns whether the property can be applied to this pseudo-element
+- `bool is_highlight_pseudo_element(PseudoElement)` returns whether the pseudo-element is a [highlight pseudo-element](https://drafts.csswg.org/css-pseudo-4/#highlight-pseudos)
 
 ### `property-whitelist`
 
 This is an array of strings. Properties can be named directly ("color"), or categories of properties with a leading `#`
 ("#font-properties"), as the specs often says a group is allowed instead of listing the properties exactly.
 Any properties we don't support yet can be prefixed with "FIXME:" and will be ignored.
+The property groups and the properties that always apply are defined in
+`PseudoElementPropertyGroups.txt` and generated into the Rust cascade tables.
 
 The following categories are supported:
 
@@ -315,7 +312,7 @@ NOTE: "element-reference" is an implementation detail and is distinct from the s
 ## MediaFeatures.json
 
 This is a single JSON object, with media-feature names as keys and the values being objects with fields for the media-feature.
-This generates `MediaFeatureID.h` and `MediaFeatureID.cpp`.
+This generates `MediaFeatureID.h`.
 
 A `<media-feature>` is a value that a media query can inspect.
 They are listed in the [`@media` descriptor table](https://www.w3.org/TR/mediaqueries-5/#media-descriptor-table) in the latest Media Queries spec.
@@ -330,12 +327,6 @@ The definitions here are like a simplified version of the `Properties.json` defi
 
 The generated code provides:
 - A `MediaFeatureID` enum, listing each media-feature
-- `Optional<MediaFeatureID> media_feature_id_from_string(StringView)` to convert a string to a `MediaFeatureID`
-- `StringView string_from_media_feature_id(MediaFeatureID)` to convert a `MediaFeatureID` back to a string
-- `bool media_feature_type_is_range(MediaFeatureID)` returns whether the media feature is a `range` type, as opposed to a `discrete` type
-- `bool media_feature_accepts_type(MediaFeatureID, QueryValueType)` returns whether the media feature will accept values of this type
-- `bool media_feature_accepts_keyword(MediaFeatureID, Keyword)` returns whether the media feature accepts this keyword
-- `bool media_feature_keyword_is_falsey(MediaFeatureID, Keyword)` returns whether the given keyword is considered false when the media-feature is evaluated in a boolean context. (Like `@media (foo)`)
 
 ## MathFunctions.json
 
@@ -398,7 +389,6 @@ Each entry has 3 properties, all taken from the spec:
 
 The generated code provides:
 - An `EnvironmentVariable` enum listing the environment variables
-- `Optional<EnvironmentVariable> environment_variable_from_string(StringView)` to parse a string as an `EnvironmentVariable`
 - `StringView to_string(EnvironmentVariable)` to convert the `EnvironmentVariable` back to a string
 - `ValueType environment_variable_type(EnvironmentVariable)` to get the variable's value type
 - `u32 environment_variable_dimension_count(EnvironmentVariable)` to get its dimension count
@@ -428,24 +418,3 @@ The generated code provides:
   - `bool units_are_compatible(FooUnit, FooUnit)` which returns whether these are compatible - basically whether you can convert from one to the other.
   - `double ratio_between_units(FooUnit, FooUnit)` to get a multiplier for converting the first unit into the second.
 - `bool is_absolute(LengthUnit)`, `bool is_font_relative(LengthUnit)`, `bool is_viewport_relative(LengthUnit)`, and `bool is_relative(LengthUnit)` for checking the category of length units.
-
-## ValueTypes.json
-
-This is a JSON object with the keys being value type names, and the values being the definition of the value type.
-It generates Parser/GeneratedValueTypesParsing.h and Parser/GeneratedValueTypesParsing.cpp
-
-NOTE: The generated parsing code is limited to the information given by the CSS value definition grammar, if there are
-additional requirements not representable in this grammar (e.g. bespoke resultant StyleValue types, default value
-handling, etc) parsing will need to be implemented manually.
-
-Each value type has the following properties:
-| Field       | Required | Description                                                       |
-|-------------|----------|-------------------------------------------------------------------|
-| `spec`      | Yes      | A link to the CSS specification where this value type is defined. |
-| `grammar`   | Yes      | The grammar of the CSS value type, as defined in the spec.        |
-| `__comment` | No       | Strings, for when you want to leave a note.                       |
-
-The generated code provides:
-- A `GenerateValueTypes` enum, listing each of the generated value types.
-- For each of those...
-  - A `CSS::Parser::Parser::parse_foo_value` method to parse the value type.

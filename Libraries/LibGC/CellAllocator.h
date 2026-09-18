@@ -18,7 +18,7 @@
     static GC::TypeIsolatingCellAllocator<ClassName> cell_allocator
 
 #define GC_DEFINE_ALLOCATOR(ClassName) \
-    GC::TypeIsolatingCellAllocator<ClassName> ClassName::cell_allocator { #ClassName##sv, ClassName::OVERRIDES_MUST_SURVIVE_GARBAGE_COLLECTION, ClassName::OVERRIDES_FINALIZE }
+    GC::TypeIsolatingCellAllocator<ClassName> ClassName::cell_allocator { #ClassName##sv, ClassName::OVERRIDES_FINALIZE }
 
 namespace GC {
 
@@ -29,7 +29,6 @@ class GC_API CellAllocatorDescriptorBase {
 public:
     Optional<StringView> class_name() const { return m_class_name; }
     size_t cell_size() const { return m_cell_size; }
-    bool overrides_must_survive_garbage_collection() const { return m_overrides_must_survive_garbage_collection; }
     bool overrides_finalize() const { return m_overrides_finalize; }
 
     CellAllocator& for_heap(Heap&);
@@ -43,10 +42,9 @@ public:
     }
 
 protected:
-    CellAllocatorDescriptorBase(size_t cell_size, StringView class_name, bool overrides_must_survive_garbage_collection, bool overrides_finalize)
+    CellAllocatorDescriptorBase(size_t cell_size, StringView class_name, bool overrides_finalize)
         : m_class_name(class_name)
         , m_cell_size(cell_size)
-        , m_overrides_must_survive_garbage_collection(overrides_must_survive_garbage_collection)
         , m_overrides_finalize(overrides_finalize)
     {
     }
@@ -54,7 +52,6 @@ protected:
 private:
     Optional<StringView> m_class_name;
     size_t m_cell_size { 0 };
-    bool m_overrides_must_survive_garbage_collection { false };
     bool m_overrides_finalize { false };
 
     Heap* m_last_heap { nullptr };
@@ -63,7 +60,7 @@ private:
 
 class GC_API CellAllocator {
 public:
-    CellAllocator(size_t cell_size, Optional<StringView> = {}, bool overrides_must_survive_garbage_collection = false, bool overrides_finalize = false);
+    CellAllocator(size_t cell_size, Optional<StringView> = {}, bool overrides_finalize = false);
     ~CellAllocator();
 
     static BlockAllocator& shared_block_allocator();
@@ -99,8 +96,6 @@ public:
     using SweepList = IntrusiveList<&CellAllocator::m_sweep_list_node>;
 
     BlockAllocator& block_allocator() { return m_block_allocator; }
-    FlatPtr min_block_address() const { return m_min_block_address; }
-    FlatPtr max_block_address() const { return m_max_block_address; }
 
 private:
     friend class Heap;
@@ -115,9 +110,6 @@ private:
     BlockList m_full_blocks;
     BlockList m_usable_blocks;
     SweepBlockList m_blocks_pending_sweep;
-    FlatPtr m_min_block_address { explode_byte(0xff) };
-    FlatPtr m_max_block_address { 0 };
-    bool m_overrides_must_survive_garbage_collection { false };
     bool m_overrides_finalize { false };
 };
 
@@ -126,8 +118,8 @@ class GC_API TypeIsolatingCellAllocator final : public CellAllocatorDescriptorBa
 public:
     using CellType = T;
 
-    TypeIsolatingCellAllocator(StringView class_name, bool overrides_must_survive_garbage_collection, bool overrides_finalize)
-        : CellAllocatorDescriptorBase(sizeof(T), class_name, overrides_must_survive_garbage_collection, overrides_finalize)
+    TypeIsolatingCellAllocator(StringView class_name, bool overrides_finalize)
+        : CellAllocatorDescriptorBase(sizeof(T), class_name, overrides_finalize)
     {
     }
 };

@@ -15,8 +15,8 @@
 #include <LibWeb/HTML/HTMLCanvasElement.h>
 #include <LibWeb/HTML/LocalNavigable.h>
 #include <LibWeb/Infra/Strings.h>
+#include <LibWeb/Layout/Node.h>
 #include <LibWeb/Page/Page.h>
-#include <LibWeb/Painting/Paintable.h>
 #include <LibWeb/WebGL/EventNames.h>
 #include <LibWeb/WebGL/RemoteWebGLTransport.h>
 #include <LibWeb/WebGL/WebGLContextEvent.h>
@@ -35,11 +35,11 @@ GC_DEFINE_ALLOCATOR(WebGLRenderingContext);
 // https://www.khronos.org/registry/webgl/specs/latest/1.0/#fire-a-webgl-context-event
 // Returns false if the event was canceled (the page called preventDefault), which is how
 // webglcontextlost signals that the page wants the context restored.
-bool fire_webgl_context_event(HTML::HTMLCanvasElement& canvas_element, FlyString const& type)
+bool fire_webgl_context_event(HTML::HTMLCanvasElement& canvas_element, Utf16FlyString const& type)
 {
     // To fire a WebGL context event named e means that an event using the WebGLContextEvent interface, with its type attribute [DOM4] initialized to e, its cancelable attribute initialized to true, and its isTrusted attribute [DOM4] initialized to true, is to be dispatched at the given object.
     // FIXME: Consider setting a status message.
-    auto event = WebGLContextEvent::create(canvas_element.realm(), type, Bindings::WebGLContextEventInit {});
+    auto event = WebGLContextEvent::create(type, Bindings::WebGLContextEventInit {}, HighResolutionTime::current_high_resolution_time(HTML::relevant_global_object(canvas_element)));
     event->set_is_trusted(true);
     event->set_cancelable(true);
     return canvas_element.dispatch_event(*event);
@@ -87,6 +87,10 @@ Optional<RemoteWebGLContext> create_remote_webgl_context(HTML::HTMLCanvasElement
         context_attributes.antialias);
     if (!result.success)
         return {};
+
+    // NB: The display list must be re-recorded so its DrawCanvas command refers to the new remote context's
+    //     canvas id. Content updates alone don't invalidate the display list, so do it here.
+    canvas_element.set_needs_repaint(InvalidateDisplayList::PaintCommands);
 
     return RemoteWebGLContext { transport.release_nonnull(), move(result) };
 }
@@ -136,12 +140,6 @@ WebGLRenderingContext::WebGLRenderingContext(JS::Realm& realm, HTML::HTMLCanvasE
 
 WebGLRenderingContext::~WebGLRenderingContext() = default;
 
-void WebGLRenderingContext::initialize(JS::Realm& realm)
-{
-    WEB_SET_PROTOTYPE_FOR_INTERFACE(WebGLRenderingContext);
-    Base::initialize(realm);
-}
-
 void WebGLRenderingContext::visit_edges(Cell::Visitor& visitor)
 {
     Base::visit_edges(visitor);
@@ -168,7 +166,10 @@ void WebGLRenderingContext::did_update_canvas_content()
 {
     m_canvas_element->set_canvas_content_dirty();
 
-    m_canvas_element->set_needs_repaint();
+    // NB: Don't request a display list recording here: the new content reaches the compositor through the canvas
+    //     surface registry when the canvas is presented, and the cached DrawCanvas command is invalidated when the
+    //     content generation moves in prepare_for_compositing.
+    m_canvas_element->set_needs_repaint(InvalidateDisplayList::No);
 }
 
 Optional<WebGLContextAttributes> WebGLRenderingContext::get_context_attributes()

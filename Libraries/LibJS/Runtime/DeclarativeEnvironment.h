@@ -46,8 +46,6 @@ public:
     virtual ThrowCompletionOr<Value> get_binding_value(VM&, Utf16FlyString const& name, bool strict) override;
     virtual ThrowCompletionOr<bool> delete_binding(VM&, Utf16FlyString const& name) override;
 
-    ThrowCompletionOr<void> initialize_or_set_mutable_binding(VM&, Utf16FlyString const& name, Value value);
-
     // This is not a method defined in the spec! Do not use this in any LibJS (or other spec related) code.
     [[nodiscard]] Vector<Utf16FlyString> bindings() const
     {
@@ -73,6 +71,8 @@ public:
 
         return names;
     }
+
+    bool binding_is_mutable_by_name(Utf16FlyString const&) const;
 
     ThrowCompletionOr<void> initialize_binding_direct(VM&, size_t index, Value, InitializeBindingHint);
     ThrowCompletionOr<void> set_mutable_binding_direct(VM&, size_t index, Value, bool strict);
@@ -112,7 +112,6 @@ private:
         DisposeCapability m_dispose_capability;
         GC::Ptr<EnvironmentShape>* m_environment_shape_cache { nullptr };
         size_t m_expected_binding_count { 0 };
-        u64 m_environment_serial_number { 0 };
         bool m_is_catch_environment { false };
     };
 
@@ -219,6 +218,7 @@ private:
     GC::Ptr<EnvironmentShape> m_shape;
     Vector<Value> m_binding_values;
     OwnPtr<RareData> m_rare_data;
+    u64 m_environment_serial_number { 0 };
 };
 
 inline ThrowCompletionOr<Value> DeclarativeEnvironment::get_binding_value_direct(VM& vm, size_t index) const
@@ -227,6 +227,13 @@ inline ThrowCompletionOr<Value> DeclarativeEnvironment::get_binding_value_direct
         return vm.throw_completion<ReferenceError>(ErrorType::BindingNotInitialized, binding_name(index));
 
     return m_binding_values[index];
+}
+
+inline bool DeclarativeEnvironment::binding_is_mutable_by_name(Utf16FlyString const& name) const
+{
+    auto binding = find_binding_and_index(name);
+    VERIFY(binding.has_value());
+    return binding->binding().mutable_;
 }
 
 inline ThrowCompletionOr<Value> DeclarativeEnvironment::get_binding_value_direct(VM&, Binding const& binding) const

@@ -4,11 +4,13 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/Base64.h>
 #include <AK/JsonArray.h>
 #include <AK/JsonObject.h>
 #include <LibURL/Parser.h>
 #include <LibWebView/Application.h>
 #include <LibWebView/HistoryStore.h>
+#include <LibWebView/WebContentClient.h>
 #include <LibWebView/WebUI/HistoryUI.h>
 
 #include <algorithm>
@@ -30,15 +32,21 @@ static Optional<String> site_key_for_entry(HistoryEntry const& entry)
     if (auto registrable_domain = parsed_url->host()->registrable_domain(); registrable_domain.has_value())
         return registrable_domain.release_value();
 
-    return parsed_url->serialized_host();
+    return MUST(String::from_utf8(parsed_url->serialized_host()));
 }
 
 static JsonObject serialize_history_entry(HistoryEntry const& entry)
 {
+    String favicon_base64_png;
+    if (entry.favicon_png.has_value()) {
+        if (auto encoded = encode_base64(entry.favicon_png->bytes()); !encoded.is_error())
+            favicon_base64_png = encoded.release_value();
+    }
+
     JsonObject serialized;
     serialized.set("url"sv, entry.url);
     serialized.set("title"sv, entry.title.value_or(String {}));
-    serialized.set("faviconBase64Png"sv, entry.favicon_base64_png.value_or(String {}));
+    serialized.set("faviconBase64Png"sv, move(favicon_base64_png));
     serialized.set("visitCount"sv, entry.visit_count);
     serialized.set("lastVisitedTime"sv, entry.last_visited_time.milliseconds_since_epoch());
     serialized.set("siteKey"sv, site_key_for_entry(entry).value_or(String {}));
@@ -75,7 +83,7 @@ void HistoryUI::load_history_entries(JsonValue const& data)
     else
         limit = DEFAULT_HISTORY_PAGE_SIZE;
 
-    auto entries = Application::history_store().list_entries(query, offset, *limit + 1);
+    auto entries = client().session().history_store->list_entries(query, offset, *limit + 1);
     auto has_more = entries.size() > *limit;
     if (has_more)
         entries.resize(*limit);
@@ -108,7 +116,10 @@ void HistoryUI::remove_history_entry(JsonValue const& data)
     if (!parsed_url.has_value())
         return;
 
-    Application::history_store().remove_entry_for_url(*parsed_url);
+    auto remove_engagements = Application::bookmark_store().is_bookmarked(*parsed_url)
+        ? RemoveHistoryEntryEngagements::No
+        : RemoveHistoryEntryEngagements::Yes;
+    client().session().history_store->remove_entry_for_url(*parsed_url, remove_engagements);
 }
 
 void HistoryUI::forget_history_site(JsonValue const& data)
@@ -124,7 +135,7 @@ void HistoryUI::forget_history_site(JsonValue const& data)
     if (!parsed_url.has_value())
         return;
 
-    Application::history_store().remove_entries_for_same_site(*parsed_url);
+    client().session().history_store->remove_entries_for_same_site(*parsed_url);
 }
 
 }

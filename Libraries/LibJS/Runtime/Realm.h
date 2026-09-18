@@ -11,6 +11,7 @@
 #include <AK/HashTable.h>
 #include <AK/OwnPtr.h>
 #include <AK/StringView.h>
+#include <AK/Traits.h>
 #include <AK/Weakable.h>
 #include <LibGC/CellAllocator.h>
 #include <LibGC/Heap.h>
@@ -44,11 +45,12 @@ public:
     GC::Ref<T> create(Args&&... args)
     {
         auto object = heap().allocate<T>(forward<Args>(args)...);
-        static_cast<Cell*>(object)->initialize(*this);
+        if constexpr (IsBaseOf<Cell, T>)
+            static_cast<Cell*>(object.ptr())->initialize(*this);
         return *object;
     }
 
-    static ThrowCompletionOr<NonnullOwnPtr<ExecutionContext>> initialize_host_defined_realm(VM&, Function<Object*(Realm&)> create_global_object, Function<Object*(Realm&)> create_global_this_value);
+    static ThrowCompletionOr<NonnullOwnPtr<ExecutionContext>> initialize_host_defined_realm(VM&, Function<GC::Ref<Object>(Realm&)> create_global_object, Function<GC::Ref<Object>(Realm&)> create_global_this_value);
 
     [[nodiscard]] Object& global_object() const { return *m_global_object; }
     void set_global_object(GC::Ref<Object> global) { m_global_object = global; }
