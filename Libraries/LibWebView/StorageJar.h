@@ -34,6 +34,8 @@ class WEBVIEW_API StorageJar {
     AK_MAKE_NONMOVABLE(StorageJar);
 
 public:
+    AK_ALLOC_WITH_KMALLOC;
+
     static ErrorOr<Database::MigrationOutcome> migrate_schema(Database::Database&, Database::MigrationMode = Database::MigrationMode::Apply);
 
     static ErrorOr<NonnullOwnPtr<StorageJar>> create(Database::Database&);
@@ -98,7 +100,7 @@ private:
         u64 usage(String const& storage_key);
         Requests::CacheSizes estimate_storage_size_accessed_since(UnixDateTime since) const;
 
-        Database::Database& database;
+        NonnullRefPtr<Database::Database> database;
         Statements statements;
     };
 

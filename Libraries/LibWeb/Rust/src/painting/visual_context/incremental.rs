@@ -284,7 +284,7 @@ pub(crate) fn box_owns_geometry_dependent_nodes(
     });
     let effects_filter_is_resolved_by_the_host_against_geometry = layout_arena
         .node_style_if_live(slot)
-        .is_some_and(|style| crate::painting::filter_bytes::contains_url(&style.effects().filter));
+        .is_some_and(|style| crate::painting::css_filter::contains_url(&style.effects().filter));
     let clips_are_geometry_dependent = handles
         .clip_handles()
         .any(|index| tree.clip_nodes[index.0 as usize].data.is_live());
@@ -617,6 +617,9 @@ pub(crate) fn update_visual_context_tree<Arena: PaintableRowsRead>(
     tree.debug_assert_slot_accounting();
     if delta.structural_epoch_changed {
         tree.structural_epoch = allocate_structural_epoch();
+        // The animations name nodes of the epoch they were published with; the main thread
+        // publishes them again for this one.
+        tree.clear_visual_animations();
     }
     // Whether any box but the viewport could take a wheel event decides if scroll metadata
     // everywhere carries per-box wheel targets.
@@ -701,6 +704,7 @@ pub(crate) fn debug_assert_every_live_node_is_owned(
 mod tests {
     use super::*;
     use libgfx_rust::{CompositingAndBlendingOperator, FloatMatrix4x4};
+    use libgfx_rust::{FloatPoint, FloatRect};
 
     fn effects() -> EffectNodeData {
         EffectNodeData::Effects(EffectsData {

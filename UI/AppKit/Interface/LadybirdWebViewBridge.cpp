@@ -20,12 +20,12 @@ static T scale_for_device(T size, double device_pixel_ratio)
     return size.template to_type<double>().scaled(device_pixel_ratio).template to_type<int>();
 }
 
-ErrorOr<NonnullOwnPtr<WebViewBridge>> WebViewBridge::create(WebView::IsPrivate is_private, Vector<Web::DevicePixelRect> screen_rects, double device_pixel_ratio, u64 maximum_frames_per_second, Optional<u64> display_id)
+ErrorOr<NonnullOwnPtr<WebViewBridge>> WebViewBridge::create(WebView::IsPrivate is_private, Vector<Compositing::DevicePixelRect> screen_rects, double device_pixel_ratio, u64 maximum_frames_per_second, Optional<u64> display_id)
 {
     return adopt_nonnull_own_or_enomem(new (nothrow) WebViewBridge(is_private, move(screen_rects), device_pixel_ratio, maximum_frames_per_second, display_id));
 }
 
-WebViewBridge::WebViewBridge(WebView::IsPrivate is_private, Vector<Web::DevicePixelRect> screen_rects, double device_pixel_ratio, u64 maximum_frames_per_second, Optional<u64> display_id)
+WebViewBridge::WebViewBridge(WebView::IsPrivate is_private, Vector<Compositing::DevicePixelRect> screen_rects, double device_pixel_ratio, u64 maximum_frames_per_second, Optional<u64> display_id)
     : WebView::ViewImplementation(is_private)
     , m_screen_rects(move(screen_rects))
 {
@@ -60,42 +60,42 @@ void WebViewBridge::set_display_metadata(u64 maximum_frames_per_second, Optional
 {
     m_maximum_frames_per_second = static_cast<double>(maximum_frames_per_second);
     m_display_id = display_id;
-    client().async_set_maximum_frames_per_second(m_client_state.page_index, maximum_frames_per_second);
+    client().async_set_maximum_frames_per_second(page_id(), maximum_frames_per_second);
     update_compositor_display_metadata();
 }
 
 void WebViewBridge::exit_fullscreen()
 {
-    client().async_exit_fullscreen(m_client_state.page_index);
+    client().async_exit_fullscreen(page_id());
 }
 
 void WebViewBridge::update_palette()
 {
     set_page_background_color_to_system_canvas(is_using_dark_system_theme());
     auto theme = create_system_palette();
-    client().async_update_system_theme(m_client_state.page_index, move(theme));
+    client().async_update_system_theme(page_id(), move(theme));
 }
 
-void WebViewBridge::enqueue_input_event(Web::MouseEvent event)
+void WebViewBridge::enqueue_input_event(Compositing::MouseEvent event)
 {
-    event.position = to_content_position(event.position.to_type<int>()).to_type<Web::DevicePixels>();
-    event.screen_position = to_content_position(event.screen_position.to_type<int>()).to_type<Web::DevicePixels>();
+    event.position = to_content_position(event.position.to_type<int>()).to_type<Compositing::DevicePixels>();
+    event.screen_position = to_content_position(event.screen_position.to_type<int>()).to_type<Compositing::DevicePixels>();
     ViewImplementation::enqueue_input_event(move(event));
 }
 
 void WebViewBridge::enqueue_input_event(Web::DragEvent event)
 {
-    event.position = to_content_position(event.position.to_type<int>()).to_type<Web::DevicePixels>();
-    event.screen_position = to_content_position(event.screen_position.to_type<int>()).to_type<Web::DevicePixels>();
+    event.position = to_content_position(event.position.to_type<int>()).to_type<Compositing::DevicePixels>();
+    event.screen_position = to_content_position(event.screen_position.to_type<int>()).to_type<Compositing::DevicePixels>();
     ViewImplementation::enqueue_input_event(move(event));
 }
 
-void WebViewBridge::enqueue_input_event(Web::KeyEvent event)
+void WebViewBridge::enqueue_input_event(Compositing::KeyEvent event)
 {
     ViewImplementation::enqueue_input_event(move(event));
 }
 
-void WebViewBridge::enqueue_input_event(Web::PinchEvent event)
+void WebViewBridge::enqueue_input_event(Compositing::PinchEvent event)
 {
     ViewImplementation::enqueue_input_event(move(event));
 }
@@ -126,9 +126,9 @@ void WebViewBridge::update_zoom()
         on_zoom_level_changed();
 }
 
-Web::DevicePixelSize WebViewBridge::viewport_size() const
+Compositing::DevicePixelSize WebViewBridge::viewport_size() const
 {
-    return m_viewport_size.to_type<Web::DevicePixels>();
+    return m_viewport_size.to_type<Compositing::DevicePixels>();
 }
 
 Gfx::IntPoint WebViewBridge::to_content_position(Gfx::IntPoint widget_position) const
@@ -149,24 +149,23 @@ void WebViewBridge::initialize_client(CreateNewClient create_new_client, Optiona
 
     if (!m_screen_rects.is_empty()) {
         // FIXME: Update the screens again if they ever change.
-        client().async_update_screen_rects(m_client_state.page_index, m_screen_rects, 0);
+        client().async_update_screen_rects(page_id(), m_screen_rects, 0);
     }
 }
 
-void WebViewBridge::initialize_client_as_child(WebViewBridge& parent, Web::PageId page_index)
+void WebViewBridge::initialize_client_as_child(WebView::WebContentClient& page_process, Compositing::PageId page_index)
 {
-    m_client_state.client = parent.client();
-    m_client_state.page_index = page_index;
+    page_process.register_view(page_index, *this);
 
     initialize_client(CreateNewClient::No);
 }
 
 void WebViewBridge::update_compositor_display_metadata()
 {
-    if (!m_client_state.client)
+    if (!m_client_state.page)
         return;
 
-    auto compositor_context_id = client().compositor_context_id_for_page(m_client_state.page_index);
+    auto compositor_context_id = page().compositor_context_id();
     WebView::Application::the().update_compositor_display_metadata(compositor_context_id, m_display_id, m_maximum_frames_per_second);
 }
 

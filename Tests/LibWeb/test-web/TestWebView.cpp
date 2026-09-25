@@ -14,7 +14,7 @@
 
 namespace TestWeb {
 
-NonnullOwnPtr<TestWebView> TestWebView::create(Core::AnonymousBuffer theme, Web::DevicePixelSize window_size)
+NonnullOwnPtr<TestWebView> TestWebView::create(Core::AnonymousBuffer theme, Compositing::DevicePixelSize window_size)
 {
     auto view = adopt_own(*new TestWebView(move(theme), window_size));
     view->initialize_client(CreateNewClient::Yes);
@@ -22,7 +22,7 @@ NonnullOwnPtr<TestWebView> TestWebView::create(Core::AnonymousBuffer theme, Web:
     return view;
 }
 
-TestWebView::TestWebView(Core::AnonymousBuffer theme, Web::DevicePixelSize viewport_size)
+TestWebView::TestWebView(Core::AnonymousBuffer theme, Compositing::DevicePixelSize viewport_size)
     : WebView::HeadlessWebView(move(theme), viewport_size)
     , m_test_promise(TestPromise::construct())
 {
@@ -45,6 +45,12 @@ void TestWebView::reset_line_box_borders()
     debug_request("set-line-box-borders"sv, "off"sv);
 }
 
+// The emulated position lives on the page, so a test that moves it would otherwise hand its position to the next test.
+void TestWebView::reset_geolocation_emulated_position()
+{
+    geolocation_settings_changed();
+}
+
 NonnullRefPtr<Core::Promise<Empty>> TestWebView::reset_session_history()
 {
     return WebView::ViewImplementation::reset_session_history_for_testing();
@@ -65,7 +71,7 @@ NonnullRefPtr<Core::Promise<RefPtr<Gfx::Bitmap const>>> TestWebView::take_screen
     return *m_pending_screenshot;
 }
 
-void TestWebView::did_receive_screenshot(Badge<WebView::WebContentClient>, Gfx::ShareableBitmap const& screenshot)
+void TestWebView::did_receive_screenshot(Badge<WebView::WebContentPage>, Gfx::ShareableBitmap const& screenshot)
 {
     // NOTE: The screenshot may arrive after a timeout already completed the test and cleared m_pending_screenshot.
     if (!m_pending_screenshot)
@@ -81,7 +87,7 @@ void TestWebView::on_test_complete(TestCompletion completion)
     m_pending_dialog = Web::Page::PendingDialog::None;
     m_pending_prompt_text.clear();
     m_is_fullscreen = Web::ViewportIsFullscreen::No;
-    client().async_set_viewport(m_client_state.page_index, viewport_size(), 1.0, Web::ViewportIsFullscreen::No);
+    client().async_set_viewport(page_id(), viewport_size(), 1.0, Web::ViewportIsFullscreen::No);
 
     m_test_promise->resolve(move(completion));
 }

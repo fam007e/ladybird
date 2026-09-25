@@ -58,6 +58,8 @@ public:
 
     void add_an_event_listener(DOMEventListener&);
     void remove_an_event_listener(DOMEventListener&);
+    void remove_all_event_listeners();
+    void erase_all_event_listeners_and_handlers();
 
     // A dispatch clones only the listeners it can run, and rarely more than a couple, so keep them inline.
     using ClonedEventListeners = GC::RootVector<GC::Ref<DOMEventListener>, 4>;
@@ -89,6 +91,8 @@ protected:
 
 private:
     struct Data {
+        AK_ALLOC_WITH_KMALLOC;
+
         Vector<GC::Ref<DOMEventListener>> event_listener_list;
 
         // https://html.spec.whatwg.org/multipage/webappapis.html#event-handler-map

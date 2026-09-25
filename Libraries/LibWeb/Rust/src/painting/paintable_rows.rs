@@ -16,6 +16,7 @@ use crate::painting::visual_context::dirty::{
 use crate::painting::visual_context::{
     BoxVisualContextNodeHandles, EMPTY_BOX_VISUAL_CONTEXT_NODE_HANDLES, PaintableVisualContextRecord,
 };
+use smallvec::{SmallVec, smallvec};
 use std::cell::{Cell, Ref, RefCell, RefMut};
 use std::ffi::c_void;
 use std::ops::{Deref, DerefMut};
@@ -25,6 +26,12 @@ pub(crate) const PAINTABLE_SLOTS_PER_CHUNK: usize = 64;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn committed_geometry_validity_fits_in_the_link_slots_existing_padding() {
+        assert_eq!(std::mem::size_of::<CommittedFragmentLinkSlot>(), 16);
+    }
 
     #[test]
     fn overflow_queries_do_not_measure_ordinary_inline_fragments() {
@@ -161,6 +168,8 @@ impl PaintableRowReset {
 #[derive(Default)]
 struct CommittedFragmentLinkSlot {
     layout_slot_generation: u8,
+    geometry_epoch: u32,
+    geometry_is_current: bool,
     link: Option<Box<fragment_tree::FragmentLink>>,
 }
 
@@ -287,7 +296,7 @@ where
             return;
         }
         repaint(id);
-        let mut stack = vec![id];
+        let mut stack: SmallVec<[NodeSlotId; 16]> = smallvec![id];
         while let Some(current) = stack.pop() {
             let mut child = crate::painting::paint_order::first_paint_child(self, current);
             while let Some(child_slot) = child {
@@ -408,6 +417,34 @@ where
 }
 
 impl PaintableRowStore {
+    pub(crate) fn with_current_committed_fragment<R>(
+        &self,
+        layout_slot_index: u32,
+        layout_slot_generation: u8,
+        geometry_epoch: u32,
+        read: impl FnOnce(&fragment_tree::Fragment) -> R,
+    ) -> Option<R> {
+        let slots = self.committed_fragment_links.borrow();
+        let slot = slots.get(layout_slot_index as usize)?;
+        if slot.layout_slot_generation != layout_slot_generation
+            || !slot.geometry_is_current
+            || slot.geometry_epoch != geometry_epoch
+        {
+            return None;
+        }
+        Some(read(&slot.link.as_deref()?.fragment))
+    }
+
+    pub(crate) fn invalidate_committed_geometry(&self, layout_slot_index: u32) {
+        if let Some(slot) = self
+            .committed_fragment_links
+            .borrow_mut()
+            .get_mut(layout_slot_index as usize)
+        {
+            slot.geometry_is_current = false;
+        }
+    }
+
     pub(crate) fn committed_fragment_link_cloned(
         &self,
         layout_slot_index: u32,
@@ -439,6 +476,7 @@ impl PaintableRowStore {
         &self,
         layout_slot_index: u32,
         layout_slot_generation: u8,
+        geometry_epoch: Option<u32>,
         link: fragment_tree::FragmentLink,
     ) {
         let mut slots = self.committed_fragment_links.borrow_mut();
@@ -450,12 +488,15 @@ impl PaintableRowStore {
             *slot = CommittedFragmentLinkSlot {
                 layout_slot_generation,
                 link: Some(Box::new(link)),
+                ..Default::default()
             };
         } else if let Some(retained_link) = &mut slot.link {
             **retained_link = link;
         } else {
             slot.link = Some(Box::new(link));
         }
+        slot.geometry_epoch = geometry_epoch.unwrap_or_default();
+        slot.geometry_is_current = geometry_epoch.is_some();
     }
 
     pub(crate) fn take_committed_fragment_link(
@@ -522,10 +563,9 @@ impl LayoutNodeArena {
                     paintable_rows.clear_cached_overflow_data(containing_box);
                 }
                 // SAFETY: As above.
-                let next = self.data(containing_box).containing_block.get();
-                if next.is_invalid() || !self.slot_is_live(next) {
+                let Some(next) = self.node_containing_block_if_live(containing_box) else {
                     break;
-                }
+                };
                 containing_box = next;
             }
         }
@@ -780,6 +820,38 @@ impl LayoutNodeArena {
             Some(record) => read(&record.node_handles),
             None => read(&EMPTY_BOX_VISUAL_CONTEXT_NODE_HANDLES),
         }
+    }
+
+    /// The nodes of the box that an animation of the kind drives: the effect nodes of an opacity,
+    /// background color or filter animation, or the spatial nodes of a transform animation, as far
+    /// as the tree holds nodes of the right kind for them.
+    pub(crate) fn paintable_visual_animation_target_indices(
+        &self,
+        id: NodeSlotId,
+        tree: Option<&crate::painting::visual_context::VisualContextTree>,
+        target_kind: crate::painting::host::FfiVisualAnimationTargetKind,
+    ) -> Vec<u32> {
+        use crate::painting::host::FfiVisualAnimationTargetKind;
+        let Some(tree) = tree else {
+            return Vec::new();
+        };
+        self.with_paintable_visual_context_node_handles(id, |handles| {
+            let valid_targets = |indices: &mut dyn Iterator<Item = u32>| -> Vec<u32> {
+                indices
+                    .filter(|&index| tree.visual_animation_target_is_valid(target_kind, index))
+                    .collect()
+            };
+            match target_kind {
+                FfiVisualAnimationTargetKind::Opacity
+                | FfiVisualAnimationTargetKind::BackgroundColor
+                | FfiVisualAnimationTargetKind::Filter => {
+                    valid_targets(&mut handles.effects.iter().map(|index| index.0))
+                }
+                FfiVisualAnimationTargetKind::Transform => {
+                    valid_targets(&mut handles.spatial.iter().map(|index| index.0))
+                }
+            }
+        })
     }
 
     pub(crate) fn mark_paintable_subtree_may_own_geometry_dependent_nodes(&self, id: NodeSlotId) -> Option<bool> {

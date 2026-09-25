@@ -9,6 +9,7 @@
 
 #include <AK/DistinctNumeric.h>
 #include <AK/Variant.h>
+#include <LibCompositing/Forward.h>
 #include <LibGC/Forward.h>
 #include <LibGfx/Forward.h>
 #include <LibIPC/Forward.h>
@@ -20,8 +21,10 @@
 
 namespace Web {
 
+using Compositing::CSSPixels;
+using Compositing::UniqueNodeID;
+
 class AutoScrollHandler;
-class CSSPixels;
 class DragAndDropEventHandler;
 class ElementResizeAction;
 class EventHandler;
@@ -37,13 +40,10 @@ class XMLDocumentBuilder;
 enum class InvalidateDisplayList;
 enum class NavigationTarget : u8;
 enum class TraversalDecision;
-enum class WheelDeltaPrecision : u8;
-enum class ScrollGesturePhase : u8;
 
 struct AsyncScrollOperation;
 struct InitiatorSourceSnapshot;
-
-AK_TYPEDEF_DISTINCT_NUMERIC_GENERAL(i64, UniqueNodeID, Comparison, Increment, CastToUnderlying);
+struct RemoteInputEventTarget;
 
 }
 
@@ -56,24 +56,13 @@ class CompositorHost;
 
 namespace Web::Painting {
 
-class AccumulatedVisualContextTree;
 class BackingStore;
-class Canvas2DCommandStream;
-struct Canvas2DCommandStreamSegment;
 class ChromeWidget;
 class ChromeWidgetRegistry;
-class CanvasSurfaceRegistry;
-class DisplayList;
-struct DisplayListCommandRun;
-struct DisplayListGlyph;
-class DisplayListPlayerSkia;
-class DisplayListResourceStorage;
-struct DisplayListResourceSet;
-enum class CompositorScrollNodeKind : u8;
 enum class PaintCommandCacheMode : u8;
 struct GradientPaintStyle;
 struct PatternPaintStyle;
-class ScrollStateSnapshot;
+class Scrollbar;
 
 }
 
@@ -587,6 +576,7 @@ class XMLDocument;
 
 enum class QuirksMode;
 enum class SetNeedsLayoutReason;
+enum class UpdateLayoutReason;
 
 using HTMLSerializationOptions = Bindings::GetHTMLOptions;
 using ShadowRootMode = Bindings::ShadowRootMode;
@@ -844,6 +834,7 @@ class Navigable;
 class NavigableContainer;
 class NavigateEvent;
 class Navigation;
+struct NavigationAPIMethodTracker;
 class NavigationActivation;
 class NavigationCurrentEntryChangeEvent;
 class NavigationDestination;
@@ -1000,7 +991,6 @@ class IntersectionObserverEntry;
 
 namespace Web::Layout {
 
-class BlockContainer;
 class ImageProvider;
 class Box;
 class Node;
@@ -1063,7 +1053,6 @@ namespace Web::Painting {
 
 class BoxViewRepaintAccess;
 class DocumentPaintState;
-class ScrollStateSnapshot;
 
 }
 

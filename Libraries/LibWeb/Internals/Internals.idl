@@ -58,6 +58,10 @@ interface Internals {
     const unsigned short BUTTON_RIGHT = 2;
 
     undefined sendText(HTMLElement target, DOMString text, optional unsigned short modifiers = 0);
+    undefined sendTextThroughUIProcess(DOMString text);
+    undefined grantTransientActivation();
+    undefined clickThroughUIProcess(double x, double y);
+    undefined wheelThroughUIProcess(double x, double y, double deltaX, double deltaY);
     undefined sendKey(HTMLElement target, DOMString keyName, optional unsigned short modifiers = 0, optional unsigned long repeatCount = 1);
     undefined paste(HTMLElement target, DOMString text);
     undefined pasteFromClipboard();
@@ -65,6 +69,7 @@ interface Internals {
 
     // Low-level mouse primitives
     undefined mouseDown(double x, double y, optional unsigned short clickCount = 1, optional unsigned short button = 0, optional unsigned short modifiers = 0);
+    undefined mouseDownOnScrollbarDraggedByCompositor(double x, double y, Element scroller, boolean vertical);
     undefined mouseUp(double x, double y, optional unsigned short button = 0, optional unsigned short modifiers = 0);
     undefined mouseMove(double x, double y, optional unsigned short modifiers = 0);
     undefined mouseLeave();

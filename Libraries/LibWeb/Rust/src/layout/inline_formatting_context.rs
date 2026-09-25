@@ -23,7 +23,7 @@ fn truncate_line_at_glyph_boundary(
         if index == 0 {
             return Some((index, fragment.inline_offset));
         }
-        fragment.glyphs.as_mut().unwrap().glyphs.pop();
+        fragment.glyphs.as_mut().unwrap().glyphs.to_mut().pop();
         fragment.has_text_overflow_ellipsis = false;
     }
     let available = available_inline_size - fragment.inline_offset;
@@ -54,9 +54,10 @@ fn truncate_line_at_glyph_boundary(
     }
     let origin = CssPixels::nearest_value_for_f32(glyphs.glyphs[start].x);
     let inline_size = glyph_end(&glyphs.glyphs[end - 1]) - origin;
-    glyphs.glyphs.drain(end..);
-    glyphs.glyphs.drain(..start);
-    for glyph in &mut glyphs.glyphs {
+    let kept_glyphs = glyphs.glyphs.to_mut();
+    kept_glyphs.drain(end..);
+    kept_glyphs.drain(..start);
+    for glyph in kept_glyphs.iter_mut() {
         glyph.x -= origin.to_double() as f32;
     }
     let length = glyphs.glyphs.iter().map(|glyph| glyph.length_in_code_units).sum();
@@ -98,7 +99,7 @@ fn apply_text_overflow_to_line(line: &mut line_box::LineBoxData) {
         let mut keep_count = 0usize;
         let mut last_kept_end = 0.0f32;
         let mut glyph_block_offset = 0.0f32;
-        for glyph in glyphs {
+        for glyph in glyphs.iter() {
             let glyph_end = glyph.x + glyph.glyph_width;
             if glyph_end > max_text_inline_size && (keep_count > 0 || line_has_visible_content) {
                 break;
@@ -109,8 +110,9 @@ fn apply_text_overflow_to_line(line: &mut line_box::LineBoxData) {
         }
 
         let glyph_data = line.fragments[index].glyphs.as_mut().unwrap();
-        glyph_data.glyphs.truncate(keep_count);
-        glyph_data.glyphs.push(libgfx_rust::text_layout::DrawGlyph {
+        let kept_glyphs = glyph_data.glyphs.to_mut();
+        kept_glyphs.truncate(keep_count);
+        kept_glyphs.push(libgfx_rust::text_layout::DrawGlyph {
             x: last_kept_end,
             y: glyph_block_offset,
             length_in_code_units: 1,
@@ -188,7 +190,7 @@ fn apply_block_ellipsis(
         if last_retained_fragment.length_in_code_units > length || last_retained_fragment.has_text_overflow_ellipsis {
             let mut retained_code_units = 0usize;
             if let Some(glyphs) = &mut last_retained_fragment.glyphs {
-                glyphs.glyphs.retain(|glyph| {
+                glyphs.glyphs.to_mut().retain(|glyph| {
                     retained_code_units += glyph.length_in_code_units;
                     retained_code_units <= length
                 });
@@ -798,7 +800,7 @@ pub(crate) fn compute(
         if node_is_inline_containing_block
             && let Some(rect) = padding_box_rect_spanning_first_and_last_content_lines(
                 &corners,
-                &used,
+                used,
                 horizontal,
                 reversed,
                 container_inline_axis_is_reverse,
@@ -973,7 +975,7 @@ pub(crate) struct InlineFormattingContext<'context> {
     pub(crate) input: LayoutInput,
     pub(crate) callbacks: LayoutPass<'context>,
     pub(crate) parent: &'context block_formatting_context::BlockFormattingContext<'context>,
-    pub(crate) containing_used_values: std::rc::Rc<UsedValues>,
+    pub(crate) containing_used_values: &'context UsedValues,
     pub(crate) fragmented_inlines_in_pre_order: Vec<Node>,
     pub(crate) automatic_content_inline_size: CssPixels,
     pub(crate) min_content_inline_size_from_max_content_layout: Option<CssPixels>,
@@ -991,7 +993,7 @@ impl<'context> InlineFormattingContext<'context> {
         parent: &'context block_formatting_context::BlockFormattingContext<'context>,
     ) -> Self {
         let containing_used_values = run.records.used_values(containing_block);
-        containing_used_values.line_data_cell();
+        containing_used_values.ensure_line_data();
         Self {
             run,
             containing_block,
@@ -1089,24 +1091,19 @@ impl<'context> InlineFormattingContext<'context> {
     }
 
     pub(crate) fn line_data(&self) -> Ref<'_, used_values::LineData> {
-        Ref::map(self.containing_used_values.line_data_cell().borrow(), |shared| {
-            shared.building()
-        })
+        self.containing_used_values.building_line_data()
     }
 
     pub(crate) fn line_data_mut(&self) -> RefMut<'_, used_values::LineData> {
-        RefMut::map(
-            self.containing_used_values.line_data_cell().borrow_mut(),
-            used_values::LineDataState::building_mut,
-        )
+        self.containing_used_values.building_line_data_mut()
     }
 
-    pub(crate) fn containing_used(&self) -> std::rc::Rc<UsedValues> {
-        self.containing_used_values.clone()
+    pub(crate) fn containing_used(&self) -> &'context UsedValues {
+        self.containing_used_values
     }
 
     #[track_caller]
-    pub(crate) fn used(&self, node: Node) -> std::rc::Rc<UsedValues> {
+    pub(crate) fn used(&self, node: Node) -> &'context UsedValues {
         self.run.records.used_values(node)
     }
 
@@ -1114,7 +1111,7 @@ impl<'context> InlineFormattingContext<'context> {
         &self,
         node: Node,
         constraints: ContainingBlockConstraints,
-    ) -> std::rc::Rc<UsedValues> {
+    ) -> &'context UsedValues {
         self.run.records.create_used_values(&self.callbacks, node, constraints)
     }
 
@@ -1315,15 +1312,11 @@ impl<'context> InlineFormattingContext<'context> {
     }
 
     fn text_overflow_applies(&self) -> bool {
-        let mut block = self.containing_block;
-        if self.facts(block).is_anonymous() {
-            block = self.callbacks.non_anonymous_containing_block(block);
+        let facts = self.facts(self.containing_block);
+        if facts.is_anonymous() {
+            return facts.inherits_text_overflow_ellipsis();
         }
-        if block.is_invalid() {
-            return false;
-        }
-        let style = self.style(block);
-        style.text_overflow() == text_overflow::ELLIPSIS && style.overflow_x() != overflow::VISIBLE
+        node_facts::node_applies_text_overflow_ellipsis(facts.computed_values_view_if_styled())
     }
 
     fn reusable_atomic_line_prefix(
@@ -1488,10 +1481,7 @@ impl<'context> InlineFormattingContext<'context> {
             match item.type_ {
                 inline_level_iterator::ItemType::ForcedBreak => lines.finish(),
                 inline_level_iterator::ItemType::Element => {
-                    if container_wraps && lines.breaks_before_next_fragment() {
-                        lines.finish();
-                    }
-                    lines.append(border_box_inline_size, false, CssPixels::default());
+                    lines.append_atomic_inline(border_box_inline_size, container_wraps);
                 }
                 // An absolutely positioned box only takes a static position, which the pending inline edges attach to.
                 inline_level_iterator::ItemType::AbsolutelyPositionedElement => {}
@@ -1546,8 +1536,7 @@ impl<'context> InlineFormattingContext<'context> {
                 }
             }
         }
-        lines.finish();
-        Some(lines.greatest_inline_size)
+        Some(lines.finish_measurement())
     }
 
     fn text_item_wrap_opportunity(
@@ -1849,8 +1838,11 @@ impl<'context> InlineFormattingContext<'context> {
                     && self.facts(item.node).is_box()
                     && self.line_data().line_boxes.iter().any(|line| {
                         line.visible_fragments().any(|fragment| {
-                            self.callbacks
-                                .is_ancestor(self.callbacks.parent(item.node), fragment.layout_node)
+                            self.callbacks.is_ancestor(
+                                self.callbacks.parent(item.node),
+                                fragment.layout_node,
+                                self.containing_block,
+                            )
                         })
                     })
                 {
@@ -2035,12 +2027,11 @@ impl<'context> InlineFormattingContext<'context> {
                 .parent
                 .greatest_child_inline_size_including_floats(self.containing_block);
         }
-        let baselines =
-            formatting_context::derive_baselines(self.run.records, &self.callbacks, self.containing_block, false);
+        let baselines = formatting_context::derive_baselines(self.run.records, &self.callbacks, self.containing_block);
         if self.containing_block == self.parent.root_box() {
             self.parent.record_derived_baselines_of_root_box(baselines);
         } else {
-            formatting_context::store_derived_baselines(&self.used(self.containing_block), baselines);
+            formatting_context::store_derived_baselines(self.used(self.containing_block), baselines);
         }
     }
 
@@ -2135,7 +2126,7 @@ pub(crate) enum ItemMeasurement {
 }
 
 #[derive(Default)]
-struct LinesWithoutLineBoxes {
+pub(super) struct LinesWithoutLineBoxes {
     breaks_at_every_opportunity: bool,
     greatest_inline_size: CssPixels,
     inline_size: CssPixels,
@@ -2145,11 +2136,23 @@ struct LinesWithoutLineBoxes {
 }
 
 impl LinesWithoutLineBoxes {
-    fn new(breaks_at_every_opportunity: bool) -> Self {
+    pub(super) fn new(breaks_at_every_opportunity: bool) -> Self {
         Self {
             breaks_at_every_opportunity,
             ..Self::default()
         }
+    }
+
+    pub(super) fn append_atomic_inline(&mut self, border_box_inline_size: CssPixels, container_wraps: bool) {
+        if container_wraps && self.breaks_before_next_fragment() {
+            self.finish();
+        }
+        self.append(border_box_inline_size, false, CssPixels::default());
+    }
+
+    pub(super) fn finish_measurement(mut self) -> CssPixels {
+        self.finish();
+        self.greatest_inline_size
     }
 
     fn is_empty_or_ends_in_whitespace(&self) -> bool {

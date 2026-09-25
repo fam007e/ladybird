@@ -13,16 +13,19 @@ namespace Web::Painting {
 
 class Scrollbar final : public ChromeWidget {
 public:
-    static NonnullRefPtr<Scrollbar> create(Layout::NodeArena&, Layout::RustFFI::NodeSlotId, ScrollDirection);
+    static NonnullRefPtr<Scrollbar> create(Layout::NodeArena&, Compositing::RustFFI::NodeSlotId, ScrollDirection);
 
-    bool is_enlarged() const { return m_hovered || m_thumb_grab_position.has_value(); }
+    bool is_enlarged() const { return m_hovered || m_thumb_grab_position.has_value() || m_drag_is_driven_by_compositor; }
+
+    // The compositor scrolls for a drag it drives, and this scrollbar only keeps looking dragged until the release.
+    void begin_drag_driven_by_compositor();
 
     virtual MouseAction handle_pointer_event(Utf16FlyString const& type, unsigned button, CSSPixelPoint visual_viewport_position) override;
     virtual void mouse_enter() override;
     virtual void mouse_leave() override;
 
 private:
-    Scrollbar(Layout::NodeArena&, Layout::RustFFI::NodeSlotId, ScrollDirection);
+    Scrollbar(Layout::NodeArena&, Compositing::RustFFI::NodeSlotId, ScrollDirection);
 
     MouseAction mouse_down(CSSPixelPoint, unsigned button);
     MouseAction mouse_move(CSSPixelPoint);
@@ -34,6 +37,7 @@ private:
 
     ScrollDirection m_direction;
     bool m_hovered { false };
+    bool m_drag_is_driven_by_compositor { false };
     Optional<CSSPixels> m_thumb_grab_position;
     OwnPtr<HTML::UserScrollGestureHold> m_thumb_grab_gesture_hold;
 };

@@ -53,7 +53,7 @@ bool PageHost::is_connection_open() const
     return m_client.is_open();
 }
 
-Web::DevicePixelRect PageHost::screen_rect() const
+Compositing::DevicePixelRect PageHost::screen_rect() const
 {
     return {};
 }
@@ -91,11 +91,6 @@ Web::CSS::PreferredMotion PageHost::preferred_motion() const
 HTTP::Cookie::VersionedCookie PageHost::page_did_request_cookie(URL::URL const& url, HTTP::Cookie::Source source)
 {
     return m_client.did_request_cookie(url, source);
-}
-
-void PageHost::page_did_store_hsts_policy(String const& domain, HTTP::HSTS::ParsedHSTSPolicy const& policy)
-{
-    m_client.async_did_store_hsts_policy(domain, policy);
 }
 
 bool PageHost::page_did_is_known_hsts_host(String const& domain)

@@ -479,6 +479,10 @@ void StyleComputer::visit_edges(Visitor& visitor)
         visitor.visit(entry.sheet);
     for (auto const& entry : m_constructed_sheet_ids)
         visitor.visit(entry.key);
+    for (auto const& entry : m_shared_compiled_style_sheets) {
+        if (entry.value)
+            entry.value->contents().visit_edges(visitor);
+    }
 
     if (m_cached_font_computation_context.has_value())
         m_cached_font_computation_context->visit_edges(visitor);
@@ -712,7 +716,7 @@ void StyleComputer::collect_animation_effects_into(DOM::AbstractElement abstract
     Vector<KeyframeDeclaration> keyframe_declarations;
     Vector<StyleValueFFI::FfiAnimationEffect> ffi_effects;
     Vector<StyleValueFFI::FfiAnimationKeyframe> ffi_keyframes;
-    Vector<Vector<StyleValueFFI::FfiLinearEasingPoint>> linear_easing_points;
+    Vector<Vector<Compositing::RustFFI::FfiLinearEasingPoint>> linear_easing_points;
 
     auto to_ffi_composite_operation = [](Bindings::CompositeOperation operation) {
         switch (operation) {
@@ -725,52 +729,6 @@ void StyleComputer::collect_animation_effects_into(DOM::AbstractElement abstract
         }
         VERIFY_NOT_REACHED();
     };
-    auto to_ffi_easing = [](CSS::EasingFunction const& easing, Vector<StyleValueFFI::FfiLinearEasingPoint>& points) {
-        return easing.visit(
-            [&](LinearEasingFunction const& linear) {
-                points.ensure_capacity(linear.control_points.size());
-                for (auto const& point : linear.control_points)
-                    points.unchecked_append({ .input = point.input, .output = point.output });
-                return StyleValueFFI::FfiEasingDescriptor {
-                    .kind = StyleValueFFI::FfiEasingKind::Linear,
-                    .linear_points = points.data(),
-                    .linear_point_count = points.size(),
-                    .x1 = 0,
-                    .y1 = 0,
-                    .x2 = 0,
-                    .y2 = 0,
-                    .interval_count = 0,
-                    .step_position = 0,
-                };
-            },
-            [](CubicBezierEasingFunction const& cubic_bezier) {
-                return StyleValueFFI::FfiEasingDescriptor {
-                    .kind = StyleValueFFI::FfiEasingKind::CubicBezier,
-                    .linear_points = nullptr,
-                    .linear_point_count = 0,
-                    .x1 = cubic_bezier.x1,
-                    .y1 = cubic_bezier.y1,
-                    .x2 = cubic_bezier.x2,
-                    .y2 = cubic_bezier.y2,
-                    .interval_count = 0,
-                    .step_position = 0,
-                };
-            },
-            [](StepsEasingFunction const& steps) {
-                return StyleValueFFI::FfiEasingDescriptor {
-                    .kind = StyleValueFFI::FfiEasingKind::Steps,
-                    .linear_points = nullptr,
-                    .linear_point_count = 0,
-                    .x1 = 0,
-                    .y1 = 0,
-                    .x2 = 0,
-                    .y2 = 0,
-                    .interval_count = steps.interval_count,
-                    .step_position = to_underlying(steps.position),
-                };
-            });
-    };
-
     auto base_custom_property_data = [&]() -> RefPtr<CustomPropertyData const> {
         auto data = abstract_element.custom_property_data();
         if (data && data->is_animation_overlay())
@@ -900,7 +858,7 @@ void StyleComputer::collect_animation_effects_into(DOM::AbstractElement abstract
             auto& points = linear_easing_points.last();
             ffi_keyframes.append({
                 .key = static_cast<i64>(it.key()),
-                .easing = to_ffi_easing(*easing, points),
+                .easing = to_ffi_easing_descriptor<Compositing::RustFFI::FfiEasingDescriptor>(*easing, points),
                 .composite = to_ffi_composite_operation(composite_operation),
             });
             for (auto const& [property, value] : it->properties) {
@@ -1783,9 +1741,22 @@ Vector<GC::Ref<Animations::KeyframeEffect>> StyleComputer::start_needed_transiti
     for (size_t index = 0; index < prepared_transitions.size(); ++index) {
         auto& prepared_transition = prepared_transitions[index];
         auto const& property = ffi_properties[index];
-        prepared_transition.before_change_value = retain_style_value(property.before_change_value);
-        prepared_transition.after_change_value = retain_style_value(property.after_change_value);
-        prepared_transition.current_value = retain_style_value(property.current_value);
+        switch (actions[index].kind) {
+        case StyleValueFFI::FfiTransitionActionKind::None:
+        case StyleValueFFI::FfiTransitionActionKind::Remove:
+        case StyleValueFFI::FfiTransitionActionKind::Cancel:
+            break;
+        case StyleValueFFI::FfiTransitionActionKind::Start:
+        case StyleValueFFI::FfiTransitionActionKind::RemoveAndStart:
+            prepared_transition.before_change_value = retain_style_value(property.before_change_value);
+            prepared_transition.after_change_value = retain_style_value(property.after_change_value);
+            break;
+        case StyleValueFFI::FfiTransitionActionKind::CancelRemoveAndStartReversing:
+        case StyleValueFFI::FfiTransitionActionKind::CancelRemoveAndStartInterrupted:
+            prepared_transition.after_change_value = retain_style_value(property.after_change_value);
+            prepared_transition.current_value = retain_style_value(property.current_value);
+            break;
+        }
     }
 
     Vector<GC::Ref<Animations::KeyframeEffect>> newly_started_transition_effects;
@@ -2663,7 +2634,9 @@ RefPtr<StyleComputer::CascadeInput const> StyleComputer::style_engine_cascade_in
     auto input = adopt_ref(*new CascadeInput);
     bool input_is_cacheable = match_signature.has_value();
     input->author_context_count = static_cast<u32>(context_shadow_roots.size());
-    GC::Ptr<DOM::ShadowRoot const> element_context_shadow_root = as_if<DOM::ShadowRoot>(abstract_element.element().root());
+    // NB: An abstract element's root can be null if the element pseudo element doesn't exist in the DOM tree but that's
+    //     fine since it therefore also can't have inline style.
+    GC::Ptr<DOM::ShadowRoot const> element_context_shadow_root = as_if<DOM::ShadowRoot>(abstract_element.root().ptr());
     for (u32 index = 0; index < context_shadow_roots.size(); ++index) {
         if (context_shadow_roots[index] == element_context_shadow_root)
             input->inline_style_context_index = index;
@@ -5493,6 +5466,8 @@ NonnullRefPtr<ComputedStyleWorkingSet> StyleComputer::compute_properties(DOM::Ab
     }
     auto inheritance_parent = abstract_element.element_to_inherit_style_from();
     struct CustomPropertyResolutionState {
+        AK_ALLOC_WITH_KMALLOC;
+
         NonnullRefPtr<CustomPropertyData const> data;
         RefPtr<CustomPropertyData const> parent_data;
         AbstractOrHypotheticalElement resolution_element;
@@ -5515,6 +5490,8 @@ NonnullRefPtr<ComputedStyleWorkingSet> StyleComputer::compute_properties(DOM::Ab
     };
     using PreparePhaseContext = void (*)(void*, u8, ComputedValuesFFI::FfiLonghandPhaseContext*);
     struct NativeLonghandState {
+        AK_ALLOC_WITH_KMALLOC;
+
         NonnullRefPtr<ComputedStyleWorkingSet> working_set;
         RefPtr<StyleValue const> new_font_size;
         Vector<u8> document_supported_color_scheme_codes;

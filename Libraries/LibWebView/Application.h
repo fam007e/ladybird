@@ -9,10 +9,14 @@
 #include <AK/ByteBuffer.h>
 #include <AK/ByteString.h>
 #include <AK/Function.h>
+#include <AK/HashTable.h>
 #include <AK/JsonValue.h>
 #include <AK/LexicalPath.h>
 #include <AK/NonnullRawPtr.h>
 #include <AK/Optional.h>
+#include <LibCompositing/InputEvent.h>
+#include <LibCompositing/PageId.h>
+#include <LibCompositing/Types.h>
 #include <LibCore/AnonymousBuffer.h>
 #include <LibCore/EventLoop.h>
 #include <LibCore/Forward.h>
@@ -31,13 +35,11 @@
 #include <LibWeb/CSS/PreferredContrast.h>
 #include <LibWeb/CSS/PreferredMotion.h>
 #include <LibWeb/Clipboard/SystemClipboard.h>
-#include <LibWeb/Compositor/Types.h>
 #include <LibWeb/HTML/ActivateTab.h>
 #include <LibWeb/HTML/CrossProcessId.h>
 #include <LibWeb/HTML/ReplicatedNavigableState.h>
 #include <LibWeb/HTML/SessionHistoryEntry.h>
 #include <LibWeb/HTML/VisibilityState.h>
-#include <LibWeb/Page/PageId.h>
 #include <LibWebView/BlobURLStore.h>
 #include <LibWebView/BookmarkStore.h>
 #include <LibWebView/BrowserProcess.h>
@@ -62,7 +64,7 @@
 #    include <LibWasmCompilerClient/Client.h>
 #endif
 
-namespace Web {
+namespace Compositing {
 
 struct KeyEvent;
 struct MouseEvent;
@@ -79,6 +81,8 @@ class WEBVIEW_API Application : public DevTools::DevToolsDelegate {
     AK_MAKE_NONCOPYABLE(Application);
 
 public:
+    AK_ALLOC_WITH_KMALLOC;
+
     virtual ~Application();
 
     ErrorOr<int> execute();
@@ -159,6 +163,11 @@ public:
 
     static RefPtr<BrowsingSession> existing_session(IsPrivate);
 
+    // A RequestServer client uses the cookies of the browsing session it was created for, whatever RequestServer says.
+    void did_connect_request_server_client(int client_id, BrowsingSession&);
+    RefPtr<BrowsingSession> session_for_request_server_client(int client_id) const;
+    Vector<int> request_server_client_ids_for_testing(BrowsingSession const&) const;
+
     // NB: Null once that session has ended, so a closed private tab is not offered back afterwards.
     static SessionStore* session_store(IsPrivate);
 
@@ -176,10 +185,10 @@ public:
     ErrorOr<NonnullRefPtr<WebContentClient>> launch_web_content_process(ViewImplementation&, Optional<Web::HTML::CrossProcessId> navigable_to_adopt = {}, Optional<Web::HTML::CrossProcessId> initial_document_state_id = {});
     struct ChildFrameWebContentProcess {
         NonnullRefPtr<WebContentClient> client;
-        Web::PageId page_id { 0 };
+        Compositing::PageId page_id { 0 };
     };
     ErrorOr<ChildFrameWebContentProcess> launch_child_frame_web_content_process(IsPrivate, Vector<Web::HTML::RemoteNavigableDescriptor> remote_navigables, Web::HTML::CrossProcessId root_navigable_id, Web::HTML::SessionHistoryEntryDescriptor initial_history_entry);
-    Web::PageId allocate_page_id();
+    Compositing::PageId allocate_page_id();
     Web::HTML::CrossProcessIdAllocator allocate_cross_process_id_allocator();
     Web::HTML::CrossProcessId allocate_ui_process_cross_process_id();
 
@@ -189,25 +198,27 @@ public:
     void notify_webdriver_window_closed(String const& handle);
     void webdriver_browser_connection_died(Badge<WebDriverBrowserConnection>);
     void push_webdriver_session_config(ViewImplementation&);
+    void push_webdriver_session_config(WebContentPage&);
     void update_webdriver_session_config(Badge<WebDriverBrowserConnection>, Function<void(WebDriverSessionConfig&)> update);
+    Optional<u64> webdriver_page_load_timeout() const;
     void complete_webdriver_content_command(u64 command_id, Web::WebDriver::Response);
 
-    Web::Compositor::CompositorContextId allocate_compositor_context_id();
+    Compositing::CompositorContextId allocate_compositor_context_id();
     ErrorOr<void> connect_web_content_to_compositor(WebContentClient&);
     ErrorOr<IPC::TransportHandle> connect_new_compositor_canvas_client();
-    void register_compositor_context(WebContentClient&, Web::Compositor::CompositorContextId, Optional<Web::PageId> page_id);
-    ErrorOr<void> try_register_compositor_context(WebContentClient&, Web::Compositor::CompositorContextId, Optional<Web::PageId> page_id);
-    void update_compositor_viewport(Web::Compositor::CompositorContextId, Gfx::IntSize viewport_size, Web::Compositor::WindowResizingInProgress = Web::Compositor::WindowResizingInProgress::No);
-    void update_compositor_paused_debugger_overlay(Web::Compositor::CompositorContextId, bool visible, double device_pixel_ratio, Optional<String> font_family, Optional<u8> hovered_action);
-    void update_compositor_display_metadata(Web::Compositor::CompositorContextId, Optional<u64> display_id, double refresh_rate);
-    void update_compositor_context_visibility(Web::Compositor::CompositorContextId, Web::HTML::VisibilityState);
-    bool send_async_scroll_to_compositor(Web::Compositor::CompositorContextId, Gfx::FloatPoint position, Gfx::FloatPoint delta_in_device_pixels, Web::WheelDeltaPrecision, Web::ScrollGesturePhase);
-    bool handle_mouse_event_in_compositor(Web::Compositor::CompositorContextId, Web::MouseEvent const&);
-    bool handle_key_event_in_compositor(Web::Compositor::CompositorContextId, Web::KeyEvent const&);
-    bool dispatch_key_event_to_web_content(Web::Compositor::CompositorContextId, Web::KeyEvent const&);
-    bool handle_pinch_event_in_compositor(Web::Compositor::CompositorContextId, Web::PinchEvent const&);
-    bool dispatch_mouse_event_to_web_content(Web::Compositor::CompositorContextId, Web::MouseEvent const&);
-    void notify_compositor_presented_bitmap_ready_to_paint(Web::Compositor::CompositorContextId, i32 bitmap_id);
+    void register_compositor_context(WebContentClient&, Compositing::CompositorContextId, Optional<Compositing::PageId> page_id);
+    ErrorOr<void> try_register_compositor_context(WebContentClient&, Compositing::CompositorContextId, Optional<Compositing::PageId> page_id);
+    void update_compositor_viewport(Compositing::CompositorContextId, Gfx::IntSize viewport_size, Compositing::WindowResizingInProgress = Compositing::WindowResizingInProgress::No);
+    void update_compositor_paused_debugger_overlay(Compositing::CompositorContextId, bool visible, double device_pixel_ratio, Optional<String> font_family, Optional<u8> hovered_action);
+    void update_compositor_display_metadata(Compositing::CompositorContextId, Optional<u64> display_id, double refresh_rate);
+    void update_compositor_context_visibility(Compositing::CompositorContextId, Web::HTML::VisibilityState);
+    bool send_async_scroll_to_compositor(Compositing::CompositorContextId, Gfx::FloatPoint position, Gfx::FloatPoint delta_in_device_pixels, Compositing::WheelDeltaPrecision, Compositing::ScrollGesturePhase, u32 modifiers);
+    Compositing::MouseEventHandlingResult handle_mouse_event_in_compositor(Compositing::CompositorContextId, Compositing::MouseEvent const&);
+    bool handle_key_event_in_compositor(Compositing::CompositorContextId, Compositing::KeyEvent const&);
+    bool dispatch_key_event_to_web_content(Compositing::CompositorContextId, Compositing::KeyEvent const&);
+    bool handle_pinch_event_in_compositor(Compositing::CompositorContextId, Compositing::PinchEvent const&);
+    bool dispatch_mouse_event_to_web_content(Compositing::CompositorContextId, Compositing::MouseEvent const&);
+    void notify_compositor_presented_bitmap_ready_to_paint(Compositing::CompositorContextId, i32 bitmap_id);
 
     Function<void()> on_compositor_process_death;
 
@@ -301,6 +312,8 @@ public:
     Action& open_settings_page_action() { return *m_open_settings_page_action; }
 
     Menu& zoom_menu() { return *m_zoom_menu; }
+    Action& zoom_in_action() { return *m_zoom_in_action; }
+    Action& zoom_out_action() { return *m_zoom_out_action; }
     Action& reset_zoom_action() { return *m_reset_zoom_action; }
 
     Menu& color_scheme_menu() { return *m_color_scheme_menu; }
@@ -369,7 +382,7 @@ protected:
     bool has_spare_web_content_process() const { return m_spare_web_content_process; }
 
 private:
-    ErrorOr<NonnullRefPtr<WebContentClient>> create_web_content_client(Optional<ViewImplementation&>, IsPrivate, Web::PageId initial_page_id, Optional<Web::HTML::CrossProcessId> navigable_to_adopt = {}, Optional<Web::HTML::CrossProcessId> initial_document_state_id = {}, Vector<Web::HTML::RemoteNavigableDescriptor> remote_navigables = {}, Optional<Web::HTML::SessionHistoryEntryDescriptor> canonical_initial_history_entry = {});
+    ErrorOr<NonnullRefPtr<WebContentClient>> create_web_content_client(Optional<ViewImplementation&>, IsPrivate, Compositing::PageId initial_page_id, Optional<Web::HTML::CrossProcessId> navigable_to_adopt = {}, Optional<Web::HTML::CrossProcessId> initial_document_state_id = {}, Vector<Web::HTML::RemoteNavigableDescriptor> remote_navigables = {}, Optional<Web::HTML::SessionHistoryEntryDescriptor> canonical_initial_history_entry = {});
     ErrorOr<void> launch_services();
     void launch_spare_web_content_process();
     ErrorOr<void> launch_compositor_process();
@@ -439,33 +452,33 @@ private:
     virtual void inspect_accessibility_tree(DevTools::TabDescription const&, OnAccessibilityTreeInspectionComplete) const override;
     virtual void listen_for_dom_properties(DevTools::TabDescription const&, OnDOMNodePropertiesReceived) const override;
     virtual void stop_listening_for_dom_properties(DevTools::TabDescription const&) const override;
-    virtual void inspect_dom_node(DevTools::TabDescription const&, DOMNodeProperties::Type, Web::UniqueNodeID, Optional<Web::CSS::PseudoElement>, JsonObject options = {}) const override;
+    virtual void inspect_dom_node(DevTools::TabDescription const&, DOMNodeProperties::Type, Compositing::UniqueNodeID, Optional<Web::CSS::PseudoElement>, JsonObject options = {}) const override;
     virtual void clear_inspected_dom_node(DevTools::TabDescription const&) const override;
     virtual void start_node_picker(DevTools::TabDescription const&, OnNodePickerEvent) const override;
     virtual void stop_node_picker(DevTools::TabDescription const&) const override;
     virtual void clear_node_picker(DevTools::TabDescription const&) const override;
-    virtual void inspect_grid_layouts(DevTools::TabDescription const&, Web::UniqueNodeID, OnGridLayoutsReceived) const override;
-    virtual void inspect_current_grid(DevTools::TabDescription const&, Web::UniqueNodeID, OnCurrentGridReceived) const override;
-    virtual void inspect_current_flexbox(DevTools::TabDescription const&, Web::UniqueNodeID, bool, OnCurrentFlexboxReceived) const override;
-    virtual void highlight_dom_node(DevTools::TabDescription const&, Web::UniqueNodeID, Optional<Web::CSS::PseudoElement>) const override;
+    virtual void inspect_grid_layouts(DevTools::TabDescription const&, Compositing::UniqueNodeID, OnGridLayoutsReceived) const override;
+    virtual void inspect_current_grid(DevTools::TabDescription const&, Compositing::UniqueNodeID, OnCurrentGridReceived) const override;
+    virtual void inspect_current_flexbox(DevTools::TabDescription const&, Compositing::UniqueNodeID, bool, OnCurrentFlexboxReceived) const override;
+    virtual void highlight_dom_node(DevTools::TabDescription const&, Compositing::UniqueNodeID, Optional<Web::CSS::PseudoElement>) const override;
     virtual void clear_highlighted_dom_node(DevTools::TabDescription const&) const override;
-    virtual void highlight_flexbox(DevTools::TabDescription const&, Web::UniqueNodeID, JsonValue) const override;
-    virtual void clear_flexbox_highlight(DevTools::TabDescription const&, Web::UniqueNodeID) const override;
-    virtual void highlight_grid(DevTools::TabDescription const&, Web::UniqueNodeID, JsonValue) const override;
-    virtual void clear_grid_highlight(DevTools::TabDescription const&, Web::UniqueNodeID) const override;
+    virtual void highlight_flexbox(DevTools::TabDescription const&, Compositing::UniqueNodeID, JsonValue) const override;
+    virtual void clear_flexbox_highlight(DevTools::TabDescription const&, Compositing::UniqueNodeID) const override;
+    virtual void highlight_grid(DevTools::TabDescription const&, Compositing::UniqueNodeID, JsonValue) const override;
+    virtual void clear_grid_highlight(DevTools::TabDescription const&, Compositing::UniqueNodeID) const override;
     virtual void listen_for_dom_mutations(DevTools::TabDescription const&, OnDOMMutationReceived) const override;
     virtual void stop_listening_for_dom_mutations(DevTools::TabDescription const&) const override;
-    virtual void get_dom_node_inner_html(DevTools::TabDescription const&, Web::UniqueNodeID, OnDOMNodeHTMLReceived) const override;
-    virtual void get_dom_node_outer_html(DevTools::TabDescription const&, Web::UniqueNodeID, OnDOMNodeHTMLReceived) const override;
-    virtual void set_dom_node_outer_html(DevTools::TabDescription const&, Web::UniqueNodeID, String const&, OnDOMNodeEditComplete) const override;
-    virtual void set_dom_node_text(DevTools::TabDescription const&, Web::UniqueNodeID, String const&, OnDOMNodeEditComplete) const override;
-    virtual void set_dom_node_tag(DevTools::TabDescription const&, Web::UniqueNodeID, Utf16FlyString const&, OnDOMNodeEditComplete) const override;
-    virtual void add_dom_node_attributes(DevTools::TabDescription const&, Web::UniqueNodeID, ReadonlySpan<Attribute>, OnDOMNodeEditComplete) const override;
-    virtual void replace_dom_node_attribute(DevTools::TabDescription const&, Web::UniqueNodeID, Utf16FlyString const&, ReadonlySpan<Attribute>, OnDOMNodeEditComplete) const override;
-    virtual void create_child_element(DevTools::TabDescription const&, Web::UniqueNodeID, OnDOMNodeEditComplete) const override;
-    virtual void insert_dom_node_before(DevTools::TabDescription const&, Web::UniqueNodeID, Web::UniqueNodeID, Optional<Web::UniqueNodeID>, OnDOMNodeEditComplete) const override;
-    virtual void clone_dom_node(DevTools::TabDescription const&, Web::UniqueNodeID, OnDOMNodeEditComplete) const override;
-    virtual void remove_dom_node(DevTools::TabDescription const&, Web::UniqueNodeID, OnDOMNodeEditComplete) const override;
+    virtual void get_dom_node_inner_html(DevTools::TabDescription const&, Compositing::UniqueNodeID, OnDOMNodeHTMLReceived) const override;
+    virtual void get_dom_node_outer_html(DevTools::TabDescription const&, Compositing::UniqueNodeID, OnDOMNodeHTMLReceived) const override;
+    virtual void set_dom_node_outer_html(DevTools::TabDescription const&, Compositing::UniqueNodeID, String const&, OnDOMNodeEditComplete) const override;
+    virtual void set_dom_node_text(DevTools::TabDescription const&, Compositing::UniqueNodeID, String const&, OnDOMNodeEditComplete) const override;
+    virtual void set_dom_node_tag(DevTools::TabDescription const&, Compositing::UniqueNodeID, Utf16FlyString const&, OnDOMNodeEditComplete) const override;
+    virtual void add_dom_node_attributes(DevTools::TabDescription const&, Compositing::UniqueNodeID, ReadonlySpan<Attribute>, OnDOMNodeEditComplete) const override;
+    virtual void replace_dom_node_attribute(DevTools::TabDescription const&, Compositing::UniqueNodeID, Utf16FlyString const&, ReadonlySpan<Attribute>, OnDOMNodeEditComplete) const override;
+    virtual void create_child_element(DevTools::TabDescription const&, Compositing::UniqueNodeID, OnDOMNodeEditComplete) const override;
+    virtual void insert_dom_node_before(DevTools::TabDescription const&, Compositing::UniqueNodeID, Compositing::UniqueNodeID, Optional<Compositing::UniqueNodeID>, OnDOMNodeEditComplete) const override;
+    virtual void clone_dom_node(DevTools::TabDescription const&, Compositing::UniqueNodeID, OnDOMNodeEditComplete) const override;
+    virtual void remove_dom_node(DevTools::TabDescription const&, Compositing::UniqueNodeID, OnDOMNodeEditComplete) const override;
     virtual void retrieve_style_sheets(DevTools::TabDescription const&, OnStyleSheetsReceived) const override;
     virtual void retrieve_style_sheet_source(DevTools::TabDescription const&, Web::CSS::StyleSheetIdentifier const&) const override;
     virtual void listen_for_style_sheet_sources(DevTools::TabDescription const&, OnStyleSheetSourceReceived) const override;
@@ -486,7 +499,7 @@ private:
     virtual void evaluate_javascript_in_debugger_frame(DevTools::TabDescription const&, u64 frame_id, String const&, OnDebuggerEvaluationComplete) const override;
     virtual void retrieve_debugger_object_properties(DevTools::TabDescription const&, u64 object_id, OnDebuggerObjectPropertiesReceived) const override;
     virtual void retrieve_debugger_source_positions(DevTools::TabDescription const&, Web::HTML::ScriptRegistry::Identifier, OnDebuggerSourcePositionsReceived) const override;
-    virtual void resolve_dom_node_url(DevTools::TabDescription const&, Optional<Web::UniqueNodeID>, String const&, OnResolvedURLReceived) const override;
+    virtual void resolve_dom_node_url(DevTools::TabDescription const&, Optional<Compositing::UniqueNodeID>, String const&, OnResolvedURLReceived) const override;
     virtual void evaluate_javascript(DevTools::TabDescription const&, String const&, OnScriptEvaluationComplete) const override;
     virtual void listen_for_console_messages(DevTools::TabDescription const&, OnConsoleMessage) const override;
     virtual void stop_listening_for_console_messages(DevTools::TabDescription const&) const override;
@@ -565,17 +578,17 @@ private:
     CompositorRecoveryState m_compositor_recovery_state { CompositorRecoveryState::Idle };
 
     RefPtr<WebContentClient> m_spare_web_content_process;
+    // Every WebContent client, from its launch until its process exits. A page keeps no hold on its client.
+    HashTable<NonnullRefPtr<WebContentClient>> m_web_content_clients;
     bool m_has_queued_task_to_launch_spare_web_content_process { false };
     u64 m_next_page_or_compositor_context_id { 1 };
     u64 m_next_cross_process_id_namespace { 1 };
     Web::HTML::CrossProcessIdAllocator m_ui_process_cross_process_id_allocator;
 
-    RefPtr<Database::Database> m_database;
-    RefPtr<Database::Database> m_history_database;
     OwnPtr<DownloadStore> m_download_store;
     RefPtr<BrowsingSession> m_default_session;
     WeakPtr<BrowsingSession> m_private_session;
-    RefPtr<Database::Database> m_session_database;
+    HashMap<int, WeakPtr<BrowsingSession>> m_request_server_client_sessions;
 
     OwnPtr<Core::GeolocationProvider> m_geolocation_provider;
     OwnPtr<Core::TimeZoneWatcher> m_time_zone_watcher;
@@ -596,6 +609,8 @@ private:
     RefPtr<Action> m_open_settings_page_action;
 
     RefPtr<Menu> m_zoom_menu;
+    RefPtr<Action> m_zoom_in_action;
+    RefPtr<Action> m_zoom_out_action;
     RefPtr<Action> m_reset_zoom_action;
 
     RefPtr<Menu> m_color_scheme_menu;

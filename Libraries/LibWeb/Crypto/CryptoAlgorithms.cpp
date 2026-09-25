@@ -1167,7 +1167,7 @@ WebIDL::ExceptionOr<GC::Ref<CryptoKey>> RSAOAEP::import_key(JS::Realm& realm, We
             // 1. If jwk does not meet the requirements of Section 6.3.2 of JSON Web Algorithms [JWA], then throw a DataError.
             bool meets_requirements = jwk.e.has_value() && jwk.n.has_value() && jwk.d.has_value();
             if (jwk.p.has_value() || jwk.q.has_value() || jwk.dp.has_value() || jwk.dq.has_value() || jwk.qi.has_value())
-                meets_requirements |= jwk.p.has_value() && jwk.q.has_value() && jwk.dp.has_value() && jwk.dq.has_value() && jwk.qi.has_value();
+                meets_requirements &= jwk.p.has_value() && jwk.q.has_value() && jwk.dp.has_value() && jwk.dq.has_value() && jwk.qi.has_value();
 
             if (jwk.oth.has_value()) {
                 // FIXME: We don't support > 2 primes in RSA keys
@@ -1743,7 +1743,7 @@ WebIDL::ExceptionOr<GC::Ref<CryptoKey>> RSAPSS::import_key(JS::Realm& realm, Alg
             // 1. If jwk does not meet the requirements of Section 6.3.2 of JSON Web Algorithms [JWA], then throw a DataError.
             bool meets_requirements = jwk.e.has_value() && jwk.n.has_value() && jwk.d.has_value();
             if (jwk.p.has_value() || jwk.q.has_value() || jwk.dp.has_value() || jwk.dq.has_value() || jwk.qi.has_value())
-                meets_requirements |= jwk.p.has_value() && jwk.q.has_value() && jwk.dp.has_value() && jwk.dq.has_value() && jwk.qi.has_value();
+                meets_requirements &= jwk.p.has_value() && jwk.q.has_value() && jwk.dp.has_value() && jwk.dq.has_value() && jwk.qi.has_value();
 
             if (jwk.oth.has_value()) {
                 // FIXME: We don't support > 2 primes in RSA keys
@@ -2314,7 +2314,7 @@ WebIDL::ExceptionOr<GC::Ref<CryptoKey>> RSASSAPKCS1::import_key(JS::Realm& realm
             // 1. If jwk does not meet the requirements of Section 6.3.2 of JSON Web Algorithms [JWA], then throw a DataError.
             bool meets_requirements = jwk.e.has_value() && jwk.n.has_value() && jwk.d.has_value();
             if (jwk.p.has_value() || jwk.q.has_value() || jwk.dp.has_value() || jwk.dq.has_value() || jwk.qi.has_value())
-                meets_requirements |= jwk.p.has_value() && jwk.q.has_value() && jwk.dp.has_value() && jwk.dq.has_value() && jwk.qi.has_value();
+                meets_requirements &= jwk.p.has_value() && jwk.q.has_value() && jwk.dp.has_value() && jwk.dq.has_value() && jwk.qi.has_value();
 
             if (jwk.oth.has_value()) {
                 // FIXME: We don't support > 2 primes in RSA keys
@@ -4091,7 +4091,9 @@ WebIDL::ExceptionOr<bool> ECDSA::verify(JS::Realm& realm, AlgorithmParams const&
         // with M as the received message, signature as the received signature
         // and using params as the EC domain parameters, and Q as the public key.
 
-        auto half_size = signature.size() / 2;
+        auto half_size = Q.scalar_size();
+        if (signature.size() != half_size * 2)
+            return false;
         auto r = ::Crypto::UnsignedBigInteger::import_data(signature.bytes().slice(0, half_size));
         auto s = ::Crypto::UnsignedBigInteger::import_data(signature.bytes().slice(half_size, half_size));
 
@@ -4625,7 +4627,7 @@ WebIDL::ExceptionOr<ExportKeyResult> ECDSA::export_key(JS::Realm&, KeyFormat for
                 [&](::Crypto::PK::ECPublicKey const& public_key) -> ErrorOr<ByteBuffer> {
                     auto public_key_bytes = TRY(public_key.to_uncompressed());
 
-                    Span<int const> ec_params;
+                    Span<u32 const> ec_params;
                     if (algorithm.named_curve() == "P-256"_utf16)
                         ec_params = ::Crypto::ASN1::secp256r1_oid;
                     else if (algorithm.named_curve() == "P-384"_utf16)
@@ -4691,7 +4693,7 @@ WebIDL::ExceptionOr<ExportKeyResult> ECDSA::export_key(JS::Realm&, KeyFormat for
             // NOTE: everything above happens in wrap_in_private_key_info
             auto maybe_data = handle.visit(
                 [&](::Crypto::PK::ECPrivateKey const& private_key) -> ErrorOr<ByteBuffer> {
-                    Span<int const> ec_params;
+                    Span<u32 const> ec_params;
                     if (algorithm.named_curve() == "P-256"_utf16)
                         ec_params = ::Crypto::ASN1::secp256r1_oid;
                     else if (algorithm.named_curve() == "P-384"_utf16)
@@ -5544,7 +5546,7 @@ WebIDL::ExceptionOr<ExportKeyResult> ECDH::export_key(JS::Realm&, KeyFormat form
                 [&](::Crypto::PK::ECPublicKey const& public_key) -> ErrorOr<ByteBuffer> {
                     auto public_key_bytes = TRY(public_key.to_uncompressed());
 
-                    Span<int const> ec_params;
+                    Span<u32 const> ec_params;
                     if (algorithm.named_curve() == "P-256"_utf16)
                         ec_params = ::Crypto::ASN1::secp256r1_oid;
                     else if (algorithm.named_curve() == "P-384"_utf16)
@@ -5610,7 +5612,7 @@ WebIDL::ExceptionOr<ExportKeyResult> ECDH::export_key(JS::Realm&, KeyFormat form
             // NOTE: everything above happens in wrap_in_private_key_info
             auto maybe_data = handle.visit(
                 [&](::Crypto::PK::ECPrivateKey const& private_key) -> ErrorOr<ByteBuffer> {
-                    Span<int const> ec_params;
+                    Span<u32 const> ec_params;
                     if (algorithm.named_curve() == "P-256"_utf16)
                         ec_params = ::Crypto::ASN1::secp256r1_oid;
                     else if (algorithm.named_curve() == "P-384"_utf16)
@@ -8453,7 +8455,7 @@ WebIDL::ExceptionOr<GC::Ref<CryptoKey>> MLDSA::import_key(JS::Realm& realm, Algo
         // 3. If an error occurred while parsing, then throw a DataError.
         auto const spki = TRY(parse_a_subject_public_key_info(realm, key_data.get<ByteBuffer>()));
 
-        Array<int, 9> expected_oid;
+        Array<u32, 9> expected_oid;
         // 4. If the name member of normalizedAlgorithm is "ML-DSA-44":
         if (params.name == "ML-DSA-44"sv) {
             // Let expectedOid be id-ml-dsa-44 (2.16.840.1.101.3.4.3.17).
@@ -8529,7 +8531,7 @@ WebIDL::ExceptionOr<GC::Ref<CryptoKey>> MLDSA::import_key(JS::Realm& realm, Algo
         //       Let asn1Structure be the ASN.1 ML-DSA-67-PrivateKey structure.
         //    => Otherwise:
         //       throw a NotSupportedError.
-        Array<int, 9> expected_oid {};
+        Array<u32, 9> expected_oid {};
         if (params.name == "ML-DSA-44"sv) {
             expected_oid = ::Crypto::ASN1::ml_dsa_44_oid;
         } else if (params.name == "ML-DSA-65"sv) {
@@ -8661,7 +8663,7 @@ WebIDL::ExceptionOr<GC::Ref<CryptoKey>> MLDSA::import_key(JS::Realm& realm, Algo
             return WebIDL::DataError::create("Invalid algorithm"_utf16);
 
         // 5. If usages is non-empty and the use field of jwk is present and is not equal to "sig", then throw a DataError.
-        if (!usages.is_empty() && jwk->use.has_value() && jwk->use == "sig"_utf16)
+        if (!usages.is_empty() && jwk->use.has_value() && jwk->use != "sig"_utf16)
             return WebIDL::DataError::create("Invalid usage type"_utf16);
 
         // 6. If the key_ops field of jwk is present, and is invalid according to the requirements of JSON Web
@@ -8764,7 +8766,7 @@ WebIDL::ExceptionOr<ExportKeyResult> MLDSA::export_key(JS::Realm& realm, KeyForm
         //        -> Otherwise:
         //           throw a NotSupportedError.
         //    * Set the subjectPublicKey field to keyData.
-        Array<int, 9> algorithm_oid {};
+        Array<u32, 9> algorithm_oid {};
         if (key->algorithm_name() == "ML-DSA-44"sv) {
             algorithm_oid = ::Crypto::ASN1::ml_dsa_44_oid;
         } else if (key->algorithm_name() == "ML-DSA-65"sv) {
@@ -8817,7 +8819,7 @@ WebIDL::ExceptionOr<ExportKeyResult> MLDSA::export_key(JS::Realm& realm, KeyForm
         //           specific [0] primitive tag with an implicit encoding of OCTET STRING).
         //      * => Otherwise:
         //           throw a NotSupportedError.
-        Array<int, 9> algorithm_oid {};
+        Array<u32, 9> algorithm_oid {};
         if (key->algorithm_name() == "ML-DSA-44"sv) {
             algorithm_oid = ::Crypto::ASN1::ml_dsa_44_oid;
         } else if (key->algorithm_name() == "ML-DSA-65"sv) {
@@ -8998,7 +9000,7 @@ WebIDL::ExceptionOr<GC::Ref<CryptoKey>> MLKEM::import_key(JS::Realm& realm, Algo
         // 3. If an error occurred while parsing, then throw a DataError.
         auto const spki = TRY(parse_a_subject_public_key_info(realm, key_data.get<ByteBuffer>()));
 
-        Array<int, 9> expected_oid;
+        Array<u32, 9> expected_oid;
         // 4. If the name member of normalizedAlgorithm is "ML-KEM-512":
         if (params.name == "ML-KEM-512"sv) {
             // Let expectedOid be id-alg-ml-kem-512 (2.16.840.1.101.3.4.4.1).
@@ -9074,7 +9076,7 @@ WebIDL::ExceptionOr<GC::Ref<CryptoKey>> MLKEM::import_key(JS::Realm& realm, Algo
         //       Let asn1Structure be the ASN.1 ML-KEM-1024-PrivateKey structure.
         //    => Otherwise:
         //       throw a NotSupportedError.
-        Array<int, 9> expected_oid {};
+        Array<u32, 9> expected_oid {};
         if (params.name == "ML-KEM-512"sv) {
             expected_oid = ::Crypto::ASN1::ml_kem_512_oid;
         } else if (params.name == "ML-KEM-768"sv) {
@@ -9220,7 +9222,7 @@ WebIDL::ExceptionOr<ExportKeyResult> MLKEM::export_key(JS::Realm& realm, KeyForm
         //        -> Otherwise:
         //           throw a NotSupportedError.
         //    * Set the subjectPublicKey field to keyData.
-        Array<int, 9> algorithm_oid {};
+        Array<u32, 9> algorithm_oid {};
         if (key->algorithm_name() == "ML-KEM-512"sv) {
             algorithm_oid = ::Crypto::ASN1::ml_kem_512_oid;
         } else if (key->algorithm_name() == "ML-KEM-768"sv) {
@@ -9273,7 +9275,7 @@ WebIDL::ExceptionOr<ExportKeyResult> MLKEM::export_key(JS::Realm& realm, KeyForm
         //           specific [0] primitive tag with an implicit encoding of OCTET STRING).
         //      * => Otherwise:
         //           throw a NotSupportedError.
-        Array<int, 9> algorithm_oid {};
+        Array<u32, 9> algorithm_oid {};
         if (key->algorithm_name() == "ML-KEM-512"sv) {
             algorithm_oid = ::Crypto::ASN1::ml_kem_512_oid;
         } else if (key->algorithm_name() == "ML-KEM-768"sv) {
@@ -9596,7 +9598,7 @@ JS::ThrowCompletionOr<NonnullOwnPtr<AlgorithmParams>> AeadParams::from_value(JS:
     auto maybe_tag_length = Optional<u8> {};
     if (MUST(object.has_property("tagLength"_utf16_fly_string))) {
         auto tag_length_value = TRY(object.get("tagLength"_utf16_fly_string));
-        maybe_tag_length = TRY(tag_length_value.to_u8(vm));
+        maybe_tag_length = TRY(WebIDL::convert_to_int<WebIDL::Octet>(vm, tag_length_value, WebIDL::EnforceRange::Yes, WebIDL::Clamp::No));
     }
 
     return adopt_own<AlgorithmParams>(*new AeadParams { iv, maybe_additional_data, maybe_tag_length });

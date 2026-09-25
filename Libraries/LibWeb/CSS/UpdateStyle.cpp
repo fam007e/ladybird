@@ -56,9 +56,6 @@ static void apply_element_style_invalidation_after_style_change(DOM::Element& el
     if (invalidation.needs_scroll_container_resnap)
         element.document().schedule_scroll_container_resnap();
 
-    if (invalidation.changes_containing_block_establishment)
-        element.document().record_partial_relayout_escape(DOM::PartialRelayoutEscapeReason::ContainingBlockEstablishmentChangedByStyleChange);
-
     // Only a full layout pass applies viewport propagation again, so a relayout of an element the viewport takes its
     // overflow, writing mode, or direction from must not finish as a partial relayout of that element.
     bool const element_is_viewport_propagation_source = element.is_viewport_propagation_source();
@@ -1013,11 +1010,12 @@ static void update_style(DOM::Document& document)
         // that gap so derived inheritance bits can reach the descendant before its published
         // reaction is consumed.
         auto reaction_count_before_inheritance_closure = style_engine_reactions.size();
+        Vector<StyleNodeID, 16> inheritance_gap;
         for (size_t index = 0; index < reaction_count_before_inheritance_closure; ++index) {
             auto element = document.style_computer().element_for_style_node(style_engine_reactions[index].style_node);
             if (!element)
                 continue;
-            Vector<StyleNodeID> inheritance_gap;
+            inheritance_gap.clear_with_capacity();
             for (auto ancestor = DOM::AbstractElement { *element }.element_to_inherit_style_from(); ancestor.has_value(); ancestor = ancestor->element_to_inherit_style_from()) {
                 auto ancestor_style_node = ancestor->element().style_node_id();
                 VERIFY(ancestor_style_node != 0);

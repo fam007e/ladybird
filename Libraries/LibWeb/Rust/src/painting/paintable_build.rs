@@ -28,6 +28,7 @@ pub(crate) struct ReplacedCommittedFragmentLink {
 pub(crate) struct LineRootChanges {
     pub(crate) fragment_changed: bool,
     pub(crate) inline_content_changed: bool,
+    pub(crate) inline_item_order_changed: bool,
 }
 
 fn same_inline_content(left: &fragment_tree::Fragment, right: &fragment_tree::Fragment) -> bool {
@@ -228,6 +229,7 @@ impl<'a> PaintableCommit<'a> {
         let mut own_paint_unchanged = false;
         let mut child_placements_unchanged = false;
         let mut inline_content_unchanged = false;
+        let mut inline_item_order_unchanged = false;
         let mut child_sequence_unchanged = false;
         let (old_identity, old_content_size) = self.arena().with_committed_fragment_link(node, |old_link| {
             old_link.map_or((0, used_values::FfiCssPixelSize::default()), |old_link| {
@@ -236,9 +238,15 @@ impl<'a> PaintableCommit<'a> {
                     own_paint_unchanged = true;
                     child_placements_unchanged = true;
                     inline_content_unchanged = true;
+                    inline_item_order_unchanged = true;
                     child_sequence_unchanged = true;
                 } else {
                     inline_content_unchanged = same_inline_content(fragment, previous);
+                    inline_item_order_unchanged = inline_content_unchanged
+                        || match (&fragment.line_data, &previous.line_data) {
+                            (Some(left), Some(right)) => left.has_same_item_order(right),
+                            _ => false,
+                        };
                     own_paint_unchanged = inline_content_unchanged
                         && fragment.has_same_box_properties(previous)
                         && !has_descendant_dependent_paint(self.arena(), node);
@@ -305,6 +313,11 @@ impl<'a> PaintableCommit<'a> {
         if !own_paint_unchanged || enclosing_inline_paint_changed || empty_editable_children_changed {
             damage |= PaintDamage::ALL_PRODUCERS;
         }
+        if !inline_item_order_unchanged
+            || (painted_geometry_lives_in_enclosing_line_root && enclosing_line_root_changes.inline_item_order_changed)
+        {
+            damage |= PaintDamage::ORDER;
+        }
         if !paint_offset_unchanged {
             damage |= PaintDamage::MOVED;
         }
@@ -327,7 +340,7 @@ impl<'a> PaintableCommit<'a> {
         } else if !offset_unchanged {
             // NB: Moving an unchanged subtree preserves its overflow relative to its padding
             //     box. Only its contribution to containing blocks needs to be measured again.
-            let containing_block = self.arena().data(node).containing_block.get();
+            let containing_block = self.committed_containing_block(node, Some(link));
             self.schedule_scrollable_overflow_recalculation(containing_block);
         }
         {
@@ -337,13 +350,18 @@ impl<'a> PaintableCommit<'a> {
             data.content_size = new_content_size;
             data.offset = link.committed_offset;
         }
-        self.arena()
-            .set_committed_fragment_link(self.arena().data(node), link.clone());
+        let data = self.arena().data(node);
+        self.arena().set_committed_fragment_link(
+            data,
+            link.clone(),
+            self.arena().epoch_of_geometry_laid_out_in_this_pass(data),
+        );
         ReplacedCommittedFragmentLink {
             content_size_change,
             line_root_changes: LineRootChanges {
                 fragment_changed: committed_fragment_identity_changed,
                 inline_content_changed: !inline_content_unchanged,
+                inline_item_order_changed: !inline_item_order_unchanged,
             },
         }
     }
@@ -384,17 +402,32 @@ impl<'a> PaintableCommit<'a> {
                         .push(node);
                 }
             }
-            node = arena.data(node).containing_block.get();
+            node = arena.containing_block_by_walking_ancestors(node);
         }
     }
 
-    pub(crate) fn stamp_containing_block(&mut self, node: formatting_context::Node) {
-        let containing_block = self.arena().data(node).containing_block.get();
-        let arena = self.arena_mut();
-        let mut paintable_rows = arena.paintable_rows_mut();
-        if !paintable_rows.paintable_row_is_populated(node) {
+    fn committed_containing_block(
+        &self,
+        node: formatting_context::Node,
+        link: Option<&fragment_tree::FragmentLink>,
+    ) -> NodeSlotId {
+        match link.map(|link| link.containing_block) {
+            Some(containing_block) if !containing_block.is_invalid() => containing_block,
+            _ => self.arena().containing_block_by_walking_ancestors(node),
+        }
+    }
+
+    pub(crate) fn stamp_containing_block(
+        &mut self,
+        node: formatting_context::Node,
+        link: Option<&fragment_tree::FragmentLink>,
+    ) {
+        if !self.arena().paintable_row_is_populated(node) {
             return;
         }
+        let containing_block = self.committed_containing_block(node, link);
+        let arena = self.arena_mut();
+        let mut paintable_rows = arena.paintable_rows_mut();
         let containing_block = if paintable_rows.paintable_row_is_populated(containing_block) {
             containing_block
         } else {

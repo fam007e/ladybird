@@ -125,6 +125,7 @@ enum class SetNeedsLayoutReason {
     X(ShadowRootSetInnerHTML)                             \
     X(SlotAssignmentChange)                               \
     X(StyleChange)                                        \
+    X(SVGResourceContentChange)                           \
     X(SVGResourceElementRemoved)                          \
     X(TopLayerMembershipChange)
 
@@ -141,8 +142,6 @@ class WEB_API Node : public EventTarget
     WEB_WRAPPABLE(Node, EventTarget);
 
 public:
-    static constexpr bool OVERRIDES_FINALIZE = true;
-
     ParentNode* parent_or_shadow_host();
     ParentNode const* parent_or_shadow_host() const { return const_cast<Node*>(this)->parent_or_shadow_host(); }
     Node const* parent_or_shadow_host_node() const;
@@ -296,7 +295,7 @@ public:
     // NOTE: This is intended for the JS bindings.
     bool has_child_nodes() const { return has_children(); }
     GC::Ref<NodeList> child_nodes();
-    Vector<GC::Root<Node>> children_as_vector() const;
+    GC::RootVector<GC::Ref<Node>> children_as_vector() const;
 
     virtual Utf16FlyString node_name() const = 0;
 
@@ -486,7 +485,7 @@ public:
     WebIDL::ExceptionOr<void> unsafely_set_html(Variant<GC::Ref<Element>, GC::Ref<DocumentFragment>>, Utf16View);
 
     void replace_all(GC::Ptr<Node>);
-    void replace_all(Vector<GC::Root<Node>>);
+    void replace_all(GC::RootVector<GC::Ref<Node>>);
     void string_replace_all(Utf16View);
     void string_replace_all(Utf16String);
 
@@ -507,7 +506,7 @@ public:
 
     void add_registered_observer(RegisteredObserver&);
 
-    void queue_mutation_record(Utf16FlyString const& type, Optional<Utf16FlyString> const& attribute_name, Optional<Utf16FlyString> const& attribute_namespace, Optional<Utf16String> const& old_value, ReadonlySpan<GC::Root<Node>> added_nodes, ReadonlySpan<GC::Root<Node>> removed_nodes, Node* previous_sibling, Node* next_sibling);
+    void queue_mutation_record(Utf16FlyString const& type, Optional<Utf16FlyString> const& attribute_name, Optional<Utf16FlyString> const& attribute_namespace, Optional<Utf16String> const& old_value, ReadonlySpan<GC::Ref<Node>> added_nodes, ReadonlySpan<GC::Ref<Node>> removed_nodes, Node* previous_sibling, Node* next_sibling);
 
     // https://dom.spec.whatwg.org/#concept-shadow-including-inclusive-descendant
     template<typename Callback>
@@ -577,6 +576,8 @@ protected:
     friend class HTMLCollection;
 
     struct RareData {
+        AK_ALLOC_WITH_KMALLOC;
+
         virtual ~RareData();
         virtual void visit_edges(Cell::Visitor&);
         virtual size_t external_memory_size() const;
@@ -650,7 +651,7 @@ private:
     void add_transient_registered_observers_for_removal(Node& parent);
     void queue_tree_mutation_record_for_removal(Node& parent, GC::Ptr<Node> old_previous_sibling, GC::Ptr<Node> old_next_sibling);
 
-    void queue_tree_mutation_record(ReadonlySpan<GC::Root<Node>> added_nodes, ReadonlySpan<GC::Root<Node>> removed_nodes, Node* previous_sibling, Node* next_sibling);
+    void queue_tree_mutation_record(ReadonlySpan<GC::Ref<Node>> added_nodes, ReadonlySpan<GC::Ref<Node>> removed_nodes, Node* previous_sibling, Node* next_sibling);
 
     void live_range_pre_remove();
     void live_range_pre_remove_all_children();
@@ -658,7 +659,7 @@ private:
     void insert_before_impl(GC::Ref<Node>, GC::Ptr<Node> child);
     void adjust_live_ranges_for_insertion(Node& child, size_t count);
     void insert_node_into_children(GC::Ref<Node>, GC::Ptr<Node> child);
-    void insert_nodes_before(ReadonlySpan<GC::Root<Node>>, GC::Ptr<Node> child, bool suppress_observers, GC::Ref<Node> metadata_node, ChildrenChangedMetadata::AffectsElements);
+    void insert_nodes_before(ReadonlySpan<GC::Ref<Node>>, GC::Ptr<Node> child, bool suppress_observers, GC::Ref<Node> metadata_node, ChildrenChangedMetadata::AffectsElements);
     void append_child_impl(GC::Ref<Node>);
     void remove_child_impl(GC::Ref<Node>);
     void set_root_for_subtree(Node&);

@@ -62,8 +62,8 @@ else()
 endif()
 
 set(LADYBIRD_LIBS AK LibCore LibFileSystem LibGfx LibImageDecoderClient LibIPC LibJS LibMain LibWeb LibWebView LibRequests LibURL LibWakeLock)
-target_link_libraries(${LADYBIRD_TARGET} PRIVATE ${LADYBIRD_LIBS})
-target_link_libraries(${LADYBIRD_TARGET} PRIVATE OpenSSL::Crypto OpenSSL::SSL)
+target_link_libraries(${LADYBIRD_TARGET} ${LADYBIRD_LIBS})
+target_link_libraries(${LADYBIRD_TARGET} OpenSSL::Crypto OpenSSL::SSL)
 
 target_include_directories(${LADYBIRD_TARGET} ${CMAKE_CURRENT_BINARY_DIR})
 target_include_directories(${LADYBIRD_TARGET} ${LADYBIRD_SOURCE_DIR})
@@ -111,14 +111,14 @@ set_helper_process_properties(${ladybird_helper_processes})
 if (APPLE)
     set_helper_process_properties(WebDriver)
 
-    # WebDriver links into the bundle after ladybird has signed it — and that leaves the seal stale until something
-    # later relinks ladybird. Sign once more with everything in place.
+    # WebDriver and the helpers can link into the bundle after ladybird has signed it — and that leaves the seal stale
+    # until something later relinks ladybird. Sign once more with everything in place.
     set(bundle_signed_stamp "${CMAKE_CURRENT_BINARY_DIR}/ladybird_bundle_signed.stamp")
     add_custom_command(
         OUTPUT "${bundle_signed_stamp}"
         COMMAND codesign -s - -v -f --entitlements "${LADYBIRD_ENTITLEMENTS_FILE}" "$<TARGET_BUNDLE_DIR:ladybird>"
         COMMAND "${CMAKE_COMMAND}" -E touch "${bundle_signed_stamp}"
-        DEPENDS ladybird WebDriver "${LADYBIRD_ENTITLEMENTS_FILE}"
+        DEPENDS ladybird WebDriver ${ladybird_helper_processes} "${LADYBIRD_ENTITLEMENTS_FILE}"
         VERBATIM
     )
     add_custom_target(sign_ladybird_bundle ALL DEPENDS "${bundle_signed_stamp}")

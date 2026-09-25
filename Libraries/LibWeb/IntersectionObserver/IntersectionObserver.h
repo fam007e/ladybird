@@ -34,8 +34,6 @@ class IntersectionObserver final : public Bindings::GCAllocatedWrappable {
     GC_DECLARE_ALLOCATOR(IntersectionObserver);
 
 public:
-    static constexpr bool OVERRIDES_FINALIZE = true;
-
     static WebIDL::ExceptionOr<GC::Ref<IntersectionObserver>> create_with_implicit_root_document(GC::Ptr<WebIDL::CallbackType> callback, IntersectionObserverOptions, DOM::Document& implicit_root_document);
     static WebIDL::ExceptionOr<GC::Ref<IntersectionObserver>> create_for_constructor(JS::Object&, GC::Ptr<WebIDL::CallbackType>, IntersectionObserverOptions);
 
@@ -61,7 +59,7 @@ public:
     Variant<GC::Ref<DOM::Element>, GC::Ref<DOM::Document>> intersection_root() const;
     GC::Ref<DOM::Node> intersection_root_node() const;
     bool is_implicit_root() const { return !m_root; }
-    CSSPixelRect root_intersection_rectangle(Painting::AccumulatedVisualContextTree const* = nullptr) const;
+    CSSPixelRect root_intersection_rectangle(Compositing::AccumulatedVisualContextTree const* = nullptr) const;
 
     void queue_entry(Badge<DOM::Document>, GC::Ref<IntersectionObserverEntry>);
 

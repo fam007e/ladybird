@@ -11,6 +11,7 @@
 #include <AK/Mutex.h>
 #include <AK/NonnullOwnPtr.h>
 #include <AK/Vector.h>
+#include <AK/kmalloc.h>
 #include <LibMedia/CodecID.h>
 #include <LibMedia/CodecParameters.h>
 #include <LibMedia/Codecs/VP9.h>
@@ -30,6 +31,8 @@ struct ParameterSetState;
 // than filling ones we provide.
 class MEDIA_API VideoToolboxVideoDecoder final : public VideoDecoder {
 public:
+    AK_ALLOC_WITH_KMALLOC;
+
     static Optional<DecoderCapabilities> capabilities(ParsedCodec const&);
     static DecoderErrorOr<NonnullOwnPtr<VideoToolboxVideoDecoder>> try_create(CodecID, ReadonlyBytes codec_initialization_data);
 
@@ -78,6 +81,10 @@ private:
     OwnPtr<ParameterSetState> m_parameter_set_state;
     OwnPtr<Session> m_session;
     bool m_reached_end_of_stream { false };
+    // ITU-T H.265 (07/2024), 8.1.3: the IRAP picture decoding starts at has NoRaslOutputFlag set, which gives the
+    // RASL pictures associated with it PicOutputFlag equal to 0.
+    bool m_awaiting_first_submitted_frame { true };
+    bool m_discarding_open_gop_leading_pictures { false };
 
     // The media engine decodes on its own threads, so outputs arrive from outside this decoder's caller.
     mutable Mutex m_output_mutex;

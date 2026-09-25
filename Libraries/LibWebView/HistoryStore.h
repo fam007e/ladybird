@@ -46,6 +46,8 @@ class WEBVIEW_API HistoryStore {
     AK_MAKE_NONMOVABLE(HistoryStore);
 
 public:
+    AK_ALLOC_WITH_KMALLOC;
+
     static ErrorOr<Database::MigrationOutcome> migrate_schema(Database::Database&, Database::MigrationMode = Database::MigrationMode::Apply);
 
     static ErrorOr<NonnullOwnPtr<HistoryStore>> create(Database::Database&);
@@ -91,6 +93,8 @@ private:
 
     class StorageImpl {
     public:
+        AK_ALLOC_WITH_KMALLOC;
+
         virtual ~StorageImpl() = default;
 
         virtual StringView name() = 0;
@@ -170,7 +174,7 @@ private:
         virtual void remove_entries_accessed_since(UnixDateTime since) override;
 
     private:
-        Database::Database& m_database;
+        NonnullRefPtr<Database::Database> m_database;
         Statements m_statements;
     };
 

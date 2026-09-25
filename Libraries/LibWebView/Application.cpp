@@ -13,6 +13,7 @@
 #include <AK/ScopeGuard.h>
 #include <AK/StringBuilder.h>
 #include <AK/Time.h>
+#include <LibCompositing/InputEvent.h>
 #include <LibCore/AnonymousBuffer.h>
 #include <LibCore/ArgsParser.h>
 #include <LibCore/Directory.h>
@@ -41,7 +42,7 @@
 #include <LibWeb/Fetch/Infrastructure/HTTP/Statuses.h>
 #include <LibWeb/Loader/DownloadFilename.h>
 #include <LibWeb/Loader/UserAgent.h>
-#include <LibWeb/Page/InputEvent.h>
+#include <LibWeb/WebDriver/TimeoutsConfiguration.h>
 #include <LibWebView/Application.h>
 #include <LibWebView/AutocompleteService.h>
 #include <LibWebView/BlobURLStore.h>
@@ -100,6 +101,8 @@ static double sanitized_display_refresh_rate(double refresh_rate)
 }
 
 struct ApplicationSettingsObserver final : public SettingsObserver {
+    AK_ALLOC_WITH_KMALLOC;
+
     virtual void appearance_changed() override
     {
         Application::the().appearance_changed({});
@@ -152,6 +155,8 @@ struct ApplicationSettingsObserver final : public SettingsObserver {
 };
 
 struct ApplicationBookmarkStoreObserver final : public BookmarkStoreObserver {
+    AK_ALLOC_WITH_KMALLOC;
+
     virtual void bookmarks_changed() override
     {
         Application::the().bookmarks_changed({});
@@ -263,7 +268,7 @@ Requests::RequestClient& Application::request_server_client(IsPrivate is_private
         return *the().m_request_server_client;
 
     if (!the().m_private_request_server_client) {
-        auto handle = connect_new_request_server_client(IsPrivate::Yes).release_value_but_fixme_should_propagate_errors();
+        auto handle = connect_new_request_server_client(session_for_new_view(IsPrivate::Yes)).release_value_but_fixme_should_propagate_errors();
         auto transport = handle.create_transport().release_value_but_fixme_should_propagate_errors();
         auto request_server_client = make_ref_counted<Requests::RequestClient>(move(transport));
 
@@ -284,14 +289,6 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
     if (auto result = reload_site_compatibility_data(); result.is_error())
         warnln("\033[31;1mUnable to load site compatibility data:\033[0m {}", result.error());
     m_arguments = arguments;
-
-#if !defined(AK_OS_WINDOWS)
-    // Raise the open file limit well above the platform default. Each decoded image is backed by its own shared-memory
-    // file descriptor — so a document with thousands of images (or many open tabs) otherwise exhausts the descriptor
-    // table, and aborts when the next descriptor is sent over IPC.
-    if (auto result = Core::System::set_resource_limits(RLIMIT_NOFILE, 65536); result.is_error())
-        warnln("Unable to increase open file limit: {}", result.error());
-#endif
 
     Vector<ByteString> raw_urls;
     Vector<ByteString> certificates;
@@ -327,7 +324,7 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
     bool disable_http_disk_cache = false;
     bool disable_content_blocker = false;
     bool disable_sandbox = false;
-    Vector<StringView> content_blocker_list_paths;
+    Vector<ByteString> content_blocker_list_paths;
     Optional<StringView> resource_substitution_map_path;
     bool enable_autoplay = false;
     bool expose_experimental_interfaces = false;
@@ -426,11 +423,11 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
         .help_string = "Path to a content blocker list. May be specified multiple times.",
         .long_name = "content-blocker-list",
         .value_name = "path",
-        .accept_value = [&](StringView value) {
+        .accept_value = [&](ByteString value) {
             if (value.is_empty())
                 return false;
 
-            content_blocker_list_paths.append(value);
+            content_blocker_list_paths.append(move(value));
             return true;
         },
     });
@@ -592,20 +589,7 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
     if (profile_output.has_value() && selected_profile_tool != ProfileTool::CPU)
         return Error::from_string_literal("--profile-output requires --profile-tool cpu");
 
-    auto configured_content_blocker_list_paths = m_settings->config_variable_as_string_array(ConfigVariableID::ContentBlockerListPaths);
-
-    Vector<ByteString> content_blocker_list_paths_as_byte_strings;
-    TRY(content_blocker_list_paths_as_byte_strings.try_ensure_capacity(configured_content_blocker_list_paths.size() + content_blocker_list_paths.size()));
-    for (auto const& path : configured_content_blocker_list_paths) {
-        if (path.is_empty())
-            continue;
-
-        content_blocker_list_paths_as_byte_strings.unchecked_append(path.to_byte_string());
-    }
-    for (auto path : content_blocker_list_paths)
-        content_blocker_list_paths_as_byte_strings.unchecked_append(path);
-
-    m_explicit_content_blocker_list_paths = content_blocker_list_paths_as_byte_strings;
+    m_explicit_content_blocker_list_paths = move(content_blocker_list_paths);
     m_content_blocker_lists_directory = LexicalPath::join(profile().paths().data, "ContentBlocking/Lists"sv).string();
 
     // Disable site isolation when debugging WebContent. Otherwise, the process swap may interfere with the gdb session.
@@ -632,7 +616,6 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
         .devtools_port = devtools_port,
         .enable_content_blocker = disable_content_blocker ? EnableContentBlocker::No : EnableContentBlocker::Yes,
         .disable_sandbox = disable_sandbox ? DisableSandbox::Yes : DisableSandbox::No,
-        .content_blocker_list_paths = move(content_blocker_list_paths_as_byte_strings),
     };
     rebuild_content_blocker_list_paths();
 
@@ -1038,9 +1021,10 @@ void Application::open_bookmark_in_new_window(String const& bookmark_id, IsPriva
         open_url_in_new_window(bookmark->bookmark().url, is_private);
 }
 
-ErrorOr<NonnullRefPtr<WebContentClient>> Application::create_web_content_client(Optional<ViewImplementation&> view, IsPrivate is_private, Web::PageId initial_page_id, Optional<Web::HTML::CrossProcessId> navigable_to_adopt, Optional<Web::HTML::CrossProcessId> initial_document_state_id, Vector<Web::HTML::RemoteNavigableDescriptor> remote_navigables, Optional<Web::HTML::SessionHistoryEntryDescriptor> canonical_initial_history_entry)
+ErrorOr<NonnullRefPtr<WebContentClient>> Application::create_web_content_client(Optional<ViewImplementation&> view, IsPrivate is_private, Compositing::PageId initial_page_id, Optional<Web::HTML::CrossProcessId> navigable_to_adopt, Optional<Web::HTML::CrossProcessId> initial_document_state_id, Vector<Web::HTML::RemoteNavigableDescriptor> remote_navigables, Optional<Web::HTML::SessionHistoryEntryDescriptor> canonical_initial_history_entry)
 {
-    auto request_server_handle = TRY(connect_new_request_server_client(is_private));
+    // The client's WebContentClient picks up this same session when it is created.
+    auto request_server_handle = TRY(connect_new_request_server_client(session_for_new_view(is_private)));
     auto image_decoder_handle = TRY(connect_new_image_decoder_client());
 #if defined(HAVE_WASM_COMPILER_SERVICE)
     auto wasm_compiler_handle = TRY(connect_new_wasm_compiler_client());
@@ -1052,6 +1036,7 @@ ErrorOr<NonnullRefPtr<WebContentClient>> Application::create_web_content_client(
         initial_document_state_id = cross_process_id_allocator.allocate();
 
     auto client = TRY(WebView::launch_web_content_process(is_private, initial_page_id, root_navigable_id));
+    TRY(Application::the().connect_web_content_to_compositor(*client));
     // NB: A replacement process's bootstrap about:blank is not the displayed document. Keep it hidden so it
     //     cannot paint over the outgoing page; activation supplies the destination's actual visibility state.
     auto system_visibility_state = view.has_value() && !navigable_to_adopt.has_value()
@@ -1077,8 +1062,8 @@ ErrorOr<NonnullRefPtr<WebContentClient>> Application::create_web_content_client(
 #if defined(HAVE_WASM_COMPILER_SERVICE)
     client->async_connect_to_wasm_compiler(wasm_compiler_handle);
 #endif
-    TRY(Application::the().connect_web_content_to_compositor(*client));
 
+    m_web_content_clients.set(client);
     return client;
 }
 
@@ -1095,10 +1080,10 @@ ErrorOr<void> Application::reload_site_compatibility_data()
     return {};
 }
 
-Web::PageId Application::allocate_page_id()
+Compositing::PageId Application::allocate_page_id()
 {
     VERIFY(m_next_page_or_compositor_context_id > 0);
-    return Web::PageId { m_next_page_or_compositor_context_id++ };
+    return Compositing::PageId { m_next_page_or_compositor_context_id++ };
 }
 
 Web::HTML::CrossProcessIdAllocator Application::allocate_cross_process_id_allocator()
@@ -1123,6 +1108,28 @@ NonnullRefPtr<BrowsingSession> Application::session_for_new_view(IsPrivate is_pr
     auto session = BrowsingSession::create(IsPrivate::Yes);
     the().m_private_session = session;
     return session;
+}
+
+void Application::did_connect_request_server_client(int client_id, BrowsingSession& session)
+{
+    m_request_server_client_sessions.set(client_id, session.make_weak_ptr());
+}
+
+Vector<int> Application::request_server_client_ids_for_testing(BrowsingSession const& session) const
+{
+    Vector<int> client_ids;
+    for (auto const& [client_id, client_session] : m_request_server_client_sessions) {
+        if (client_session.ptr() == &session)
+            client_ids.append(client_id);
+    }
+    return client_ids;
+}
+
+RefPtr<BrowsingSession> Application::session_for_request_server_client(int client_id) const
+{
+    if (auto it = m_request_server_client_sessions.find(client_id); it != m_request_server_client_sessions.end())
+        return it->value.strong_ref();
+    return {};
 }
 
 RefPtr<BrowsingSession> Application::existing_session(IsPrivate is_private)
@@ -1174,7 +1181,15 @@ void Application::webdriver_browser_connection_died(Badge<WebDriverBrowserConnec
 
 void Application::push_webdriver_session_config(ViewImplementation& view)
 {
-    view.apply_webdriver_session_config(m_webdriver_session_config);
+    view.traversable().for_each_hosting_page([&](WebContentPage& page) {
+        push_webdriver_session_config(page);
+    });
+}
+
+void Application::push_webdriver_session_config(WebContentPage& page)
+{
+    auto const& config = m_webdriver_session_config;
+    page.async_set_webdriver_session_config(config.user_prompt_handler, config.page_load_strategy, config.strict_file_interactability, config.timeouts);
 }
 
 void Application::update_webdriver_session_config(Badge<WebDriverBrowserConnection>, Function<void(WebDriverSessionConfig&)> update)
@@ -1187,6 +1202,13 @@ void Application::update_webdriver_session_config(Badge<WebDriverBrowserConnecti
     });
 }
 
+Optional<u64> Application::webdriver_page_load_timeout() const
+{
+    Web::WebDriver::TimeoutsConfiguration timeouts;
+    (void)Web::WebDriver::json_deserialize_as_a_timeouts_configuration_into(m_webdriver_session_config.timeouts, timeouts);
+    return timeouts.page_load_timeout;
+}
+
 void Application::complete_webdriver_content_command(u64 command_id, Web::WebDriver::Response response)
 {
     if (m_webdriver_browser_connection)
@@ -1196,6 +1218,10 @@ void Application::complete_webdriver_content_command(u64 command_id, Web::WebDri
 void Application::reset_private_browsing_session()
 {
     m_file_downloader.cancel_private_downloads();
+
+    // RequestServer answers our own private client with the cookies of the session it was created for, so the next
+    // private request made by the UI process needs a client of the new session.
+    m_private_request_server_client = nullptr;
 
     // Views pending deferred deletion may still push updates, and the replacement store reuses their ids.
     ViewImplementation::for_each_view([](ViewImplementation& view) {
@@ -1209,10 +1235,10 @@ void Application::reset_private_browsing_session()
     m_private_session.clear();
 }
 
-Web::Compositor::CompositorContextId Application::allocate_compositor_context_id()
+Compositing::CompositorContextId Application::allocate_compositor_context_id()
 {
     VERIFY(m_next_page_or_compositor_context_id > 0);
-    return Web::Compositor::CompositorContextId { m_next_page_or_compositor_context_id++ };
+    return Compositing::CompositorContextId { m_next_page_or_compositor_context_id++ };
 }
 
 static bool can_send_compositor_process_ipc(RefPtr<CompositorClient> const& compositor_client)
@@ -1254,7 +1280,7 @@ ErrorOr<IPC::TransportHandle> Application::connect_new_compositor_canvas_client(
     return response_or_error.release_value().take_handle();
 }
 
-void Application::register_compositor_context(WebContentClient& web_content_client, Web::Compositor::CompositorContextId context_id, Optional<Web::PageId> page_id)
+void Application::register_compositor_context(WebContentClient& web_content_client, Compositing::CompositorContextId context_id, Optional<Compositing::PageId> page_id)
 {
     if (!can_send_compositor_process_ipc(m_compositor_client))
         return;
@@ -1263,7 +1289,7 @@ void Application::register_compositor_context(WebContentClient& web_content_clie
         dbgln("Unable to register Compositor context: {}", result.error());
 }
 
-ErrorOr<void> Application::try_register_compositor_context(WebContentClient& web_content_client, Web::Compositor::CompositorContextId context_id, Optional<Web::PageId> page_id)
+ErrorOr<void> Application::try_register_compositor_context(WebContentClient& web_content_client, Compositing::CompositorContextId context_id, Optional<Compositing::PageId> page_id)
 {
     if (!m_compositor_client)
         return Error::from_string_literal("Compositor process is not available");
@@ -1277,7 +1303,7 @@ ErrorOr<void> Application::try_register_compositor_context(WebContentClient& web
     }
     VERIFY(web_content_connection_id.has_value());
 
-    auto compositor_page_id = page_id.map([](Web::PageId id) { return id.value(); });
+    auto compositor_page_id = page_id.map([](Compositing::PageId id) { return id.value(); });
     auto result = m_compositor_client->try_create_context(context_id, compositor_page_id, *web_content_connection_id);
     if (result.is_error())
         return Error::from_string_literal("Compositor process disconnected while creating context");
@@ -1285,7 +1311,7 @@ ErrorOr<void> Application::try_register_compositor_context(WebContentClient& web
     return {};
 }
 
-void Application::update_compositor_viewport(Web::Compositor::CompositorContextId context_id, Gfx::IntSize viewport_size, Web::Compositor::WindowResizingInProgress window_resize_in_progress)
+void Application::update_compositor_viewport(Compositing::CompositorContextId context_id, Gfx::IntSize viewport_size, Compositing::WindowResizingInProgress window_resize_in_progress)
 {
     if (!can_send_compositor_process_ipc(m_compositor_client))
         return;
@@ -1294,7 +1320,7 @@ void Application::update_compositor_viewport(Web::Compositor::CompositorContextI
     m_compositor_client->async_viewport_size_updated(context_id, viewport_size, window_resize_in_progress);
 }
 
-void Application::update_compositor_paused_debugger_overlay(Web::Compositor::CompositorContextId context_id, bool visible, double device_pixel_ratio, Optional<String> font_family, Optional<u8> hovered_action)
+void Application::update_compositor_paused_debugger_overlay(Compositing::CompositorContextId context_id, bool visible, double device_pixel_ratio, Optional<String> font_family, Optional<u8> hovered_action)
 {
     if (!can_send_compositor_process_ipc(m_compositor_client))
         return;
@@ -1303,7 +1329,7 @@ void Application::update_compositor_paused_debugger_overlay(Web::Compositor::Com
     m_compositor_client->async_set_paused_debugger_overlay(context_id, visible, device_pixel_ratio, move(font_family), hovered_action);
 }
 
-void Application::update_compositor_display_metadata(Web::Compositor::CompositorContextId context_id, Optional<u64> display_id, double refresh_rate)
+void Application::update_compositor_display_metadata(Compositing::CompositorContextId context_id, Optional<u64> display_id, double refresh_rate)
 {
     if (!can_send_compositor_process_ipc(m_compositor_client))
         return;
@@ -1312,30 +1338,30 @@ void Application::update_compositor_display_metadata(Web::Compositor::Compositor
     m_compositor_client->async_set_display_metadata(context_id, display_id, sanitized_display_refresh_rate(refresh_rate));
 }
 
-void Application::update_compositor_context_visibility(Web::Compositor::CompositorContextId context_id, Web::HTML::VisibilityState visibility_state)
+void Application::update_compositor_context_visibility(Compositing::CompositorContextId context_id, Web::HTML::VisibilityState visibility_state)
 {
     if (!can_send_compositor_process_ipc(m_compositor_client))
         return;
     VERIFY(m_compositor_client);
 
     auto context_visibility = visibility_state == Web::HTML::VisibilityState::Visible
-        ? Web::Compositor::ContextVisibility::Visible
-        : Web::Compositor::ContextVisibility::Hidden;
+        ? Compositing::ContextVisibility::Visible
+        : Compositing::ContextVisibility::Hidden;
     m_compositor_client->async_set_context_visibility(context_id, context_visibility);
 }
 
-bool Application::send_async_scroll_to_compositor(Web::Compositor::CompositorContextId context_id, Gfx::FloatPoint position, Gfx::FloatPoint delta_in_device_pixels, Web::WheelDeltaPrecision wheel_delta_precision, Web::ScrollGesturePhase scroll_gesture_phase)
+bool Application::send_async_scroll_to_compositor(Compositing::CompositorContextId context_id, Gfx::FloatPoint position, Gfx::FloatPoint delta_in_device_pixels, Compositing::WheelDeltaPrecision wheel_delta_precision, Compositing::ScrollGesturePhase scroll_gesture_phase, u32 modifiers)
 {
     if (!can_send_compositor_process_ipc(m_compositor_client))
         return false;
 
-    auto result = m_compositor_client->try_async_scroll_by(context_id, position, delta_in_device_pixels, wheel_delta_precision, scroll_gesture_phase);
+    auto result = m_compositor_client->try_async_scroll_by(context_id, position, delta_in_device_pixels, wheel_delta_precision, scroll_gesture_phase, modifiers);
     if (result.is_error())
         return false;
     return result.release_value();
 }
 
-bool Application::handle_key_event_in_compositor(Web::Compositor::CompositorContextId context_id, Web::KeyEvent const& event)
+bool Application::handle_key_event_in_compositor(Compositing::CompositorContextId context_id, Compositing::KeyEvent const& event)
 {
     if (!can_send_compositor_process_ipc(m_compositor_client))
         return false;
@@ -1343,7 +1369,7 @@ bool Application::handle_key_event_in_compositor(Web::Compositor::CompositorCont
     return !result.is_error() && result.release_value();
 }
 
-bool Application::dispatch_key_event_to_web_content(Web::Compositor::CompositorContextId context_id, Web::KeyEvent const& event)
+bool Application::dispatch_key_event_to_web_content(Compositing::CompositorContextId context_id, Compositing::KeyEvent const& event)
 {
     if (!can_send_compositor_process_ipc(m_compositor_client))
         return false;
@@ -1351,18 +1377,18 @@ bool Application::dispatch_key_event_to_web_content(Web::Compositor::CompositorC
     return !result.is_error() && result.release_value();
 }
 
-bool Application::handle_mouse_event_in_compositor(Web::Compositor::CompositorContextId context_id, Web::MouseEvent const& event)
+Compositing::MouseEventHandlingResult Application::handle_mouse_event_in_compositor(Compositing::CompositorContextId context_id, Compositing::MouseEvent const& event)
 {
     if (!can_send_compositor_process_ipc(m_compositor_client))
-        return false;
+        return {};
 
     auto result = m_compositor_client->try_handle_mouse_event(context_id, event.clone_without_browser_data());
     if (result.is_error())
-        return false;
+        return {};
     return result.release_value();
 }
 
-bool Application::handle_pinch_event_in_compositor(Web::Compositor::CompositorContextId context_id, Web::PinchEvent const& event)
+bool Application::handle_pinch_event_in_compositor(Compositing::CompositorContextId context_id, Compositing::PinchEvent const& event)
 {
     if (!can_send_compositor_process_ipc(m_compositor_client))
         return false;
@@ -1373,7 +1399,7 @@ bool Application::handle_pinch_event_in_compositor(Web::Compositor::CompositorCo
     return result.release_value();
 }
 
-bool Application::dispatch_mouse_event_to_web_content(Web::Compositor::CompositorContextId context_id, Web::MouseEvent const& event)
+bool Application::dispatch_mouse_event_to_web_content(Compositing::CompositorContextId context_id, Compositing::MouseEvent const& event)
 {
     if (!can_send_compositor_process_ipc(m_compositor_client))
         return false;
@@ -1385,7 +1411,7 @@ bool Application::dispatch_mouse_event_to_web_content(Web::Compositor::Composito
     return result.release_value();
 }
 
-void Application::notify_compositor_presented_bitmap_ready_to_paint(Web::Compositor::CompositorContextId context_id, i32 bitmap_id)
+void Application::notify_compositor_presented_bitmap_ready_to_paint(Compositing::CompositorContextId context_id, i32 bitmap_id)
 {
     if (!can_send_compositor_process_ipc(m_compositor_client))
         return;
@@ -1488,33 +1514,33 @@ ErrorOr<void> Application::launch_services()
         auto database_path = profile().paths().data;
         history_database_directory = database_path;
 
-        m_database = TRY(Database::Database::create(database_path, "Ladybird"sv));
-        m_history_database = TRY(Database::Database::create(database_path, "History"sv));
+        auto database = TRY(Database::Database::create(database_path, "Ladybird"sv));
+        auto history_database = TRY(Database::Database::create(database_path, "History"sv));
 
-        if (auto history_database_path = m_history_database->database_path(); history_database_path.has_value())
+        if (auto history_database_path = history_database->database_path(); history_database_path.has_value())
             dbgln_if(WEBVIEW_HISTORY_DEBUG, "[History] SQL history is enabled, using {}", history_database_path->string());
 
         // The browsing database is shared by several stores, so the decision to fall back is
         // made for the file as a whole: if any store's schema is too new, none of them may
         // modify the file. The check-only preflight never writes, so the file is untouched
         // if any store then has to veto.
-        auto cookies_outcome = TRY(CookieJar::migrate_schema(*m_database, Database::MigrationMode::CheckOnly));
-        auto hsts_outcome = TRY(HSTSStore::migrate_schema(*m_database, Database::MigrationMode::CheckOnly));
-        auto storage_outcome = TRY(StorageJar::migrate_schema(*m_database, Database::MigrationMode::CheckOnly));
-        auto downloads_outcome = TRY(DownloadStore::migrate_schema(*m_database, Database::MigrationMode::CheckOnly));
+        auto cookies_outcome = TRY(CookieJar::migrate_schema(database, Database::MigrationMode::CheckOnly));
+        auto hsts_outcome = TRY(HSTSStore::migrate_schema(database, Database::MigrationMode::CheckOnly));
+        auto storage_outcome = TRY(StorageJar::migrate_schema(database, Database::MigrationMode::CheckOnly));
+        auto downloads_outcome = TRY(DownloadStore::migrate_schema(database, Database::MigrationMode::CheckOnly));
 
         if (cookies_outcome == Database::MigrationOutcome::Success && hsts_outcome == Database::MigrationOutcome::Success && storage_outcome == Database::MigrationOutcome::Success && downloads_outcome == Database::MigrationOutcome::Success) {
             // Apply in order, stopping at the first store that finds the database too new
             // (a concurrent process may have migrated it since the preflight).
-            cookies_outcome = TRY(CookieJar::migrate_schema(*m_database));
+            cookies_outcome = TRY(CookieJar::migrate_schema(database));
             hsts_outcome = cookies_outcome == Database::MigrationOutcome::Success
-                ? TRY(HSTSStore::migrate_schema(*m_database))
+                ? TRY(HSTSStore::migrate_schema(database))
                 : Database::MigrationOutcome::DatabaseTooNew;
             storage_outcome = hsts_outcome == Database::MigrationOutcome::Success
-                ? TRY(StorageJar::migrate_schema(*m_database))
+                ? TRY(StorageJar::migrate_schema(database))
                 : Database::MigrationOutcome::DatabaseTooNew;
             downloads_outcome = storage_outcome == Database::MigrationOutcome::Success
-                ? TRY(DownloadStore::migrate_schema(*m_database))
+                ? TRY(DownloadStore::migrate_schema(database))
                 : Database::MigrationOutcome::DatabaseTooNew;
         }
 
@@ -1530,40 +1556,40 @@ ErrorOr<void> Application::launch_services()
         }
 
         if (cookies_outcome == Database::MigrationOutcome::Success)
-            m_default_session->cookie_jar = TRY(CookieJar::create(*m_database));
+            m_default_session->cookie_jar = TRY(CookieJar::create(database));
         else
             m_default_session->cookie_jar = CookieJar::create();
 
         if (hsts_outcome == Database::MigrationOutcome::Success)
-            m_default_session->hsts_store = TRY(HSTSStore::create(*m_database));
+            m_default_session->hsts_store = TRY(HSTSStore::create(database));
         else
             m_default_session->hsts_store = HSTSStore::create();
 
         if (storage_outcome == Database::MigrationOutcome::Success)
-            m_default_session->storage_jar = TRY(StorageJar::create(*m_database));
+            m_default_session->storage_jar = TRY(StorageJar::create(database));
         else
             m_default_session->storage_jar = StorageJar::create();
 
         if (downloads_outcome == Database::MigrationOutcome::Success)
-            m_download_store = TRY(DownloadStore::create(*m_database));
+            m_download_store = TRY(DownloadStore::create(database));
         else
             m_download_store = DownloadStore::create_disabled();
 
         // The History database is shared by the favicon and history stores. Preflight both before applying either
         // migration so a database that is too new remains untouched.
-        auto favicons_outcome = TRY(FaviconStore::migrate_schema(*m_history_database, Database::MigrationMode::CheckOnly));
-        auto history_outcome = TRY(HistoryStore::migrate_schema(*m_history_database, Database::MigrationMode::CheckOnly));
+        auto favicons_outcome = TRY(FaviconStore::migrate_schema(history_database, Database::MigrationMode::CheckOnly));
+        auto history_outcome = TRY(HistoryStore::migrate_schema(history_database, Database::MigrationMode::CheckOnly));
 
         if (favicons_outcome == Database::MigrationOutcome::Success && history_outcome == Database::MigrationOutcome::Success) {
-            favicons_outcome = TRY(FaviconStore::migrate_schema(*m_history_database));
+            favicons_outcome = TRY(FaviconStore::migrate_schema(history_database));
             history_outcome = favicons_outcome == Database::MigrationOutcome::Success
-                ? TRY(HistoryStore::migrate_schema(*m_history_database))
+                ? TRY(HistoryStore::migrate_schema(history_database))
                 : Database::MigrationOutcome::DatabaseTooNew;
         }
 
         if (favicons_outcome == Database::MigrationOutcome::Success && history_outcome == Database::MigrationOutcome::Success) {
-            m_default_session->favicon_store = TRY(FaviconStore::create(*m_history_database));
-            m_default_session->history_store = TRY(HistoryStore::create(*m_history_database));
+            m_default_session->favicon_store = TRY(FaviconStore::create(history_database));
+            m_default_session->history_store = TRY(HistoryStore::create(history_database));
             should_remove_unreferenced_favicons = true;
         } else {
             dbgln("History database was created by a newer Ladybird version; favicons and history will not be persisted this session");
@@ -1574,10 +1600,10 @@ ErrorOr<void> Application::launch_services()
 
         // Fall back without modifying the existing Sessions database.
         auto session_store = [&]() -> ErrorOr<NonnullOwnPtr<SessionStore>> {
-            m_session_database = TRY(Database::Database::create(database_path, "Sessions"sv, { .foreign_keys = Database::Database::ForeignKeys::Yes }));
-            if (TRY(SessionStore::migrate_schema(*m_session_database)) != Database::MigrationOutcome::Success)
+            auto session_database = TRY(Database::Database::create(database_path, "Sessions"sv, { .foreign_keys = Database::Database::ForeignKeys::Yes }));
+            if (TRY(SessionStore::migrate_schema(session_database)) != Database::MigrationOutcome::Success)
                 return Error::from_string_literal("Sessions database was created by a newer Ladybird version");
-            return SessionStore::create(*m_session_database);
+            return SessionStore::create(session_database);
         }();
         if (session_store.is_error()) {
             dbgln("Sessions will not be persisted this session: {}", session_store.error());
@@ -1759,11 +1785,13 @@ void Application::recover_compositor_process()
 
 ErrorOr<void> Application::launch_request_server()
 {
+    // A new RequestServer hands out client IDs from the start again.
+    m_request_server_client_sessions.clear();
     m_request_server_control_client = TRY(launch_request_server_process());
 
     // The UI process speaks the control endpoint over the initial socket, and gets its own data connection from it,
     // exactly like every other client of RequestServer.
-    auto request_server_handle = TRY(connect_new_request_server_client(IsPrivate::No));
+    auto request_server_handle = TRY(connect_new_request_server_client(*m_default_session));
     auto request_server_transport = TRY(request_server_handle.create_transport());
     m_request_server_client = make_ref_counted<Requests::RequestClient>(move(request_server_transport));
 
@@ -1774,8 +1802,24 @@ ErrorOr<void> Application::launch_request_server()
 
     TabPerformanceMonitor::request_server_did_restart();
 
-    m_request_server_control_client->on_retrieve_http_cookie = [](URL::URL const& url, RequestServer::IsPrivate is_private) -> String {
-        auto session = existing_session(is_private == RequestServer::IsPrivate::Yes ? IsPrivate::Yes : IsPrivate::No);
+    m_request_server_control_client->on_client_disconnected = [](int client_id) {
+        the().m_request_server_client_sessions.remove(client_id);
+    };
+
+    m_request_server_control_client->on_store_response_cookies_and_hsts_policy = [](int client_id, URL::URL const& url, Vector<HTTP::Cookie::ParsedCookie> const& cookies, Optional<HTTP::HSTS::ParsedHSTSPolicy> const& hsts_policy) {
+        auto session = the().session_for_request_server_client(client_id);
+        if (!session)
+            return;
+
+        for (auto const& cookie : cookies)
+            session->cookie_jar->set_cookie(url, cookie, HTTP::Cookie::Source::Http);
+
+        if (hsts_policy.has_value() && url.host().has_value() && url.host()->is_domain())
+            session->hsts_store->store_policy(url.host()->get<String>(), *hsts_policy);
+    };
+
+    m_request_server_control_client->on_retrieve_http_cookie = [](int client_id, URL::URL const& url) -> String {
+        auto session = the().session_for_request_server_client(client_id);
         if (!session)
             return {};
         auto& cookie_jar = *session->cookie_jar;
@@ -1811,25 +1855,32 @@ ErrorOr<void> Application::launch_request_server()
             return IterationDecision::Continue;
         });
 
-        auto create_handles = [&](auto is_private, auto client_count) -> Vector<IPC::TransportHandle> {
+        struct NewClients {
+            Vector<IPC::TransportHandle> handles;
+            Vector<int> client_ids;
+        };
+        auto create_clients = [&](auto is_private, auto client_count) -> NewClients {
             if (client_count == 0)
                 return {};
 
             auto response = m_request_server_control_client->send_sync_but_allow_failure<Messages::RequestServerControl::ConnectNewClients>(client_count, is_private);
-            if (!response || response->handles().size() != client_count) {
+            if (!response || response->handles().size() != client_count || response->client_ids().size() != client_count) {
                 warnln("Failed to connect {} new clients to RequestServer", client_count);
                 VERIFY_NOT_REACHED();
             }
 
-            return response->take_handles();
+            return { response->take_handles(), response->take_client_ids() };
         };
 
-        auto normal_handles = create_handles(RequestServer::IsPrivate::No, normal_client_count);
-        auto private_handles = create_handles(RequestServer::IsPrivate::Yes, private_client_count);
+        auto normal_clients = create_clients(RequestServer::IsPrivate::No, normal_client_count);
+        auto private_clients = create_clients(RequestServer::IsPrivate::Yes, private_client_count);
 
         WebContentClient::for_each_client([&](WebContentClient& client) {
-            auto& handles = client.is_private() == IsPrivate::No ? normal_handles : private_handles;
-            client.async_connect_to_request_server(handles.take_last());
+            auto& new_clients = client.is_private() == IsPrivate::No ? normal_clients : private_clients;
+            // A replacement client belongs to the session of the process it is for, which may be a private session
+            // that has since been replaced by a newer one.
+            did_connect_request_server_client(new_clients.client_ids.take_last(), client.session());
+            client.async_connect_to_request_server(new_clients.handles.take_last());
             return IterationDecision::Continue;
         });
 
@@ -2105,11 +2156,13 @@ void Application::process_did_exit(Process&& process, Optional<int> exit_status)
         break;
     case ProcessType::WebContent:
         if (auto client = process.client<WebContentClient>()) {
+            bool exited_on_request = false;
 #if !defined(AK_OS_WINDOWS)
-            if (exit_status.has_value() && WIFEXITED(*exit_status) && WEXITSTATUS(*exit_status) == 0 && !client->has_views())
-                break;
+            exited_on_request = exit_status.has_value() && WIFEXITED(*exit_status) && WEXITSTATUS(*exit_status) == 0 && !client->has_views();
 #endif
-            client->notify_all_views_of_crash();
+            if (!exited_on_request)
+                client->notify_all_views_of_crash();
+            m_web_content_clients.remove(client.release_nonnull());
         }
         break;
     case ProcessType::WebWorker:
@@ -2411,21 +2464,23 @@ void Application::initialize_actions()
         open_url_in_new_tab(URL::about_settings(), Web::HTML::ActivateTab::Yes);
     });
 
-    m_zoom_menu = Menu::create_group("Zoom"sv);
-    m_zoom_menu->add_action(Action::create("Zoom In"sv, ActionID::ZoomIn, [this]() {
+    m_zoom_in_action = Action::create("Zoom In"sv, ActionID::ZoomIn, [this]() {
         if (auto view = active_web_view(); view.has_value())
             view->zoom_in();
-    }));
-    m_zoom_menu->add_action(Action::create("Zoom Out"sv, ActionID::ZoomOut, [this]() {
+    });
+    m_zoom_out_action = Action::create("Zoom Out"sv, ActionID::ZoomOut, [this]() {
         if (auto view = active_web_view(); view.has_value())
             view->zoom_out();
-    }));
-
+    });
     m_reset_zoom_action = Action::create("Reset Zoom"sv, ActionID::ResetZoom, [this]() {
         if (auto view = active_web_view(); view.has_value())
             view->reset_zoom();
     });
-    m_zoom_menu->add_action(*m_reset_zoom_action);
+
+    m_zoom_menu = Menu::create_group("Zoom"sv);
+    m_zoom_menu->add_action(zoom_in_action());
+    m_zoom_menu->add_action(zoom_out_action());
+    m_zoom_menu->add_action(reset_zoom_action());
 
     auto set_color_scheme = [this](auto color_scheme) {
         return [this, color_scheme]() {
@@ -3269,7 +3324,7 @@ void Application::stop_listening_for_dom_properties(DevTools::TabDescription con
     view->on_received_dom_node_properties = nullptr;
 }
 
-void Application::inspect_dom_node(DevTools::TabDescription const& description, DOMNodeProperties::Type property_type, Web::UniqueNodeID node_id, Optional<Web::CSS::PseudoElement> pseudo_element, JsonObject options) const
+void Application::inspect_dom_node(DevTools::TabDescription const& description, DOMNodeProperties::Type property_type, Compositing::UniqueNodeID node_id, Optional<Web::CSS::PseudoElement> pseudo_element, JsonObject options) const
 {
     auto view = ViewImplementation::find_view_by_id(description.id);
     if (!view.has_value())
@@ -3278,7 +3333,7 @@ void Application::inspect_dom_node(DevTools::TabDescription const& description, 
     view->inspect_dom_node(node_id, property_type, pseudo_element, JsonValue { move(options) });
 }
 
-void Application::inspect_grid_layouts(DevTools::TabDescription const& description, Web::UniqueNodeID root_node_id, OnGridLayoutsReceived on_grid_layouts_received) const
+void Application::inspect_grid_layouts(DevTools::TabDescription const& description, Compositing::UniqueNodeID root_node_id, OnGridLayoutsReceived on_grid_layouts_received) const
 {
     auto view = ViewImplementation::find_view_by_id(description.id);
     if (!view.has_value()) {
@@ -3294,7 +3349,7 @@ void Application::inspect_grid_layouts(DevTools::TabDescription const& descripti
     view->inspect_grid_layouts(root_node_id);
 }
 
-void Application::inspect_current_grid(DevTools::TabDescription const& description, Web::UniqueNodeID node_id, OnCurrentGridReceived on_current_grid_received) const
+void Application::inspect_current_grid(DevTools::TabDescription const& description, Compositing::UniqueNodeID node_id, OnCurrentGridReceived on_current_grid_received) const
 {
     auto view = ViewImplementation::find_view_by_id(description.id);
     if (!view.has_value()) {
@@ -3310,7 +3365,7 @@ void Application::inspect_current_grid(DevTools::TabDescription const& descripti
     view->inspect_current_grid(node_id);
 }
 
-void Application::inspect_current_flexbox(DevTools::TabDescription const& description, Web::UniqueNodeID node_id, bool only_look_at_parents, OnCurrentFlexboxReceived on_current_flexbox_received) const
+void Application::inspect_current_flexbox(DevTools::TabDescription const& description, Compositing::UniqueNodeID node_id, bool only_look_at_parents, OnCurrentFlexboxReceived on_current_flexbox_received) const
 {
     auto view = ViewImplementation::find_view_by_id(description.id);
     if (!view.has_value()) {
@@ -3350,7 +3405,7 @@ void Application::clear_node_picker(DevTools::TabDescription const& description)
         view->clear_node_picker();
 }
 
-void Application::highlight_dom_node(DevTools::TabDescription const& description, Web::UniqueNodeID node_id, Optional<Web::CSS::PseudoElement> pseudo_element) const
+void Application::highlight_dom_node(DevTools::TabDescription const& description, Compositing::UniqueNodeID node_id, Optional<Web::CSS::PseudoElement> pseudo_element) const
 {
     if (auto view = ViewImplementation::find_view_by_id(description.id); view.has_value())
         view->highlight_dom_node(node_id, pseudo_element);
@@ -3362,25 +3417,25 @@ void Application::clear_highlighted_dom_node(DevTools::TabDescription const& des
         view->clear_highlighted_dom_node();
 }
 
-void Application::highlight_flexbox(DevTools::TabDescription const& description, Web::UniqueNodeID node_id, JsonValue options) const
+void Application::highlight_flexbox(DevTools::TabDescription const& description, Compositing::UniqueNodeID node_id, JsonValue options) const
 {
     if (auto view = ViewImplementation::find_view_by_id(description.id); view.has_value())
         view->highlight_flexbox(node_id, move(options));
 }
 
-void Application::clear_flexbox_highlight(DevTools::TabDescription const& description, Web::UniqueNodeID node_id) const
+void Application::clear_flexbox_highlight(DevTools::TabDescription const& description, Compositing::UniqueNodeID node_id) const
 {
     if (auto view = ViewImplementation::find_view_by_id(description.id); view.has_value())
         view->clear_flexbox_highlight(node_id);
 }
 
-void Application::highlight_grid(DevTools::TabDescription const& description, Web::UniqueNodeID node_id, JsonValue options) const
+void Application::highlight_grid(DevTools::TabDescription const& description, Compositing::UniqueNodeID node_id, JsonValue options) const
 {
     if (auto view = ViewImplementation::find_view_by_id(description.id); view.has_value())
         view->highlight_grid(node_id, move(options));
 }
 
-void Application::clear_grid_highlight(DevTools::TabDescription const& description, Web::UniqueNodeID node_id) const
+void Application::clear_grid_highlight(DevTools::TabDescription const& description, Compositing::UniqueNodeID node_id) const
 {
     if (auto view = ViewImplementation::find_view_by_id(description.id); view.has_value())
         view->clear_grid_highlight(node_id);
@@ -3427,7 +3482,7 @@ static void edit_dom_node(DevTools::TabDescription const& description, Applicati
     edit(*view);
 }
 
-void Application::get_dom_node_inner_html(DevTools::TabDescription const& description, Web::UniqueNodeID node_id, OnDOMNodeHTMLReceived on_complete) const
+void Application::get_dom_node_inner_html(DevTools::TabDescription const& description, Compositing::UniqueNodeID node_id, OnDOMNodeHTMLReceived on_complete) const
 {
     auto view = ViewImplementation::find_view_by_id(description.id);
     if (!view.has_value()) {
@@ -3443,7 +3498,7 @@ void Application::get_dom_node_inner_html(DevTools::TabDescription const& descri
     view->get_dom_node_inner_html(node_id);
 }
 
-void Application::get_dom_node_outer_html(DevTools::TabDescription const& description, Web::UniqueNodeID node_id, OnDOMNodeHTMLReceived on_complete) const
+void Application::get_dom_node_outer_html(DevTools::TabDescription const& description, Compositing::UniqueNodeID node_id, OnDOMNodeHTMLReceived on_complete) const
 {
     auto view = ViewImplementation::find_view_by_id(description.id);
     if (!view.has_value()) {
@@ -3459,63 +3514,63 @@ void Application::get_dom_node_outer_html(DevTools::TabDescription const& descri
     view->get_dom_node_outer_html(node_id);
 }
 
-void Application::set_dom_node_outer_html(DevTools::TabDescription const& description, Web::UniqueNodeID node_id, String const& value, OnDOMNodeEditComplete on_complete) const
+void Application::set_dom_node_outer_html(DevTools::TabDescription const& description, Compositing::UniqueNodeID node_id, String const& value, OnDOMNodeEditComplete on_complete) const
 {
     edit_dom_node(description, move(on_complete), [&](auto& view) {
         view.set_dom_node_outer_html(node_id, value);
     });
 }
 
-void Application::set_dom_node_text(DevTools::TabDescription const& description, Web::UniqueNodeID node_id, String const& value, OnDOMNodeEditComplete on_complete) const
+void Application::set_dom_node_text(DevTools::TabDescription const& description, Compositing::UniqueNodeID node_id, String const& value, OnDOMNodeEditComplete on_complete) const
 {
     edit_dom_node(description, move(on_complete), [&](auto& view) {
         view.set_dom_node_text(node_id, value);
     });
 }
 
-void Application::set_dom_node_tag(DevTools::TabDescription const& description, Web::UniqueNodeID node_id, Utf16FlyString const& value, OnDOMNodeEditComplete on_complete) const
+void Application::set_dom_node_tag(DevTools::TabDescription const& description, Compositing::UniqueNodeID node_id, Utf16FlyString const& value, OnDOMNodeEditComplete on_complete) const
 {
     edit_dom_node(description, move(on_complete), [&](auto& view) {
         view.set_dom_node_tag(node_id, value);
     });
 }
 
-void Application::add_dom_node_attributes(DevTools::TabDescription const& description, Web::UniqueNodeID node_id, ReadonlySpan<Attribute> replacement_attributes, OnDOMNodeEditComplete on_complete) const
+void Application::add_dom_node_attributes(DevTools::TabDescription const& description, Compositing::UniqueNodeID node_id, ReadonlySpan<Attribute> replacement_attributes, OnDOMNodeEditComplete on_complete) const
 {
     edit_dom_node(description, move(on_complete), [&](auto& view) {
         view.add_dom_node_attributes(node_id, replacement_attributes);
     });
 }
 
-void Application::replace_dom_node_attribute(DevTools::TabDescription const& description, Web::UniqueNodeID node_id, Utf16FlyString const& name, ReadonlySpan<Attribute> replacement_attributes, OnDOMNodeEditComplete on_complete) const
+void Application::replace_dom_node_attribute(DevTools::TabDescription const& description, Compositing::UniqueNodeID node_id, Utf16FlyString const& name, ReadonlySpan<Attribute> replacement_attributes, OnDOMNodeEditComplete on_complete) const
 {
     edit_dom_node(description, move(on_complete), [&](auto& view) {
         view.replace_dom_node_attribute(node_id, name, replacement_attributes);
     });
 }
 
-void Application::create_child_element(DevTools::TabDescription const& description, Web::UniqueNodeID node_id, OnDOMNodeEditComplete on_complete) const
+void Application::create_child_element(DevTools::TabDescription const& description, Compositing::UniqueNodeID node_id, OnDOMNodeEditComplete on_complete) const
 {
     edit_dom_node(description, move(on_complete), [&](auto& view) {
         view.create_child_element(node_id);
     });
 }
 
-void Application::insert_dom_node_before(DevTools::TabDescription const& description, Web::UniqueNodeID node_id, Web::UniqueNodeID parent_node_id, Optional<Web::UniqueNodeID> sibling_node_id, OnDOMNodeEditComplete on_complete) const
+void Application::insert_dom_node_before(DevTools::TabDescription const& description, Compositing::UniqueNodeID node_id, Compositing::UniqueNodeID parent_node_id, Optional<Compositing::UniqueNodeID> sibling_node_id, OnDOMNodeEditComplete on_complete) const
 {
     edit_dom_node(description, move(on_complete), [&](auto& view) {
         view.insert_dom_node_before(node_id, parent_node_id, sibling_node_id);
     });
 }
 
-void Application::clone_dom_node(DevTools::TabDescription const& description, Web::UniqueNodeID node_id, OnDOMNodeEditComplete on_complete) const
+void Application::clone_dom_node(DevTools::TabDescription const& description, Compositing::UniqueNodeID node_id, OnDOMNodeEditComplete on_complete) const
 {
     edit_dom_node(description, move(on_complete), [&](auto& view) {
         view.clone_dom_node(node_id);
     });
 }
 
-void Application::remove_dom_node(DevTools::TabDescription const& description, Web::UniqueNodeID node_id, OnDOMNodeEditComplete on_complete) const
+void Application::remove_dom_node(DevTools::TabDescription const& description, Compositing::UniqueNodeID node_id, OnDOMNodeEditComplete on_complete) const
 {
     edit_dom_node(description, move(on_complete), [&](auto& view) {
         view.remove_dom_node(node_id);
@@ -3726,7 +3781,7 @@ void Application::retrieve_debugger_source_positions(DevTools::TabDescription co
     view->retrieve_debugger_source_positions(source_id, move(on_complete));
 }
 
-void Application::resolve_dom_node_url(DevTools::TabDescription const& description, Optional<Web::UniqueNodeID> node_id, String const& url, OnResolvedURLReceived on_complete) const
+void Application::resolve_dom_node_url(DevTools::TabDescription const& description, Optional<Compositing::UniqueNodeID> node_id, String const& url, OnResolvedURLReceived on_complete) const
 {
     auto view = ViewImplementation::find_view_by_id(description.id);
     if (!view.has_value()) {

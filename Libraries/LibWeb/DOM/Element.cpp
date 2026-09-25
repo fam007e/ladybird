@@ -17,6 +17,7 @@
 #include <AK/QuickSort.h>
 #include <AK/SaturatingMath.h>
 #include <AK/Utf16StringBuilder.h>
+#include <LibCompositing/DisplayList/AccumulatedVisualContext.h>
 #include <LibGC/Heap.h>
 #include <LibGC/WeakHashMap.h>
 #include <LibGfx/Bitmap.h>
@@ -134,7 +135,6 @@
 #include <LibWeb/Infra/CharacterTypes.h>
 #include <LibWeb/Infra/Strings.h>
 #include <LibWeb/IntersectionObserver/IntersectionObserver.h>
-#include <LibWeb/Layout/BlockContainer.h>
 #include <LibWeb/Layout/TreeBuilder.h>
 #include <LibWeb/Layout/Viewport.h>
 #include <LibWeb/Loader/ContentBlocker.h>
@@ -142,7 +142,6 @@
 #include <LibWeb/MathML/TagNames.h>
 #include <LibWeb/Namespace.h>
 #include <LibWeb/Page/Page.h>
-#include <LibWeb/Painting/AccumulatedVisualContext.h>
 #include <LibWeb/Painting/BoxViews.h>
 #include <LibWeb/PixelUnits.h>
 #include <LibWeb/Platform/EventLoopPlugin.h>
@@ -321,6 +320,13 @@ Element::AttributeList& Element::ensure_attribute_list()
     return *m_attributes;
 }
 
+void Element::ensure_attribute_capacity(size_t capacity)
+{
+    if (capacity == 0)
+        return;
+    ensure_attribute_list().ensure_capacity(capacity);
+}
+
 void Element::synchronize_attribute(Utf16FlyString const& qualified_name) const
 {
     if (m_style_attribute_is_dirty && qualified_name == HTML::AttributeNames::style)
@@ -468,7 +474,7 @@ HTML::TokenizedFeature::NoOpener Element::get_an_elements_noopener(URL::URL cons
 {
     // To get an element's noopener, given an a, area, or form element element, a URL record url, and a string target,
     // perform the following steps. They return a boolean.
-    auto link_types = attribute(HTML::AttributeNames::rel).value_or({});
+    auto link_types = get_attribute_ns({}, HTML::AttributeNames::rel).value_or({});
     auto has_link_type = [&](Utf16View link_type) {
         size_t start = 0;
         for (size_t i = 0; i <= link_types.length_in_code_units(); ++i) {
@@ -1261,14 +1267,14 @@ Layout::NodeWithStyle* Element::create_layout_node_for_display_type(DOM::Documen
         return &Layout::allocate_layout_node<Layout::Box>(document, element, style);
 
     if (display.is_list_item())
-        return &Layout::allocate_layout_node<Layout::BlockContainer>(document, element, style, Layout::RustFFI::NodeKind::ListItemBox);
+        return &Layout::allocate_layout_node<Layout::Box>(document, element, style, Layout::RustFFI::NodeKind::ListItemBox);
 
     if (display.is_table_cell())
-        return &Layout::allocate_layout_node<Layout::BlockContainer>(document, element, style);
+        return &Layout::allocate_layout_node<Layout::Box>(document, element, style, Layout::RustFFI::NodeKind::BlockContainer);
 
     if (display.is_table_column() || display.is_table_column_group() || display.is_table_caption()) {
         // FIXME: This is just an incorrect placeholder until we improve table layout support.
-        return &Layout::allocate_layout_node<Layout::BlockContainer>(document, element, style);
+        return &Layout::allocate_layout_node<Layout::Box>(document, element, style, Layout::RustFFI::NodeKind::BlockContainer);
     }
 
     if (display.is_math_inside()) {
@@ -1276,12 +1282,12 @@ Layout::NodeWithStyle* Element::create_layout_node_for_display_type(DOM::Documen
         // MathML elements with a computed display value equal to block math or inline math control box generation
         // and layout according to their tag name, as described in the relevant sections.
         // FIXME: Figure out what kind of node we should make for them. For now, we'll stick with a generic Box.
-        return &Layout::allocate_layout_node<Layout::BlockContainer>(document, element, style);
+        return &Layout::allocate_layout_node<Layout::Box>(document, element, style, Layout::RustFFI::NodeKind::BlockContainer);
     }
 
     if (display.is_inline_outside()) {
         if (display.is_flow_root_inside())
-            return &Layout::allocate_layout_node<Layout::BlockContainer>(document, element, style);
+            return &Layout::allocate_layout_node<Layout::Box>(document, element, style, Layout::RustFFI::NodeKind::BlockContainer);
         if (display.is_flow_inside())
             return &Layout::allocate_layout_node<Layout::NodeWithStyle>(document, element, style, Layout::RustFFI::NodeKind::InlineNode);
         if (display.is_flex_inside())
@@ -1296,13 +1302,13 @@ Layout::NodeWithStyle* Element::create_layout_node_for_display_type(DOM::Documen
         return &Layout::allocate_layout_node<Layout::Box>(document, element, style);
 
     if (display.is_flow_inside() || display.is_flow_root_inside())
-        return &Layout::allocate_layout_node<Layout::BlockContainer>(document, element, style);
+        return &Layout::allocate_layout_node<Layout::Box>(document, element, style, Layout::RustFFI::NodeKind::BlockContainer);
 
     dbgln("FIXME: CSS display '{}' not implemented yet.", display.to_string());
 
     // FIXME: We don't actually support `display: block ruby`, this is just a hack to prevent a crash
     if (display.is_ruby_inside())
-        return &Layout::allocate_layout_node<Layout::BlockContainer>(document, element, style);
+        return &Layout::allocate_layout_node<Layout::Box>(document, element, style, Layout::RustFFI::NodeKind::BlockContainer);
 
     return &Layout::allocate_layout_node<Layout::NodeWithStyle>(document, element, style, Layout::RustFFI::NodeKind::InlineNode);
 }
@@ -1820,7 +1826,7 @@ void Element::set_needs_layout_tree_rebuild(SetNeedsLayoutTreeUpdateReason reaso
         set_needs_layout_tree_update(true, reason);
         return;
     }
-    if (auto parent = parent_element())
+    if (auto* parent = parent_or_shadow_host_element())
         parent->set_needs_layout_tree_update(true, reason);
     else
         set_needs_layout_tree_update(true, reason);
@@ -1948,8 +1954,9 @@ bool Element::apply_box_presence_change_in_place(SetNeedsLayoutTreeUpdateReason 
 {
     if (is_html_html_element() || is_html_body_element() || rendered_in_top_layer() || is<SVG::SVGElement>(*this))
         return false;
-    GC::Ptr<Element> parent = parent_element();
-    if (!parent || parent->shadow_root() || assigned_slot() || is<HTML::HTMLSlotElement>(*parent))
+    bool is_shadow_root_child = is<ShadowRoot>(this->parent());
+    GC::Ptr<Element> parent = parent_or_shadow_host_element();
+    if (!parent || (parent->shadow_root() && !is_shadow_root_child) || assigned_slot() || is<HTML::HTMLSlotElement>(*parent))
         return false;
     auto* parent_layout_node = parent->unsafe_layout_node();
     if (!parent_layout_node)
@@ -1985,7 +1992,7 @@ bool Element::apply_box_presence_change_in_place(SetNeedsLayoutTreeUpdateReason 
         return true;
     }
 
-    if (unsafe_layout_node())
+    if (unsafe_layout_node() || is_shadow_root_child)
         return false;
     if (style->position() == CSS::Positioning::Fixed || style->float_() != CSS::Float::None)
         return false;
@@ -2097,6 +2104,22 @@ void Element::record_style_query_custom_property_reference(Optional<CSS::PseudoE
         return;
     }
     consumer_data.style_query_references.append(name);
+}
+
+void Element::set_style_uses_if_css_function()
+{
+    if (m_style_uses_if_css_function)
+        return;
+    m_style_uses_if_css_function = true;
+    document().add_element_with_viewport_dependent_style(*this);
+}
+
+void Element::set_style_depends_on_viewport_metrics()
+{
+    if (m_style_depends_on_viewport_metrics)
+        return;
+    m_style_depends_on_viewport_metrics = true;
+    document().add_element_with_viewport_dependent_style(*this);
 }
 
 void Element::finish_recording_style_dependencies()
@@ -2517,9 +2540,8 @@ CSS::RequiredInvalidationAfterStyleChange Element::apply_style_engine_reaction(b
             anchor_names.register_name(name, *this);
         }
 
-        // Anchor names that vanish here become invisible to the dispatch-time check of the
-        // live anchor-name maps, while positioned boxes anywhere may hold geometry resolved
-        // against them; names still registered keep that check refusing partial relayout.
+        // Anchor names that vanish here become invisible to the partial relayout planner's
+        // subtree check, while positioned boxes anywhere may hold geometry resolved against them.
         if (element_had_registered_anchor_names && !element_has_anchor_names)
             document().record_partial_relayout_escape(PartialRelayoutEscapeReason::AnchorNamesUnregisteredByStyleChange);
     }
@@ -3086,7 +3108,11 @@ Utf16FlyString Element::make_html_uppercased_qualified_name() const
 // https://html.spec.whatwg.org/multipage/webappapis.html#queue-an-element-task
 HTML::TaskID Element::queue_an_element_task(HTML::Task::Source source, Function<void()> steps)
 {
-    return queue_a_task(source, HTML::main_thread_event_loop(), document(), GC::create_function(GC::Heap::the(), move(steps)));
+    // 1. Let global be element's relevant global object.
+    auto& global = HTML::relevant_global_object(*this);
+
+    // 2. Queue a global task given source, global, and steps.
+    return HTML::queue_global_task(source, global, GC::create_function(GC::Heap::the(), move(steps)));
 }
 
 // https://html.spec.whatwg.org/multipage/syntax.html#void-elements
@@ -3113,7 +3139,9 @@ static QueryResult query_client_rects_after_layout_update(Element const& element
 
     // 1. If the element on which it was invoked does not have an associated layout box return an empty DOMRectList
     //    object and stop this algorithm.
-    auto const* layout_node = element.layout_node();
+    // INTEROP: For a table, the spec lists the table box and its caption boxes separately. Chrome reports the table
+    //          wrapper box, which is their union.
+    auto const* layout_node = element.principal_layout_node();
     if (!layout_node)
         return QueryResult {};
 
@@ -3151,9 +3179,9 @@ CSSPixelRect Element::bounding_client_rect_assuming_layout_clean() const
     return bounding_client_rect_assuming_layout_clean(document().visual_context_tree());
 }
 
-CSSPixelRect Element::bounding_client_rect_assuming_layout_clean(Painting::AccumulatedVisualContextTree const& visual_context_tree) const
+CSSPixelRect Element::bounding_client_rect_assuming_layout_clean(Compositing::AccumulatedVisualContextTree const& visual_context_tree) const
 {
-    auto const* layout_node = this->layout_node();
+    auto const* layout_node = principal_layout_node();
     if (!layout_node)
         return {};
     return Painting::bounding_client_rect(*layout_node, Painting::rect_to_viewport_transform(document(), visual_context_tree));
@@ -3312,7 +3340,7 @@ void Element::removed_from(IsSubtreeRoot is_subtree_root, Node* old_ancestor, No
             document().element_with_name_was_removed({}, *this);
         if (unregister_current_anchor_names(*this, old_root)) {
             // Positioned boxes anywhere may hold geometry resolved against these names, which
-            // the dispatch-time check of the live anchor-name maps can no longer see.
+            // the partial relayout planner's subtree check can no longer see.
             document().record_partial_relayout_escape(PartialRelayoutEscapeReason::AnchorNamesUnregisteredByElementRemoval);
         }
     }
@@ -4407,7 +4435,7 @@ static CSSPixelPoint determine_the_scroll_into_view_position(Element& target, CS
         current_scroll_position = document.navigable()->viewport_scroll_offset() + visual_viewport.offset();
     } else if (auto* layout_node = scrolling_box.layout_node(); layout_node && Painting::has_committed_box(*layout_node)) {
         current_scroll_position = Painting::scroll_offset(*layout_node);
-        scrolling_box_rect = Painting::transform_rect_to_viewport(*layout_node, Painting::scroll_snapport_rect(*layout_node), Painting::AccumulatedVisualContextTree::IncludeVisualViewportTransform::No);
+        scrolling_box_rect = Painting::transform_rect_to_viewport(*layout_node, Painting::scroll_snapport_rect(*layout_node), Compositing::AccumulatedVisualContextTree::IncludeVisualViewportTransform::No);
     } else {
         return {};
     }
@@ -4587,7 +4615,7 @@ static void scroll_an_element_into_view(Element& target, Element::ScrollBehavior
         if (!scrolling_box.is_document()) {
             if (auto const* layout_node = scrolling_box.layout_node(); layout_node && Painting::has_committed_box(*layout_node)) {
                 target_bounding_border_box.translate_by(Painting::scroll_offset(*layout_node) - Painting::clamp_scroll_offset(*layout_node, position));
-                auto scrollport_rect = Painting::transform_rect_to_viewport(*layout_node, Painting::absolute_padding_box_rect(*layout_node), Painting::AccumulatedVisualContextTree::IncludeVisualViewportTransform::No);
+                auto scrollport_rect = Painting::transform_rect_to_viewport(*layout_node, Painting::absolute_padding_box_rect(*layout_node), Compositing::AccumulatedVisualContextTree::IncludeVisualViewportTransform::No);
                 auto visible_rect = target_bounding_border_box.intersected(scrollport_rect);
                 if (!visible_rect.is_empty())
                     target_bounding_border_box = visible_rect;
@@ -5151,6 +5179,18 @@ Layout::NodeWithStyle* Element::layout_node()
 Layout::NodeWithStyle const* Element::layout_node() const
 {
     return static_cast<Layout::NodeWithStyle const*>(Node::layout_node());
+}
+
+// https://drafts.csswg.org/css-tables-3/#table-wrapper-box
+Layout::NodeWithStyle const* Element::principal_layout_node() const
+{
+    // The table wrapper box is the principal box of a table, and contains its caption boxes.
+    auto const* layout_node = this->layout_node();
+    if (!layout_node || !layout_node->display().is_table_inside())
+        return layout_node;
+    if (auto const* parent = layout_node->parent(); parent && parent->is_table_wrapper())
+        return parent;
+    return layout_node;
 }
 
 Layout::NodeWithStyle* Element::unsafe_layout_node()
@@ -6261,11 +6301,11 @@ void Element::attribute_changed(Utf16FlyString const& local_name, Optional<Utf16
         if (is_connected())
             document().element_name_changed({}, *this);
     } else if (local_name == HTML::AttributeNames::class_) {
-        // Elements without a StyleEngine identity have no feature state to update. Avoid copying
-        // their class list just for record_element_class_list_changed() to reject the update.
+        // Elements without a StyleEngine identity have no feature state to update. Avoid moving
+        // their class list out just for record_element_class_list_changed() to reject the update.
         Optional<Vector<Utf16FlyString>> old_style_engine_classes;
         if (style_node_id().value() != 0)
-            old_style_engine_classes = m_classes;
+            old_style_engine_classes = move(m_classes);
 
         if (value_or_empty.is_empty()) {
             m_classes.clear();

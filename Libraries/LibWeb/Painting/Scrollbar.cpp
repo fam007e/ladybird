@@ -16,19 +16,36 @@
 
 namespace Web::Painting {
 
-NonnullRefPtr<Scrollbar> Scrollbar::create(Layout::NodeArena& arena, Layout::RustFFI::NodeSlotId slot, ScrollDirection direction)
+NonnullRefPtr<Scrollbar> Scrollbar::create(Layout::NodeArena& arena, Compositing::RustFFI::NodeSlotId slot, ScrollDirection direction)
 {
     return adopt_ref(*new Scrollbar(arena, slot, direction));
 }
 
-Scrollbar::Scrollbar(Layout::NodeArena& arena, Layout::RustFFI::NodeSlotId slot, ScrollDirection direction)
+Scrollbar::Scrollbar(Layout::NodeArena& arena, Compositing::RustFFI::NodeSlotId slot, ScrollDirection direction)
     : ChromeWidget(arena, slot)
     , m_direction(direction)
 {
 }
 
+void Scrollbar::begin_drag_driven_by_compositor()
+{
+    m_drag_is_driven_by_compositor = true;
+    push_enlarged_state();
+    if (auto* node = layout_node())
+        Painting::set_needs_repaint(*node, InvalidateDisplayList::PaintCommands);
+}
+
 MouseAction Scrollbar::handle_pointer_event(Utf16FlyString const& type, unsigned button, CSSPixelPoint visual_viewport_position)
 {
+    if (m_drag_is_driven_by_compositor) {
+        if (type != UIEvents::EventNames::pointerup || button != UIEvents::MouseButton::Primary)
+            return MouseAction::CaptureInput;
+        release_thumb_grab();
+        if (auto* node = layout_node())
+            Painting::set_needs_repaint(*node, InvalidateDisplayList::PaintCommands);
+        return MouseAction::None;
+    }
+
     if (type == UIEvents::EventNames::pointermove || type == UIEvents::EventNames::pointerup) {
         if (!m_thumb_grab_position.has_value())
             return MouseAction::None;
@@ -78,6 +95,7 @@ MouseAction Scrollbar::mouse_up(CSSPixelPoint, unsigned)
 
 void Scrollbar::release_thumb_grab()
 {
+    m_drag_is_driven_by_compositor = false;
     m_thumb_grab_position.clear();
     m_thumb_grab_gesture_hold = nullptr;
     push_enlarged_state();
@@ -162,7 +180,7 @@ bool Scrollbar::scroll_to_mouse_position(CSSPixelPoint position)
     // Common examples of absolute scrolls include:
     //     manipulating the scrollbar "thumb" explicitly
     if (auto navigable = node->document().navigable())
-        navigable->note_user_scroll_input_intent(Painting::SnapSelectionStrategy::Type::EndPosition);
+        navigable->note_user_scroll_input_intent(Compositing::SnapSelectionStrategy::Type::EndPosition);
 
     Painting::set_scroll_offset_from_user_input(*node, new_scroll_offset, Painting::ScrollKind::Absolute);
     return true;

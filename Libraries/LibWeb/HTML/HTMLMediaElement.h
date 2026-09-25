@@ -14,6 +14,7 @@
 #include <AK/Time.h>
 #include <AK/Utf16View.h>
 #include <AK/Variant.h>
+#include <LibCompositing/DisplayList/DisplayListResourceIds.h>
 #include <LibCore/Forward.h>
 #include <LibGC/RootVector.h>
 #include <LibGfx/Rect.h>
@@ -29,7 +30,6 @@
 #include <LibWeb/HTML/MediaControls.h>
 #include <LibWeb/HTML/TextTrack.h>
 #include <LibWeb/Page/ScreenWakeLockHandle.h>
-#include <LibWeb/Painting/DisplayListResourceIds.h>
 #include <LibWeb/PixelUnits.h>
 #include <LibWeb/WebIDL/DOMException.h>
 
@@ -63,7 +63,6 @@ public:
     static constexpr size_t audio_tracks_offset() { return offsetof(HTMLMediaElement, m_audio_tracks); }
     static constexpr size_t video_tracks_offset() { return offsetof(HTMLMediaElement, m_video_tracks); }
     static constexpr size_t text_tracks_offset() { return offsetof(HTMLMediaElement, m_text_tracks); }
-    static constexpr bool OVERRIDES_FINALIZE = true;
 
     virtual ~HTMLMediaElement() override;
 
@@ -186,7 +185,7 @@ public:
     Optional<Media::VideoSinkHandle> video_sink_handle() const;
     RefPtr<Media::VideoFrame> current_presented_frame() const;
 
-    Optional<Painting::VideoSinkResourceId> video_sink_resource_id() const;
+    Optional<Compositing::VideoSinkResourceId> video_sink_resource_id() const;
 
     virtual void update_natural_dimensions() { }
 
@@ -249,13 +248,18 @@ private:
     };
     void process_media_data(FetchingStatus);
 
+    enum class SourceType : u8 {
+        Remote,
+        Local,
+    };
+
     void handle_media_source_failure(Span<GC::Ref<WebIDL::Promise>> promises, Utf16String error_message);
     void forget_media_resource_specific_tracks();
     void set_ready_state(ReadyState);
 
     void on_audio_track_added(Media::Track const&);
     void on_video_track_added(Media::Track const&);
-    void on_metadata_parsed();
+    void on_metadata_parsed(SourceType);
     void on_playback_manager_state_change();
     void upon_current_playback_position_possibly_changed();
     void start_or_stop_playback_position_update_timer();

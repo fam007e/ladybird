@@ -11,9 +11,9 @@
 #include <AK/OwnPtr.h>
 #include <AK/RefPtr.h>
 #include <AK/Vector.h>
+#include <LibCompositing/WebGL/GLFunctions.h>
 #include <LibGfx/Forward.h>
 #include <LibGfx/Size.h>
-#include <LibWeb/WebGL/GLFunctions.h>
 
 #ifdef AK_OS_MACOS
 #    include <LibGfx/SharedImageBuffer.h>
@@ -25,9 +25,11 @@
 
 namespace Compositor {
 
-class OpenGLContext : public Web::WebGL::GLFunctions {
+class OpenGLContext : public Compositing::WebGL::GLFunctions {
 public:
-    using WebGLVersion = Web::WebGL::WebGLVersion;
+    AK_ALLOC_WITH_KMALLOC;
+
+    using WebGLVersion = Compositing::WebGL::WebGLVersion;
 
     struct DrawingBufferOptions {
         bool depth;
@@ -48,7 +50,7 @@ public:
 
     void make_current();
 
-    void present(bool preserve_drawing_buffer);
+    void present();
 
     void set_size(Gfx::IntSize const&);
 
@@ -67,7 +69,6 @@ private:
     OwnPtr<Gfx::SharedImageBuffer> m_shared_image_buffer;
 #endif
     NonnullOwnPtr<Impl> m_impl;
-    Optional<Vector<String>> m_requestable_extensions;
     WebGLVersion m_webgl_version;
     [[maybe_unused]] DrawingBufferOptions m_drawing_buffer_options;
 

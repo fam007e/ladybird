@@ -7,7 +7,7 @@
 #pragma once
 
 #include <AK/Utf16String.h>
-#include <LibWeb/Compositor/Types.h>
+#include <LibCompositing/Types.h>
 #include <LibWeb/Export.h>
 #include <LibWeb/HTML/HTMLElement.h>
 #include <LibWeb/HTML/InitialInsertion.h>
@@ -19,8 +19,6 @@ class WEB_API NavigableContainer : public HTMLElement {
     WEB_NON_IDL_WRAPPABLE(NavigableContainer, HTMLElement);
 
 public:
-    static constexpr bool OVERRIDES_FINALIZE = true;
-
     virtual ~NavigableContainer() override;
 
     static HashTable<NavigableContainer*>& all_instances();
@@ -53,6 +51,11 @@ public:
 
     ReplicatedContainerState replicated_container_state();
 
+    // The UI process routes input over a navigable another process hosts by the rect of its container's content box
+    // in the viewport of the local root, and tells that navigable the part of it the top-level viewport shows. Both
+    // are reported whenever they change.
+    void report_content_navigable_viewport_rect();
+
 protected:
     NavigableContainer(DOM::Document&, DOM::QualifiedName);
 
@@ -79,6 +82,13 @@ private:
     static void finish_destroying_the_child_navigable(Navigable&);
 
     bool m_potentially_delays_the_load_event { true };
+
+    struct ReportedContentNavigableViewport {
+        DevicePixelRect rect;
+        DevicePixelRect intersection;
+        bool operator==(ReportedContentNavigableViewport const&) const = default;
+    };
+    Optional<ReportedContentNavigableViewport> m_reported_content_navigable_viewport;
 };
 
 }

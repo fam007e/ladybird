@@ -7,6 +7,7 @@
 #include <AK/LexicalPath.h>
 #include <LibCore/ArgsParser.h>
 #include <LibCore/CrashHandler.h>
+#include <LibCore/Environment.h>
 #include <LibCore/EventLoop.h>
 #include <LibCore/LocalServer.h>
 #include <LibCore/Process.h>
@@ -19,6 +20,7 @@
 #include <LibIPC/TransportHandle.h>
 #include <LibMain/Main.h>
 #include <LibRequests/RequestClient.h>
+#include <LibSandbox/ConnectBroker.h>
 #include <LibUnicode/TimeZone.h>
 #include <LibWeb/Bindings/MainThreadVM.h>
 #include <LibWeb/DOM/Document.h>
@@ -31,9 +33,11 @@
 #include <LibWeb/Painting/BoxViews.h>
 #include <LibWeb/Platform/EventLoopPlugin.h>
 #include <LibWebView/Plugins/ImageCodecPlugin.h>
-#include <LibWebView/SiteIsolation.h>
 #include <LibWebView/Utilities.h>
 #include <Services/RendererSandbox.h>
+#if defined(AK_OS_LINUX)
+#    include <LibMedia/FFmpeg/SystemFFmpeg.h>
+#endif
 #include <WebContent/ConnectionFromClient.h>
 #include <WebContent/PageClient.h>
 #include <WebContent/WebContentCompositorHost.h>
@@ -132,17 +136,16 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
 
     Web::Platform::EventLoopPlugin::install(*new Web::Platform::EventLoopPlugin);
 
-    auto config_path = WebView::s_ladybird_resource_root;
     StringView cache_path;
     StringView mach_server_name {};
     Vector<ByteString> certificates;
     int crash_report_fd = -1;
+    int connect_broker_fd = -1;
     bool enable_test_mode = false;
     bool expose_experimental_interfaces = false;
     bool expose_internals_object = false;
     bool wait_for_debugger = false;
     bool log_all_js_exceptions = false;
-    auto site_isolation_mode = WebView::SiteIsolationMode::TopLevel;
     bool enable_http_memory_cache = false;
     bool force_fontconfig = false;
     bool collect_garbage_on_every_allocation = false;
@@ -156,7 +159,7 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
 
     Core::ArgsParser args_parser;
     args_parser.add_option(crash_report_fd, "Descriptor for anonymous crash diagnostics", "crash-report-fd", 0, "fd");
-    args_parser.add_option(config_path, "Ladybird configuration path", "config-path", 0, "config_path");
+    args_parser.add_option(connect_broker_fd, "Descriptor for the sandbox connection broker", "connect-broker-fd", 0, "fd");
     args_parser.add_option(cache_path, "Path to the profile cache", "cache-path", 0, "path");
     args_parser.add_option(enable_test_mode, "Enable test mode", "test-mode");
     args_parser.add_option(expose_experimental_interfaces, "Expose experimental IDL interfaces", "expose-experimental-interfaces");
@@ -165,20 +168,6 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
     args_parser.add_option(wait_for_debugger, "Wait for debugger", "wait-for-debugger");
     args_parser.add_option(mach_server_name, "Mach server name", "mach-server-name", 0, "mach_server_name");
     args_parser.add_option(log_all_js_exceptions, "Log all JavaScript exceptions", "log-all-js-exceptions");
-    args_parser.add_option(Core::ArgsParser::Option {
-        .argument_mode = Core::ArgsParser::OptionArgumentMode::Required,
-        .help_string = "Set site isolation mode. Mode may be 'disable', 'top-level' (default), or 'iframe'.",
-        .long_name = "site-isolation",
-        .value_name = "mode",
-        .accept_value = [&](StringView value) {
-            auto parsed_mode = WebView::site_isolation_mode_from_string(value);
-            if (!parsed_mode.has_value())
-                return false;
-
-            site_isolation_mode = *parsed_mode;
-            return true;
-        },
-    });
     args_parser.add_option(enable_http_memory_cache, "Enable HTTP cache", "enable-http-memory-cache");
     args_parser.add_option(force_fontconfig, "Force using fontconfig for font loading", "force-fontconfig");
     args_parser.add_option(collect_garbage_on_every_allocation, "Collect garbage after every JS heap allocation", "collect-garbage-on-every-allocation");
@@ -214,8 +203,6 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
 
     WebContent::PageClient::set_is_headless(is_headless);
 
-    WebView::set_site_isolation_mode(site_isolation_mode);
-
     if (enable_http_memory_cache)
         Web::Fetch::Fetching::set_http_memory_cache_enabled(true);
 
@@ -244,8 +231,15 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
         JS::set_log_all_js_exceptions(true);
     }
 
+#if defined(AK_OS_LINUX)
+    if (connect_broker_fd != -1)
+        Sandbox::set_connect_broker_fd(connect_broker_fd);
+    // FIXME: Remove once media decoding runs in its own sandboxed process; the library's dependencies need more than this sandbox allows.
+    (void)Media::FFmpeg::SystemFFmpeg::the();
+#endif
+
     if (!disable_sandbox)
-        TRY(RendererSandbox::apply_sandbox(config_path, cache_path));
+        TRY(RendererSandbox::apply_sandbox(mach_server_name, cache_path, RendererSandbox::AudioAccess::Yes));
 
 #if defined(AK_OS_MACOS)
     auto browser_port = TRY(Core::MachPort::look_up_from_bootstrap_server(ByteString { mach_server_name }));

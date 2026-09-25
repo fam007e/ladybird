@@ -8,8 +8,8 @@
 
 #include <AK/Function.h>
 #include <AK/Platform.h>
+#include <LibCompositing/PageId.h>
 #include <LibURL/URL.h>
-#include <LibWeb/Page/PageId.h>
 #include <LibWebView/Application.h>
 #include <LibWebView/BrowsingSession.h>
 #include <UI/Qt/BrowserWindow.h>
@@ -26,10 +26,10 @@ namespace Ladybird {
 class ProcessManagerWindow;
 
 struct WindowConfiguration {
-    Optional<Web::DevicePixels> x {};
-    Optional<Web::DevicePixels> y {};
-    Optional<Web::DevicePixels> width {};
-    Optional<Web::DevicePixels> height {};
+    Optional<Compositing::DevicePixels> x {};
+    Optional<Compositing::DevicePixels> y {};
+    Optional<Compositing::DevicePixels> width {};
+    Optional<Compositing::DevicePixels> height {};
     Optional<bool> maximized {};
 };
 
@@ -46,7 +46,7 @@ public:
 
     Function<void(URL::URL)> on_open_file;
 
-    BrowserWindow& new_window(Vector<URL::URL> const& initial_urls, WindowConfiguration const& = {}, BrowserWindow::IsPopupWindow is_popup_window = BrowserWindow::IsPopupWindow::No, WebView::IsPrivate = WebView::IsPrivate::No, Tab* parent_tab = nullptr, Optional<Web::PageId> page_index = {}, ShowWindow = ShowWindow::Yes);
+    BrowserWindow& new_window(Vector<URL::URL> const& initial_urls, WindowConfiguration const& = {}, BrowserWindow::IsPopupWindow is_popup_window = BrowserWindow::IsPopupWindow::No, WebView::IsPrivate = WebView::IsPrivate::No, Tab* parent_tab = nullptr, RefPtr<WebView::WebContentClient> page_process = nullptr, Optional<Compositing::PageId> page_index = {}, ShowWindow = ShowWindow::Yes);
     WindowConfiguration configuration_for_new_window() const;
 
     void open_new_tab();
@@ -78,7 +78,6 @@ public:
     QMenu* history_menu();
     QMenu* inspect_menu();
     QMenu* debug_menu();
-    QMenu* zoom_menu();
     QMenu* help_menu();
 
     QAction* new_tab_action();
@@ -92,6 +91,9 @@ public:
     QAction* open_settings_action();
     QAction* open_downloads_action();
     QAction* find_in_page_action();
+    QAction* zoom_in_action();
+    QAction* zoom_out_action();
+    QAction* reset_zoom_action();
     QAction* quit_action();
 
 private:

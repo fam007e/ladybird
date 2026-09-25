@@ -432,11 +432,11 @@ impl<'pass> SvgFormattingContext<'pass> {
     }
 
     #[track_caller]
-    fn used_values(&self, node: Node) -> std::rc::Rc<UsedValues> {
+    fn used_values(&self, node: Node) -> &'pass UsedValues {
         self.records.used_values(node)
     }
 
-    fn create_used_values(&self, node: Node) -> std::rc::Rc<UsedValues> {
+    fn create_used_values(&self, node: Node) -> &'pass UsedValues {
         // SVG descendants deliberately carry no percentage basis.
         // SVG layout resolves percentages against the SVG viewport, not a CSS containing
         // block, so boxes inside the SVG subtree carry no percentage basis.
@@ -520,6 +520,12 @@ impl<'pass> SvgFormattingContext<'pass> {
         //       I'm not sure if this is good or bad, but our viewport transform logic depends on it.
         used.has_definite_inline_size.set(true);
         used.has_definite_block_size.set(true);
+
+        // An embedded SVG viewport's outer size does not depend on its descendants. Measuring it
+        // only needs the root sizing above; shapes, text, and foreignObject content wait for layout.
+        if self.purpose.is_measurement() && kind == NodeKind::SVGSVGBox && !facts.is_document_element {
+            return;
+        }
 
         if kind == NodeKind::SVGSVGBox {
             self.set_svg_viewport_size(

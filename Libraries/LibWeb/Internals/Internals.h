@@ -6,8 +6,8 @@
 
 #pragma once
 
+#include <LibCompositing/Scrolling/AsyncScrollingState.h>
 #include <LibWeb/Bindings/Internals.h>
-#include <LibWeb/Compositor/AsyncScrollingState.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/Export.h>
 #include <LibWeb/Forward.h>
@@ -83,6 +83,10 @@ public:
     GC::Ptr<JS::Object> take_context_menu_request();
 
     void send_text(HTML::HTMLElement&, Utf16String const&, WebIDL::UnsignedShort modifiers);
+    void send_text_through_ui_process(Utf16String const&);
+    void grant_transient_activation();
+    void click_through_ui_process(double x, double y);
+    void wheel_through_ui_process(double x, double y, double delta_x, double delta_y);
     void send_key(HTML::HTMLElement&, Utf16String const&, WebIDL::UnsignedShort modifiers, WebIDL::UnsignedLong repeat_count);
     void paste(HTML::HTMLElement& target, Utf16String const& text);
     void paste_from_clipboard();
@@ -90,6 +94,7 @@ public:
 
     // Low-level mouse primitives
     void mouse_down(double x, double y, WebIDL::UnsignedShort click_count, WebIDL::UnsignedShort button, WebIDL::UnsignedShort modifiers);
+    void mouse_down_on_scrollbar_dragged_by_compositor(double x, double y, DOM::Element& scroller, bool vertical);
     void mouse_up(double x, double y, WebIDL::UnsignedShort button, WebIDL::UnsignedShort modifiers);
     void mouse_move(double x, double y, WebIDL::UnsignedShort modifiers);
     void mouse_leave();
@@ -255,7 +260,7 @@ public:
     void set_media_element_seeking(HTML::HTMLMediaElement&, bool seeking);
     void set_page_muted(bool muted);
     WebIDL::UnsignedLongLong active_image_style_value_animation_count();
-    Compositor::AsyncScrollingState async_scrolling_state();
+    Compositing::AsyncScrollingState async_scrolling_state();
     GC::Ref<JS::Object> async_scrolling_state_object();
     bool async_scrolling_state_blocks_wheel_event_at(double x, double y);
     bool async_scrolling_state_can_wheel_scroll_at(double x, double y, double delta_x, double delta_y, bool force_stale_wheel_event_regions);

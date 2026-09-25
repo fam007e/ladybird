@@ -19,6 +19,16 @@ pub struct InlineContent {
     pub lines: Vec<LineRecord>,
     pub fragments: Vec<FragmentRecord>,
     pub inline_box_pieces: Vec<InlineBoxPieceRecord>,
+    /// Boxes and text in line order, then tree order within each line. Empty when
+    /// there are no boxes to interleave, so text can be painted together.
+    pub items: Vec<InlineItem>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InlineItem {
+    BoxPiece(u32),
+    TextFragment(u32),
+    AtomicInline(u32),
 }
 
 impl PartialEq for GlyphRunRecord {
@@ -68,7 +78,7 @@ impl LineRecord {
 }
 
 pub struct GlyphRunRecord {
-    pub glyphs: Vec<libgfx_rust::text_layout::DrawGlyph>,
+    pub glyphs: libgfx_rust::text_layout::GlyphBuffer,
     pub font: libgfx_rust::font::FontHandle,
     // Conservative painted bounds in CSS pixels, relative to the run's baseline origin.
     pub bounding_box: libgfx_rust::FloatRect,
@@ -176,11 +186,60 @@ impl InlineContent {
             piece.baseline += piece.relpos_delta.y;
             piece.relpos_delta = used_values::FfiCssPixelPoint::default();
         }
-        Self {
+        let mut content = Self {
             lines,
             fragments,
             inline_box_pieces: pieces,
+            items: Vec::new(),
+        };
+        // Plain text needs no interleaving and keeps its single foreground producer.
+        if content.inline_box_pieces.is_empty() && !content.fragments.iter().any(|fragment| fragment.is_atomic_inline) {
+            return content;
         }
+        let box_pieces = content
+            .inline_box_pieces
+            .iter()
+            .enumerate()
+            .filter(|(_, piece)| !piece.is_geometry_only_placeholder)
+            .map(|(index, _)| InlineItem::BoxPiece(index as u32));
+        let fragment_items = content.fragments.iter().enumerate().filter_map(|(index, fragment)| {
+            if fragment.glyph_run.is_some() {
+                Some(InlineItem::TextFragment(index as u32))
+            } else {
+                fragment
+                    .is_atomic_inline
+                    .then_some(InlineItem::AtomicInline(index as u32))
+            }
+        });
+        let mut items = Vec::with_capacity(box_pieces.clone().count() + fragment_items.clone().count());
+        items.extend(box_pieces.chain(fragment_items));
+        items.sort_by_key(|&item| {
+            let (node, line) = content.item_position(item);
+            (line, arena.node_pre_order_label(node))
+        });
+        content.items = items;
+        content
+    }
+
+    fn item_position(&self, item: InlineItem) -> (NodeSlotId, u32) {
+        match item {
+            InlineItem::BoxPiece(index) => {
+                let piece = &self.inline_box_pieces[index as usize];
+                (piece.node, piece.line_index)
+            }
+            InlineItem::TextFragment(index) | InlineItem::AtomicInline(index) => {
+                let fragment = &self.fragments[index as usize];
+                (fragment.layout_node, fragment.line_index)
+            }
+        }
+    }
+
+    pub(crate) fn has_same_item_order(&self, other: &Self) -> bool {
+        self.items == other.items
+            && self
+                .items
+                .iter()
+                .all(|&item| self.item_position(item).0 == other.item_position(item).0)
     }
 }
 

@@ -16,6 +16,7 @@ use crate::painting::dump::{
 };
 #[cfg(test)]
 use crate::painting::visual_context::VisualContextTree;
+use crate::painting::visual_context::VisualContextTreeDump;
 use crate::painting::visual_context::dump::SlotKind;
 use libgfx_rust::path::OwnedPath;
 use libgfx_rust::{
@@ -143,8 +144,8 @@ pub unsafe extern "C" fn painting_dump(
 ) {
     assert!(!display_list.is_null());
     let arena = unsafe { crate::painting::ffi::arena_from_handle(arena) };
-    let visual_context_tree = unsafe { crate::painting::ffi::tree_from_handle(visual_context_tree) };
-    let command_runs = unsafe { crate::painting::ffi::ffi_slice(command_runs, command_run_count) };
+    let visual_context_tree = unsafe { libcompositing_rust::ffi::tree_from_handle(visual_context_tree) };
+    let command_runs = unsafe { libcompositing_rust::ffi::ffi_slice(command_runs, command_run_count) };
     let owners = VisualContextNodeOwners::collect(arena, viewport);
     let mut output = visual_context_tree.dump_nodes_reachable_from_runs(command_runs, |kind, index| {
         let shell = arena.shell_if_live(owners.owner(kind, index)?);
@@ -561,11 +562,12 @@ fn dump_command(output: &mut String, command_type: DisplayListCommandType, paylo
             let command = read_command::<CompositorMainThreadWheelEventRegion>(payload);
             write_field(output, "rect", command.rect);
         }
-        DisplayListCommandType::CompositorViewportScrollbar => {
-            let command = read_command::<CompositorViewportScrollbar>(payload);
+        DisplayListCommandType::CompositorScrollbar => {
+            let command = read_command::<CompositorScrollbar>(payload);
             write_field(output, "scroll_node_index", command.scroll_node_index);
             write_field(output, "gutter_rect", command.gutter_rect);
             write_field(output, "thumb_rect", command.thumb_rect);
+            write_field(output, "track_rect", command.track_rect);
             write_field(output, "expanded_gutter_rect", command.expanded_gutter_rect);
             write_field(output, "expanded_thumb_rect", command.expanded_thumb_rect);
             write!(
@@ -578,7 +580,12 @@ fn dump_command(output: &mut String, command_type: DisplayListCommandType, paylo
             write_field(output, "max_scroll_offset", command.max_scroll_offset);
             write_field(output, "thumb_color", command.thumb_color);
             write_field(output, "track_color", command.track_color);
-            write!(output, " vertical={}", command.vertical).unwrap();
+            write!(
+                output,
+                " vertical={} is_painted_by_compositor={} display_list_paints_enlarged_scrollbar={}",
+                command.vertical, command.is_painted_by_compositor, command.display_list_paints_enlarged_scrollbar
+            )
+            .unwrap();
         }
         DisplayListCommandType::PaintScrollBar => {}
         DisplayListCommandType::CompositorSnapContainer => {

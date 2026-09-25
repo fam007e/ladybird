@@ -18,6 +18,8 @@ namespace WebView {
 
 class WEBVIEW_API HSTSStore {
 public:
+    AK_ALLOC_WITH_KMALLOC;
+
     static ErrorOr<Database::MigrationOutcome> migrate_schema(Database::Database&, Database::MigrationMode = Database::MigrationMode::Apply);
 
     static ErrorOr<NonnullOwnPtr<HSTSStore>> create(Database::Database&);
@@ -69,7 +71,7 @@ private:
         void insert_policy(String const& domain, StoredPolicy const& policy);
         TransientStorage::Policies select_all_policies();
 
-        Database::Database& database;
+        NonnullRefPtr<Database::Database> database;
         Statements statements;
         RefPtr<Core::Timer> synchronization_timer {};
     };

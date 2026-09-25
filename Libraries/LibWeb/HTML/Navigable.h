@@ -58,6 +58,8 @@ public:
     virtual bool has_been_destroyed() const = 0;
     virtual void set_has_been_destroyed() = 0;
 
+    bool is_in_a_destroyed_subtree() const;
+
     virtual GC::Ptr<WindowProxy> active_window_proxy() = 0;
     virtual Utf16String const& target_name() const = 0;
     virtual bool is_traversable() const { return false; }
@@ -78,6 +80,8 @@ public:
     virtual Optional<URL::Origin> active_document_top_level_origin() const = 0;
     virtual bool active_document_has_cross_site_ancestor() const = 0;
     virtual OpenerPolicy const& active_document_opener_policy() const = 0;
+    virtual bool active_browsing_context_is_auxiliary() const = 0;
+    virtual GC::Ptr<WindowProxy> active_browsing_context_opener_window_proxy() const = 0;
 
     virtual ReplicatedContainerState container_state() const = 0;
     bool container_is_in_document_tree() const { return container_state().is_in_document_tree; }
@@ -88,6 +92,10 @@ public:
 
     virtual bool has_session_history_entry_and_ready_for_navigation() const = 0;
     virtual bool delays_the_load_event_of_its_container() const = 0;
+
+    // https://html.spec.whatwg.org/multipage/interaction.html#currently-focused-area-of-a-top-level-traversable
+    virtual GC::Ptr<DOM::Node> currently_focused_area() = 0;
+    GC::Ptr<DOM::Node> currently_focused_area_shown_by_focused_navigable();
 
     WebIDL::ExceptionOr<void> navigate(NavigateParams);
 
@@ -113,6 +121,10 @@ private:
 
     GC::Ref<Page> m_page;
 };
+
+// A navigable a process holds in any of its pages, preferring the one it holds in preferredPage. The same navigable
+// can be represented in more than one page, so naming the page a caller has in hand keeps the answer stable.
+WEB_API GC::Ptr<Navigable> navigable_with_id_in_any_page(Page const& preferred_page, CrossProcessId);
 
 template<>
 inline bool Navigable::fast_is<LocalNavigable>() const { return is_local_navigable(); }

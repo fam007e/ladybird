@@ -67,6 +67,8 @@ namespace Web::HTML {
 struct HTMLElement::RareData final
     : DOM::Element::RareData
     , FormAssociatedElement::RareData {
+    AK_ALLOC_WITH_KMALLOC;
+
     virtual void visit_edges(Cell::Visitor&) override;
 
     GC::Ptr<DOM::NodeList> labels;
@@ -690,7 +692,7 @@ int HTMLElement::offset_top() const
     // NOTE: Ensure that layout is up-to-date before looking at metrics.
     const_cast<DOM::Document&>(document()).update_layout_if_needed_for_node(*this, DOM::UpdateLayoutReason::HTMLElementOffsetTop);
 
-    auto const* layout_node = this->layout_node();
+    auto const* layout_node = principal_layout_node();
     if (!layout_node || !Painting::has_committed_box(*layout_node))
         return 0;
 
@@ -734,7 +736,7 @@ int HTMLElement::offset_left() const
     // NOTE: Ensure that layout is up-to-date before looking at metrics.
     const_cast<DOM::Document&>(document()).update_layout_if_needed_for_node(*this, DOM::UpdateLayoutReason::HTMLElementOffsetLeft);
 
-    auto const* layout_node = this->layout_node();
+    auto const* layout_node = principal_layout_node();
     if (!layout_node || !Painting::has_committed_box(*layout_node))
         return 0;
 
@@ -775,7 +777,7 @@ int HTMLElement::offset_width() const
     const_cast<DOM::Document&>(document()).update_layout_if_needed_for_node(*this, DOM::UpdateLayoutReason::HTMLElementOffsetWidth);
 
     // 1. If the element does not have any associated box return zero and terminate this algorithm.
-    auto const* layout_node = this->layout_node();
+    auto const* layout_node = principal_layout_node();
     if (!layout_node || !Painting::has_committed_box(*layout_node))
         return 0;
 
@@ -794,7 +796,7 @@ int HTMLElement::offset_height() const
     const_cast<DOM::Document&>(document()).update_layout_if_needed_for_node(*this, DOM::UpdateLayoutReason::HTMLElementOffsetHeight);
 
     // 1. If the element does not have any associated box return zero and terminate this algorithm.
-    auto const* layout_node = this->layout_node();
+    auto const* layout_node = principal_layout_node();
     if (!layout_node || !Painting::has_committed_box(*layout_node))
         return 0;
 

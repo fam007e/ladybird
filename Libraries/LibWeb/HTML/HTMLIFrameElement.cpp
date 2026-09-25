@@ -101,21 +101,23 @@ void HTMLIFrameElement::attribute_changed(Utf16FlyString const& name, Optional<U
 // https://html.spec.whatwg.org/multipage/iframe-embed-object.html#the-iframe-element:html-element-post-connection-steps
 void HTMLIFrameElement::post_connection()
 {
-    DOM::Document& document = as<DOM::Document>(shadow_including_root());
-
-    // NOTE: The check for "not fully active" is to prevent a crash on the dom/nodes/node-appendchild-crash.html WPT test.
-    if (!document.browsing_context() || !document.is_fully_active())
+    // 1. If insertedNode's node document's browsing context is null, then return.
+    if (document().browsing_context() == nullptr)
         return;
 
-    // 1. If insertedNode has a sandbox attribute, then parse the sandboxing directive given the attribute's
+    // AD-HOC: The check for "not fully active" is to prevent a crash on the dom/nodes/node-appendchild-crash.html WPT test.
+    if (!document().is_fully_active())
+        return;
+
+    // 2. If insertedNode has a sandbox attribute, then parse the sandboxing directive given the attribute's
     //    value and insertedNode's iframe sandboxing flag set.
     if (auto sandbox = attribute(AttributeNames::sandbox); sandbox.has_value())
         m_iframe_sandboxing_flag_set = parse_a_sandboxing_directive(sandbox->utf16_view());
 
-    // 2. Create a new child navigable for insertedNode.
+    // 3. Create a new child navigable for insertedNode.
     create_new_child_navigable();
 
-    // 3. Process the iframe attributes for insertedNode, with initialInsertion set to true.
+    // 4. Process the iframe attributes for insertedNode, with initialInsertion set to true.
     process_the_iframe_attributes(InitialInsertion::Yes);
 }
 
@@ -176,7 +178,7 @@ void HTMLIFrameElement::process_the_iframe_attributes(InitialInsertion initial_i
     }
 
     // 4. Let referrerPolicy be the current state of element's referrerpolicy content attribute.
-    auto referrer_policy = ReferrerPolicy::from_string(attribute(HTML::AttributeNames::referrerpolicy).value_or({})).value_or(ReferrerPolicy::ReferrerPolicy::EmptyString);
+    auto referrer_policy = ReferrerPolicy::from_string(get_attribute_ns({}, HTML::AttributeNames::referrerpolicy).value_or({})).value_or(ReferrerPolicy::ReferrerPolicy::EmptyString);
 
     // 5. Set element's current navigation was lazy loaded boolean to false.
     set_current_navigation_was_lazy_loaded(false);
@@ -376,7 +378,7 @@ ReferrerPolicy::ReferrerPolicy determine_iframe_element_referrer_policy(GC::Ptr<
     // 1. If embedder is an iframe element, then return embedder's referrerpolicy attribute's state's corresponding
     //    keyword.
     if (auto* iframe = as_if<HTMLIFrameElement>(embedder.ptr())) {
-        return ReferrerPolicy::from_string(iframe->attribute(HTML::AttributeNames::referrerpolicy).value_or({})).value_or(ReferrerPolicy::ReferrerPolicy::EmptyString);
+        return ReferrerPolicy::from_string(iframe->get_attribute_ns({}, HTML::AttributeNames::referrerpolicy).value_or({})).value_or(ReferrerPolicy::ReferrerPolicy::EmptyString);
     }
 
     // 2. Return the empty string.

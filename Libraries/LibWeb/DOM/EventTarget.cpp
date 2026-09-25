@@ -879,6 +879,33 @@ void EventTarget::deactivate_event_handler(Utf16FlyString const& name)
     handler_map.remove(event_handler_iterator);
 }
 
+// https://dom.spec.whatwg.org/#remove-all-event-listeners
+void EventTarget::remove_all_event_listeners()
+{
+    if (!m_data)
+        return;
+
+    // For each listener of eventTarget's event listener list, remove an event listener with eventTarget and listener.
+    while (!m_data->event_listener_list.is_empty())
+        remove_an_event_listener(*m_data->event_listener_list.first());
+}
+
+// https://html.spec.whatwg.org/multipage/webappapis.html#erase-all-event-listeners-and-handlers
+void EventTarget::erase_all_event_listeners_and_handlers()
+{
+    if (!m_data)
+        return;
+
+    // 1. If eventTarget has an associated event handler map, then for each name -> eventHandler of eventTarget's
+    //    associated event handler map, deactivate an event handler given eventTarget and name.
+    // NB: Deactivating an event handler removes it from the map, so collect the names up front.
+    for (auto const& name : m_data->event_handler_map.keys())
+        deactivate_event_handler(name);
+
+    // 2. Remove all event listeners given eventTarget.
+    remove_all_event_listeners();
+}
+
 // https://html.spec.whatwg.org/multipage/webappapis.html#the-event-handler-processing-algorithm
 JS::ThrowCompletionOr<void> EventTarget::process_event_handler_for_event(Utf16FlyString const& name, Event& event)
 {
@@ -1070,14 +1097,8 @@ bool EventTarget::dispatch_event(Event& event)
             return GC::Ptr<HTML::Window> { nullptr };
         }();
 
-        if (window) {
-            auto unsafe_shared_time = HighResolutionTime::unsafe_shared_current_time();
-            auto current_time = HighResolutionTime::relative_high_resolution_time(
-                unsafe_shared_time,
-                window->associated_document().relevant_settings_object().global_object());
-            window->set_last_activation_timestamp(current_time);
-            window->close_watcher_manager()->notify_about_user_activation();
-        }
+        if (window)
+            window->notify_about_user_activation();
     }
 
     return EventDispatcher::dispatch(*this, event);

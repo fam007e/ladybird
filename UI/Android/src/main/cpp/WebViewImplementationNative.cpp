@@ -52,11 +52,11 @@ void WebViewImplementationNative::initialize_client(WebView::ViewImplementation:
 
     auto new_client = bind_web_content_client();
 
-    m_client_state.client = new_client;
-    m_client_state.client->on_web_content_process_crash = [] {
+    new_client->on_web_content_process_crash = [] {
         warnln("WebContent crashed!");
         // FIXME: launch a new client
     };
+    new_client->register_view(0, *this);
 
     m_client_state.client_handle = MUST(Web::Crypto::generate_random_uuid());
     client().async_set_window_handle(0, m_client_state.client_handle);
@@ -100,21 +100,21 @@ void WebViewImplementationNative::set_zoom_level(double f)
     client().async_set_zoom_level(0, m_zoom_level);
 }
 
-void WebViewImplementationNative::mouse_event(Web::MouseEvent::Type event_type, float x, float y, float raw_x, float raw_y)
+void WebViewImplementationNative::mouse_event(Compositing::MouseEvent::Type event_type, float x, float y, float raw_x, float raw_y)
 {
     Gfx::IntPoint position = { x, y };
     Gfx::IntPoint screen_position = { raw_x, raw_y };
-    auto event = Web::MouseEvent {
+    auto event = Compositing::MouseEvent {
         event_type,
-        position.to_type<Web::DevicePixels>(),
-        screen_position.to_type<Web::DevicePixels>(),
-        Web::UIEvents::MouseButton::Primary,
-        Web::UIEvents::MouseButton::Primary,
-        Web::UIEvents::KeyModifier::Mod_None,
+        position.to_type<Compositing::DevicePixels>(),
+        screen_position.to_type<Compositing::DevicePixels>(),
+        Compositing::MouseButton::Primary,
+        Compositing::MouseButton::Primary,
+        Compositing::KeyModifier::Mod_None,
         0,
         0,
-        Web::WheelDeltaPrecision::Discrete,
-        Web::ScrollGesturePhase::None,
+        Compositing::WheelDeltaPrecision::Discrete,
+        Compositing::ScrollGesturePhase::None,
         0,
         nullptr
     };

@@ -26,7 +26,6 @@ namespace Media::FFmpeg {
 
 class MEDIA_API FFmpegDemuxer : public Demuxer {
 public:
-    static bool should_attempt(NonnullRefPtr<MediaStream> const&);
     static DecoderErrorOr<NonnullRefPtr<Demuxer>> from_stream(NonnullRefPtr<MediaStream> const&);
     static bool supports_container_mime_type(ContainerMimeType);
     static bool supports_codec_in_container(ContainerID, CodecID);
@@ -65,6 +64,8 @@ private:
     };
 
     struct TrackContext {
+        AK_ALLOC_WITH_KMALLOC;
+
         TrackContext(NonnullRefPtr<MediaStreamCursor>&& cursor, NonnullOwnPtr<FFmpegIOContext>&& io_context)
             : cursor(move(cursor))
             , io_context(move(io_context))
@@ -92,7 +93,7 @@ private:
 
     FFmpegDemuxer(NonnullRefPtr<MediaStream> const&);
 
-    static OwnPtr<ContainerNavigator> create_single_track_container_navigator(AVFormatContext&, AK::Duration, NonnullRefPtr<MediaStream> const&);
+    static OwnPtr<ContainerNavigator> create_single_track_container_navigator(AVFormatContext&, NonnullRefPtr<MediaStream> const&);
 
     void start_buffered_scan_thread(AVFormatContext&);
 

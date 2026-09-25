@@ -134,12 +134,12 @@ void PageClient::set_async_scrolling_enabled(bool enabled)
     s_async_scrolling_enabled = enabled;
 }
 
-GC::Ref<PageClient> PageClient::create(PageHost& page_host, Web::PageId id, Optional<Web::HTML::CrossProcessId> pending_root_navigable_id)
+GC::Ref<PageClient> PageClient::create(PageHost& page_host, Compositing::PageId id, Optional<Web::HTML::CrossProcessId> pending_root_navigable_id)
 {
     return GC::Heap::the().allocate<PageClient>(page_host, id, pending_root_navigable_id);
 }
 
-PageClient::PageClient(PageHost& owner, Web::PageId id, Optional<Web::HTML::CrossProcessId> pending_root_navigable_id)
+PageClient::PageClient(PageHost& owner, Compositing::PageId id, Optional<Web::HTML::CrossProcessId> pending_root_navigable_id)
     : m_owner(owner)
     , m_page(Web::Page::create(*this))
     , m_id(id)
@@ -172,6 +172,8 @@ void PageClient::visit_edges(JS::Cell::Visitor& visitor)
 
     if (m_webdriver)
         m_webdriver->visit_edges(visitor);
+    for (auto& pending_mouse_event : m_pending_webdriver_mouse_events)
+        visitor.visit(pending_mouse_event.value);
     if (m_web_ui)
         m_web_ui->visit_edges(visitor);
 }
@@ -267,6 +269,21 @@ void PageClient::request_close_of_remote_traversable(Web::HTML::RemoteNavigable&
     client().async_did_request_close_of_traversable(m_id, navigable.id(), source.id());
 }
 
+void PageClient::request_focusing_steps_for_remote_navigable(Web::HTML::RemoteNavigable& navigable, Web::HTML::FocusTrigger focus_trigger)
+{
+    client().async_did_request_focusing_steps_for_navigable(m_id, navigable.id(), focus_trigger);
+}
+
+void PageClient::request_window_focus_of_remote_navigable(Web::HTML::RemoteNavigable& navigable)
+{
+    client().async_did_request_window_focus_of_navigable(m_id, navigable.id());
+}
+
+void PageClient::request_set_opener_of_remote_navigable(Web::HTML::RemoteNavigable& navigable, Web::HTML::Navigable const& opener)
+{
+    client().async_did_request_set_opener_of_navigable(m_id, navigable.id(), opener.id());
+}
+
 void PageClient::navigate_navigable(Web::HTML::CrossProcessId navigable_id, Web::HTML::PreparedNavigationDescriptor navigation)
 {
     // A navigable the page represents without hosting its document is addressed by the page hosting it.
@@ -359,9 +376,9 @@ void PageClient::page_did_create_child_frame(Web::HTML::CrossProcessId parent_fr
     client().async_did_create_child_frame(m_id, parent_frame_id, frame_id, replicated_state);
 }
 
-void PageClient::page_did_update_child_frame_viewport(Web::HTML::CrossProcessId frame_id, Web::CSSPixelRect viewport_rect)
+void PageClient::page_did_update_child_frame_viewport(Web::HTML::CrossProcessId frame_id, Compositing::DevicePixelRect viewport_rect, Compositing::DevicePixelRect viewport_intersection)
 {
-    client().async_did_update_child_frame_viewport(m_id, frame_id, page().css_to_device_rect(viewport_rect), page().client().device_pixel_ratio());
+    client().async_did_update_child_frame_viewport(m_id, frame_id, viewport_rect, viewport_intersection, page().client().device_pixel_ratio());
 }
 
 void PageClient::page_did_destroy_child_frame(Web::HTML::CrossProcessId frame_id)
@@ -404,12 +421,12 @@ void PageClient::set_is_scripting_enabled(bool is_scripting_enabled)
     page().set_is_scripting_enabled(is_scripting_enabled);
 }
 
-void PageClient::set_window_position(Web::DevicePixelPoint position)
+void PageClient::set_window_position(Compositing::DevicePixelPoint position)
 {
     page().set_window_position(position);
 }
 
-void PageClient::set_window_size(Web::DevicePixelSize size)
+void PageClient::set_window_size(Compositing::DevicePixelSize size)
 {
     page().set_window_size(size);
 }
@@ -451,21 +468,21 @@ Queue<Web::QueuedInputEvent>& PageClient::input_event_queue()
     return client().input_event_queue();
 }
 
-void PageClient::did_handle_input_event(Web::PageId page_id, Web::InputEvent const& event)
+void PageClient::did_handle_input_event(Compositing::PageId page_id, Web::InputEvent const& event)
 {
     auto should_update_input_method_state = event.visit(
-        [](Web::KeyEvent const&) {
+        [](Compositing::KeyEvent const&) {
             return true;
         },
-        [](Web::MouseEvent const& mouse_event) {
+        [](Compositing::MouseEvent const& mouse_event) {
             switch (mouse_event.type) {
-            case Web::MouseEvent::Type::MouseDown:
-            case Web::MouseEvent::Type::MouseUp:
+            case Compositing::MouseEvent::Type::MouseDown:
+            case Compositing::MouseEvent::Type::MouseUp:
                 return true;
-            case Web::MouseEvent::Type::MouseMove:
-                return mouse_event.buttons != Web::UIEvents::MouseButton::None;
-            case Web::MouseEvent::Type::MouseLeave:
-            case Web::MouseEvent::Type::MouseWheel:
+            case Compositing::MouseEvent::Type::MouseMove:
+                return mouse_event.buttons != Compositing::MouseButton::None;
+            case Compositing::MouseEvent::Type::MouseLeave:
+            case Compositing::MouseEvent::Type::MouseWheel:
                 return false;
             }
             VERIFY_NOT_REACHED();
@@ -478,17 +495,22 @@ void PageClient::did_handle_input_event(Web::PageId page_id, Web::InputEvent con
         client().update_input_method_state(page_id);
 }
 
-void PageClient::report_finished_handling_input_event(Web::PageId page_id, Web::EventResult event_was_handled)
+void PageClient::report_finished_handling_input_event(Compositing::PageId page_id, u64 event_id, Web::EventResult event_was_handled)
 {
-    client().async_did_finish_handling_input_event(page_id, event_was_handled);
+    client().async_did_finish_handling_input_event(page_id, event_id, event_was_handled);
 }
 
-Web::Compositor::CompositorContextId PageClient::allocate_compositor_context_id(Web::Compositor::PagePresentationRegistration page_presentation_registration)
+void PageClient::forward_mouse_event_to_remote_navigable(Compositing::PageId page_id, Web::HTML::CrossProcessId navigable_id, Compositing::MouseEvent event)
+{
+    client().async_did_forward_mouse_event_to_child_frame(page_id, navigable_id, move(event));
+}
+
+Compositing::CompositorContextId PageClient::allocate_compositor_context_id(Compositing::PagePresentationRegistration page_presentation_registration)
 {
     return client().allocate_compositor_context_id(m_id, page_presentation_registration);
 }
 
-void PageClient::set_viewport(Web::DevicePixelSize const& size, double device_pixel_ratio)
+void PageClient::set_viewport(Compositing::DevicePixelSize const& size, double device_pixel_ratio)
 {
     auto invalidate = m_device_pixel_ratio != device_pixel_ratio
         ? Web::InvalidateDisplayList::PaintCommandsAndHitTestList
@@ -501,7 +523,7 @@ void PageClient::set_viewport(Web::DevicePixelSize const& size, double device_pi
     hurry_outstanding_rendering_opportunity();
 }
 
-void PageClient::set_hosted_root_viewport(Web::HTML::CrossProcessId navigable_id, Web::DevicePixelSize const& size, double device_pixel_ratio)
+void PageClient::set_hosted_root_viewport(Web::HTML::CrossProcessId navigable_id, Compositing::DevicePixelSize const& size, Compositing::DevicePixelRect const& viewport_intersection, double device_pixel_ratio)
 {
     auto* navigable = as_if<Web::HTML::LocalNavigable>(page().navigable_with_id(navigable_id).ptr());
     if (!navigable || !navigable->is_local_root())
@@ -514,6 +536,7 @@ void PageClient::set_hosted_root_viewport(Web::HTML::CrossProcessId navigable_id
     m_device_pixel_ratio = device_pixel_ratio;
 
     navigable->set_viewport_size(page().device_to_css_size(size), invalidate);
+    navigable->set_viewport_intersection(page().device_to_css_rect(viewport_intersection));
     hurry_outstanding_rendering_opportunity();
 }
 
@@ -553,7 +576,9 @@ bool PageClient::hosted_documents_are_hidden() const
 void PageClient::set_zoom_level(double zoom_level)
 {
     m_zoom_level = zoom_level;
-    page().local_traversable()->set_viewport_size(page().device_to_css_size(m_viewport_size), Web::InvalidateDisplayList::PaintCommandsAndHitTestList);
+    // A local root another page's document embeds is sized by that page again at the new zoom level.
+    if (page().has_local_traversable())
+        page().local_traversable()->set_viewport_size(page().device_to_css_size(m_viewport_size), Web::InvalidateDisplayList::PaintCommandsAndHitTestList);
 }
 
 void PageClient::request_frame()
@@ -831,7 +856,7 @@ void PageClient::page_did_request_exit_fullscreen()
     client().async_did_request_exit_fullscreen(m_id);
 }
 
-void PageClient::page_did_request_tooltip_override(Web::CSSPixelPoint position, ByteString const& title)
+void PageClient::page_did_request_tooltip_override(Compositing::CSSPixelPoint position, ByteString const& title)
 {
     auto device_position = page().css_to_device_point(position);
     client().async_did_request_tooltip_override(m_id, { device_position.x(), device_position.y() }, title);
@@ -880,7 +905,6 @@ void PageClient::page_did_request_external_url(URL::URL const& url, URL::Origin 
 void PageClient::page_did_create_new_document(Web::DOM::Document& document)
 {
     initialize_js_console(document);
-    apply_pending_geolocation_emulated_position();
 }
 
 void PageClient::page_did_change_active_document_in_top_level_browsing_context(Web::DOM::Document& document)
@@ -1014,54 +1038,38 @@ void PageClient::page_did_set_device_pixel_ratio_for_testing(double ratio)
     set_viewport(m_viewport_size, ratio);
 }
 
-void PageClient::page_did_request_context_menu(Web::CSSPixelPoint content_position, Web::ContextMenuForInputEventsTarget for_input_events_target)
+void PageClient::page_did_request_context_menu(Web::HTML::CrossProcessId local_root_id, Compositing::CSSPixelPoint content_position, Web::ContextMenuForInputEventsTarget for_input_events_target)
 {
-    client().async_did_request_context_menu(m_id, page().css_to_device_point(content_position).to_type<int>(), for_input_events_target);
+    client().async_did_request_context_menu(m_id, local_root_id, page().css_to_device_point(content_position).to_type<int>(), for_input_events_target);
 }
 
-void PageClient::page_did_request_link_context_menu(Web::CSSPixelPoint content_position, URL::URL const& url, ByteString const& target, unsigned modifiers)
+void PageClient::page_did_request_link_context_menu(Web::HTML::CrossProcessId local_root_id, Compositing::CSSPixelPoint content_position, URL::URL const& url, ByteString const& target, unsigned modifiers)
 {
-    client().async_did_request_link_context_menu(m_id, page().css_to_device_point(content_position).to_type<int>(), url, target, modifiers);
+    client().async_did_request_link_context_menu(m_id, local_root_id, page().css_to_device_point(content_position).to_type<int>(), url, target, modifiers);
 }
 
-void PageClient::page_did_request_image_context_menu(Web::CSSPixelPoint content_position, URL::URL const& url, ByteString const& target, unsigned modifiers, Optional<Gfx::Bitmap const*> bitmap_pointer)
+void PageClient::page_did_request_image_context_menu(Web::HTML::CrossProcessId local_root_id, Compositing::CSSPixelPoint content_position, URL::URL const& url, ByteString const& target, unsigned modifiers, Optional<Gfx::Bitmap const*> bitmap_pointer)
 {
     Optional<Gfx::ShareableBitmap> bitmap;
     if (bitmap_pointer.has_value() && bitmap_pointer.value())
         bitmap = bitmap_pointer.value()->to_shareable_bitmap();
 
-    client().async_did_request_image_context_menu(m_id, page().css_to_device_point(content_position).to_type<int>(), url, target, modifiers, bitmap);
+    client().async_did_request_image_context_menu(m_id, local_root_id, page().css_to_device_point(content_position).to_type<int>(), url, target, modifiers, bitmap);
 }
 
-void PageClient::page_did_request_media_context_menu(Web::CSSPixelPoint content_position, ByteString const& target, unsigned modifiers, Web::Page::MediaContextMenu const& menu)
+void PageClient::page_did_request_media_context_menu(Web::HTML::CrossProcessId local_root_id, Compositing::CSSPixelPoint content_position, ByteString const& target, unsigned modifiers, Web::Page::MediaContextMenu const& menu)
 {
-    client().async_did_request_media_context_menu(m_id, page().css_to_device_point(content_position).to_type<int>(), target, modifiers, menu);
+    client().async_did_request_media_context_menu(m_id, local_root_id, page().css_to_device_point(content_position).to_type<int>(), target, modifiers, menu);
 }
 
 void PageClient::set_geolocation_emulated_position(WebView::GeolocationPositionData const& position, Optional<u16> error_code)
 {
-    m_pending_geolocation_emulated_position = PendingGeolocationEmulatedPosition {
-        .position = position,
-        .error_code = error_code,
-    };
-    apply_pending_geolocation_emulated_position();
-}
-
-void PageClient::apply_pending_geolocation_emulated_position()
-{
-    if (!m_pending_geolocation_emulated_position.has_value() || !page().has_local_traversable())
-        return;
-
-    auto const& pending = *m_pending_geolocation_emulated_position;
-    auto const& position = pending.position;
-    auto& traversable = as<Web::HTML::LocalTraversableNavigable>(*page().top_level_traversable());
-
-    if (pending.error_code.has_value())
-        traversable.set_emulated_position_data(geolocation_position_error_code_from_ipc(*pending.error_code));
+    if (error_code.has_value())
+        page().set_emulated_position_data(geolocation_position_error_code_from_ipc(*error_code));
     else if (auto coordinates = geolocation_coordinates_from_ipc(position); coordinates.has_value())
-        traversable.set_emulated_position_data(*coordinates);
+        page().set_emulated_position_data(*coordinates);
     else
-        traversable.set_emulated_position_data(Empty {});
+        page().set_emulated_position_data(Empty {});
 }
 
 void PageClient::geolocation_position_response(u64 request_id, WebView::GeolocationPositionData const& position, Optional<u16> error_code)
@@ -1198,13 +1206,13 @@ void PageClient::page_did_receive_document_cookie_version_buffer(Core::Anonymous
     m_document_cookie_version_buffer = move(document_cookie_version_buffer);
 }
 
-void PageClient::page_did_request_document_cookie_version_index(Web::UniqueNodeID document_id, String const& domain)
+void PageClient::page_did_request_document_cookie_version_index(Compositing::UniqueNodeID document_id, String const& domain)
 {
     // FIXME: Support transferring DistinctNumeric over IPC.
     client().async_did_request_document_cookie_version_index(m_id, document_id.value(), domain);
 }
 
-void PageClient::page_did_receive_document_cookie_version_index(Web::UniqueNodeID document_id, Core::SharedVersionIndex document_index)
+void PageClient::page_did_receive_document_cookie_version_index(Compositing::UniqueNodeID document_id, Core::SharedVersionIndex document_index)
 {
     if (auto* document = as_if<Web::DOM::Document>(Web::DOM::Node::from_unique_id(document_id)))
         document->set_cookie_version_index(document_index);
@@ -1318,9 +1326,10 @@ void PageClient::page_did_simulate_worker_request_server_connection_loss()
     }
 }
 
-void PageClient::page_did_store_hsts_policy(String const& domain, HTTP::HSTS::ParsedHSTSPolicy const& policy)
+void PageClient::page_did_store_hsts_policy_for_testing(String const& domain, HTTP::HSTS::ParsedHSTSPolicy const& policy)
 {
-    client().async_did_store_hsts_policy(domain, policy);
+    if (auto* test_connection = client().test_connection())
+        test_connection->did_store_hsts_policy_for_testing(domain, policy);
 }
 
 bool PageClient::page_did_is_known_hsts_host(String const& domain)
@@ -1492,6 +1501,34 @@ void PageClient::page_did_set_session_history_entry_document_state_reload_pendin
     client().async_did_set_session_history_entry_document_state_reload_pending(m_id, navigable_id, navigation_api_key, reload_pending);
 }
 
+void PageClient::page_did_request_set_system_focus(bool has_system_focus)
+{
+    client().async_did_request_set_system_focus(m_id, has_system_focus);
+}
+
+void PageClient::page_did_change_focused_navigable(Web::HTML::CrossProcessId navigable_id)
+{
+    client().async_did_change_focused_navigable(m_id, navigable_id);
+}
+
+void PageClient::page_did_request_key_event_for_testing(Compositing::KeyEvent event)
+{
+    client().async_did_request_key_event_for_testing(m_id, move(event));
+}
+
+void PageClient::page_did_request_webdriver_mouse_event(Web::HTML::CrossProcessId local_root_id, Compositing::MouseEvent event, GC::Ref<GC::Function<void()>> on_handled)
+{
+    auto request_id = m_next_webdriver_mouse_event_request_id++;
+    m_pending_webdriver_mouse_events.set(request_id, on_handled);
+    client().async_did_request_webdriver_mouse_event(m_id, request_id, local_root_id, move(event));
+}
+
+void PageClient::did_handle_webdriver_mouse_event(u64 request_id)
+{
+    if (auto on_handled = m_pending_webdriver_mouse_events.take(request_id); on_handled.has_value())
+        (*on_handled)->function()();
+}
+
 void PageClient::page_did_request_set_system_visibility_state(Web::HTML::VisibilityState visibility_state)
 {
     client().async_did_request_set_system_visibility_state(m_id, visibility_state);
@@ -1515,6 +1552,26 @@ void PageClient::page_did_request_remote_document_abort(Web::HTML::CrossProcessI
 void PageClient::page_did_request_remote_document_unfullscreen(Web::HTML::CrossProcessId navigable_id)
 {
     client().async_request_navigable_document_unfullscreen(m_id, navigable_id);
+}
+
+void PageClient::page_did_request_container_fullscreen(Web::HTML::CrossProcessId navigable_id, Web::HTML::CrossProcessId requesting_navigable_id, Web::Fullscreen::RequestType request_type)
+{
+    client().async_request_navigable_container_fullscreen(m_id, navigable_id, requesting_navigable_id, request_type);
+}
+
+void PageClient::page_did_request_container_unfullscreen(Web::HTML::CrossProcessId navigable_id)
+{
+    client().async_request_navigable_container_unfullscreen(m_id, navigable_id);
+}
+
+void PageClient::page_did_complete_container_unfullscreen(Web::HTML::CrossProcessId requesting_navigable_id)
+{
+    client().async_navigable_container_unfullscreen_complete(m_id, requesting_navigable_id);
+}
+
+void PageClient::page_did_request_fully_exit_fullscreen()
+{
+    client().async_request_fully_exit_fullscreen(m_id);
 }
 
 void PageClient::page_did_request_unload_check(Web::HTML::CrossProcessId navigable_id, GC::Ref<GC::Function<void(Web::HTML::CheckIfUnloadingIsCanceledResult)>> on_complete)
@@ -1643,9 +1700,9 @@ void PageClient::page_did_request_file_picker(Web::HTML::FileFilter const& accep
     client().async_did_request_file_picker(m_id, accepted_file_types, allow_multiple_files);
 }
 
-void PageClient::page_did_request_select_dropdown(Web::CSSPixelPoint content_position, Web::CSSPixels minimum_width, Vector<Web::HTML::SelectItem> items)
+void PageClient::page_did_request_select_dropdown(Web::HTML::CrossProcessId local_root_id, Compositing::CSSPixelPoint content_position, Compositing::CSSPixels minimum_width, Vector<Web::HTML::SelectItem> items)
 {
-    client().async_did_request_select_dropdown(m_id, page().css_to_device_point(content_position).to_type<int>(), minimum_width * device_pixels_per_css_pixel(), items);
+    client().async_did_request_select_dropdown(m_id, local_root_id, page().css_to_device_point(content_position).to_type<int>(), minimum_width * device_pixels_per_css_pixel(), items);
 }
 
 void PageClient::page_did_change_theme_color(Gfx::Color color)
@@ -1725,10 +1782,10 @@ void PageClient::page_did_mutate_dom(Utf16FlyString const& type, Web::DOM::Node 
         auto const& character_data = as<Web::DOM::CharacterData>(target);
         mutation = WebView::CharacterDataMutation { character_data.data().to_utf8_but_should_be_ported_to_utf16() };
     } else if (type == Web::DOM::MutationType::childList) {
-        Vector<Web::UniqueNodeID> added;
+        Vector<Compositing::UniqueNodeID> added;
         added.ensure_capacity(added_nodes.length());
 
-        Vector<Web::UniqueNodeID> removed;
+        Vector<Compositing::UniqueNodeID> removed;
         removed.ensure_capacity(removed_nodes.length());
 
         for (auto i = 0u; i < added_nodes.length(); ++i)
@@ -1789,9 +1846,14 @@ WebDriverConnection& PageClient::ensure_webdriver_session()
     return *m_webdriver;
 }
 
-void PageClient::run_webdriver_command(u64 command_id, String const& name, JsonValue payload, Vector<String> arguments)
+void PageClient::run_webdriver_command(u64 command_id, Optional<Web::HTML::CrossProcessId> navigable_id, String const& name, JsonValue payload, Vector<String> arguments)
 {
-    ensure_webdriver_session().run_command(command_id, name, move(payload), move(arguments));
+    ensure_webdriver_session().run_command(command_id, navigable_id, name, move(payload), move(arguments));
+}
+
+void PageClient::webdriver_did_set_current_browsing_context(u64 command_id, Web::HTML::CrossProcessId navigable_id)
+{
+    client().async_webdriver_did_set_current_browsing_context(m_id, command_id, navigable_id);
 }
 
 void PageClient::webdriver_command_complete(u64 command_id, Web::WebDriver::Response response)
@@ -2084,7 +2146,7 @@ Web::Compositor::CompositorHost const* PageClient::compositor_host() const
     return m_owner.compositor_host();
 }
 
-void PageClient::queue_screenshot_task(Optional<Web::UniqueNodeID> node_id)
+void PageClient::queue_screenshot_task(Optional<Compositing::UniqueNodeID> node_id)
 {
     page().queue_screenshot_task(node_id);
 }

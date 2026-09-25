@@ -4,16 +4,15 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+use crate::css::easing::FfiEasingDescriptor;
 use crate::css::ffi_support::FfiUtf16View;
 use crate::layout::used_values;
 use crate::layout::used_values::OptionalCssPixelRect;
-use crate::painting::display_list::commands::OptionalF32;
 use libgfx_rust::filter::Filter;
-use libgfx_rust::{
-    Color, CompositingAndBlendingOperator, FloatMatrix4x4, FloatPoint, FloatRect, FloatSize, IntRect,
-    InterpolationColorSpace,
-};
+use libgfx_rust::{Color, CompositingAndBlendingOperator, IntRect, InterpolationColorSpace};
 use std::ffi::c_void;
+
+pub use crate::painting::visual_context::ffi_types::*;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -48,17 +47,6 @@ pub struct FfiVisualContextUpdateOutcome {
     pub structural_epoch_changed: bool,
     pub requires_display_list_recording: bool,
     pub structural_epoch: u64,
-}
-
-#[derive(Clone, Copy, Debug)]
-#[repr(C)]
-pub struct FfiVisualContextTreeInputs {
-    pub device_pixels_per_css_pixel: f64,
-    pub visual_viewport_offset_x: f64,
-    pub visual_viewport_offset_y: f64,
-    pub visual_viewport_scale: f64,
-    pub viewport_wheel_overflow_x: u8,
-    pub viewport_wheel_overflow_y: u8,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -182,64 +170,112 @@ impl FfiVisualContextHostCallbacks {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-#[repr(C)]
-pub struct FfiVisualViewportTransform {
-    pub matrix: FloatMatrix4x4,
-    pub origin: FloatPoint,
-}
-
-#[derive(Clone, Copy, Debug)]
-#[repr(C)]
-pub struct FfiEffectOpacitySample {
-    pub effect: u32,
-    pub opacity: f32,
-}
-
-#[derive(Clone, Copy, Debug)]
-#[repr(C)]
-pub struct FfiEffectBackgroundColorSample {
-    pub effect: u32,
-    pub color: libgfx_rust::Color,
-}
-
-#[derive(Clone, Copy, Debug)]
+/// Whether a keyframe gives a property a value of its own, takes the target's underlying style
+/// for it, or leaves it out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
-pub enum FfiVisualAnimationTargetKind {
-    Opacity,
-    BackgroundColor,
-    Filter,
-    Transform,
+pub enum FfiCompositorKeyframeValueState {
+    Absent,
+    UsesUnderlyingStyle,
+    Present,
 }
 
+/// One keyframe of an effect as the compositor animation builder reads it. The values themselves
+/// are resolved through the host on demand; the keyframe only says which properties it carries.
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
-pub struct FfiEffectFilterSample {
-    pub effect: u32,
-    pub filter_bytes: *const u8,
-    pub filter_size: usize,
+pub struct FfiCompositorAnimationKeyframe {
+    pub offset: f64,
+    pub easing: FfiEasingDescriptor,
+    /// An easing the main thread could not describe keeps the effect off the compositor.
+    pub easing_is_supported: bool,
+    pub composite_is_replace: bool,
+    pub opacity: FfiCompositorKeyframeValueState,
+    pub background_color: FfiCompositorKeyframeValueState,
+    pub filter: FfiCompositorKeyframeValueState,
+    pub translate: FfiCompositorKeyframeValueState,
+    pub rotate: FfiCompositorKeyframeValueState,
+    pub scale: FfiCompositorKeyframeValueState,
+    pub transform: FfiCompositorKeyframeValueState,
 }
 
+/// The timing of an effect at the moment the main thread anchored it to the monotonic clock.
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
-pub struct FfiSpatialTransformSample {
-    pub spatial: u32,
-    pub matrix: FloatMatrix4x4,
+pub struct FfiCompositorAnimationTiming {
+    pub monotonic_time_at_anchor_ns: i64,
+    pub local_time_at_anchor_ms: f64,
+    pub playback_rate: f64,
+    pub start_delay_ms: f64,
+    pub iteration_duration_ms: f64,
+    pub iteration_count: f64,
+    pub iteration_start: f64,
+    pub playback_direction: FfiVisualAnimationPlaybackDirection,
+    pub fill_mode: FfiVisualAnimationFillMode,
+    pub easing: FfiEasingDescriptor,
 }
 
+pub const TARGETED_TRANSFORM_PROPERTY_TRANSLATE: u8 = 1;
+pub const TARGETED_TRANSFORM_PROPERTY_ROTATE: u8 = 2;
+pub const TARGETED_TRANSFORM_PROPERTY_SCALE: u8 = 4;
+pub const TARGETED_TRANSFORM_PROPERTY_TRANSFORM: u8 = 8;
+
+/// What the builder needs from an effect to build the compositor animation of one target kind, once
+/// the main thread has found the effect eligible.
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
-pub struct FfiTestStickyConstraints {
-    pub scroller: u32,
-    pub has_parent_sticky: bool,
-    pub parent_sticky: u32,
-    pub position_relative_to_scroller: FloatPoint,
-    pub border_box_size: FloatSize,
-    pub scrollport_size: FloatSize,
-    pub containing_block_region: FloatRect,
-    pub needs_parent_offset_adjustment: bool,
-    pub inset_top: OptionalF32,
-    pub inset_right: OptionalF32,
-    pub inset_bottom: OptionalF32,
-    pub inset_left: OptionalF32,
+pub struct FfiCompositorAnimationRequest {
+    pub target_kind: FfiVisualAnimationTargetKind,
+    /// The target's box, whose visual context nodes the animation drives.
+    pub layout_node: crate::layout::node_data::NodeSlotId,
+    pub timing: FfiCompositorAnimationTiming,
+    pub keyframes: *const FfiCompositorAnimationKeyframe,
+    pub keyframe_count: usize,
+    /// The identity of the effect's keyframe set and the versions of the style it resolves against;
+    /// the builder keeps the values it lowered while these stay the same.
+    pub key_frame_set_identity: u64,
+    pub target_style_generation: u64,
+    pub style_environment_version: u64,
+    /// The box transform percentages resolve against, in CSS pixels; zero for the other kinds.
+    pub reference_box_width: f32,
+    pub reference_box_height: f32,
+    pub device_pixels_per_css_pixel: f32,
+    /// The transform-family properties the effect targets, as TARGETED_TRANSFORM_PROPERTY flags.
+    pub targeted_transform_properties: u8,
+    /// Whether the effect targets the transform property and nothing else.
+    pub targets_only_transform: bool,
+}
+
+/// What the builder asks the main thread for while lowering keyframe values.
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+pub struct FfiCompositorAnimationHost {
+    pub context: *mut std::ffi::c_void,
+    /// The keyframe's value of the property, resolved and absolutized for the target, as a
+    /// retained style value; null when it resolves to nothing usable. With
+    /// `uses_underlying_style` set, the target's computed value without animations instead.
+    pub resolved_keyframe_value: unsafe extern "C" fn(
+        context: *mut std::ffi::c_void,
+        keyframe_index: usize,
+        property_id: u16,
+        uses_underlying_style: bool,
+    ) -> *const std::ffi::c_void,
+    /// The color a resolved color value names for the target; false when it names none.
+    pub resolve_color: unsafe extern "C" fn(
+        context: *mut std::ffi::c_void,
+        value: *const std::ffi::c_void,
+        color: *mut libgfx_rust::Color,
+    ) -> bool,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+#[repr(C)]
+pub struct FfiCompositorAnimationBuildOutcome {
+    /// The animation is built and waits with the effect's other pending animations.
+    pub built: bool,
+    /// The animation was valid but the target owns no node of the kind it drives yet.
+    pub missing_visual_context_node: bool,
+    /// Whether a transform animation's keyframes only ever translate horizontally, once known.
+    pub only_translates_horizontally_is_known: bool,
+    pub only_translates_horizontally: bool,
 }

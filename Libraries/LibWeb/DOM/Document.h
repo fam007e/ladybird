@@ -23,6 +23,7 @@
 #include <AK/Utf16View.h>
 #include <AK/Vector.h>
 #include <AK/WeakPtr.h>
+#include <LibCompositing/Scrolling/AsyncScrollingState.h>
 #include <LibCore/Forward.h>
 #include <LibCore/SharedVersion.h>
 #include <LibGC/WeakHashSet.h>
@@ -36,7 +37,6 @@
 #include <LibWeb/CSS/PreferredColorScheme.h>
 #include <LibWeb/CSS/ScrollStateContainerQuery.h>
 #include <LibWeb/CSS/StyleScope.h>
-#include <LibWeb/Compositor/AsyncScrollingState.h>
 #include <LibWeb/DOM/AnchorNameMap.h>
 #include <LibWeb/DOM/HoverEventData.h>
 #include <LibWeb/DOM/ParentNode.h>
@@ -46,6 +46,7 @@
 #include <LibWeb/Export.h>
 #include <LibWeb/Fullscreen/FullscreenRequestType.h>
 #include <LibWeb/HTML/CrossOrigin/OpenerPolicy.h>
+#include <LibWeb/HTML/CrossProcessId.h>
 #include <LibWeb/HTML/DocumentReadyState.h>
 #include <LibWeb/HTML/Focus.h>
 #include <LibWeb/HTML/GlobalEventHandlers.h>
@@ -186,11 +187,9 @@ enum class UpdateLayoutReason {
 
 [[nodiscard]] Utf16View to_string(UpdateLayoutReason);
 
-#define ENUMERATE_PARTIAL_RELAYOUT_ESCAPE_REASONS(X)       \
-    X(AnchorNamesUnregisteredByElementRemoval)             \
-    X(AnchorNamesUnregisteredByStyleChange)                \
-    X(ContainingBlockEstablishmentChangedByKeyframeEffect) \
-    X(ContainingBlockEstablishmentChangedByStyleChange)    \
+#define ENUMERATE_PARTIAL_RELAYOUT_ESCAPE_REASONS(X) \
+    X(AnchorNamesUnregisteredByElementRemoval)       \
+    X(AnchorNamesUnregisteredByStyleChange)          \
     X(ViewportPropagationSourceChangedByStyleChange)
 
 enum class PartialRelayoutEscapeReason {
@@ -256,8 +255,6 @@ class WEB_API Document
     GC_DECLARE_ALLOCATOR(Document);
 
 public:
-    static constexpr bool OVERRIDES_FINALIZE = true;
-
     enum class Type {
         XML,
         HTML
@@ -482,6 +479,7 @@ public:
     bool compositor_animation_observation_timer_is_active() const;
     void throttled_animation_visibility_changed();
     void invalidate_style_for_viewport_change();
+    void add_element_with_viewport_dependent_style(Element& element) { m_elements_with_viewport_dependent_style.set(element); }
     bool suppresses_attribute_style_invalidation() const { return m_suppresses_attribute_style_invalidation; }
     void set_suppresses_attribute_style_invalidation(bool suppresses) { m_suppresses_attribute_style_invalidation = suppresses; }
     enum class StyleUpdateMode : u8 {
@@ -532,9 +530,9 @@ public:
 
     Painting::DocumentPaintState& paint_state();
     Painting::DocumentPaintState const& paint_state() const;
-    Painting::AccumulatedVisualContextTree visual_context_tree() const;
+    Compositing::AccumulatedVisualContextTree visual_context_tree() const;
     u64 visual_context_tree_structural_epoch() const;
-    Painting::ScrollStateSnapshot const& scroll_state_snapshot() const;
+    Compositing::ScrollStateSnapshot const& scroll_state_snapshot() const;
 
     GC::Ref<NodeList> get_elements_by_name(Utf16View);
 
@@ -1186,8 +1184,8 @@ public:
     void schedule_accumulated_visual_context_update(Element&, AccumulatedVisualContextUpdateScope);
     void schedule_accumulated_visual_context_update(Layout::Node const&, AccumulatedVisualContextUpdateScope);
 
-    Painting::SnappedAreas const& snapped_areas_of_scroll_container(Compositor::AsyncScrollNodeStableID const&) const;
-    void set_snapped_areas_of_scroll_container(Compositor::AsyncScrollNodeStableID const&, Painting::SnappedAreas);
+    Compositing::SnappedAreas const& snapped_areas_of_scroll_container(Compositing::AsyncScrollNodeStableID const&) const;
+    void set_snapped_areas_of_scroll_container(Compositing::AsyncScrollNodeStableID const&, Compositing::SnappedAreas);
     void forget_snapped_areas_of_scroll_container(Layout::Node const&);
 
     void schedule_list_item_renumber(Element& list_owner);
@@ -1295,7 +1293,7 @@ public:
         set_needs_repaint(should_invalidate_display_list);
     }
 
-    RefPtr<Painting::DisplayList> record_display_list(HTML::PaintConfig, Painting::DisplayListResourceStorage&, Painting::PaintCommandCacheMode);
+    RefPtr<Compositing::DisplayList> record_display_list(HTML::PaintConfig, Compositing::DisplayListResourceStorage&, Painting::PaintCommandCacheMode);
     Painting::HitTestDisplayList const* hit_test_display_list() const { return m_hit_test_display_list.ptr(); }
     Painting::HitTestDisplayList const* ensure_hit_test_display_list();
     Optional<Painting::HitTestResult> hit_test(CSSPixelPoint);
@@ -1431,7 +1429,7 @@ public:
     bool fullscreen_enabled() const;
 
     void fully_exit_fullscreen();
-    void exit_fullscreen(GC::Ptr<WebIDL::Promise>);
+    void exit_fullscreen(GC::Ptr<WebIDL::Promise>, Optional<HTML::CrossProcessId> requesting_navigable_id = {});
     void webkit_exit_fullscreen();
 
     void unfullscreen_element(GC::Ref<Element> element);
@@ -1505,7 +1503,7 @@ private:
     virtual void finalize() override final;
 
     void tear_down_layout_tree_for_inactive_document();
-    void set_layout_root(Layout::RustFFI::NodeSlotId viewport_slot);
+    void set_layout_root(Compositing::RustFFI::NodeSlotId viewport_slot);
     void tear_down_layout_tree();
     void process_pending_top_layer_layout_changes();
 
@@ -1735,6 +1733,7 @@ private:
     bool m_has_completed_style_update { false };
     bool m_style_engine_tracks_tree { false };
     GC::WeakHashSet<Element> m_elements_with_dirty_style_attributes;
+    GC::WeakHashSet<Element> m_elements_with_viewport_dependent_style;
     bool m_suppresses_attribute_style_invalidation { false };
     HashTable<GC::Ref<Element>> m_query_containers_needing_container_query_evaluation_after_layout;
     CSS::ScrollStateQueryContainers m_scroll_state_query_containers;
@@ -1920,7 +1919,7 @@ private:
 
     bool m_needs_accumulated_visual_contexts_update { false };
 
-    HashMap<Compositor::AsyncScrollNodeStableID, Painting::SnappedAreas> m_scroll_container_snapped_areas;
+    HashMap<Compositing::AsyncScrollNodeStableID, Compositing::SnappedAreas> m_scroll_container_snapped_areas;
     Vector<WeakPtr<Layout::Node const>> m_scroll_snap_containers;
     bool m_needs_scroll_container_resnap { false };
     bool m_may_have_scroll_snap_areas { false };

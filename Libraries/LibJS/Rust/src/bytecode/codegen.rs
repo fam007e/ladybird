@@ -683,10 +683,12 @@ fn generate_function_expression(
             .unwrap_or_else(|| generator.add_constant_undefined());
         let new_env = generator.allocate_register();
         generator.start_boundary(BlockBoundaryType::LeaveLexicalEnvironment);
+        let shape_cache = generator.next_environment_shape_cache();
         generator.emit(Instruction::CreateLexicalEnvironment {
             dst: new_env.operand(),
             parent: parent.operand(),
-            capacity: 0,
+            capacity: 1,
+            shape_cache,
             is_catch_environment: false,
         });
         generator.push_static_lexical_environment(new_env);
@@ -2531,7 +2533,7 @@ fn generate_for_statement(
 
             // begin_variable_scope: CreateLexicalEnvironment + boundary
             generator.start_boundary(BlockBoundaryType::LeaveLexicalEnvironment);
-            generator.push_new_lexical_environment(0);
+            generator.push_new_lexical_environment(u32_from_usize(non_local_names.len()));
 
             for (name, _) in &non_local_names {
                 let id = generator.intern_identifier(name);
@@ -2682,7 +2684,7 @@ fn emit_per_iteration_bindings(generator: &mut Generator, bindings: &[Utf16Strin
 
     // Push new environment (begin_variable_scope).
     generator.start_boundary(BlockBoundaryType::LeaveLexicalEnvironment);
-    generator.push_new_lexical_environment(0);
+    generator.push_new_lexical_environment(u32_from_usize(saved.len()));
 
     // Re-create variables and initialize from saved values.
     for (reg, id) in &saved {
@@ -2877,7 +2879,8 @@ fn emit_block_declaration_instantiation(generator: &mut Generator, scope: &Scope
         return false;
     }
 
-    let new_env = generator.push_new_lexical_environment(0);
+    let capacity = count_lexical_declarations_for_block(scope.children.iter(), &generator.arena);
+    let new_env = generator.push_new_lexical_environment(capacity);
 
     emit_lexical_declarations_for_block(generator, &new_env, scope.children.iter());
 
@@ -5415,7 +5418,8 @@ fn emit_switch_block_declaration_instantiation(generator: &mut Generator, data: 
         return false;
     }
 
-    let new_env = generator.push_new_lexical_environment(0);
+    let capacity = count_lexical_declarations_for_block(all_children.iter().copied(), &generator.arena);
+    let new_env = generator.push_new_lexical_environment(capacity);
 
     emit_lexical_declarations_for_block(generator, &new_env, all_children.iter().copied());
 
@@ -6258,12 +6262,16 @@ fn generate_class_expression(
     };
 
     // Step 2: Save parent environment, create class lexical environment.
+    let has_class_binding = data.name.is_some() || lhs_name.is_none();
     let parent_env = generator.current_lexical_environment();
     let class_env = generator.allocate_register();
+    let shape_cache = generator.next_environment_shape_cache();
+    // An anonymous class binds an empty name, which an environment shape cannot hold.
     generator.emit(Instruction::CreateLexicalEnvironment {
         dst: class_env.operand(),
         parent: parent_env.operand(),
-        capacity: 0,
+        capacity: if data.name.is_some() { 1 } else { 0 },
+        shape_cache,
         is_catch_environment: false,
     });
     generator.push_static_lexical_environment(class_env.clone());
@@ -6273,7 +6281,7 @@ fn generate_class_expression(
     //   Perform ! _classEnv_.CreateImmutableBinding(_classBinding_, *true*).
     // Only emit when the class has a name, or when there's no lhs_name
     // (skip this for anonymous classes with lhs_name).
-    if data.name.is_some() || lhs_name.is_none() {
+    if has_class_binding {
         let name = if let Some(name_ident_id) = data.name {
             generator.arena.name_of(name_ident_id).clone()
         } else {
@@ -6781,7 +6789,7 @@ fn create_for_in_of_lexical_env(generator: &mut Generator, lhs: &ForInOfLhs) -> 
         }
     }
 
-    generator.push_new_lexical_environment(0);
+    generator.push_new_lexical_environment(u32_from_usize(binding_names.len()));
 
     // Create variable bindings in the new environment.
     for (name, _) in &binding_names {
@@ -6814,7 +6822,7 @@ fn enter_for_in_of_head_tdz(generator: &mut Generator, lhs: &ForInOfLhs) -> bool
             collect_target_names(&declaration.target, &mut names, &generator.arena);
         }
         if !names.is_empty() {
-            generator.push_new_lexical_environment(0);
+            generator.push_new_lexical_environment(u32_from_usize(names.len()));
             for (name, _) in &names {
                 let id = generator.intern_identifier(name);
                 generator.emit(Instruction::CreateVariable {
@@ -6889,42 +6897,45 @@ fn generate_for_in_statement(
     // Create TDZ for lexical declarations before evaluating the RHS expression.
     let entered_tdz = enter_for_in_of_head_tdz(generator, lhs);
 
-    // Evaluate RHS into `object`, allocate the internal property iterator
-    // register, emit the null/undefined check + GetObjectPropertyIterator,
-    // then let `object` go out of scope so its register is freed before the
-    // loop body.
-    let iterator_object = {
-        let object = generate_expression_or_undefined(rhs, generator, None);
-        if entered_tdz {
-            leave_for_in_of_head_tdz(generator);
-        }
+    // Evaluate RHS into `receiver`. The receiver, its flattened key snapshot, and the cursor all
+    // outlive the loop body: the next op revalidates against the live receiver and advances the
+    // cursor in place. Keeping this state in registers instead of a heap iterator object means
+    // nothing enumeration-internal can be observed as a script value.
+    let source = generate_expression_or_undefined(rhs, generator, None);
+    if entered_tdz {
+        leave_for_in_of_head_tdz(generator);
+    }
 
-        let iterator_object = generator.allocate_register();
+    let receiver = generator.allocate_register();
+    let keys = generator.allocate_register();
+    let cursor = generator.allocate_register();
 
-        // Check for null/undefined
-        let nullish_block = generator.make_block();
-        let continue_block = generator.make_block();
-        generator.emit(Instruction::JumpNullish {
-            condition: object.operand(),
-            true_target: nullish_block,
-            false_target: continue_block,
-        });
+    // Check for null/undefined
+    let nullish_block = generator.make_block();
+    let continue_block = generator.make_block();
+    generator.emit(Instruction::JumpNullish {
+        condition: source.operand(),
+        true_target: nullish_block,
+        false_target: continue_block,
+    });
 
-        generator.switch_to_basic_block(nullish_block);
-        generator.emit(Instruction::Jump { target: end_block });
+    generator.switch_to_basic_block(nullish_block);
+    generator.emit(Instruction::Jump { target: end_block });
 
-        generator.switch_to_basic_block(continue_block);
+    generator.switch_to_basic_block(continue_block);
 
-        // Get property iterator
-        let cache = generator.next_object_property_iterator_cache();
-        generator.emit(Instruction::GetObjectPropertyIterator {
-            dst_iterator: iterator_object.operand(),
-            object: object.operand(),
-            cache,
-        });
+    // Snapshot the enumerable keys and start the cursor at the first one. GetObjectPropertyIterator
+    // also writes back the ToObject'd receiver, which is what the next op enumerates against.
+    let cache = generator.next_object_property_iterator_cache();
+    generator.emit(Instruction::GetObjectPropertyIterator {
+        dst_keys: keys.operand(),
+        dst_receiver: receiver.operand(),
+        object: source.operand(),
+        cache,
+    });
+    let zero = generator.add_constant_i32(0);
+    generator.emit_mov(&cursor, &zero);
 
-        iterator_object
-    };
     // Body evaluation: completion, then jump to update block.
     let completion = generator.allocate_completion_register();
 
@@ -6937,7 +6948,9 @@ fn generate_for_in_statement(
     generator.emit(Instruction::ObjectPropertyIteratorNext {
         dst_value: next_value.operand(),
         dst_done: done.operand(),
-        iterator_object: iterator_object.operand(),
+        receiver: receiver.operand(),
+        keys: keys.operand(),
+        cursor: cursor.operand(),
     });
 
     let loop_continue_block = generator.make_block();
@@ -8632,9 +8645,9 @@ pub fn emit_function_declaration_instantiation(
     // --- Step 1: Parameter scope for parameter expressions ---
 
     if has_parameter_expressions {
-        let has_non_local_parameters = parameter_names.iter().any(|p| !p.is_local);
-        if has_non_local_parameters {
-            generator.push_new_lexical_environment(0);
+        let non_local_parameter_count = parameter_names.iter().filter(|p| !p.is_local).count();
+        if non_local_parameter_count > 0 {
+            generator.push_new_lexical_environment(u32_from_usize(non_local_parameter_count));
         }
     }
 
@@ -9016,6 +9029,50 @@ fn needs_block_declaration_instantiation(scope: &ScopeData, arena: &crate::ast::
         }
     }
     false
+}
+
+/// Count the bindings a block or switch declaration instantiation creates.
+fn count_lexical_declarations_for_block<'a>(
+    children: impl Iterator<Item = &'a Statement>,
+    arena: &crate::ast::AstArena,
+) -> u32 {
+    let mut count = 0u32;
+    for child in children {
+        if let Some(fd) = child.inner.function_declaration_for_labelled_item()
+            && let Some(name_ident_id) = fd.name
+        {
+            if !arena.identifiers[name_ident_id].is_local() {
+                count += 1;
+            }
+            continue;
+        }
+
+        match &child.inner {
+            StatementKind::VariableDeclaration(vd)
+                if vd.kind == DeclarationKind::Let || vd.kind == DeclarationKind::Const =>
+            {
+                for declaration in &vd.declarations {
+                    let mut names = Vec::new();
+                    collect_target_names(&declaration.target, &mut names, arena);
+                    count += u32_from_usize(names.len());
+                }
+            }
+            StatementKind::UsingDeclaration(declarations) => {
+                for declaration in declarations.iter() {
+                    let mut names = Vec::new();
+                    collect_target_names(&declaration.target, &mut names, arena);
+                    count += u32_from_usize(names.len());
+                }
+            }
+            StatementKind::ClassDeclaration(class_data)
+                if class_data.name.is_some_and(|n| !arena.identifiers[n].is_local()) =>
+            {
+                count += 1;
+            }
+            _ => {}
+        }
+    }
+    count
 }
 
 /// Count non-local lexical bindings in a function body scope.

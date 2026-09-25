@@ -52,6 +52,8 @@ class WEBVIEW_API SessionStore {
     AK_MAKE_NONMOVABLE(SessionStore);
 
 public:
+    AK_ALLOC_WITH_KMALLOC;
+
     enum class IsActive {
         No,
         Yes,
@@ -312,7 +314,7 @@ private:
         ErrorOr<Vector<ClosedUnit>> load_closed_units();
         ErrorOr<Vector<ClosedSessionTab>> take_closed_unit(SessionWindowId);
 
-        Database::Database& database;
+        NonnullRefPtr<Database::Database> database;
         Statements statements;
 
     private:

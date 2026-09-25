@@ -8,7 +8,7 @@ use crate::layout::CssPixels;
 use std::cell::Cell;
 use std::ffi::c_void;
 
-pub const INVALID_NODE_SLOT_INDEX: u32 = u32::MAX;
+pub use super::node_slot_id::INVALID_NODE_SLOT_INDEX;
 pub const GENERATED_FOR_AFTER: u8 = 1;
 pub const GENERATED_FOR_FIRST_LETTER: u8 = 4;
 pub const GENERATED_FOR_MARKER: u8 = 6;
@@ -46,50 +46,7 @@ impl Default for FfiStylePayloads {
     }
 }
 
-const NODE_SLOT_INDEX_BITS: u32 = 24;
-const NODE_SLOT_INDEX_MASK: u32 = (1 << NODE_SLOT_INDEX_BITS) - 1;
-pub(crate) const MAX_NODE_SLOT_COUNT: u32 = NODE_SLOT_INDEX_MASK;
-
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-#[repr(C)]
-pub struct NodeSlotId {
-    pub index: u32,
-}
-
-impl NodeSlotId {
-    pub const INVALID: Self = Self {
-        index: INVALID_NODE_SLOT_INDEX,
-    };
-
-    pub(crate) fn new(index: u32, generation: u8) -> Self {
-        assert!(
-            index < MAX_NODE_SLOT_COUNT,
-            "layout node arena exhausted its 24-bit slot index space"
-        );
-        assert_ne!(generation, 0, "layout node arena slot generation must be nonzero");
-        Self {
-            index: index | (u32::from(generation) << NODE_SLOT_INDEX_BITS),
-        }
-    }
-
-    pub(crate) fn slot_index(self) -> u32 {
-        self.index & NODE_SLOT_INDEX_MASK
-    }
-
-    pub(crate) fn generation(self) -> u8 {
-        (self.index >> NODE_SLOT_INDEX_BITS) as u8
-    }
-
-    pub fn is_invalid(self) -> bool {
-        self == Self::INVALID
-    }
-}
-
-impl Default for NodeSlotId {
-    fn default() -> Self {
-        Self::INVALID
-    }
-}
+pub use super::node_slot_id::{MAX_NODE_SLOT_COUNT, NodeSlotId};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -160,6 +117,7 @@ pub enum NodeFlag {
     ReplacedBoxCanHaveChildren = 1 << 18,
     IsPseudoElementPrincipalBox = 1 << 19,
     FollowsPrincipalStyle = 1 << 20,
+    EstablishesAbsolutePositionContainingBlock = 1 << 21,
     ProducesLineBoxFragmentWhenEmpty = 1 << 22,
     ListMarkerIsInside = 1 << 23,
     HasAnchorNames = 1 << 24,
@@ -169,6 +127,26 @@ pub enum NodeFlag {
     IsMissingTableCell = 1 << 28,
     HasAnimatedOpacityOrTransform = 1 << 29,
     IsDocumentElement = 1 << 30,
+    EstablishesFixedPositionContainingBlock = 0x8000_0000,
+}
+
+/// Facts a node takes from its ancestors. They are derived when the node is attached or its
+/// ancestors' styles change, so laying out a subtree never reads above it to learn them.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub(crate) enum AncestorFact {
+    /// The parent's inner display type is flex or grid.
+    ParentIsFlexOrGridContainer = 1 << 0,
+    /// The parent is unstyled, or is not floating and has a flow or flow-root inner display type.
+    ParentIsUnfloatedFlowContainer = 1 << 1,
+    /// An anonymous box whose parent uses button layout, like the wrapper around a button's content.
+    IsAnonymousButtonContentWrapper = 1 << 2,
+    /// An anonymous box whose parent is an anonymous button content wrapper.
+    IsAnonymousButtonContentBox = 1 << 3,
+    /// The node or one of its ancestors has an inline outer display type.
+    HasInlineLevelInclusiveAncestor = 1 << 4,
+    /// An anonymous box whose nearest non-anonymous ancestor puts an ellipsis on overflowing lines.
+    InheritsTextOverflowEllipsis = 1 << 5,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -221,8 +199,6 @@ pub(crate) struct NodeData {
     pub last_child: Cell<NodeSlotId>,
     pub previous_sibling: Cell<NodeSlotId>,
     pub next_sibling: Cell<NodeSlotId>,
-    pub containing_block: Cell<NodeSlotId>,
-    pub inline_containing_block: Cell<NodeSlotId>,
     pub kind: Cell<NodeKind>,
     pub generated_for: Cell<u8>,
     pub intrinsic_cache_epoch: Cell<u16>,
@@ -239,6 +215,7 @@ pub(crate) struct NodeData {
     pub table_column_span: Cell<u16>,
     pub table_row_span: Cell<u16>,
     pub dom_paint_facts: Cell<u8>,
+    pub ancestor_facts: Cell<u8>,
     pub style: Cell<*const c_void>,
     pub shell: Cell<*mut c_void>,
 }
@@ -251,8 +228,6 @@ impl Default for NodeData {
             last_child: Cell::new(NodeSlotId::INVALID),
             previous_sibling: Cell::new(NodeSlotId::INVALID),
             next_sibling: Cell::new(NodeSlotId::INVALID),
-            containing_block: Cell::new(NodeSlotId::INVALID),
-            inline_containing_block: Cell::new(NodeSlotId::INVALID),
             kind: Cell::new(NodeKind::Unset),
             generated_for: Cell::new(0),
             intrinsic_cache_epoch: Cell::new(0),
@@ -262,6 +237,7 @@ impl Default for NodeData {
             table_column_span: Cell::new(1),
             table_row_span: Cell::new(1),
             dom_paint_facts: Cell::new(0),
+            ancestor_facts: Cell::new(0),
             fragment_cache_epoch: Cell::new(0),
             style: Cell::new(std::ptr::null()),
             shell: Cell::new(std::ptr::null_mut()),
@@ -281,17 +257,18 @@ mod tests {
 
     #[test]
     fn intrinsic_cache_epoch_uses_existing_node_data_padding() {
-        assert_eq!(std::mem::size_of::<NodeData>(), 64);
-        assert_eq!(std::mem::offset_of!(NodeData, intrinsic_cache_epoch), 30);
-        assert_eq!(std::mem::offset_of!(NodeData, flags), 32);
-        assert_eq!(std::mem::offset_of!(NodeData, fragment_cache_epoch), 36);
-        assert_eq!(std::mem::offset_of!(NodeData, slot_generation), 40);
-        assert_eq!(std::mem::offset_of!(NodeData, compositor_animation_frame_kinds), 41);
-        assert_eq!(std::mem::offset_of!(NodeData, table_column_span), 42);
-        assert_eq!(std::mem::offset_of!(NodeData, table_row_span), 44);
-        assert_eq!(std::mem::offset_of!(NodeData, dom_paint_facts), 46);
-        assert_eq!(std::mem::offset_of!(NodeData, style), 48);
-        assert_eq!(std::mem::offset_of!(NodeData, shell), 56);
+        assert_eq!(std::mem::size_of::<NodeData>(), 56);
+        assert_eq!(std::mem::offset_of!(NodeData, intrinsic_cache_epoch), 22);
+        assert_eq!(std::mem::offset_of!(NodeData, flags), 24);
+        assert_eq!(std::mem::offset_of!(NodeData, fragment_cache_epoch), 28);
+        assert_eq!(std::mem::offset_of!(NodeData, slot_generation), 32);
+        assert_eq!(std::mem::offset_of!(NodeData, compositor_animation_frame_kinds), 33);
+        assert_eq!(std::mem::offset_of!(NodeData, table_column_span), 34);
+        assert_eq!(std::mem::offset_of!(NodeData, table_row_span), 36);
+        assert_eq!(std::mem::offset_of!(NodeData, dom_paint_facts), 38);
+        assert_eq!(std::mem::offset_of!(NodeData, ancestor_facts), 39);
+        assert_eq!(std::mem::offset_of!(NodeData, style), 40);
+        assert_eq!(std::mem::offset_of!(NodeData, shell), 48);
     }
 
     #[test]

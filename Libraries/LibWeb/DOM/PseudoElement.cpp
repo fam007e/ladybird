@@ -22,6 +22,8 @@ GC_DEFINE_ALLOCATOR(SyntheticPseudoElementTreeNode);
 GC_DEFINE_ALLOCATOR(ElementReferencePseudoElement);
 
 struct SyntheticPseudoElement::CustomPropertyDataStorage {
+    AK_ALLOC_WITH_KMALLOC;
+
     RefPtr<CSS::CustomPropertyData const> data;
 };
 
@@ -53,6 +55,12 @@ void SyntheticPseudoElement::set_layout_node(Layout::NodeWithStyle* value)
         Layout::RustFFI::layout_arena_set_node_flag(value->arena_handle(), Layout::Node::slot_id(value), Layout::RustFFI::NodeFlag::IsPseudoElementPrincipalBox, true);
         value->update_has_scroll_offset_flag();
     }
+}
+
+Node& SyntheticPseudoElement::root() const
+{
+    VERIFY(m_originating_element);
+    return m_originating_element->root();
 }
 
 void SyntheticPseudoElement::update_animated_properties(Badge<Web::Animations::KeyframeEffect> const&, DOM::AbstractElement abstract_element, Web::Animations::KeyframeEffect& effect, Web::Animations::AnimationUpdateContext& context)
@@ -158,6 +166,11 @@ Layout::NodeWithStyle* ElementReferencePseudoElement::layout_node() const
 Layout::NodeWithStyle* ElementReferencePseudoElement::unsafe_layout_node() const
 {
     return m_referenced_element->unsafe_layout_node();
+}
+
+Node& ElementReferencePseudoElement::root() const
+{
+    return m_referenced_element->root();
 }
 
 CSS::StyleRecordID ElementReferencePseudoElement::style_record_identity() const

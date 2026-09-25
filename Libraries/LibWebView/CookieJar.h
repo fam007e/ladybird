@@ -33,6 +33,8 @@ struct CookieStorageKey {
 
 class WEBVIEW_API CookieJar {
 public:
+    AK_ALLOC_WITH_KMALLOC;
+
     static ErrorOr<Database::MigrationOutcome> migrate_schema(Database::Database&, Database::MigrationMode = Database::MigrationMode::Apply);
 
     static ErrorOr<NonnullOwnPtr<CookieJar>> create(Database::Database&);
@@ -110,7 +112,7 @@ private:
         void insert_cookie(HTTP::Cookie::Cookie const& cookie);
         TransientStorage::Cookies select_all_cookies();
 
-        Database::Database& database;
+        NonnullRefPtr<Database::Database> database;
         Statements statements;
         RefPtr<Core::Timer> synchronization_timer {};
     };

@@ -8,6 +8,20 @@ test("simple test", () => {
     expect(re.test("test")).toBe(true);
 });
 
+test("non-global fast path coerces lastIndex", () => {
+    const accepted = regexp => {
+        regexp.lastIndex = Symbol("revoked");
+        try {
+            return regexp.test("allow");
+        } catch {
+            return false;
+        }
+    };
+
+    expect(accepted(/^allow$/)).toBeFalse();
+    expect(accepted(/^allow$/g)).toBeFalse();
+});
+
 test("simple global test", () => {
     let re = /test/g;
     expect(re.test("testtest")).toBe(true);
@@ -112,6 +126,17 @@ test("override exec with non-function", () => {
     expect(re.test("test")).toBe(true);
 });
 
+test("successful fast test invalidates nonlegacy state", () => {
+    function NewTarget() {}
+    NewTarget.prototype = RegExp.prototype;
+    const regexp = Reflect.construct(RegExp, ["(.)"], NewTarget);
+
+    /(PROTECTED)/.test("PROTECTED");
+    expect(regexp.test("P")).toBeTrue();
+    expect(RegExp.input).toBe("");
+    expect(RegExp.$1).toBe("");
+});
+
 test("property escapes", () => {
     expect(/\p{ASCII}/.test("a")).toBeFalse();
     expect(/\p{ASCII}/.test("p{ASCII}")).toBeTrue();
@@ -129,4 +154,13 @@ test("case-insensitive character class with mixed builtins and literals", () => 
     expect(/[\dA]/i.test("A")).toBeTrue();
     expect(/[\dA]/i.test("5")).toBeTrue();
     expect(/[\dA]/i.test("b")).toBeFalse();
+});
+
+test("a non-writable lastIndex is fine on a pattern that is neither global nor sticky", () => {
+    // RegExpBuiltinExec writes lastIndex back only for a global or sticky pattern, so nothing here throws.
+    const pattern = /a/;
+    Object.defineProperty(pattern, "lastIndex", { writable: false });
+
+    expect(pattern.test("aaa")).toBeTrue();
+    expect(pattern.lastIndex).toBe(0);
 });

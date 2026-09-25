@@ -34,14 +34,12 @@ bool DocumentPaintState::has_visual_context_tree() const
     return Layout::RustFFI::layout_arena_has_visual_context_tree(m_layout_node_arena->handle());
 }
 
-AccumulatedVisualContextTree DocumentPaintState::visual_context_tree_without_update(DOM::Document const& document) const
+Compositing::AccumulatedVisualContextTree DocumentPaintState::visual_context_tree_without_update(DOM::Document const& document) const
 {
-    auto tree = AccumulatedVisualContextTree::adopt_rust_handle(retain_rust_main_visual_context_tree(document));
-    tree.set_visual_animations(m_visual_context_tree_visual_animations);
-    return tree;
+    return Compositing::AccumulatedVisualContextTree::adopt_rust_handle(retain_rust_main_visual_context_tree(document));
 }
 
-AccumulatedVisualContextTree DocumentPaintState::visual_context_tree(DOM::Document const& document) const
+Compositing::AccumulatedVisualContextTree DocumentPaintState::visual_context_tree(DOM::Document const& document) const
 {
     ensure_visual_context_tree(document);
     return visual_context_tree_without_update(document);
@@ -94,8 +92,6 @@ void DocumentPaintState::update_accumulated_visual_contexts(DOM::Document& docum
         ++m_accumulated_visual_context_tree_incremental_update_count;
     if (result.requires_display_list_recording || svg_paint_resources_changed)
         document.set_needs_to_record_display_list();
-    if (result.structural_epoch_changed)
-        m_visual_context_tree_visual_animations = nullptr;
     m_visual_context_tree_needs_compositor_update = true;
 }
 
@@ -109,47 +105,34 @@ void DocumentPaintState::update_visual_viewport_accumulated_visual_context(DOM::
     m_visual_context_tree_needs_compositor_update = true;
 }
 
-void DocumentPaintState::set_visual_animations(DOM::Document& document, Vector<Compositor::VisualAnimation> animations)
+void DocumentPaintState::begin_compositor_animation_update(DOM::Document& document)
 {
     ensure_visual_context_tree(document);
-    auto published_animations = m_visual_context_tree_visual_animations ? m_visual_context_tree_visual_animations->animations.span() : ReadonlySpan<Compositor::VisualAnimation> {};
-    if (published_animations == animations.span())
+    Layout::RustFFI::layout_arena_begin_compositor_animation_update(m_layout_node_arena->handle());
+}
+
+void DocumentPaintState::publish_compositor_animations(DOM::Document& document, PublishPendingCompositorAnimations publish_pending)
+{
+    ensure_visual_context_tree(document);
+    auto outcome = Layout::RustFFI::layout_arena_publish_compositor_animations(m_layout_node_arena->handle(), publish_pending == PublishPendingCompositorAnimations::Yes);
+    if (!outcome.published)
         return;
-    bool animation_parameters_changed = m_visual_animations.size() != animations.size();
-    bool animation_timing_anchor_changed = false;
-    if (!animation_parameters_changed) {
-        for (size_t index = 0; index < animations.size(); ++index) {
-            if (m_visual_animations[index].monotonic_time_at_anchor_ns != animations[index].monotonic_time_at_anchor_ns
-                || m_visual_animations[index].local_time_at_anchor_ms != animations[index].local_time_at_anchor_ms)
-                animation_timing_anchor_changed = true;
-            if (!m_visual_animations[index].has_same_animation_parameters(animations[index])) {
-                animation_parameters_changed = true;
-                break;
-            }
-        }
-    }
-    m_visual_animations = animations;
-    if (animations.is_empty()) {
-        m_visual_context_tree_visual_animations = nullptr;
-    } else {
-        m_visual_context_tree_visual_animations = adopt_ref(*new VisualAnimationList(move(animations)));
-    }
     m_visual_context_tree_needs_compositor_update = true;
-    if (animation_parameters_changed)
+    if (outcome.parameters_changed)
         ++document.style_invalidation_counters().compositor_visual_animation_updates;
-    if (animation_timing_anchor_changed)
+    if (outcome.timing_anchors_changed)
         ++document.style_invalidation_counters().compositor_visual_animation_timing_anchor_updates;
 }
 
 void DocumentPaintState::republish_visual_animations(DOM::Document& document)
 {
-    if (!m_visual_context_tree_visual_animations)
+    if (!Layout::RustFFI::layout_arena_visual_context_tree_has_visual_animations(m_layout_node_arena->handle()))
         return;
     m_visual_context_tree_needs_compositor_update = true;
     ++document.style_invalidation_counters().compositor_visual_animation_updates;
 }
 
-void DocumentPaintState::append_paint_command_cache_source_resources(DisplayListResourceSet& retained_resources) const
+void DocumentPaintState::append_paint_command_cache_source_resources(Compositing::DisplayListResourceSet& retained_resources) const
 {
     retained_resources.include(m_paint_command_cache_source_referenced_resources);
 }
@@ -171,7 +154,7 @@ void DocumentPaintState::refresh_scroll_state(DOM::Document& document)
     static bool const verify_scroll_state = getenv("LIBWEB_VERIFY_SCROLL_STATE") != nullptr;
     if (!verify_scroll_state)
         return;
-    ScrollStateSnapshot rederived_snapshot;
+    Compositing::ScrollStateSnapshot rederived_snapshot;
     rust_refresh_scroll_state(document, rederived_snapshot, ForceScrollStateRefresh::Yes);
     VERIFY(rederived_snapshot.device_offsets() == m_scroll_state_snapshot.device_offsets());
 }

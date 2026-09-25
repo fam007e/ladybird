@@ -10,6 +10,8 @@
 #include <LibCore/File.h>
 #include <LibCore/Process.h>
 #include <LibCore/System.h>
+#include <LibMedia/Audio/AudioServerPath.h>
+#include <LibSandbox/ConnectBroker.h>
 #include <LibWebView/Application.h>
 #include <LibWebView/CompositorClient.h>
 #include <LibWebView/FontService.h>
@@ -92,8 +94,6 @@ static ErrorOr<CPUProfiler> launch_cpu_profiler(StringView server_name, pid_t pi
     Array<int, 2> acknowledgement_socket;
     TRY(Core::System::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, control_socket.data()));
     TRY(Core::System::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, acknowledgement_socket.data()));
-    TRY(Core::System::set_close_on_exec(control_socket[1], false));
-    TRY(Core::System::set_close_on_exec(acknowledgement_socket[1], false));
     ScopeGuard close_sockets = [&] {
         for (auto fd : control_socket)
             (void)Core::System::close(fd);
@@ -114,6 +114,10 @@ static ErrorOr<CPUProfiler> launch_cpu_profiler(StringView server_name, pid_t pi
         .executable = "perf"sv,
         .search_for_executable_in_path = true,
         .arguments = arguments,
+        .file_actions = {
+            Core::FileAction::DupFd { .write_fd = control_socket[1], .fd = control_socket[1] },
+            Core::FileAction::DupFd { .write_fd = acknowledgement_socket[1], .fd = acknowledgement_socket[1] },
+        },
     }));
     TRY(Core::System::close(control_socket[1]));
     control_socket[1] = -1;
@@ -209,6 +213,34 @@ static ErrorOr<NonnullRefPtr<ClientType>> launch_server_process(
             }
         }
 #endif
+#if defined(AK_OS_LINUX)
+        OwnPtr<Sandbox::ConnectBroker> connect_broker;
+        OwnPtr<Core::File> connect_broker_child_file;
+
+        // The renderer cannot create a socket of its own, so the one endpoint it is allowed to
+        // reach is opened here and handed over as a connected descriptor.
+        if (process_type == ProcessType::WebContent) {
+            if (auto audio_server_paths = Audio::audio_server_path_candidates(); !audio_server_paths.is_empty()) {
+                // Asking again covers an audio server that was not reachable when the renderer
+                // started, and a configured fallback the audio library had not got to yet.
+                auto broker = Sandbox::ConnectBroker::create(move(audio_server_paths), [] {
+                    return Audio::audio_server_path_candidates();
+                });
+                if (broker.is_error()) {
+                    warnln("Could not start the {} connection broker: {}", server_name, broker.error());
+                } else {
+                    connect_broker = broker.release_value();
+                    // Reserve a distinct destination so dup2 clears close-on-exec in the child.
+                    auto child_fd = TRY(Core::System::fcntl(connect_broker->helper_fd(), F_DUPFD_CLOEXEC, 0));
+                    connect_broker_child_file = TRY(Core::File::adopt_fd(child_fd, Core::File::OpenMode::ReadWrite));
+                    options.file_actions.append(Core::FileAction::DupFd { .write_fd = connect_broker->helper_fd(), .fd = child_fd });
+                    process_arguments.append("--connect-broker-fd"sv);
+                    process_arguments.append(ByteString::number(connect_broker_child_file->fd()));
+                }
+            }
+        }
+#endif
+
         bool capture_output = WebView::Application::the().should_capture_web_content_output();
         auto result = WebView::Process::spawn<ClientType>(process_type, move(options), capture_output, forward<ClientArguments>(client_arguments)...);
 
@@ -216,6 +248,10 @@ static ErrorOr<NonnullRefPtr<ClientType>> launch_server_process(
             auto&& [process, client] = result.release_value();
             if (crash_report)
                 process.set_crash_report(crash_report.release_nonnull());
+#if defined(AK_OS_LINUX)
+            if (connect_broker)
+                process.set_connect_broker(connect_broker.release_nonnull());
+#endif
 
             if (WebView::Application::the().claim_cpu_profiler(process_type)) {
                 auto profiler = TRY(launch_cpu_profiler(server_name, process.pid(), browser_options.profile_output));
@@ -251,7 +287,7 @@ static ErrorOr<NonnullRefPtr<ClientType>> launch_server_process(
     VERIFY_NOT_REACHED();
 }
 
-ErrorOr<NonnullRefPtr<WebView::WebContentClient>> launch_web_content_process(IsPrivate is_private, Web::PageId initial_page_id, Web::HTML::CrossProcessId root_navigable_id)
+ErrorOr<NonnullRefPtr<WebView::WebContentClient>> launch_web_content_process(IsPrivate is_private, Compositing::PageId initial_page_id, Web::HTML::CrossProcessId root_navigable_id)
 {
     auto const& browser_options = WebView::Application::browser_options();
     auto const& web_content_options = WebView::Application::web_content_options();
@@ -261,10 +297,6 @@ ErrorOr<NonnullRefPtr<WebView::WebContentClient>> launch_web_content_process(IsP
     if (browser_options.headless_mode.has_value())
         arguments.append("--headless"sv);
 
-    if (web_content_options.config_path.has_value()) {
-        arguments.append("--config-path"sv);
-        arguments.append(web_content_options.config_path.value());
-    }
     if (web_content_options.cache_path.has_value()) {
         arguments.append("--cache-path"sv);
         arguments.append(web_content_options.cache_path.value());
@@ -273,7 +305,6 @@ ErrorOr<NonnullRefPtr<WebView::WebContentClient>> launch_web_content_process(IsP
         arguments.append("--test-mode"sv);
     if (web_content_options.log_all_js_exceptions == WebView::LogAllJSExceptions::Yes)
         arguments.append("--log-all-js-exceptions"sv);
-    arguments.append(ByteString::formatted("--site-isolation={}", WebView::site_isolation_mode_to_string(web_content_options.site_isolation_mode)));
     if (web_content_options.enable_http_memory_cache == WebView::EnableMemoryHTTPCache::Yes)
         arguments.append("--enable-http-memory-cache"sv);
     if (web_content_options.expose_experimental_interfaces == WebView::ExposeExperimentalInterfaces::Yes)
@@ -366,6 +397,8 @@ ErrorOr<NonnullRefPtr<WebView::CompositorClient>> launch_compositor_process()
         arguments.append("--cache-path"sv);
         arguments.append(web_content_options.cache_path.value());
     }
+    arguments.append("--resource-root"sv);
+    arguments.append(s_ladybird_resource_root);
     if (browser_options.disable_sandbox == DisableSandbox::Yes)
         arguments.append("--disable-sandbox"sv);
     if (web_content_options.is_test_mode == WebView::IsTestMode::Yes)
@@ -492,11 +525,12 @@ ErrorOr<NonnullRefPtr<Requests::RequestControlClient>> launch_request_server_pro
     return client;
 }
 
-ErrorOr<IPC::TransportHandle> connect_new_request_server_client(IsPrivate is_private)
+ErrorOr<IPC::TransportHandle> connect_new_request_server_client(BrowsingSession& session)
 {
-    auto response = Application::request_server_control_client().send_sync_but_allow_failure<Messages::RequestServerControl::ConnectNewClient>(is_private == IsPrivate::Yes ? RequestServer::IsPrivate::Yes : RequestServer::IsPrivate::No);
-    if (!response)
+    auto response = Application::request_server_control_client().send_sync_but_allow_failure<Messages::RequestServerControl::ConnectNewClient>(session.is_private() == IsPrivate::Yes ? RequestServer::IsPrivate::Yes : RequestServer::IsPrivate::No);
+    if (!response || response->client_id() < 0)
         return Error::from_string_literal("Failed to connect to RequestServer");
+    Application::the().did_connect_request_server_client(response->client_id(), session);
     return response->take_handle();
 }
 

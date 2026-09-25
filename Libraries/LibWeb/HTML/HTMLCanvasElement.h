@@ -7,11 +7,11 @@
 #pragma once
 
 #include <AK/Optional.h>
+#include <LibCompositing/DisplayList/DisplayListResourceIds.h>
 #include <LibGC/Function.h>
 #include <LibGfx/Forward.h>
 #include <LibWeb/HTML/Canvas/CanvasSettings.h>
 #include <LibWeb/HTML/HTMLElement.h>
-#include <LibWeb/Painting/DisplayListResourceIds.h>
 #include <LibWeb/WebGL/WebGLContextAttributes.h>
 #include <LibWeb/WebIDL/Types.h>
 
@@ -22,8 +22,6 @@ class HTMLCanvasElement final : public HTMLElement {
     GC_DECLARE_ALLOCATOR(HTMLCanvasElement);
 
 public:
-    static constexpr bool OVERRIDES_FINALIZE = true;
-
     using RenderingContext = Variant<GC::Ref<CanvasRenderingContext2D>, GC::Ref<WebGL::WebGLRenderingContext>, GC::Ref<WebGL::WebGL2RenderingContext>, Empty>;
 
     virtual ~HTMLCanvasElement() override;
@@ -62,7 +60,7 @@ public:
         return nullptr;
     }
 
-    Optional<Painting::CanvasId> canvas_id() const;
+    Optional<Compositing::CanvasId> canvas_id() const;
 
     u64 content_generation() const { return m_content_generation; }
 

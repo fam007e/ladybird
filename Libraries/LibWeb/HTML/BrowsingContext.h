@@ -33,8 +33,6 @@ public:
 
     virtual ~BrowsingContext() override;
 
-    GC::Ref<LocalTraversableNavigable> top_level_traversable() const;
-
     bool is_ancestor_of(BrowsingContext const&) const;
 
     bool is_top_level() const;
@@ -57,8 +55,6 @@ public:
     Page& page() { return m_page; }
     Page const& page() const { return m_page; }
 
-    u64 virtual_browsing_context_group_id() const { return m_virtual_browsing_context_group_id; }
-
     GC::Ptr<BrowsingContext> top_level_browsing_context() const;
 
     BrowsingContextGroup* group();
@@ -77,8 +73,9 @@ public:
 
     bool has_navigable_been_destroyed() const;
 
-    GC::Ptr<BrowsingContext> opener_browsing_context() const { return m_opener_browsing_context; }
-    void set_opener_browsing_context(GC::Ptr<BrowsingContext> browsing_context) { m_opener_browsing_context = browsing_context; }
+    GC::Ptr<WindowProxy> opener_browsing_context_window_proxy() const { return m_opener_browsing_context_window_proxy; }
+    void set_opener_browsing_context(GC::Ptr<BrowsingContext>);
+    void set_opener_browsing_context(RemoteNavigable&);
 
     void set_is_popup(TokenizedFeature::Popup is_popup) { m_is_popup = is_popup; }
     [[nodiscard]] TokenizedFeature::Popup is_popup() const { return m_is_popup; }
@@ -104,10 +101,8 @@ private:
     GC::Ptr<DOM::Document> m_active_document;
 
     // https://html.spec.whatwg.org/multipage/browsers.html#opener-browsing-context
-    GC::Ptr<BrowsingContext> m_opener_browsing_context;
-
-    // https://html.spec.whatwg.org/multipage/document-sequences.html#opener-origin-at-creation
-    Optional<URL::Origin> m_opener_origin_at_creation;
+    // NB: Held as its WindowProxy, which also stands for a browsing context another process holds.
+    GC::Ptr<WindowProxy> m_opener_browsing_context_window_proxy;
 
     // https://html.spec.whatwg.org/multipage/browsers.html#is-popup
     TokenizedFeature::Popup m_is_popup { TokenizedFeature::Popup::No };
@@ -117,12 +112,6 @@ private:
 
     // https://html.spec.whatwg.org/multipage/document-sequences.html#is-auxiliary
     bool m_is_auxiliary { false };
-
-    // https://html.spec.whatwg.org/multipage/document-sequences.html#browsing-context-initial-url
-    Optional<URL::URL> m_initial_url;
-
-    // https://html.spec.whatwg.org/multipage/document-sequences.html#virtual-browsing-context-group-id
-    u64 m_virtual_browsing_context_group_id = { 0 };
 
     // https://html.spec.whatwg.org/multipage/browsers.html#tlbc-group
     GC::Ptr<BrowsingContextGroup> m_group;

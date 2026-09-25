@@ -6,11 +6,12 @@
 
 #pragma once
 
+#include <LibCompositing/PageId.h>
+#include <LibCompositing/PixelUnits.h>
 #include <LibGfx/Rect.h>
 #include <LibHTTP/Forward.h>
 #include <LibWeb/Page/Page.h>
-#include <LibWeb/Page/PageId.h>
-#include <LibWeb/PixelUnits.h>
+#include <LibWeb/Page/QueuedInputEvent.h>
 #include <WebWorker/Forward.h>
 
 namespace WebWorker {
@@ -24,12 +25,12 @@ public:
 
     virtual ~PageHost();
 
-    virtual Web::PageId id() const override { VERIFY_NOT_REACHED(); }
+    virtual Compositing::PageId id() const override { VERIFY_NOT_REACHED(); }
     virtual Web::Page& page() override;
     virtual Web::Page const& page() const override;
     virtual bool is_connection_open() const override;
     virtual Gfx::Palette palette() const override;
-    virtual Web::DevicePixelRect screen_rect() const override;
+    virtual Compositing::DevicePixelRect screen_rect() const override;
     virtual double zoom_level() const override;
     virtual double device_pixel_ratio() const override;
     virtual double device_pixels_per_css_pixel() const override;
@@ -38,7 +39,6 @@ public:
     virtual Web::CSS::PreferredMotion preferred_motion() const override;
     virtual size_t screen_count() const override { return 1; }
     virtual HTTP::Cookie::VersionedCookie page_did_request_cookie(URL::URL const&, HTTP::Cookie::Source) override;
-    virtual void page_did_store_hsts_policy(String const&, HTTP::HSTS::ParsedHSTSPolicy const&) override;
     virtual bool page_did_is_known_hsts_host(String const&) override;
     virtual void page_did_report_worker_exception(Utf16String const& message, Utf16String const& filename, u32 lineno, u32 colno) override;
     virtual void page_did_post_broadcast_channel_message(Web::HTML::BroadcastChannelMessage const& message) override;
@@ -55,7 +55,7 @@ public:
     void compositor_process_lost();
     virtual bool is_headless() const override { VERIFY_NOT_REACHED(); }
     virtual Queue<Web::QueuedInputEvent>& input_event_queue() override { VERIFY_NOT_REACHED(); }
-    virtual void report_finished_handling_input_event([[maybe_unused]] Web::PageId page_id, [[maybe_unused]] Web::EventResult event_was_handled) override { VERIFY_NOT_REACHED(); }
+    virtual void report_finished_handling_input_event([[maybe_unused]] Compositing::PageId page_id, [[maybe_unused]] u64 event_id, [[maybe_unused]] Web::EventResult event_was_handled) override { VERIFY_NOT_REACHED(); }
     virtual void request_frame() override { VERIFY_NOT_REACHED(); }
     virtual double maximum_frames_per_second() const override { return m_maximum_frames_per_second; }
     void set_maximum_frames_per_second(double maximum_frames_per_second) { m_maximum_frames_per_second = maximum_frames_per_second; }

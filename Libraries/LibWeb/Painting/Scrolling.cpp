@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <LibCompositing/DisplayList/DisplayListCommand.h>
 #include <LibWeb/CSS/ComputedValues.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/Element.h>
@@ -16,7 +17,6 @@
 #include <LibWeb/Layout/LayoutRustBridge.h>
 #include <LibWeb/Layout/Node.h>
 #include <LibWeb/Painting/BoxViews.h>
-#include <LibWeb/Painting/DisplayListCommand.h>
 #include <LibWeb/Painting/PaintingRustBridge.h>
 #include <LibWeb/Painting/Scrolling.h>
 
@@ -198,17 +198,20 @@ ScrollHandled scroll_by(Layout::Node& node, double delta_x, double delta_y, Scro
 {
     if (!has_committed_box(node))
         return ScrollHandled::No;
+    // A scroll by nothing is not user input: it neither takes over a scroll in flight nor keeps a gesture going.
+    if (delta_x == 0 && delta_y == 0)
+        return ScrollHandled::No;
     return set_scroll_offset_from_user_input(node, scroll_offset(node).translated(CSSPixels::nearest_value_for(delta_x), CSSPixels::nearest_value_for(delta_y)), scroll_kind);
 }
 
-static Optional<CompositorScrollNodeKind> scroll_node_kind_for(Layout::Node const& node)
+static Optional<Compositing::CompositorScrollNodeKind> scroll_node_kind_for(Layout::Node const& node)
 {
     if (node.is_viewport())
-        return CompositorScrollNodeKind::Viewport;
+        return Compositing::CompositorScrollNodeKind::Viewport;
     if (node.generated_for_pseudo_element().has_value())
-        return CompositorScrollNodeKind::PseudoElement;
+        return Compositing::CompositorScrollNodeKind::PseudoElement;
     if (node.dom_node() && is<DOM::Element>(*node.dom_node()))
-        return CompositorScrollNodeKind::Element;
+        return Compositing::CompositorScrollNodeKind::Element;
     return {};
 }
 
@@ -229,15 +232,15 @@ static u8 pseudo_element_type_for(Layout::Node const& node)
     return static_cast<u8>(to_underlying(*pseudo_element));
 }
 
-Optional<Compositor::AsyncScrollNodeStableID> async_scroll_node_stable_id(Layout::Node const& node)
+Optional<Compositing::AsyncScrollNodeStableID> async_scroll_node_stable_id(Layout::Node const& node)
 {
     auto scroll_node_kind = scroll_node_kind_for(node);
     if (!scroll_node_kind.has_value())
         return {};
 
-    return Compositor::AsyncScrollNodeStableID {
+    return Compositing::AsyncScrollNodeStableID {
         .node_id = scrollable_node_id_for(node),
-        .kind = Compositor::async_scroll_node_kind_for(*scroll_node_kind),
+        .kind = Compositing::async_scroll_node_kind_for(*scroll_node_kind),
         .pseudo_element_type = pseudo_element_type_for(node),
     };
 }
@@ -289,7 +292,7 @@ static CSSPixelPoint scroll_offset_of_layout_node_shell(void* layout_node_shell)
     return scroll_offset(*static_cast<Layout::Node const*>(layout_node_shell));
 }
 
-ScrollHandled wheel_scroll_along_containing_block_chain(Layout::Node& node, double wheel_delta_x, double wheel_delta_y, ScrollKind scroll_kind)
+Layout::Node* wheel_scroll_along_containing_block_chain(Layout::Node& node, double wheel_delta_x, double wheel_delta_y, ScrollKind scroll_kind)
 {
     struct WheelScrollableBox {
         Layout::Node* node;
@@ -305,9 +308,9 @@ ScrollHandled wheel_scroll_along_containing_block_chain(Layout::Node& node, doub
         });
     for (auto const& wheel_scrollable_box : wheel_scrollable_boxes) {
         if (scroll_by(*wheel_scrollable_box.node, wheel_scrollable_box.accepted_delta_x, wheel_scrollable_box.accepted_delta_y, scroll_kind) == ScrollHandled::Yes)
-            return ScrollHandled::Yes;
+            return wheel_scrollable_box.node;
     }
-    return ScrollHandled::No;
+    return nullptr;
 }
 
 Layout::Node* scrolling_box_for_scroll_step_in_containing_block_chain(Layout::Node& target, CSSPixelPoint delta)

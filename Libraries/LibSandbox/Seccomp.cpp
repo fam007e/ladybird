@@ -4,14 +4,20 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/Array.h>
+#include <LibSandbox/ConnectBroker.h>
 #include <LibSandbox/Seccomp.h>
 #include <asm/termbits.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/audit.h>
+#include <linux/netlink.h>
 #include <linux/sched.h>
 #include <linux/seccomp.h>
 #include <linux/sockios.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <netinet/udp.h>
 #include <signal.h>
 #include <stddef.h>
 #include <sys/ioctl.h>
@@ -20,6 +26,7 @@
 #include <sys/socket.h>
 #include <sys/syscall.h>
 #include <sys/ucontext.h>
+#include <sys/un.h>
 #include <unistd.h>
 
 #ifndef SYS_SECCOMP
@@ -41,6 +48,8 @@ static constexpr u32 audit_architecture = AUDIT_ARCH_RISCV64;
 #endif
 
 static constexpr u16 emulate_fstatat_trap = 1;
+static constexpr u16 broker_socket_trap = 2;
+static constexpr u16 broker_connect_trap = 3;
 
 static constexpr u32 thread_clone_required_flags = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD;
 static constexpr u32 thread_clone_allowed_flags = thread_clone_required_flags
@@ -192,7 +201,6 @@ static constexpr unsigned read_only_open_flags = O_CLOEXEC;
 #define IF_DEFINED_unlinkat(if_defined, if_not_defined) if_defined
 #define IF_DEFINED_umask(if_defined, if_not_defined) if_defined
 #define IF_DEFINED_uname(if_defined, if_not_defined) if_defined
-#define IF_DEFINED_utimensat(if_defined, if_not_defined) if_defined
 #define IF_DEFINED_wait4(if_defined, if_not_defined) if_defined
 #define IF_DEFINED_waitid(if_defined, if_not_defined) if_defined
 #define IF_DEFINED_write(if_defined, if_not_defined) if_defined
@@ -482,10 +490,6 @@ static constexpr unsigned read_only_open_flags = O_CLOEXEC;
 #    undef IF_DEFINED_umask
 #    define IF_DEFINED_umask(if_defined, if_not_defined) if_not_defined
 #endif
-#ifndef __NR_utimensat
-#    undef IF_DEFINED_utimensat
-#    define IF_DEFINED_utimensat(if_defined, if_not_defined) if_not_defined
-#endif
 #ifndef __NR_wait4
 #    undef IF_DEFINED_wait4
 #    define IF_DEFINED_wait4(if_defined, if_not_defined) if_not_defined
@@ -712,54 +716,349 @@ static char const* syscall_name(long syscall_number)
 
 static char s_process_name[16] = "unknown";
 
+// The arguments are copied out before anything is written back, because the result register and the
+// first argument register are the same one on some architectures.
+struct SyscallRegisters {
+    FlatPtr arguments[4];
+    FlatPtr* result;
+};
+
+static SyscallRegisters syscall_registers(void* context)
+{
+    auto& machine_context = static_cast<ucontext_t*>(context)->uc_mcontext;
+#if defined(__x86_64__)
+    static_assert(sizeof(machine_context.gregs[0]) == sizeof(FlatPtr));
+    return {
+        {
+            static_cast<FlatPtr>(machine_context.gregs[REG_RDI]),
+            static_cast<FlatPtr>(machine_context.gregs[REG_RSI]),
+            static_cast<FlatPtr>(machine_context.gregs[REG_RDX]),
+            static_cast<FlatPtr>(machine_context.gregs[REG_R10]),
+        },
+        reinterpret_cast<FlatPtr*>(&machine_context.gregs[REG_RAX]),
+    };
+#elif defined(__aarch64__)
+    static_assert(sizeof(machine_context.regs[0]) == sizeof(FlatPtr));
+    return {
+        {
+            static_cast<FlatPtr>(machine_context.regs[0]),
+            static_cast<FlatPtr>(machine_context.regs[1]),
+            static_cast<FlatPtr>(machine_context.regs[2]),
+            static_cast<FlatPtr>(machine_context.regs[3]),
+        },
+        reinterpret_cast<FlatPtr*>(&machine_context.regs[0]),
+    };
+#elif defined(__riscv) && __riscv_xlen == 64
+    static_assert(sizeof(machine_context.__gregs[0]) == sizeof(FlatPtr));
+    return {
+        {
+            static_cast<FlatPtr>(machine_context.__gregs[REG_A0]),
+            static_cast<FlatPtr>(machine_context.__gregs[REG_A0 + 1]),
+            static_cast<FlatPtr>(machine_context.__gregs[REG_A0 + 2]),
+            static_cast<FlatPtr>(machine_context.__gregs[REG_A0 + 3]),
+        },
+        reinterpret_cast<FlatPtr*>(&machine_context.__gregs[REG_A0]),
+    };
+#endif
+}
+
+// A syscall reports failure as the negated error number, so this is how the kernel would have
+// written it had the syscall actually run.
+static void set_syscall_result(SyscallRegisters const& registers, i64 result)
+{
+    *registers.result = static_cast<FlatPtr>(result);
+}
+
 #if defined(__NR_newfstatat) && defined(__NR_fstat)
 static void emulate_fstatat(void* context)
 {
-    auto& machine_context = static_cast<ucontext_t*>(context)->uc_mcontext;
-#    if defined(__x86_64__)
-    auto fd = static_cast<int>(machine_context.gregs[REG_RDI]);
-    auto* path = reinterpret_cast<char const*>(machine_context.gregs[REG_RSI]);
-    auto* buffer = reinterpret_cast<void*>(machine_context.gregs[REG_RDX]);
-    auto flags = static_cast<int>(machine_context.gregs[REG_R10]);
-    auto& result = machine_context.gregs[REG_RAX];
-#    elif defined(__aarch64__)
-    auto fd = static_cast<int>(machine_context.regs[0]);
-    auto* path = reinterpret_cast<char const*>(machine_context.regs[1]);
-    auto* buffer = reinterpret_cast<void*>(machine_context.regs[2]);
-    auto flags = static_cast<int>(machine_context.regs[3]);
-    auto& result = machine_context.regs[0];
-#    elif defined(__riscv) && __riscv_xlen == 64
-    auto fd = static_cast<int>(machine_context.__gregs[REG_A0]);
-    auto* path = reinterpret_cast<char const*>(machine_context.__gregs[REG_A0 + 1]);
-    auto* buffer = reinterpret_cast<void*>(machine_context.__gregs[REG_A0 + 2]);
-    auto flags = static_cast<int>(machine_context.__gregs[REG_A0 + 3]);
-    auto& result = machine_context.__gregs[REG_A0];
-#    endif
+    auto registers = syscall_registers(context);
+    auto fd = static_cast<int>(registers.arguments[0]);
+    auto* path = reinterpret_cast<char const*>(registers.arguments[1]);
+    auto* buffer = reinterpret_cast<void*>(registers.arguments[2]);
+    auto flags = static_cast<int>(registers.arguments[3]);
 
     // NB: glibc can implement fstat() using newfstatat(). Follow Chromium's SIGSYSFstatatHandler
     //     and Firefox's StatAtTrap by translating empty-path descriptor queries back to fstat().
     //     Seccomp cannot inspect pathname strings, and AT_EMPTY_PATH also permits nonempty paths.
     //     https://chromium.googlesource.com/chromium/src/+/main/sandbox/linux/seccomp-bpf-helpers/sigsys_handlers.cc
     //     https://searchfox.org/firefox-main/source/security/sandbox/linux/SandboxFilter.cpp
-    result = -EACCES;
+    set_syscall_result(registers, -EACCES);
     if (flags != AT_EMPTY_PATH || (path && path[0] != '\0'))
         return;
 
     auto saved_errno = errno;
     auto syscall_result = syscall(__NR_fstat, fd, buffer);
-    result = syscall_result < 0 ? -errno : syscall_result;
+    set_syscall_result(registers, syscall_result < 0 ? -errno : syscall_result);
     errno = saved_errno;
 }
 #endif
 
-static void handle_sigsys(int, siginfo_t* info, void* context)
+static int s_connect_broker_fd = -1;
+
+// Runs inside the SIGSYS handler, so it may only touch descriptors and syscalls. Each call carries
+// its own reply socket, which is what keeps it safe to run on several threads at once. Returns the
+// descriptor the answer carried, zero when it carried none, or a negative errno.
+static i64 ask_broker(Detail::ConnectBrokerRequest const& request, int socket_fd, bool expect_descriptor)
 {
-#if defined(__NR_newfstatat) && defined(__NR_fstat)
-    if (info->si_code == SYS_SECCOMP && info->si_arch == audit_architecture && info->si_syscall == __NR_newfstatat && info->si_errno == emulate_fstatat_trap) {
-        emulate_fstatat(context);
+    if (s_connect_broker_fd < 0)
+        return -EACCES;
+
+    int reply_fds[2];
+    if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, reply_fds) < 0)
+        return -errno;
+
+    int passed_fds[2] = { reply_fds[1], socket_fd };
+    size_t passed_fd_count = socket_fd >= 0 ? 2 : 1;
+
+    iovec request_io {
+        .iov_base = const_cast<Detail::ConnectBrokerRequest*>(&request),
+        .iov_len = sizeof(request),
+    };
+
+    union {
+        cmsghdr header;
+        char space[CMSG_SPACE(2 * sizeof(int))];
+    } request_control {};
+
+    msghdr request_message {
+        .msg_name = nullptr,
+        .msg_namelen = 0,
+        .msg_iov = &request_io,
+        .msg_iovlen = 1,
+        .msg_control = &request_control,
+        .msg_controllen = CMSG_SPACE(passed_fd_count * sizeof(int)),
+        .msg_flags = 0,
+    };
+
+    auto* request_header = CMSG_FIRSTHDR(&request_message);
+    request_header->cmsg_level = SOL_SOCKET;
+    request_header->cmsg_type = SCM_RIGHTS;
+    request_header->cmsg_len = CMSG_LEN(passed_fd_count * sizeof(int));
+    __builtin_memcpy(CMSG_DATA(request_header), passed_fds, passed_fd_count * sizeof(int));
+
+    ssize_t sent = 0;
+    do {
+        sent = sendmsg(s_connect_broker_fd, &request_message, MSG_NOSIGNAL);
+    } while (sent < 0 && errno == EINTR);
+
+    close(reply_fds[1]);
+
+    if (sent < 0) {
+        auto saved_errno = errno;
+        close(reply_fds[0]);
+        return -saved_errno;
+    }
+
+    Detail::ConnectBrokerResponse response {};
+    iovec response_io {
+        .iov_base = &response,
+        .iov_len = sizeof(response),
+    };
+
+    union {
+        cmsghdr header;
+        char space[CMSG_SPACE(sizeof(int))];
+    } response_control {};
+
+    msghdr response_message {
+        .msg_name = nullptr,
+        .msg_namelen = 0,
+        .msg_iov = &response_io,
+        .msg_iovlen = 1,
+        .msg_control = &response_control,
+        .msg_controllen = sizeof(response_control),
+        .msg_flags = 0,
+    };
+
+    ssize_t received = 0;
+    do {
+        received = recvmsg(reply_fds[0], &response_message, MSG_CMSG_CLOEXEC);
+    } while (received < 0 && errno == EINTR);
+
+    auto saved_errno = errno;
+    close(reply_fds[0]);
+
+    if (received < 0)
+        return -saved_errno;
+
+    int answered_fd = -1;
+    for (auto* header = CMSG_FIRSTHDR(&response_message); header; header = CMSG_NXTHDR(&response_message, header)) {
+        if (header->cmsg_level != SOL_SOCKET || header->cmsg_type != SCM_RIGHTS)
+            continue;
+        if (header->cmsg_len < CMSG_LEN(0))
+            continue;
+        auto count = (header->cmsg_len - CMSG_LEN(0)) / sizeof(int);
+        for (size_t i = 0; i < count; ++i) {
+            int fd = -1;
+            __builtin_memcpy(&fd, CMSG_DATA(header) + i * sizeof(int), sizeof(fd));
+            if (answered_fd < 0)
+                answered_fd = fd;
+            else
+                close(fd);
+        }
+    }
+
+    auto fail = [&](i64 error) {
+        if (answered_fd >= 0)
+            close(answered_fd);
+        return error;
+    };
+
+    if (static_cast<size_t>(received) != sizeof(response) || response.magic != Detail::connect_broker_magic)
+        return fail(-EACCES);
+    if (response.error != 0)
+        return fail(-response.error);
+    if (!expect_descriptor)
+        return fail(0);
+    if (answered_fd < 0)
+        return -EACCES;
+
+    return answered_fd;
+}
+
+// Reading the caller's address directly would turn a bad pointer into a fault, where the syscall
+// this stands in for returns EFAULT. Copying it through a pipe leaves the checking to the kernel,
+// and a short copy means the far end is unreadable, which is the same answer.
+static i64 copy_from_caller(void* destination, void const* source, size_t length)
+{
+    int fds[2];
+    if (pipe2(fds, O_CLOEXEC) < 0)
+        return -errno;
+
+    i64 result = 0;
+    ssize_t written = 0;
+    do {
+        written = write(fds[1], source, length);
+    } while (written < 0 && errno == EINTR);
+
+    if (written < 0)
+        result = -errno;
+    else if (static_cast<size_t>(written) != length)
+        result = -EFAULT;
+
+    if (result == 0) {
+        ssize_t read_back = 0;
+        do {
+            read_back = read(fds[0], destination, length);
+        } while (read_back < 0 && errno == EINTR);
+
+        if (read_back < 0)
+            result = -errno;
+        else if (static_cast<size_t>(read_back) != length)
+            result = -EFAULT;
+    }
+
+    close(fds[0]);
+    close(fds[1]);
+    return result;
+}
+
+// socket() hands back a stream or seqpacket socket that the Browser made. Only the broker can
+// connect it, and bind and listen are blocked. Datagram sockets must not be handed out: sending
+// to an address would bypass connect(). The caller can configure its socket before connecting.
+static void emulate_socket(void* context)
+{
+    auto registers = syscall_registers(context);
+
+    Detail::ConnectBrokerRequest request {};
+    request.magic = Detail::connect_broker_magic;
+    request.operation = static_cast<u32>(Detail::ConnectBrokerOperation::CreateSocket);
+    request.socket_domain = static_cast<int>(registers.arguments[0]);
+    request.socket_type = static_cast<int>(registers.arguments[1]);
+    request.socket_protocol = static_cast<int>(registers.arguments[2]);
+
+    auto socket_type = request.socket_type & ~(SOCK_CLOEXEC | SOCK_NONBLOCK);
+    if (socket_type != SOCK_STREAM && socket_type != SOCK_SEQPACKET) {
+        set_syscall_result(registers, -ESOCKTNOSUPPORT);
         return;
     }
+
+    auto saved_errno = errno;
+
+    auto result = ask_broker(request, -1, true);
+
+    // The descriptor arrives close-on-exec, because that is how it travels safely. Put the caller's
+    // own preference back on it.
+    if (result >= 0 && (request.socket_type & SOCK_CLOEXEC) == 0) {
+        if (fcntl(static_cast<int>(result), F_SETFD, 0) < 0) {
+            auto failure = -errno;
+            close(static_cast<int>(result));
+            result = failure;
+        }
+    }
+
+    set_syscall_result(registers, result);
+    errno = saved_errno;
+}
+
+static i64 connect_through_broker(int fd, void const* address, socklen_t address_length)
+{
+    if (fd < 0)
+        return -EBADF;
+    if (address_length < static_cast<socklen_t>(offsetof(sockaddr_un, sun_path)) || address_length > static_cast<socklen_t>(sizeof(sockaddr_un)))
+        return -EINVAL;
+
+    sockaddr_un local_address {};
+    if (auto result = copy_from_caller(&local_address, address, address_length); result < 0)
+        return result;
+
+    if (local_address.sun_family != AF_UNIX)
+        return -EAFNOSUPPORT;
+
+    auto available = static_cast<size_t>(address_length) - offsetof(sockaddr_un, sun_path);
+    if (available > sizeof(local_address.sun_path))
+        available = sizeof(local_address.sun_path);
+
+    // An abstract socket starts with a null byte. Nothing we broker uses one, and the abstract
+    // namespace is shared by the whole network namespace, so it is not worth carrying.
+    if (available == 0 || local_address.sun_path[0] == '\0')
+        return -EACCES;
+
+    size_t path_length = 0;
+    while (path_length < available && local_address.sun_path[path_length] != '\0')
+        ++path_length;
+
+    Detail::ConnectBrokerRequest request {};
+    request.magic = Detail::connect_broker_magic;
+    request.operation = static_cast<u32>(Detail::ConnectBrokerOperation::Connect);
+    request.socket_domain = AF_UNIX;
+    request.path_length = static_cast<u32>(path_length);
+    __builtin_memcpy(request.path, local_address.sun_path, path_length);
+
+    return ask_broker(request, fd, false);
+}
+
+static void emulate_connect(void* context)
+{
+    auto registers = syscall_registers(context);
+    auto fd = static_cast<int>(registers.arguments[0]);
+    auto* address = reinterpret_cast<void const*>(registers.arguments[1]);
+    auto address_length = static_cast<socklen_t>(registers.arguments[2]);
+
+    auto saved_errno = errno;
+    set_syscall_result(registers, connect_through_broker(fd, address, address_length));
+    errno = saved_errno;
+}
+
+static void handle_sigsys(int, siginfo_t* info, void* context)
+{
+    if (info->si_code == SYS_SECCOMP && info->si_arch == audit_architecture) {
+#if defined(__NR_newfstatat) && defined(__NR_fstat)
+        if (info->si_syscall == __NR_newfstatat && info->si_errno == emulate_fstatat_trap) {
+            emulate_fstatat(context);
+            return;
+        }
 #endif
+        if (info->si_errno == broker_socket_trap) {
+            emulate_socket(context);
+            return;
+        }
+        if (info->si_errno == broker_connect_trap) {
+            emulate_connect(context);
+            return;
+        }
+    }
 
     write_string("Sandbox violation in ");
     write_string(s_process_name);
@@ -938,9 +1237,12 @@ void SeccompPolicy::allow_filesystem_writes()
     SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, fallocate);
     SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, fchmod);
     SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, flock);
-    // NB: Mesa's shader disk cache updates entry mtimes for LRU eviction, and glibc routes the
-    //     whole utime() family through utimensat() on modern kernels.
-    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, utimensat);
+#ifdef __NR_utimensat
+    // Landlock does not restrict timestamp changes. Mesa's shader cache attempts these,
+    // so return an ordinary error instead of terminating the process.
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_utimensat, 0, 1));
+    append(SECCOMP_ERRNO(EPERM));
+#endif
 
     append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_fcntl, 0, 5));
     append(SECCOMP_LOAD_ARGUMENT(1));
@@ -1084,6 +1386,17 @@ void SeccompPolicy::allow_file_descriptor_operations()
 
 void SeccompPolicy::allow_process_creation()
 {
+    // Compiler children inherit this filter but have different thread group IDs. Landlock
+    // signal scoping confines their signals to the sandbox's process tree on ABI 6 and newer.
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, tgkill);
+    // Core::Process::spawn() asks for compiler children to die with their parent.
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_prctl, 0, 6));
+    append(SECCOMP_LOAD_ARGUMENT(0));
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, PR_SET_PDEATHSIG, 0, 3));
+    append(SECCOMP_LOAD_ARGUMENT(1));
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SIGKILL, 0, 1));
+    append(SECCOMP_ALLOW);
+    append(SECCOMP_LOAD_SYSCALL_NR);
 #ifdef __NR_arch_prctl
     SECCOMP_APPEND_ALLOW_SYSCALL(*this, arch_prctl);
 #endif
@@ -1111,12 +1424,74 @@ void SeccompPolicy::allow_process_creation()
     append(BPF_STMT(BPF_ALU | BPF_ADD | BPF_K, 0));
 #endif
 
+    // Core::Process::spawn() closes every descriptor that the child was not given, just before exec().
+#ifdef __NR_close_range
+    SECCOMP_APPEND_ALLOW_SYSCALL(*this, close_range);
+#endif
     SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, execve);
     SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, execveat);
     SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, wait4);
     SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, waitid);
 }
 
+// NB: Seccomp cannot follow the sockaddr pointer that connect() is given, and Landlock does not
+//     mediate UNIX socket connections, so neither mechanism can restrict which endpoint a process
+//     reaches. The domain argument of socket() is the only part of this the kernel lets us filter,
+//     and connect() fails with EAFNOSUPPORT when the address family does not match the socket.
+//     Being able to create a socket in a domain is therefore the same thing as being able to
+//     address every endpoint in it.
+void SeccompPolicy::append_allow_socket_with_domains([[maybe_unused]] ReadonlySpan<u32> domains)
+{
+#ifdef __NR_socket
+    // Every jump offset below is a byte, so the group has to stay well short of 255 domains.
+    VERIFY(!domains.is_empty());
+    VERIFY(domains.size() < 32);
+
+    // Jump past the whole group when this is not socket(). The group is one argument load, one
+    // comparison per domain, and the allow.
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_socket, 0, static_cast<u8>(domains.size() + 2)));
+    append(SECCOMP_LOAD_ARGUMENT(0));
+    for (size_t i = 0; i < domains.size(); ++i) {
+        // A matching domain jumps to the allow. The last comparison is the one that has to step
+        // over the allow when it does not match.
+        auto instructions_to_allow = static_cast<u8>(domains.size() - i - 1);
+        auto instructions_past_allow = static_cast<u8>(i + 1 == domains.size() ? 1 : 0);
+        append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, domains[i], instructions_to_allow, instructions_past_allow));
+    }
+    append(SECCOMP_ALLOW);
+    append(SECCOMP_LOAD_SYSCALL_NR);
+#endif
+}
+
+// NB: Socket options reach deep into the kernel. SO_ATTACH_FILTER, for one, loads a classic BPF program into it. So we
+//     allow only the options that we know to be used, and install() refuses every other one with EPERM.
+void SeccompPolicy::append_allow_socket_options(u32 syscall_number, u32 level, ReadonlySpan<u32> options)
+{
+    // Every jump offset below is a byte, so the group has to stay well short of 255 options.
+    VERIFY(!options.is_empty());
+    VERIFY(options.size() < 32);
+    auto option_count = static_cast<u8>(options.size());
+
+    // The group is the syscall comparison, the level load and comparison, the option load, one comparison per option,
+    // the allow, and the reload of the syscall number. Any other syscall jumps past all of it.
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, syscall_number, 0, static_cast<u8>(option_count + 5)));
+    append(SECCOMP_LOAD_ARGUMENT(1));
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, level, 0, static_cast<u8>(option_count + 2)));
+    append(SECCOMP_LOAD_ARGUMENT(2));
+    for (size_t i = 0; i < options.size(); ++i) {
+        // A matching option jumps to the allow. The last comparison is the one that has to step over the allow when
+        // it does not match.
+        auto instructions_to_allow = static_cast<u8>(options.size() - i - 1);
+        auto instructions_past_allow = static_cast<u8>(i + 1 == options.size() ? 1 : 0);
+        append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, options[i], instructions_to_allow, instructions_past_allow));
+    }
+    append(SECCOMP_ALLOW);
+    append(SECCOMP_LOAD_SYSCALL_NR);
+}
+
+// NB: This group covers sockets that the process already has. The Browser mints every Ladybird IPC
+//     channel with socketpair() and hands the helper a connected descriptor, so no sandboxed helper
+//     needs to create or connect a socket of its own to talk to us.
 void SeccompPolicy::allow_ipc()
 {
     SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, eventfd2);
@@ -1127,32 +1502,113 @@ void SeccompPolicy::allow_ipc()
     SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, recvfrom);
     SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, recvmmsg);
     SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, sendmsg);
-    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, sendto);
     SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, sendmmsg);
-    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, socketpair);
-#ifdef __NR_socket
-    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_socket, 0, 3));
-    append(SECCOMP_LOAD_ARGUMENT(0));
-    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AF_UNIX, 0, 1));
+#ifdef __NR_sendto
+    // send() also uses sendto(), with a null destination. Check both halves of the pointer.
+    // An addressed send falls through so allow_network() can permit it for RequestServer.
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_sendto, 0, 5));
+    append(SECCOMP_LOAD_ARGUMENT(4));
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0, 0, 3));
+    append(BPF_STMT(BPF_LD | BPF_W | BPF_ABS, static_cast<u32>(offsetof(seccomp_data, args[4]) + sizeof(u32))));
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0, 0, 1));
     append(SECCOMP_ALLOW);
     append(SECCOMP_LOAD_SYSCALL_NR);
 #endif
-    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, connect);
-    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, getsockopt);
-    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, setsockopt);
+#ifdef __NR_socketpair
+    // A datagram socketpair can send to arbitrary UNIX socket addresses without connect().
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_socketpair, 0, 6));
+    append(SECCOMP_LOAD_ARGUMENT(1));
+    append(BPF_STMT(BPF_ALU | BPF_AND | BPF_K, static_cast<u32>(~(SOCK_CLOEXEC | SOCK_NONBLOCK))));
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SOCK_STREAM, 2, 0));
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SOCK_SEQPACKET, 1, 0));
+    append(SECCOMP_ERRNO(ESOCKTNOSUPPORT));
+    append(SECCOMP_ALLOW);
+    append(SECCOMP_LOAD_SYSCALL_NR);
+#endif
     SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, getsockname);
     SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, getpeername);
+
+#if defined(__NR_getsockopt) && defined(__NR_setsockopt)
+    // LibIPC sizes the buffers of its sockets.
+    static constexpr Array<u32, 2> buffer_sizes { SO_SNDBUF, SO_RCVBUF };
+    append_allow_socket_options(__NR_setsockopt, SOL_SOCKET, buffer_sizes);
+
+    static constexpr Array<u32, 5> queries { SO_ERROR, SO_TYPE, SO_PEERCRED, SO_SNDBUF, SO_RCVBUF };
+    append_allow_socket_options(__NR_getsockopt, SOL_SOCKET, queries);
+#endif
+}
+
+// socket(AF_UNIX) asks the Browser for a stream or seqpacket socket. connect() goes to the
+// Browser too, and it connects only to a path it put on its own allowlist. Every other domain is
+// refused outright, so this cannot become a way onto the network either.
+void SeccompPolicy::broker_unix_socket_connections()
+{
+#ifdef __NR_socket
+    // Any other domain falls through to the refusal that install() puts at the end.
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_socket, 0, 3));
+    append(SECCOMP_LOAD_ARGUMENT(0));
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AF_UNIX, 0, 1));
+    append(BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRAP | broker_socket_trap));
+    append(SECCOMP_LOAD_SYSCALL_NR);
+#endif
+#ifdef __NR_connect
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_connect, 0, 1));
+    append(BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRAP | broker_connect_trap));
+#endif
+
+#if defined(__NR_getsockopt) && defined(__NR_setsockopt)
+    // libpulse asks for credentials and for a higher priority on its connection to the audio server.
+    static constexpr Array<u32, 2> client_options { SO_PASSCRED, SO_PRIORITY };
+    append_allow_socket_options(__NR_setsockopt, SOL_SOCKET, client_options);
+    append_allow_socket_options(__NR_getsockopt, SOL_SOCKET, client_options);
+#endif
+}
+
+void set_connect_broker_fd(int fd)
+{
+    s_connect_broker_fd = fd;
 }
 
 void SeccompPolicy::allow_network()
 {
-    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, socket);
+#ifdef __NR_socket
+    // glibc enumerates local interfaces with NETLINK_ROUTE sockets.
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_socket, 0, 11));
+    append(SECCOMP_LOAD_ARGUMENT(0));
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AF_NETLINK, 0, 8));
+    append(SECCOMP_LOAD_ARGUMENT(1));
+    append(BPF_STMT(BPF_ALU | BPF_AND | BPF_K, ~static_cast<u32>(SOCK_CLOEXEC | SOCK_NONBLOCK)));
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SOCK_RAW, 1, 0));
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SOCK_DGRAM, 0, 3));
+    append(SECCOMP_LOAD_ARGUMENT(2));
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, NETLINK_ROUTE, 0, 1));
+    append(SECCOMP_ALLOW);
+    append(SECCOMP_ERRNO(EPERM));
+    append(SECCOMP_LOAD_SYSCALL_NR);
+#endif
+    static constexpr Array<u32, 2> domains { AF_INET, AF_INET6 };
+    append_allow_socket_with_domains(domains);
+
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, sendto);
     SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, connect);
     SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, bind);
     SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, listen);
     SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, accept);
     SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, accept4);
     SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, shutdown);
+
+#ifdef __NR_setsockopt
+    // libcurl turns off Nagle's algorithm, and glibc's resolver asks for ICMP errors on its UDP sockets. For HTTP/3,
+    // libcurl stops the kernel from fragmenting QUIC packets and lets it coalesce the ones that it receives.
+    static constexpr Array<u32, 1> tcp_options { TCP_NODELAY };
+    append_allow_socket_options(__NR_setsockopt, IPPROTO_TCP, tcp_options);
+    static constexpr Array<u32, 1> udp_options { UDP_GRO };
+    append_allow_socket_options(__NR_setsockopt, IPPROTO_UDP, udp_options);
+    static constexpr Array<u32, 2> ipv4_options { IP_RECVERR, IP_MTU_DISCOVER };
+    append_allow_socket_options(__NR_setsockopt, IPPROTO_IP, ipv4_options);
+    static constexpr Array<u32, 3> ipv6_options { IPV6_RECVERR, IPV6_V6ONLY, IPV6_MTU_DISCOVER };
+    append_allow_socket_options(__NR_setsockopt, IPPROTO_IPV6, ipv6_options);
+#endif
 
     // Required by glibc's if_nametoindex() when resolving IPv6 link-local nameserver scopes.
     append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_ioctl, 0, 5));
@@ -1285,7 +1741,13 @@ void SeccompPolicy::allow_signals()
     SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, rt_sigprocmask);
     SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, rt_sigreturn);
     SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, sigaltstack);
-    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, tgkill);
+#ifdef __NR_tgkill
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_tgkill, 0, 4));
+    append(SECCOMP_LOAD_ARGUMENT(0));
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, static_cast<u32>(getpid()), 0, 1));
+    append(SECCOMP_ALLOW);
+    append(SECCOMP_LOAD_SYSCALL_NR);
+#endif
 }
 
 void SeccompPolicy::allow_clocks()
@@ -1299,7 +1761,46 @@ void SeccompPolicy::allow_clocks()
 
 void SeccompPolicy::allow_gpu_device_operations()
 {
-    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, ioctl);
+    // NVIDIA tries to chmod its device nodes. Refuse permission changes with an ordinary
+    // error so driver initialization can continue without granting pathname-based chmod.
+#ifdef __NR_chmod
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_chmod, 0, 1));
+    append(SECCOMP_ERRNO(EPERM));
+#endif
+#ifdef __NR_fchmodat
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_fchmodat, 0, 1));
+    append(SECCOMP_ERRNO(EPERM));
+#endif
+#ifdef __NR_fchmodat2
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_fchmodat2, 0, 1));
+    append(SECCOMP_ERRNO(EPERM));
+#endif
+
+    // DRM, DMA-BUF, sync files, udmabuf, and NVIDIA's device interfaces. Keep unrelated
+    // device and terminal controls out of the GPU policy. Individual driver commands
+    // remain the driver's responsibility; ioctl type numbers are not unique device IDs.
+    static constexpr Array types {
+        'd',
+        'b',
+        '>',
+        'u',
+        'F',
+        'm',
+#if defined(__aarch64__)
+        // NVIDIA Tegra's nvmap and nvhost interfaces.
+        'N',
+        'H',
+#endif
+    };
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_ioctl, 0, 2 * types.size() + 3));
+    append(SECCOMP_LOAD_ARGUMENT(1));
+    append(BPF_STMT(BPF_ALU | BPF_AND | BPF_K, _IOC_TYPEMASK << _IOC_TYPESHIFT));
+    for (auto type : types) {
+        append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, static_cast<u32>(type) << _IOC_TYPESHIFT, 0, 1));
+        append(SECCOMP_ALLOW);
+    }
+    append(SECCOMP_LOAD_SYSCALL_NR);
+
     SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, eventfd2);
     SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, epoll_create1);
     SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, epoll_ctl);
@@ -1325,7 +1826,20 @@ void SeccompPolicy::allow_process_metadata()
     SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, getrandom);
     SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, gettimeofday);
     SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, getrlimit);
-    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, prlimit64);
+#ifdef __NR_prlimit64
+    // glibc implements getrlimit() with prlimit64(). Only self queries are needed.
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_prlimit64, 0, 10));
+    append(SECCOMP_LOAD_ARGUMENT(0));
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0, 1, 0));
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, static_cast<u32>(getpid()), 0, 5));
+    append(SECCOMP_LOAD_ARGUMENT(2));
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0, 0, 3));
+    append(BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(seccomp_data, args[2]) + sizeof(u32)));
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0, 0, 1));
+    append(SECCOMP_ALLOW);
+    append(SECCOMP_ERRNO(EPERM));
+    append(SECCOMP_LOAD_SYSCALL_NR);
+#endif
     SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, getrusage);
     SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, sched_getaffinity);
     SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, sched_yield);
@@ -1391,7 +1905,26 @@ void SeccompPolicy::deny_current_directory_queries()
 
 void SeccompPolicy::allow_prctl()
 {
-    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, prctl);
+    // Thread names and libpulse's capability probe are the common runtime operations.
+    static constexpr Array<u32, 3> options { PR_GET_NAME, PR_SET_NAME, PR_CAPBSET_READ };
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_prctl, 0, 2 * options.size() + 2));
+    append(SECCOMP_LOAD_ARGUMENT(0));
+    for (auto option : options) {
+        append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, option, 0, 1));
+        append(SECCOMP_ALLOW);
+    }
+    append(SECCOMP_LOAD_SYSCALL_NR);
+
+#if defined(PR_SET_VMA) && defined(PR_SET_VMA_ANON_NAME)
+    // glibc and allocators name anonymous memory mappings.
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_prctl, 0, 6));
+    append(SECCOMP_LOAD_ARGUMENT(0));
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, PR_SET_VMA, 0, 3));
+    append(SECCOMP_LOAD_ARGUMENT(1));
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, PR_SET_VMA_ANON_NAME, 0, 1));
+    append(SECCOMP_ALLOW);
+    append(SECCOMP_LOAD_SYSCALL_NR);
+#endif
 }
 
 void SeccompPolicy::allow_exit()
@@ -1403,6 +1936,39 @@ void SeccompPolicy::allow_exit()
 ErrorOr<void> SeccompPolicy::install()
 {
     TRY(install_sigsys_handler());
+
+    // A socket domain that no group asked for is refused rather than fatal. Libraries probe
+    // transports they can live without; glibc, for one, tries an nscd socket before it falls back
+    // to reading files, and killing the process over that would be a stability bug, not security.
+#ifdef __NR_socket
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_socket, 0, 1));
+    append(SECCOMP_ERRNO(EAFNOSUPPORT));
+#endif
+
+#ifdef __NR_sendto
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_sendto, 0, 1));
+    append(SECCOMP_ERRNO(EPERM));
+#endif
+
+#ifdef __NR_tgkill
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_tgkill, 0, 1));
+    append(SECCOMP_ERRNO(EPERM));
+#endif
+
+#ifdef __NR_prctl
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_prctl, 0, 1));
+    append(SECCOMP_ERRNO(EPERM));
+#endif
+
+    // The same goes for a socket option that no group asked for.
+#ifdef __NR_setsockopt
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_setsockopt, 0, 1));
+    append(SECCOMP_ERRNO(EPERM));
+#endif
+#ifdef __NR_getsockopt
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_getsockopt, 0, 1));
+    append(SECCOMP_ERRNO(EPERM));
+#endif
 
     append_kill();
 

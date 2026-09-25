@@ -6,7 +6,7 @@
 
 #pragma once
 
-#include <LibWeb/Compositor/AsyncScrollingState.h>
+#include <LibCompositing/Scrolling/AsyncScrollingState.h>
 #include <LibWeb/Forward.h>
 #include <LibWeb/PixelUnits.h>
 #include <LibWeb/TextAffinity.h>
@@ -51,11 +51,12 @@ struct WheelScrollableAxes {
 WheelScrollableAxes wheel_scrollable_axes(Layout::Node const&);
 bool could_be_scrolled_by_wheel_event(Layout::Node const&);
 bool could_be_scrolled_by_wheel_event(Layout::Node const&, ScrollDirection);
-WEB_API Optional<Compositor::AsyncScrollNodeStableID> async_scroll_node_stable_id(Layout::Node const&);
+WEB_API Optional<Compositing::AsyncScrollNodeStableID> async_scroll_node_stable_id(Layout::Node const&);
 ScrollHandled set_scroll_offset(Layout::Node&, CSSPixelPoint);
 ScrollHandled set_scroll_offset_from_user_input(Layout::Node&, CSSPixelPoint, ScrollKind = ScrollKind::Relative);
 ScrollHandled scroll_by(Layout::Node&, double delta_x, double delta_y, ScrollKind = ScrollKind::Relative);
-ScrollHandled wheel_scroll_along_containing_block_chain(Layout::Node&, double wheel_delta_x, double wheel_delta_y, ScrollKind = ScrollKind::Relative);
+// The box the walk scrolled, if any.
+Layout::Node* wheel_scroll_along_containing_block_chain(Layout::Node&, double wheel_delta_x, double wheel_delta_y, ScrollKind = ScrollKind::Relative);
 
 WEB_API Layout::Node* scrolling_box_for_scroll_step_in_containing_block_chain(Layout::Node&, CSSPixelPoint delta);
 WEB_API Layout::Node* first_wheel_scrollable_box_in_containing_block_chain(Layout::Node const&);

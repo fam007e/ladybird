@@ -7,9 +7,10 @@
 #pragma once
 
 #include <AK/Forward.h>
+#include <LibCompositing/PageId.h>
 #include <LibURL/URL.h>
-#include <LibWeb/Page/PageId.h>
 #include <LibWebView/BrowsingSession.h>
+#include <LibWebView/Forward.h>
 
 #import <Cocoa/Cocoa.h>
 
@@ -19,7 +20,8 @@
 
 - (instancetype)init:(WebView::IsPrivate)is_private;
 - (instancetype)initAsChild:(Tab*)parent
-                  pageIndex:(Web::PageId)page_index;
+                pageProcess:(WebView::WebContentClient&)page_process
+                  pageIndex:(Compositing::PageId)page_index;
 
 - (WebView::IsPrivate)isPrivate;
 

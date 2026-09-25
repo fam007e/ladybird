@@ -24,6 +24,8 @@ namespace Compositor {
 
 class TimerVSyncScheduler final : public VSyncScheduler {
 public:
+    AK_ALLOC_WITH_KMALLOC;
+
     explicit TimerVSyncScheduler(Function<void(MonotonicTime)>&& tick_callback)
         : m_tick_callback(move(tick_callback))
         , m_timer(Core::Timer::create_single_shot(0, [this] {
@@ -52,18 +54,8 @@ public:
         else
             advance_next_tick_time_past(now);
 
-        if (m_timer->is_active()) {
-            if (refresh_rate_changed) {
-                m_reschedule_after_fire = false;
-                arm_timer(now);
-                return;
-            }
-            // A compositor tick can queue another tick while the timer is
-            // dispatching its callback. Remember that request instead of
-            // dropping it when the one-shot timer is still marked active.
-            m_reschedule_after_fire = true;
+        if (m_timer->is_active() && !refresh_rate_changed)
             return;
-        }
 
         arm_timer(now);
     }
@@ -84,10 +76,6 @@ private:
         advance_next_tick_time_past(now);
         auto frame_time = *m_next_tick_time - frame_interval();
         m_tick_callback(frame_time);
-        if (m_reschedule_after_fire) {
-            m_reschedule_after_fire = false;
-            arm_timer(MonotonicTime::now());
-        }
     }
 
     AK::Duration frame_interval() const
@@ -122,7 +110,6 @@ private:
     Function<void(MonotonicTime)> m_tick_callback;
     double m_refresh_rate { 60.0 };
     RefPtr<Core::Timer> m_timer;
-    bool m_reschedule_after_fire { false };
     Optional<MonotonicTime> m_next_tick_time;
 };
 
@@ -287,6 +274,8 @@ bool DisplayLinkState::is_running() const
 
 class CVDisplayLinkVSyncScheduler final : public VSyncScheduler {
 public:
+    AK_ALLOC_WITH_KMALLOC;
+
     static OwnPtr<CVDisplayLinkVSyncScheduler> try_create(u64 display_id, Function<void(MonotonicTime)>&& tick_callback)
     {
         auto state = DisplayLinkState::create(display_id, Core::EventLoop::current(), move(tick_callback));

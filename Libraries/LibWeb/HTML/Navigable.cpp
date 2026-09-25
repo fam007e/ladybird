@@ -9,6 +9,7 @@
 #include <LibWeb/HTML/LocalNavigable.h>
 #include <LibWeb/HTML/Navigable.h>
 #include <LibWeb/HTML/NavigableContainer.h>
+#include <LibWeb/HTML/RemoteNavigable.h>
 #include <LibWeb/HTML/SandboxingFlagSet.h>
 #include <LibWeb/HTML/SourceSnapshotParams.h>
 #include <LibWeb/HTML/UserNavigationInvolvement.h>
@@ -56,6 +57,42 @@ bool Navigable::is_ancestor_of(Navigable const& other) const
 {
     for (auto ancestor = other.parent(); ancestor; ancestor = ancestor->parent()) {
         if (ancestor.ptr() == this)
+            return true;
+    }
+    return false;
+}
+
+// The currently focused area of the walk from this navigable down, as far as this page holds it. Other processes can
+// host the documents on the way to the tab's focused navigable. The walk then resumes at the nearest navigable above the
+// focused navigable that this page hosts, or ends at the nearest container this page holds.
+GC::Ptr<DOM::Node> Navigable::currently_focused_area_shown_by_focused_navigable()
+{
+    if (!page().client().has_focus())
+        return nullptr;
+
+    auto focused_navigable = page().focused_navigable();
+    if (!focused_navigable || (focused_navigable.ptr() != this && !is_ancestor_of(*focused_navigable)))
+        return nullptr;
+
+    for (auto navigable = focused_navigable; navigable; navigable = navigable->parent()) {
+        if (auto* local_navigable = as_if<LocalNavigable>(*navigable))
+            return local_navigable->currently_focused_area();
+        if (navigable.ptr() == this)
+            return nullptr;
+        if (auto container = navigable->container())
+            return container;
+    }
+    return nullptr;
+}
+
+// AD-HOC: Destroying a child navigable detaches its subtree from the traversable, although the documents in that
+//         subtree keep their navigable until the destruction's unload steps complete. The spec destroys each of those
+//         documents from a queued task, so the node navigable of a removed iframe's documents stays non-null — leaving
+//         them reporting their child navigables long after the removal. Other engines detach the whole subtree at once.
+bool Navigable::is_in_a_destroyed_subtree() const
+{
+    for (auto navigable = GC::Ptr<Navigable const> { this }; navigable; navigable = navigable->parent()) {
+        if (navigable->has_been_destroyed())
             return true;
     }
     return false;
@@ -195,6 +232,7 @@ WebIDL::ExceptionOr<void> Navigable::navigate(NavigateParams params)
         .navigation_id = params.navigation_id.release_value(),
         .source_element = params.source_element,
         .initial_insertion = params.initial_insertion,
+        .api_method_tracker = params.api_method_tracker,
         .csp_navigation_type = csp_navigation_type,
         .source_snapshot_params = source_snapshot_params,
         .initiator_origin_snapshot = move(initiator_origin_snapshot),
@@ -254,6 +292,34 @@ bool Navigable::allowed_by_sandboxing_to_navigate(Navigable const& target, Sourc
     // 5. If sourceSnapshotParams's sandboxing flags's sandboxed navigation browsing context flag is set, then return false.
     // 6. Return true.
     return !has_flag(source_snapshot_params.sandboxing_flags, SandboxingFlagSet::SandboxedNavigation);
+}
+
+GC::Ptr<Navigable> navigable_with_id_in_any_page(Page const& preferred_page, CrossProcessId id)
+{
+    // A local navigable is the navigable itself, so scanning those first stands one in another page ahead of any
+    // proxy of it.
+    GC::Ptr<Navigable> match;
+    auto consider = [&](Navigable& navigable) {
+        if (navigable.id() != id || navigable.has_been_destroyed())
+            return false;
+        if (&navigable.page() == &preferred_page) {
+            match = navigable;
+            return true;
+        }
+        if (!match)
+            match = navigable;
+        return false;
+    };
+
+    for (auto& navigable : all_local_navigables()) {
+        if (consider(navigable))
+            return match;
+    }
+    for (auto& navigable : all_remote_navigables()) {
+        if (consider(navigable))
+            return match;
+    }
+    return match;
 }
 
 }

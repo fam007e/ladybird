@@ -8,9 +8,10 @@
 #pragma once
 
 #include <AK/Optional.h>
+#include <AK/kmalloc.h>
+#include <LibCompositing/PageId.h>
 #include <LibWakeLock/DisplaySleepInhibitor.h>
 #include <LibWeb/HTML/AudioPlayState.h>
-#include <LibWeb/Page/PageId.h>
 #include <LibWeb/Page/ScreenWakeLockHandle.h>
 #include <LibWebView/FileDownloader.h>
 #include <LibWebView/Settings.h>
@@ -44,6 +45,8 @@ class HyperlinkLabel final : public QLabel {
     Q_OBJECT
 
 public:
+    AK_ALLOC_WITH_KMALLOC;
+
     explicit HyperlinkLabel(QWidget* parent = nullptr)
         : QLabel(parent, Qt::ToolTip | Qt::FramelessWindowHint | Qt::NoDropShadowWindowHint)
     {
@@ -67,7 +70,9 @@ class Tab final
     Q_OBJECT
 
 public:
-    Tab(BrowserWindow* window, RefPtr<WebView::WebContentClient> parent_client = nullptr, Web::PageId page_index = 0);
+    AK_ALLOC_WITH_KMALLOC;
+
+    Tab(BrowserWindow* window, RefPtr<WebView::WebContentClient> parent_client = nullptr, Compositing::PageId page_index = 0);
     virtual ~Tab() override;
 
     WebContentView& view() { return *m_view; }

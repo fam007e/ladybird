@@ -12,9 +12,7 @@ use crate::layout::svg_formatting_context;
 use crate::layout::used_values::FfiCssPixelPoint;
 use crate::layout::used_values::FfiCssPixelRect;
 use crate::layout::used_values::FfiCssPixelSize;
-use crate::painting::display_list::commands::SpatialNodeIndex;
-use crate::painting::display_list::commands::{ClipNodeIndex, ContextRef, EffectNodeIndex};
-use crate::painting::filter_bytes::filter_functions_graph;
+use crate::painting::filter_bytes::{FfiFilterFunction, filter_functions_graph};
 use crate::painting::force_dark::ForceDarkRole;
 use crate::painting::host::visual_context::FfiSvgFilterPrimitive;
 use crate::painting::paintable_data::*;
@@ -22,6 +20,7 @@ use crate::painting::paintable_rows::{PaintableRowsRead, with_inline_pieces};
 use crate::painting::rect_to_viewport_transform::RectToViewportTransform;
 use crate::painting::scroll_chain::ViewportWheelOverflow;
 use crate::painting::svg_filter::SvgFilterPrimitive;
+use libcompositing_rust::ffi::{ffi_slice, tree_from_handle};
 use libgfx_rust::filter::Filter;
 use std::ffi::c_void;
 use std::rc::Rc;
@@ -106,26 +105,6 @@ pub unsafe extern "C" fn layout_arena_paintable_set_scrollbar_enlarged(
     rows.paintable_data_mut(slot).set_flag(flag, enlarged);
     use crate::painting::record::damage::PaintDamage;
     rows.push_paint_damage(slot, PaintDamage::DRAW_OVERLAY | PaintDamage::HIT_OVERLAY);
-}
-
-/// Decide if force-dark should invert an image: the caller owns the sampling, this owns the policy. Returns false
-/// for an empty or null buffer, which leaves the image untouched.
-///
-/// # Safety
-/// `samples` must point to `count` packed colors, or be null.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn ladybird_web_force_dark_should_filter_image(
-    samples: *const u32,
-    count: usize,
-    transparency_ratio: f32,
-) -> bool {
-    if samples.is_null() || count == 0 {
-        return false;
-    }
-    // Color is repr(transparent) over u32, so the buffer needs no copy to be read as colors.
-    let colors = unsafe { std::slice::from_raw_parts(samples.cast::<libgfx_rust::Color>(), count) };
-    let features = crate::painting::force_dark::features_from_samples(colors, transparency_ratio);
-    crate::painting::force_dark::should_filter(&features)
 }
 
 /// # Safety
@@ -493,191 +472,6 @@ pub unsafe extern "C" fn layout_arena_paintable_has_child_paintables(arena: *mut
     crate::painting::paint_order::first_paint_child(&arena.paintable_rows(), slot).is_some()
 }
 
-pub(crate) unsafe fn ffi_slice<'a, T>(data: *const T, length: usize) -> &'a [T] {
-    assert!(!data.is_null() || length == 0);
-    if length == 0 {
-        return &[];
-    }
-    // SAFETY: The caller guarantees `data` points at `length` valid values for
-    // the duration of the borrow.
-    unsafe { std::slice::from_raw_parts(data, length) }
-}
-
-/// # Safety
-///
-/// `tree` must be a live retained tree handle.
-pub(crate) unsafe fn tree_from_handle<'a>(
-    tree: *const c_void,
-) -> &'a crate::painting::visual_context::VisualContextTree {
-    // SAFETY: The caller guarantees `tree` is a live retained handle.
-    unsafe { &*tree.cast::<crate::painting::visual_context::VisualContextTree>() }
-}
-
-/// # Safety
-///
-/// Both trees must be live retained tree handles and every pointer must address the stated number of
-/// bytes, runs or points for the call; each run table must be the validated table of its tape.
-/// Writes the damage rect through `out_damage_rect` and returns whether the damage is bounded;
-/// unbounded damage means the whole viewport must repaint.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn display_list_compute_damage(
-    old_command_bytes: *const u8,
-    old_command_bytes_length: usize,
-    old_command_runs: *const crate::painting::display_list::commands::DisplayListCommandRun,
-    old_command_run_count: usize,
-    old_tree: *const c_void,
-    old_scroll_offsets: *const libgfx_rust::FloatPoint,
-    old_scroll_offsets_len: usize,
-    new_command_bytes: *const u8,
-    new_command_bytes_length: usize,
-    new_command_runs: *const crate::painting::display_list::commands::DisplayListCommandRun,
-    new_command_run_count: usize,
-    new_tree: *const c_void,
-    new_scroll_offsets: *const libgfx_rust::FloatPoint,
-    new_scroll_offsets_len: usize,
-    viewport_rect: libgfx_rust::IntRect,
-    out_damage_rect: *mut libgfx_rust::IntRect,
-) -> bool {
-    let (old_tree, new_tree) = unsafe { (tree_from_handle(old_tree), tree_from_handle(new_tree)) };
-    // SAFETY: The caller guarantees the slices address the stated number of values.
-    let (old_command_bytes, old_command_runs, old_scroll_offsets) = unsafe {
-        (
-            ffi_slice(old_command_bytes, old_command_bytes_length),
-            ffi_slice(old_command_runs, old_command_run_count),
-            ffi_slice(old_scroll_offsets, old_scroll_offsets_len),
-        )
-    };
-    // SAFETY: As above, for the new frame's inputs.
-    let (new_command_bytes, new_command_runs, new_scroll_offsets) = unsafe {
-        (
-            ffi_slice(new_command_bytes, new_command_bytes_length),
-            ffi_slice(new_command_runs, new_command_run_count),
-            ffi_slice(new_scroll_offsets, new_scroll_offsets_len),
-        )
-    };
-    let damage = crate::painting::display_list::damage::compute_display_list_damage(
-        crate::painting::display_list::damage::DisplayListFrame {
-            command_bytes: old_command_bytes,
-            command_runs: old_command_runs,
-            visual_context_tree: old_tree,
-            scroll_offsets: old_scroll_offsets,
-        },
-        crate::painting::display_list::damage::DisplayListFrame {
-            command_bytes: new_command_bytes,
-            command_runs: new_command_runs,
-            visual_context_tree: new_tree,
-            scroll_offsets: new_scroll_offsets,
-        },
-        viewport_rect,
-    );
-    match damage {
-        Some(damage_rect) => {
-            // SAFETY: The caller guarantees `out_damage_rect` is writable.
-            unsafe { *out_damage_rect = damage_rect };
-            true
-        }
-        None => false,
-    }
-}
-
-/// # Safety
-///
-/// The tree must be a live retained handle and each pointer must address the stated number of values.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn display_list_animated_content_may_affect_viewport(
-    command_bytes: *const u8,
-    command_bytes_length: usize,
-    tree: *const c_void,
-    scroll_offsets: *const libgfx_rust::FloatPoint,
-    scroll_offsets_len: usize,
-    rotation_nodes: *const crate::painting::display_list::commands::SpatialNodeIndex,
-    rotation_nodes_len: usize,
-    opacity_nodes: *const crate::painting::display_list::commands::EffectNodeIndex,
-    opacity_nodes_len: usize,
-    viewport_rect: libgfx_rust::IntRect,
-) -> bool {
-    // SAFETY: The caller guarantees a live tree and valid slices for the duration of the call.
-    unsafe {
-        crate::painting::display_list::damage::animated_content_may_affect_viewport(
-            ffi_slice(command_bytes, command_bytes_length),
-            tree_from_handle(tree),
-            ffi_slice(scroll_offsets, scroll_offsets_len),
-            ffi_slice(rotation_nodes, rotation_nodes_len),
-            ffi_slice(opacity_nodes, opacity_nodes_len),
-            viewport_rect,
-        )
-    }
-}
-
-/// # Safety
-/// `tree` must be a live, structurally valid tree; `command_runs` must be valid for
-/// `command_run_count` entries. The returned immutable plan is safe to share across
-/// replay threads while its owner keeps it alive.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn display_list_create_effect_clip_plan(
-    tree: *const c_void,
-    command_runs: *const crate::painting::display_list::commands::DisplayListCommandRun,
-    command_run_count: usize,
-) -> *const c_void {
-    let tree = unsafe { tree_from_handle(tree) };
-    let runs = unsafe { ffi_slice(command_runs, command_run_count) };
-    crate::painting::display_list::effect_clip_plan::EffectClipPlan::new(tree, runs)
-        .map_or(std::ptr::null(), |plan| Box::into_raw(Box::new(plan)).cast())
-}
-
-/// # Safety
-/// `plan` must be a plan returned by `display_list_create_effect_clip_plan`, and
-/// no thread may still be using it. This consumes ownership of the plan.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn display_list_destroy_effect_clip_plan(plan: *const c_void) {
-    if !plan.is_null() {
-        unsafe {
-            drop(Box::from_raw(
-                plan.cast_mut()
-                    .cast::<crate::painting::display_list::effect_clip_plan::EffectClipPlan>(),
-            ));
-        }
-    }
-}
-
-/// # Safety
-///
-/// `tree` must be a live retained tree handle, `command_runs` must address `command_run_count`
-/// runs and `scroll_offsets` `scroll_offsets_len` points for the call, and `callbacks` must be
-/// live. The painter callbacks run synchronously and may re-enter this function for a nested
-/// display list. `effect_clip_plan` must remain live and must have been prepared
-/// for these runs and the tree's current structural epoch.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn display_list_replay(
-    tree: *const c_void,
-    effect_clip_plan: *const c_void,
-    command_runs: *const crate::painting::display_list::commands::DisplayListCommandRun,
-    command_run_count: usize,
-    scroll_offsets: *const libgfx_rust::FloatPoint,
-    scroll_offsets_len: usize,
-    callbacks: *const crate::painting::host::FfiDisplayListReplayCallbacks,
-) {
-    let tree = unsafe { tree_from_handle(tree) };
-    // SAFETY: The caller guarantees the slices address the stated number of values.
-    let (command_runs, scroll_offsets) = unsafe {
-        (
-            ffi_slice(command_runs, command_run_count),
-            ffi_slice(scroll_offsets, scroll_offsets_len),
-        )
-    };
-    // SAFETY: The caller guarantees `callbacks` is live for the call.
-    let mut painter = unsafe { *callbacks };
-    let effect_clip_plan =
-        unsafe { &*effect_clip_plan.cast::<crate::painting::display_list::effect_clip_plan::EffectClipPlan>() };
-    crate::painting::display_list::replay::replay_display_list(
-        tree,
-        command_runs,
-        effect_clip_plan,
-        scroll_offsets,
-        &mut painter,
-    );
-}
-
 /// # Safety
 ///
 /// `arena` must be a live handle from `layout_arena_create`, used on the
@@ -781,6 +575,10 @@ pub unsafe extern "C" fn layout_arena_prepare_for_rendering(
         .borrow_mut()
         .update_root_background_source(arena, root_background_source);
     crate::painting::scrollable_overflow::update_scrollable_overflow(arena);
+    // The root background covers the viewport united with the root's scrollable overflow, which
+    // recording reads. Measure it here: measuring it lazily during recording could flip its
+    // scrollability while the paint state is borrowed, and the flip would miss this frame.
+    arena.ensure_scrollable_overflow(root_background_source.root_layout_node);
     let changed = arena.scrollable_overflow.geometry_changed.replace(false);
     let flipped = arena.scrollable_overflow.scrollability_changed.replace(false);
     let mut visual_context_values_changed = false;
@@ -1058,42 +856,6 @@ pub unsafe extern "C" fn layout_arena_visual_context_pending_dirty_box_count(are
     let arena = unsafe { arena_from_handle(arena) };
     let paint_state = arena.paint_state().borrow();
     paint_state.visual_context.dirty_boxes.boxes.len()
-}
-
-/// # Safety
-///
-/// `arena` must be a live handle from `layout_arena_create`, used on the document thread, and
-/// `tree` a live retained tree handle. `append` is called synchronously with every node the
-/// paintable owns that an animation of the given kind can target.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn layout_arena_paintable_visual_animation_target_indices(
-    arena: *mut c_void,
-    slot: NodeSlotId,
-    tree: *const c_void,
-    target_kind: crate::painting::host::FfiVisualAnimationTargetKind,
-    context: *mut c_void,
-    append: unsafe extern "C" fn(*mut c_void, u32),
-) {
-    let arena = unsafe { arena_from_handle(arena) };
-    let tree = unsafe { tree_from_handle(tree) };
-    arena.with_paintable_visual_context_node_handles(slot, |handles| {
-        let owned_indices: Vec<u32> = match target_kind {
-            crate::painting::host::FfiVisualAnimationTargetKind::Opacity
-            | crate::painting::host::FfiVisualAnimationTargetKind::BackgroundColor
-            | crate::painting::host::FfiVisualAnimationTargetKind::Filter => {
-                handles.effects.iter().map(|index| index.0).collect()
-            }
-            crate::painting::host::FfiVisualAnimationTargetKind::Transform => {
-                handles.spatial.iter().map(|index| index.0).collect()
-            }
-        };
-        for index in owned_indices {
-            if tree.visual_animation_target_is_valid(target_kind, index) {
-                // SAFETY: the host appends into its own storage synchronously.
-                unsafe { append(context, index) };
-            }
-        }
-    });
 }
 
 /// # Safety
@@ -2919,705 +2681,199 @@ pub unsafe extern "C" fn layout_arena_visual_context_tree_structural_epoch(arena
 
 /// # Safety
 ///
-/// `tree` must be a retained tree handle (from `layout_arena_main_visual_context_tree_retain`,
-/// a host callback, or an earlier retain), used on the thread that owns it.
+/// `arena` must be a live handle from `layout_arena_create`, used on the document thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn visual_context_tree_retain(tree: *const c_void) -> *const c_void {
-    // SAFETY: The caller guarantees `tree` is a live retained handle, so the strong count is at least one.
-    unsafe { Rc::increment_strong_count(tree.cast::<crate::painting::visual_context::VisualContextTree>()) };
-    tree
+pub unsafe extern "C" fn layout_arena_visual_context_tree_has_visual_animations(arena: *mut c_void) -> bool {
+    let arena = unsafe { arena_from_handle(arena) };
+    let paint_state = arena.paint_state().borrow();
+    paint_state
+        .visual_context
+        .tree
+        .as_deref()
+        .is_some_and(|tree| tree.has_visual_animations())
 }
 
 /// # Safety
 ///
-/// `tree` must be null or a retained tree handle that the caller gives up with this call.
+/// The returned handle is owned by the caller until `compositor_animation_effect_state_destroy`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn visual_context_tree_release(tree: *const c_void) {
-    if tree.is_null() {
+pub unsafe extern "C" fn compositor_animation_effect_state_create() -> *mut c_void {
+    Box::into_raw(Box::new(
+        crate::painting::visual_animation_builder::CompositorAnimationEffectState::default(),
+    ))
+    .cast()
+}
+
+/// # Safety
+///
+/// `state` must be a handle from `compositor_animation_effect_state_create` that is given up here.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn compositor_animation_effect_state_destroy(state: *mut c_void) {
+    if state.is_null() {
         return;
     }
-    // SAFETY: The caller gives up the reference it retained, and the strong count is at least one.
-    unsafe { Rc::decrement_strong_count(tree.cast::<crate::painting::visual_context::VisualContextTree>()) };
+    // SAFETY: The caller gives up the handle it created.
+    drop(unsafe {
+        Box::from_raw(state.cast::<crate::painting::visual_animation_builder::CompositorAnimationEffectState>())
+    });
+}
+
+/// Builds the animation of the request's target kind for the effect and keeps it pending with the
+/// effect. The target's nodes come from the arena's main tree.
+///
+/// # Safety
+///
+/// `state` must be a live effect state handle, `arena` a live handle from `layout_arena_create`
+/// used on the document thread, and the request and host, with every range they address, live
+/// for the call. The host's callbacks run synchronously and may not touch the arena.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn compositor_animation_effect_build(
+    state: *mut c_void,
+    arena: *mut c_void,
+    request: *const crate::painting::host::FfiCompositorAnimationRequest,
+    host: *const crate::painting::host::FfiCompositorAnimationHost,
+) -> crate::painting::host::FfiCompositorAnimationBuildOutcome {
+    use crate::painting::visual_animation_builder::{Host, Request, effect_state_from_handle};
+    let state = unsafe { effect_state_from_handle(state) };
+    let arena = unsafe { arena_from_handle(arena) };
+    let request = unsafe { Request::new(&*request) };
+    let host = Host::new(unsafe { &*host });
+    let tree = arena.paint_state().borrow().visual_context.tree.clone();
+    state.build(&request, &host, |kind| {
+        arena.paintable_visual_animation_target_indices(request.layout_node(), tree.as_deref(), kind)
+    })
 }
 
 /// # Safety
 ///
-/// `tree` must be a live retained tree handle.
+/// `state` must be a live effect state handle.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn visual_context_tree_structural_epoch(tree: *const c_void) -> u64 {
-    unsafe { tree_from_handle(tree) }.structural_epoch
-}
-
-/// # Safety
-///
-/// `tree` must be a live retained tree handle; `append` is called synchronously with `sink`.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn visual_context_tree_serialize(
-    tree: *const c_void,
-    sink: *mut c_void,
-    append: unsafe extern "C" fn(*mut c_void, *const u8, usize),
+pub unsafe extern "C" fn compositor_animation_effect_discard_pending(
+    state: *mut c_void,
+    kind: crate::painting::host::FfiVisualAnimationTargetKind,
 ) {
-    let bytes = unsafe { tree_from_handle(tree) }.to_bytes();
-    // SAFETY: The C++ sink copies the bytes synchronously.
-    unsafe { append(sink, bytes.as_ptr(), bytes.len()) };
+    unsafe { crate::painting::visual_animation_builder::effect_state_from_handle(state) }.discard_pending(kind);
 }
 
 /// # Safety
 ///
-/// `bytes` must address `length` readable bytes for the call. Returns a retained tree handle the
-/// caller owns, or null when the bytes do not describe a valid tree.
+/// `state` must be a live effect state handle.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn visual_context_tree_deserialize(bytes: *const u8, length: usize) -> *const c_void {
-    // SAFETY: The caller guarantees `bytes` addresses `length` readable bytes.
-    let bytes = unsafe { ffi_slice(bytes, length) };
-    match crate::painting::visual_context::VisualContextTree::from_bytes(bytes) {
-        Some(tree) => Rc::into_raw(Rc::new(tree)).cast(),
-        None => std::ptr::null(),
-    }
+pub unsafe extern "C" fn compositor_animation_effect_has_pending(state: *mut c_void) -> bool {
+    unsafe { crate::painting::visual_animation_builder::effect_state_from_handle(state) }.has_pending()
 }
 
 /// # Safety
 ///
-/// `tree` must be a live retained tree handle.
+/// `state` must be a live effect state handle.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn visual_context_tree_spatial_node_count(tree: *const c_void) -> usize {
-    unsafe { tree_from_handle(tree) }.spatial_nodes.len()
+pub unsafe extern "C" fn compositor_animation_effect_clear_pending(state: *mut c_void) {
+    unsafe { crate::painting::visual_animation_builder::effect_state_from_handle(state) }.clear_pending();
 }
 
+/// Publishes the effect's pending animations: they become the ones it retains, and copies join the
+/// document's list for the current update pass.
+///
 /// # Safety
 ///
-/// `tree` must be a live retained tree handle.
+/// `state` must be a live effect state handle and `arena` a live handle from `layout_arena_create`
+/// used on the document thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn visual_context_tree_context_is_valid(tree: *const c_void, context: ContextRef) -> bool {
-    unsafe { tree_from_handle(tree) }.context_is_valid(context)
-}
-
-/// # Safety
-///
-/// `tree` must be a live retained tree handle. Every node slot, live or dead.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn visual_context_tree_node_count(tree: *const c_void) -> usize {
-    unsafe { tree_from_handle(tree) }.node_count()
-}
-
-/// # Safety
-///
-/// `tree` must be a live retained tree handle.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn visual_context_tree_live_node_count(tree: *const c_void) -> usize {
-    unsafe { tree_from_handle(tree) }.live_node_count()
-}
-
-/// # Safety
-///
-/// `tree` must be a live retained tree handle; `command_runs` must address `command_run_count`
-/// runs for the call.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn display_list_references_only_live_visual_context_nodes(
-    tree: *const c_void,
-    command_runs: *const crate::painting::display_list::commands::DisplayListCommandRun,
-    command_run_count: usize,
-) -> bool {
-    let tree = unsafe { tree_from_handle(tree) };
-    // SAFETY: The caller guarantees the slice addresses the stated number of runs.
-    let command_runs = unsafe { ffi_slice(command_runs, command_run_count) };
-    tree.display_list_references_only_live_nodes(command_runs)
-}
-
-/// # Safety
-///
-/// `tree` must be a live retained tree handle; `scroll_offsets` must address `scroll_offsets_len`
-/// points and `out_local_point` must be writable.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn visual_context_tree_transform_point_for_hit_test(
-    tree: *const c_void,
-    context: crate::painting::display_list::commands::ContextRef,
-    screen_point: libgfx_rust::FloatPoint,
-    scroll_offsets: *const libgfx_rust::FloatPoint,
-    scroll_offsets_len: usize,
-    respect_clip: bool,
-    out_local_point: *mut libgfx_rust::FloatPoint,
-) -> bool {
-    let tree = unsafe { tree_from_handle(tree) };
-    // SAFETY: The caller guarantees the offsets address `scroll_offsets_len` points.
-    let scroll_offsets = unsafe { ffi_slice(scroll_offsets, scroll_offsets_len) };
-    let clip_behavior = crate::painting::visual_context::ClipBehavior::from_respect_clip(respect_clip);
-    match tree.transform_point_for_hit_test(context, screen_point, scroll_offsets, clip_behavior) {
-        Some(local_point) => {
-            // SAFETY: The caller guarantees `out_local_point` is writable.
-            unsafe { *out_local_point = local_point };
-            true
-        }
-        None => false,
-    }
-}
-
-/// # Safety
-///
-/// `tree` must be a live retained tree handle.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn visual_context_tree_inverse_transform_point(
-    tree: *const c_void,
-    spatial: SpatialNodeIndex,
-    screen_point: libgfx_rust::FloatPoint,
-) -> libgfx_rust::FloatPoint {
-    unsafe { tree_from_handle(tree) }.inverse_transform_point(spatial, screen_point)
-}
-
-fn include_visual_viewport_transform_from(
-    include: bool,
-) -> crate::painting::visual_context::IncludeVisualViewportTransform {
-    if include {
-        crate::painting::visual_context::IncludeVisualViewportTransform::Yes
-    } else {
-        crate::painting::visual_context::IncludeVisualViewportTransform::No
-    }
-}
-
-/// # Safety
-///
-/// `tree` must be a live retained tree handle; `scroll_offsets` must address `scroll_offsets_len` points.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn visual_context_tree_transform_rect_to_viewport(
-    tree: *const c_void,
-    spatial: SpatialNodeIndex,
-    rect: libgfx_rust::FloatRect,
-    scroll_offsets: *const libgfx_rust::FloatPoint,
-    scroll_offsets_len: usize,
-    include_visual_viewport_transform: bool,
-) -> libgfx_rust::FloatRect {
-    let tree = unsafe { tree_from_handle(tree) };
-    // SAFETY: The caller guarantees the offsets address `scroll_offsets_len` points.
-    let scroll_offsets = unsafe { ffi_slice(scroll_offsets, scroll_offsets_len) };
-    tree.transform_rect_to_viewport(
-        spatial,
-        rect,
-        scroll_offsets,
-        include_visual_viewport_transform_from(include_visual_viewport_transform),
-    )
-}
-
-/// # Safety
-///
-/// `tree` must be a live retained tree handle; `scroll_offsets` must address `scroll_offsets_len` points.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn visual_context_tree_cumulative_scroll_chain_offset(
-    tree: *const c_void,
-    spatial: SpatialNodeIndex,
-    scroll_offsets: *const libgfx_rust::FloatPoint,
-    scroll_offsets_len: usize,
-) -> libgfx_rust::FloatPoint {
-    let tree = unsafe { tree_from_handle(tree) };
-    // SAFETY: The caller guarantees the offsets address `scroll_offsets_len` points.
-    let scroll_offsets = unsafe { ffi_slice(scroll_offsets, scroll_offsets_len) };
-    tree.cumulative_scroll_chain_offset(spatial, scroll_offsets)
-}
-
-/// # Safety
-///
-/// `tree` must be a live retained tree handle; `scroll_offsets` must address `scroll_offsets_len` points.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn visual_context_tree_accumulated_matrix(
-    tree: *const c_void,
-    spatial: SpatialNodeIndex,
-    scroll_offsets: *const libgfx_rust::FloatPoint,
-    scroll_offsets_len: usize,
-    include_visual_viewport_transform: bool,
-) -> libgfx_rust::FloatMatrix4x4 {
-    let tree = unsafe { tree_from_handle(tree) };
-    // SAFETY: The caller guarantees the offsets address `scroll_offsets_len` points.
-    let scroll_offsets = unsafe { ffi_slice(scroll_offsets, scroll_offsets_len) };
-    tree.accumulated_matrix(
-        spatial,
-        scroll_offsets,
-        include_visual_viewport_transform_from(include_visual_viewport_transform),
-    )
-}
-
-/// # Safety
-///
-/// `tree` must be a live retained tree handle; `scroll_offsets` must address `scroll_offsets_len`
-/// points, and `push` is called synchronously with `sink` for every sticky node's resolved entry.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn visual_context_tree_resolve_sticky_offsets(
-    tree: *const c_void,
-    scroll_offsets: *const libgfx_rust::FloatPoint,
-    scroll_offsets_len: usize,
-    sink: *mut c_void,
-    push: unsafe extern "C" fn(*mut c_void, SpatialNodeIndex, libgfx_rust::FloatPoint),
+pub unsafe extern "C" fn compositor_animation_effect_publish_pending(
+    state: *mut c_void,
+    arena: *mut c_void,
+    reuse_retained_timing_anchors: bool,
 ) {
-    let resolved_sticky_entries = {
-        let tree = unsafe { tree_from_handle(tree) };
-        // SAFETY: The caller guarantees the offsets address `scroll_offsets_len` points, and the
-        // borrow ends before the sink may grow the same storage.
-        let scroll_offsets = unsafe { ffi_slice(scroll_offsets, scroll_offsets_len) };
-        tree.resolve_sticky_offsets(scroll_offsets)
-    };
-    for (node_index, offset) in resolved_sticky_entries {
-        // SAFETY: The C++ sink records the entry synchronously.
-        unsafe { push(sink, node_index, offset) };
-    }
+    let animations = unsafe { crate::painting::visual_animation_builder::effect_state_from_handle(state) }
+        .publish_pending(reuse_retained_timing_anchors);
+    let arena = unsafe { arena_from_handle(arena) };
+    arena
+        .paint_state()
+        .borrow_mut()
+        .visual_context
+        .pending_compositor_animations
+        .extend(animations);
 }
 
 /// # Safety
 ///
-/// `tree` must be a live retained tree handle.
+/// `state` must be a live effect state handle.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn visual_context_tree_visual_viewport_transform(
-    tree: *const c_void,
-) -> crate::painting::host::FfiVisualViewportTransform {
-    let tree = unsafe { tree_from_handle(tree) };
-    let crate::painting::visual_context::SpatialData::Transform(transform) =
-        &tree.spatial_nodes[crate::painting::display_list::commands::VISUAL_VIEWPORT_NODE_INDEX.0 as usize].data
-    else {
-        unreachable!("the visual viewport node is a transform");
-    };
-    crate::painting::host::FfiVisualViewportTransform {
-        matrix: transform.matrix,
-        origin: transform.origin,
-    }
+pub unsafe extern "C" fn compositor_animation_effect_has_retained(state: *mut c_void) -> bool {
+    unsafe { crate::painting::visual_animation_builder::effect_state_from_handle(state) }.has_retained()
 }
 
 /// # Safety
 ///
-/// `tree` must be a live retained tree handle. Returns a retained handle to a copy of the tree whose
-/// visual viewport node carries the given transform; the copy keeps the structural epoch.
+/// `state` must be a live effect state handle.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn visual_context_tree_with_visual_viewport_transform(
-    tree: *const c_void,
-    transform: crate::painting::host::FfiVisualViewportTransform,
-) -> *const c_void {
-    let mut copy = unsafe { tree_from_handle(tree) }.clone();
-    copy.set_visual_viewport_matrix_and_origin(transform.matrix, transform.origin);
-    Rc::into_raw(Rc::new(copy)).cast()
+pub unsafe extern "C" fn compositor_animation_effect_clear_retained(state: *mut c_void) {
+    unsafe { crate::painting::visual_animation_builder::effect_state_from_handle(state) }.clear_retained();
 }
 
 /// # Safety
 ///
-/// `tree` must be a live retained tree handle; each sample array must address its stated count, and
-/// each non-empty filter sample must address its stated byte count. Returns a retained handle to a
-/// copy of the tree carrying the sampled values; the copy keeps the structural epoch.
+/// `state` must be a live effect state handle.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn visual_context_tree_with_sampled_values(
-    tree: *const c_void,
-    effect_opacities: *const crate::painting::host::FfiEffectOpacitySample,
-    effect_opacity_count: usize,
-    effect_background_colors: *const crate::painting::host::FfiEffectBackgroundColorSample,
-    effect_background_color_count: usize,
-    effect_filters: *const crate::painting::host::FfiEffectFilterSample,
-    effect_filter_count: usize,
-    spatial_matrices: *const crate::painting::host::FfiSpatialTransformSample,
-    spatial_matrix_count: usize,
-) -> *const c_void {
-    let tree = unsafe { tree_from_handle(tree) };
-    // SAFETY: The caller guarantees the sample arrays address the stated counts.
-    let (effect_opacities, effect_background_colors, effect_filters, spatial_matrices) = unsafe {
-        (
-            ffi_slice(effect_opacities, effect_opacity_count),
-            ffi_slice(effect_background_colors, effect_background_color_count),
-            ffi_slice(effect_filters, effect_filter_count),
-            ffi_slice(spatial_matrices, spatial_matrix_count),
-        )
-    };
-    let effect_opacities: Vec<(EffectNodeIndex, f32)> = effect_opacities
-        .iter()
-        .map(|sample| (EffectNodeIndex(sample.effect), sample.opacity))
-        .collect();
-    let effect_background_colors: Vec<(EffectNodeIndex, libgfx_rust::Color)> = effect_background_colors
-        .iter()
-        .map(|sample| (EffectNodeIndex(sample.effect), sample.color))
-        .collect();
-    let effect_filters: Vec<(EffectNodeIndex, Option<Rc<Vec<u8>>>)> = effect_filters
-        .iter()
-        .map(|sample| {
-            let filter = if sample.filter_size == 0 {
-                None
-            } else {
-                // SAFETY: The caller guarantees each filter byte range addresses the stated size.
-                Some(Rc::new(
-                    unsafe { ffi_slice(sample.filter_bytes, sample.filter_size) }.to_vec(),
-                ))
-            };
-            (EffectNodeIndex(sample.effect), filter)
-        })
-        .collect();
-    let spatial_matrices: Vec<(SpatialNodeIndex, libgfx_rust::FloatMatrix4x4)> = spatial_matrices
-        .iter()
-        .map(|sample| (SpatialNodeIndex(sample.spatial), sample.matrix))
-        .collect();
-    let sampled = tree.with_sampled_visual_animation_values(
-        &effect_opacities,
-        &effect_background_colors,
-        &effect_filters,
-        &spatial_matrices,
-    );
-    Rc::into_raw(Rc::new(sampled)).cast()
+pub unsafe extern "C" fn compositor_animation_effect_reset(state: *mut c_void) {
+    unsafe { crate::painting::visual_animation_builder::effect_state_from_handle(state) }.reset();
 }
 
 /// # Safety
 ///
-/// `tree` must be a live retained tree handle and `color` must point to writable storage.
+/// The request and host, with every range they address, must be live for the call.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn visual_context_tree_sampled_background_color(
-    tree: *const c_void,
-    effect: EffectNodeIndex,
-    color: *mut libgfx_rust::Color,
+pub unsafe extern "C" fn compositor_animation_effect_only_translates_horizontally(
+    request: *const crate::painting::host::FfiCompositorAnimationRequest,
+    host: *const crate::painting::host::FfiCompositorAnimationHost,
 ) -> bool {
-    let tree = unsafe { tree_from_handle(tree) };
-    let Some(sampled_color) = tree.sampled_background_color(effect) else {
-        return false;
-    };
-    // SAFETY: The caller guarantees that `color` points to writable storage.
-    unsafe { *color = sampled_color };
-    true
+    use crate::painting::visual_animation_builder::{Host, Request, effect_only_translates_horizontally};
+    let request = unsafe { Request::new(&*request) };
+    effect_only_translates_horizontally(&request, &Host::new(unsafe { &*host }))
 }
 
 /// # Safety
 ///
-/// `tree` must be a live retained tree handle; `targets` must address `target_count` node indices.
+/// The request and host, with every range they address, must be live for the call.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn visual_context_tree_visual_animation_targets_are_valid(
-    tree: *const c_void,
-    target_kind: crate::painting::host::FfiVisualAnimationTargetKind,
-    targets: *const u32,
-    target_count: usize,
+pub unsafe extern "C" fn compositor_animation_effect_transform_preserves_axes(
+    request: *const crate::painting::host::FfiCompositorAnimationRequest,
+    host: *const crate::painting::host::FfiCompositorAnimationHost,
 ) -> bool {
-    let tree = unsafe { tree_from_handle(tree) };
-    // SAFETY: The caller guarantees the targets address `target_count` indices.
-    let targets = unsafe { ffi_slice(targets, target_count) };
-    tree.visual_animation_targets_are_valid(target_kind, targets)
+    use crate::painting::visual_animation_builder::{Host, Request, effect_transform_preserves_axes};
+    let request = unsafe { Request::new(&*request) };
+    effect_transform_preserves_axes(&request, &Host::new(unsafe { &*host }))
 }
 
+/// Starts an update pass: the effects publish into an empty document list.
+///
 /// # Safety
 ///
-/// `tree` must be a live retained tree handle and `out_opacity` must be writable. Returns whether
-/// `effect` names an effects node.
+/// `arena` must be a live handle from `layout_arena_create`, used on the document thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn visual_context_tree_effects_opacity(
-    tree: *const c_void,
-    effect: EffectNodeIndex,
-    out_opacity: *mut f32,
-) -> bool {
-    match unsafe { tree_from_handle(tree) }.effects_opacity(effect) {
-        Some(opacity) => {
-            // SAFETY: The caller guarantees `out_opacity` is writable.
-            unsafe { *out_opacity = opacity };
-            true
-        }
-        None => false,
-    }
+pub unsafe extern "C" fn layout_arena_begin_compositor_animation_update(arena: *mut c_void) {
+    let arena = unsafe { arena_from_handle(arena) };
+    arena
+        .paint_state()
+        .borrow_mut()
+        .visual_context
+        .pending_compositor_animations
+        .clear();
 }
 
+/// Gives the arena's main tree the animations the update pass published, or none.
+///
 /// # Safety
 ///
-/// `tree` must be a live retained tree handle; `roots` must address `root_count` spatial indices and
-/// `out_flags` must address one writable flag per spatial node (`flag_count` of them).
+/// `arena` must be a live handle from `layout_arena_create`, used on the document thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn visual_context_tree_mark_spatial_subtrees(
-    tree: *const c_void,
-    roots: *const SpatialNodeIndex,
-    root_count: usize,
-    out_flags: *mut bool,
-    flag_count: usize,
-) {
-    let tree = unsafe { tree_from_handle(tree) };
-    // SAFETY: The caller guarantees the roots address `root_count` indices.
-    let roots = unsafe { ffi_slice(roots, root_count) };
-    let in_subtree = tree.spatial_nodes_in_subtrees_of(roots);
-    assert_eq!(in_subtree.len(), flag_count);
-    // SAFETY: The caller guarantees `out_flags` addresses `flag_count` writable flags.
-    unsafe { std::ptr::copy_nonoverlapping(in_subtree.as_ptr(), out_flags, flag_count) };
-}
-
-/// # Safety
-///
-/// `tree` must be a live retained tree handle.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn visual_context_tree_has_unisolated_destination_reading_effect(tree: *const c_void) -> bool {
-    unsafe { tree_from_handle(tree) }.has_unisolated_destination_reading_effect()
-}
-
-/// # Safety
-///
-/// `tree` must be a live retained tree handle; `visit` is called synchronously with `context` for every
-/// filter and backdrop filter an effect node carries.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn visual_context_tree_for_each_effects_filter_bytes(
-    tree: *const c_void,
-    context: *mut c_void,
-    visit: unsafe extern "C" fn(*mut c_void, *const u8, usize),
-) {
-    let tree = unsafe { tree_from_handle(tree) };
-    for node in &tree.effect_nodes {
-        let crate::painting::visual_context::EffectNodeData::Effects(effects) = &node.data else {
-            continue;
-        };
-        let backdrop_filter_bytes = effects.backdrop_filter.as_ref().map(|backdrop| &backdrop.filter);
-        for filter_bytes in effects.filter.iter().chain(backdrop_filter_bytes) {
-            // SAFETY: The C++ visitor reads the bytes synchronously.
-            unsafe { visit(context, filter_bytes.as_ptr(), filter_bytes.len()) };
-        }
-    }
-}
-
-/// # Safety
-///
-/// `tree` must be a live retained tree handle.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn visual_context_tree_effect_is_isolated_by_layer(
-    tree: *const c_void,
-    effect: EffectNodeIndex,
-) -> bool {
-    unsafe { tree_from_handle(tree) }.effect_is_isolated_by_layer(effect)
-}
-
-/// # Safety
-///
-/// Returns a builder handle for hand-built test trees rooted at an identity visual viewport
-/// transform; every builder call must receive it until `visual_context_tree_test_builder_finish`
-/// or `visual_context_tree_test_builder_destroy` consumes it.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn visual_context_tree_test_builder_create() -> *mut c_void {
-    let tree =
-        crate::painting::visual_context::VisualContextTree::create(crate::painting::visual_context::TransformData {
-            matrix: libgfx_rust::FloatMatrix4x4::identity(),
-            origin: libgfx_rust::FloatPoint::default(),
-            sorting_context_root_index: None,
-            flattens_inherited_transform: false,
-            role: crate::painting::visual_context::TransformDataRole::CssTransform,
-            synthetic_plane: false,
-            establishes_sorting_context: false,
-        });
-    Box::into_raw(Box::new(tree)).cast()
-}
-
-/// # Safety
-///
-/// `builder` must be a live handle from `visual_context_tree_test_builder_create`.
-unsafe fn test_builder_tree<'a>(builder: *mut c_void) -> &'a mut crate::painting::visual_context::VisualContextTree {
-    // SAFETY: The caller guarantees `builder` is the live boxed tree the create call returned.
-    unsafe { &mut *builder.cast::<crate::painting::visual_context::VisualContextTree>() }
-}
-
-/// # Safety
-///
-/// `builder` must be a live handle from `visual_context_tree_test_builder_create`.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn visual_context_tree_test_builder_append_transform(
-    builder: *mut c_void,
-    parent: u32,
-    matrix: libgfx_rust::FloatMatrix4x4,
-    origin: libgfx_rust::FloatPoint,
-) -> u32 {
-    let tree = unsafe { test_builder_tree(builder) };
-    tree.append_spatial(
-        crate::painting::visual_context::SpatialData::Transform(crate::painting::visual_context::TransformData {
-            matrix,
-            origin,
-            sorting_context_root_index: None,
-            flattens_inherited_transform: false,
-            role: crate::painting::visual_context::TransformDataRole::CssTransform,
-            synthetic_plane: false,
-            establishes_sorting_context: false,
-        }),
-        SpatialNodeIndex(parent),
-    )
-    .0
-}
-
-/// # Safety
-///
-/// `builder` must be a live handle from `visual_context_tree_test_builder_create`.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn visual_context_tree_test_builder_append_scroll(builder: *mut c_void, parent: u32) -> u32 {
-    let tree = unsafe { test_builder_tree(builder) };
-    tree.append_spatial(
-        crate::painting::visual_context::SpatialData::Scroll(crate::painting::visual_context::ScrollData {
-            state_slot: crate::painting::visual_context::scroll_state::NO_SCROLL_STATE_SLOT,
-            owner_paintable: NodeSlotId::INVALID,
-            registry_parent_node: SpatialNodeIndex(parent),
-        }),
-        SpatialNodeIndex(parent),
-    )
-    .0
-}
-
-/// # Safety
-///
-/// `builder` must be a live handle from `visual_context_tree_test_builder_create`.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn visual_context_tree_test_builder_append_sticky(
-    builder: *mut c_void,
-    parent: u32,
-    constraints: crate::painting::host::FfiTestStickyConstraints,
-) -> u32 {
-    let tree = unsafe { test_builder_tree(builder) };
-    let inset = |value: crate::painting::display_list::commands::OptionalF32| value.has_value.then_some(value.value);
-    tree.append_spatial(
-        crate::painting::visual_context::SpatialData::Sticky(crate::painting::visual_context::StickyData {
-            scroller: SpatialNodeIndex(constraints.scroller),
-            parent_sticky: constraints
-                .has_parent_sticky
-                .then_some(SpatialNodeIndex(constraints.parent_sticky)),
-            position_relative_to_scroller: constraints.position_relative_to_scroller,
-            border_box_size: constraints.border_box_size,
-            scrollport_size: constraints.scrollport_size,
-            containing_block_region: constraints.containing_block_region,
-            needs_parent_offset_adjustment: constraints.needs_parent_offset_adjustment,
-            inset_top: inset(constraints.inset_top),
-            inset_right: inset(constraints.inset_right),
-            inset_bottom: inset(constraints.inset_bottom),
-            inset_left: inset(constraints.inset_left),
-            state_slot: crate::painting::visual_context::scroll_state::NO_SCROLL_STATE_SLOT,
-            owner_paintable: NodeSlotId::INVALID,
-            registry_parent_node: if constraints.has_parent_sticky {
-                SpatialNodeIndex(constraints.parent_sticky)
-            } else {
-                SpatialNodeIndex(constraints.scroller)
-            },
-        }),
-        SpatialNodeIndex(parent),
-    )
-    .0
-}
-
-/// # Safety
-///
-/// `builder` must be a live handle from `visual_context_tree_test_builder_create`.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn visual_context_tree_test_builder_append_clip(
-    builder: *mut c_void,
-    parent_clip: u32,
-    spatial: u32,
-    rect: libgfx_rust::FloatRect,
-    corner_radii: libgfx_rust::CornerRadii,
-    mode: crate::painting::visual_context::ClipMode,
-) -> u32 {
-    let tree = unsafe { test_builder_tree(builder) };
-    tree.append_clip(
-        crate::painting::visual_context::ClipNodeData::Rect(crate::painting::visual_context::ClipData {
-            rect,
-            corner_radii,
-            mode,
-        }),
-        ClipNodeIndex(parent_clip),
-        SpatialNodeIndex(spatial),
-    )
-    .0
-}
-
-/// # Safety
-///
-/// `builder` must be a live handle from `visual_context_tree_test_builder_create`.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn visual_context_tree_test_builder_append_background_color_animation(
-    builder: *mut c_void,
-    parent_effect: u32,
-    spatial: u32,
-    local_clip: u32,
-) -> u32 {
-    let tree = unsafe { test_builder_tree(builder) };
-    tree.append_effect(
-        crate::painting::visual_context::EffectNodeData::BackgroundColorAnimation,
-        EffectNodeIndex(parent_effect),
-        SpatialNodeIndex(spatial),
-        ClipNodeIndex(local_clip),
-    )
-    .0
-}
-
-/// # Safety
-///
-/// `builder` must be a live handle from `visual_context_tree_test_builder_create`; `path_bytes`
-/// must address `path_bytes_length` readable bytes of a serialized `Gfx::Path`.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn visual_context_tree_test_builder_append_clip_path(
-    builder: *mut c_void,
-    parent_clip: u32,
-    spatial: u32,
-    path_bytes: *const u8,
-    path_bytes_length: usize,
-    bounding_rect: libgfx_rust::IntRect,
-    fill_rule: libgfx_rust::WindingRule,
-) -> u32 {
-    let tree = unsafe { test_builder_tree(builder) };
-    // SAFETY: The caller guarantees `path_bytes` addresses `path_bytes_length` readable bytes.
-    let path_bytes = unsafe { ffi_slice(path_bytes, path_bytes_length) };
-    let path = libgfx_rust::path::OwnedPath::from_serialized_bytes(path_bytes);
-    tree.append_clip(
-        crate::painting::visual_context::ClipNodeData::Path(crate::painting::visual_context::ClipPathData {
-            path: Rc::new(path),
-            bounding_rect,
-            fill_rule,
-        }),
-        ClipNodeIndex(parent_clip),
-        SpatialNodeIndex(spatial),
-    )
-    .0
-}
-
-/// # Safety
-///
-/// `builder` must be a live handle from `visual_context_tree_test_builder_create`.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn visual_context_tree_test_builder_append_effects(
-    builder: *mut c_void,
-    parent_effect: u32,
-    spatial: u32,
-    local_clip: u32,
-    opacity: f32,
-    blend_mode: libgfx_rust::CompositingAndBlendingOperator,
-) -> u32 {
-    let tree = unsafe { test_builder_tree(builder) };
-    tree.append_effect(
-        crate::painting::visual_context::EffectNodeData::Effects(crate::painting::visual_context::EffectsData {
-            opacity,
-            blend_mode,
-            filter: None,
-            backdrop_filter: None,
-        }),
-        EffectNodeIndex(parent_effect),
-        SpatialNodeIndex(spatial),
-        ClipNodeIndex(local_clip),
-    )
-    .0
-}
-
-/// # Safety
-///
-/// `builder` must be a live handle from `visual_context_tree_test_builder_create`. Gives the tree
-/// the structural epoch another tree carries, so a test can stage a compatible tree-only update.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn visual_context_tree_test_builder_set_structural_epoch(
-    builder: *mut c_void,
-    structural_epoch: u64,
-) {
-    let tree = unsafe { test_builder_tree(builder) };
-    tree.structural_epoch = structural_epoch;
-}
-
-/// # Safety
-///
-/// `builder` must be a live handle from `visual_context_tree_test_builder_create`, consumed by this
-/// call. Returns a retained tree handle the caller owns.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn visual_context_tree_test_builder_finish(builder: *mut c_void) -> *const c_void {
-    // SAFETY: The caller hands over the boxed tree the create call returned.
-    let tree = unsafe { Box::from_raw(builder.cast::<crate::painting::visual_context::VisualContextTree>()) };
-    Rc::into_raw(Rc::new(*tree)).cast()
-}
-
-/// # Safety
-///
-/// `builder` must be null or a live handle from `visual_context_tree_test_builder_create`, consumed
-/// by this call.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn visual_context_tree_test_builder_destroy(builder: *mut c_void) {
-    if builder.is_null() {
-        return;
-    }
-    // SAFETY: The caller hands over the boxed tree the create call returned.
-    drop(unsafe { Box::from_raw(builder.cast::<crate::painting::visual_context::VisualContextTree>()) });
+pub unsafe extern "C" fn layout_arena_publish_compositor_animations(
+    arena: *mut c_void,
+    publish_pending: bool,
+) -> crate::painting::host::FfiCompositorAnimationPublishOutcome {
+    let arena = unsafe { arena_from_handle(arena) };
+    let mut paint_state = arena.paint_state().borrow_mut();
+    crate::painting::visual_context::publish_compositor_animations(&mut paint_state.visual_context, publish_pending)
 }
 
 /// # Safety
@@ -3880,14 +3136,14 @@ pub unsafe extern "C" fn layout_arena_sync_svg_paint_resources(
             SvgPaintResourceKind::BackdropFilter => &effects.backdrop_filter,
             SvgPaintResourceKind::Fill | SvgPaintResourceKind::Stroke => unreachable!(),
         };
-        if !crate::painting::filter_bytes::contains_url(filter_list) {
+        if !crate::painting::css_filter::contains_url(filter_list) {
             resources.withdraw(slot, kind);
             continue;
         }
         let shell = arena.shell_if_live(slot);
         let mut published = PublishedSvgFilter::default();
         for operation in filter_list.operations.as_slice() {
-            if operation.kind != crate::painting::filter_bytes::FILTER_KIND_URL {
+            if operation.kind != crate::painting::css_filter::FILTER_KIND_URL {
                 continue;
             }
             let mut primitives: Vec<SvgFilterPrimitive> = Vec::new();
@@ -3915,31 +3171,6 @@ pub unsafe extern "C" fn layout_arena_sync_svg_paint_resources(
         }
     }
     any_changed
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u8)]
-pub enum FfiFilterFunctionKind {
-    Blur,
-    DropShadow,
-    Color,
-    HueRotate,
-}
-
-/// One function of a CSS filter list with its lengths already in device pixels, for a host that
-/// builds filter graphs outside the style system: compositor animation samples and canvas filters.
-#[derive(Clone, Copy, Debug)]
-#[repr(C)]
-pub struct FfiFilterFunction {
-    pub kind: FfiFilterFunctionKind,
-    /// The blur radius, drop shadow radius, color operation amount, or hue rotation in degrees.
-    pub amount: f32,
-    /// Drop shadow only.
-    pub offset_x: f32,
-    pub offset_y: f32,
-    pub color: libgfx_rust::Color,
-    /// Color only.
-    pub color_operation: libgfx_rust::ColorFilterType,
 }
 
 /// Serializes the graph a list of filter functions describes and hands the bytes to `append`.
@@ -4000,17 +3231,13 @@ pub unsafe extern "C" fn layout_arena_hit_test_caret_line(
     })
 }
 
-fn list_generation_of(paint_state: &crate::painting::paint_state::PaintState) -> u64 {
-    paint_state.hit_test_list.as_ref().map_or(0, |list| list.generation)
-}
-
 /// # Safety
 ///
 /// `arena` must be a live handle from `layout_arena_create`, used on the document thread.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn layout_arena_hit_test_list_generation(arena: *mut c_void) -> u64 {
     let arena = unsafe { arena_from_handle(arena) };
-    list_generation_of(&arena.paint_state().borrow())
+    arena.hit_test_list.borrow().as_ref().map_or(0, |list| list.generation)
 }
 
 fn with_hit_test_list_items_only<R>(
@@ -4020,8 +3247,8 @@ fn with_hit_test_list_items_only<R>(
 ) -> R {
     // SAFETY: The caller passes a live arena handle (documented on every entry point below).
     let arena = unsafe { arena_from_handle(arena) };
-    let paint_state = arena.paint_state().borrow();
-    let Some(list) = paint_state.hit_test_list.as_ref() else {
+    let hit_test_list = arena.hit_test_list.borrow();
+    let Some(list) = hit_test_list.as_ref() else {
         return default;
     };
     query(list, arena)
@@ -4034,8 +3261,8 @@ fn with_hit_test_list_and_caret_lines<R>(
 ) -> R {
     // SAFETY: The caller passes a live arena handle (documented on every entry point below).
     let arena = unsafe { arena_from_handle(arena) };
-    let mut paint_state = arena.paint_state().borrow_mut();
-    let Some(list) = paint_state.hit_test_list.as_mut() else {
+    let mut hit_test_list = arena.hit_test_list.borrow_mut();
+    let Some(list) = hit_test_list.as_mut() else {
         return default;
     };
     list.build_caret_lines_if_needed(arena);
@@ -4054,12 +3281,7 @@ fn with_hit_test_list_spatial_indexes_and_visual_context_tree<R>(
 ) -> R {
     // SAFETY: The caller passes a live arena handle (documented on every entry point below).
     let arena = unsafe { arena_from_handle(arena) };
-    let mut paint_state = arena.paint_state().borrow_mut();
-    let crate::painting::paint_state::PaintState {
-        hit_test_list,
-        visual_context,
-        ..
-    } = &mut *paint_state;
+    let mut hit_test_list = arena.hit_test_list.borrow_mut();
     let Some(list) = hit_test_list.as_mut() else {
         return default;
     };
@@ -4067,10 +3289,12 @@ fn with_hit_test_list_spatial_indexes_and_visual_context_tree<R>(
     if needs_caret_lines {
         list.build_caret_lines_if_needed(arena);
     }
-    let Some(tree) = visual_context.tree.as_deref() else {
+    // Geometry queries can update overflow and dirty the visual context state. Keep the
+    // current tree alive without borrowing that state for the duration of the query.
+    let Some(tree) = arena.paint_state().borrow().visual_context.tree.clone() else {
         return default;
     };
-    query(list, tree, arena)
+    query(list, &tree, arena)
 }
 
 fn ffi_topmost(item: Option<crate::painting::hit_test::query::TopmostItem>) -> crate::painting::host::FfiTopmostItem {
@@ -4280,4 +3504,172 @@ pub unsafe extern "C" fn layout_arena_set_recording_trace_enabled(arena: *mut c_
         .paint_state()
         .borrow_mut()
         .trace_recordings = enabled;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::css::css_pixels::CssPixelRect;
+    use crate::layout::LayoutNodeArena;
+    use crate::layout::node_data::NodeKind;
+    use crate::painting::hit_test::HitTestList;
+    use crate::painting::host::FfiRootBackgroundSource;
+    use crate::painting::paintable_data::FfiOverflowData;
+    use crate::painting::record::damage::PaintDamage;
+    use crate::painting::visual_context::dirty::VisualContextBoxDirtyKind;
+    use crate::painting::visual_context::{TransformData, TransformDataRole, VisualContextTree};
+
+    #[test]
+    fn hit_test_queries_can_remeasure_viewport_overflow_and_invalidate_painting() {
+        for (spatial_indexes, caret_lines) in [(true, false), (true, true), (false, true), (false, false)] {
+            let mut arena = LayoutNodeArena::new();
+            let viewport = arena.allocate_for_test().slot;
+            arena.data(viewport).kind.set(NodeKind::Viewport);
+            arena.populate_paintable_row(viewport);
+            arena.scrollable_overflow.viewport.set(Some(viewport));
+            let root = arena.allocate_for_test().slot;
+            arena.populate_paintable_row(root);
+            *arena.hit_test_list.borrow_mut() = Some(HitTestList::default());
+            {
+                let mut state = arena.paint_state().borrow_mut();
+                state.root_background_source = Some(FfiRootBackgroundSource {
+                    root_layout_node: root,
+                    ..Default::default()
+                });
+                state.visual_context.tree = Some(Rc::new(VisualContextTree::create(TransformData {
+                    matrix: libgfx_rust::FloatMatrix4x4::identity(),
+                    origin: Default::default(),
+                    sorting_context_root_index: None,
+                    flattens_inherited_transform: false,
+                    role: TransformDataRole::CssTransform,
+                    synthetic_plane: false,
+                    establishes_sorting_context: false,
+                })));
+                state.visual_context.dirty_boxes.clear();
+            }
+            // Leave stale overflow for the hit-test geometry query to remeasure. Losing
+            // scrollability must invalidate both the root background and visual context.
+            arena
+                .paintable_side_data(viewport)
+                .overflow_relative_to_padding_box
+                .set(FfiOverflowData {
+                    rect: CssPixelRect::new(
+                        CssPixels::from_integer(0),
+                        CssPixels::from_integer(0),
+                        CssPixels::from_integer(100),
+                        CssPixels::from_integer(2000),
+                    )
+                    .into(),
+                    has_scrollable_overflow: true,
+                });
+            arena
+                .paintable_side_data(viewport)
+                .overflow_measured_this_commit
+                .set(true);
+            arena.note_publishing_paint_recording_started();
+            arena.clear_paint_damage_consumed_by_published_recording();
+
+            let handle = std::ptr::from_mut(&mut arena).cast();
+            let query = |_: &HitTestList, arena: &LayoutNodeArena| {
+                crate::painting::paintable_geometry::scrollable_overflow_rect(&arena.paintable_rows(), viewport)
+            };
+            let rect = if spatial_indexes {
+                with_hit_test_list_spatial_indexes_and_visual_context_tree(
+                    handle,
+                    caret_lines,
+                    None,
+                    |list, _, arena| query(list, arena),
+                )
+            } else if caret_lines {
+                with_hit_test_list_and_caret_lines(handle, None, query)
+            } else {
+                with_hit_test_list_items_only(handle, None, query)
+            };
+            assert_eq!(rect, Some(CssPixelRect::default()));
+            assert!(arena.scrollable_overflow.geometry_changed.get());
+            assert!(arena.scrollable_overflow.scrollability_changed.get());
+            assert!(arena.paint_damage_of_row(root).contains(PaintDamage::DRAW_BACKGROUND));
+            assert!(
+                arena
+                    .paint_damage_of_row(viewport)
+                    .contains(PaintDamage::SCROLL_METADATA)
+            );
+            assert!(
+                arena.paint_state().borrow().visual_context.dirty_boxes.boxes[&viewport]
+                    .contains(VisualContextBoxDirtyKind::ScrollableOverflowFlipped)
+            );
+        }
+    }
+
+    #[test]
+    fn preparing_for_rendering_measures_root_overflow_before_recording_reads_it() {
+        unsafe extern "C" fn tree_inputs(_: *mut c_void) -> crate::painting::host::FfiVisualContextTreeInputs {
+            unreachable!("no visual context tree exists to refresh")
+        }
+        unsafe extern "C" fn scroll_offset(_: *mut c_void, _: *mut c_void) -> FfiCssPixelPoint {
+            unreachable!("no visual context tree exists to refresh")
+        }
+        unsafe extern "C" fn node_identity(_: *mut c_void, _: *mut c_void) -> i64 {
+            unreachable!("no visual context tree exists to refresh")
+        }
+
+        let mut arena = LayoutNodeArena::new();
+        let viewport = arena.allocate_for_test().slot;
+        arena.data(viewport).kind.set(NodeKind::Viewport);
+        arena.populate_paintable_row(viewport);
+        arena.scrollable_overflow.viewport.set(Some(viewport));
+        let root = arena.allocate_for_test().slot;
+        arena.data(root).kind.set(NodeKind::BlockContainer);
+        arena.populate_paintable_row(root);
+        // A structural change invalidated the root's overflow, measured earlier in this commit,
+        // without queueing a recalculation, so nothing but a query measures it again. Measuring
+        // it drops its scrollable overflow.
+        arena
+            .paintable_side_data(root)
+            .overflow_relative_to_padding_box
+            .set(FfiOverflowData {
+                rect: CssPixelRect::new(
+                    CssPixels::from_integer(0),
+                    CssPixels::from_integer(0),
+                    CssPixels::from_integer(100),
+                    CssPixels::from_integer(2000),
+                )
+                .into(),
+                has_scrollable_overflow: true,
+            });
+        arena.paintable_side_data(root).overflow_measured_this_commit.set(true);
+        arena.paint_state().borrow_mut().visual_context.dirty_boxes.clear();
+
+        let handle = std::ptr::from_mut(&mut arena).cast();
+        let outcome = unsafe {
+            layout_arena_prepare_for_rendering(
+                handle,
+                FfiVisualContextHostCallbacks {
+                    context: std::ptr::null_mut(),
+                    tree_inputs,
+                    scroll_offset,
+                    node_identity,
+                },
+                FfiRootBackgroundSource {
+                    root_layout_node: root,
+                    ..Default::default()
+                },
+                false,
+            )
+        };
+        assert!(outcome.requires_visual_context_update);
+        assert!(
+            arena.paint_state().borrow().visual_context.dirty_boxes.boxes[&root]
+                .contains(VisualContextBoxDirtyKind::ScrollableOverflowFlipped)
+        );
+
+        // Recording reads the root's overflow while it holds the paint state.
+        let _paint_state = arena.paint_state().borrow();
+        let canvas_rect = crate::painting::record::paint::background_resolution::root_background_canvas_rect(
+            &arena.paintable_rows(),
+            root,
+            CssPixelRect::default(),
+        );
+        assert_eq!(canvas_rect, CssPixelRect::default());
+    }
 }

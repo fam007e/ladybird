@@ -21,8 +21,6 @@ class BroadcastChannel final : public DOM::EventTarget {
     GC_DECLARE_ALLOCATOR(BroadcastChannel);
 
 public:
-    static constexpr bool OVERRIDES_FINALIZE = true;
-
     [[nodiscard]] static GC::Ref<BroadcastChannel> create(GC::Ref<DOM::EventTarget> relevant_global_object, Utf16FlyString const& name, URL::Origin, StorageAPI::StorageKey);
     [[nodiscard]] static GC::Ref<BroadcastChannel> create_for_constructor(JS::Object&, Utf16String const& name);
 
@@ -51,9 +49,11 @@ private:
         StorageAPI::StorageKey);
     virtual void finalize() override;
     virtual void visit_edges(Cell::Visitor&) override;
+    virtual void event_listener_list_changed() override;
 
     JS::Object& relevant_global_object() const;
     bool is_eligible_for_messaging() const;
+    void update_strong_reference_from_relevant_global_object();
 
     Utf16FlyString m_channel_name;
     URL::Origin m_origin;

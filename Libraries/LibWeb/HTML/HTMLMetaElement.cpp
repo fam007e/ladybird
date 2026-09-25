@@ -37,7 +37,7 @@ HTMLMetaElement::~HTMLMetaElement() = default;
 
 Optional<HTMLMetaElement::HttpEquivAttributeState> HTMLMetaElement::http_equiv_state() const
 {
-    auto value = attribute(HTML::AttributeNames::http_equiv).value_or({});
+    auto value = get_attribute_ns({}, HTML::AttributeNames::http_equiv).value_or({});
 
 #define __ENUMERATE_HTML_META_HTTP_EQUIV_ATTRIBUTE(keyword, state) \
     if (value.equals_ignoring_ascii_case(keyword##sv))             \
@@ -50,7 +50,7 @@ Optional<HTMLMetaElement::HttpEquivAttributeState> HTMLMetaElement::http_equiv_s
 
 void HTMLMetaElement::update_metadata(Optional<Utf16String> const& old_name)
 {
-    if (auto name = attribute(AttributeNames::name); name.has_value()) {
+    if (auto name = get_attribute_ns({}, AttributeNames::name); name.has_value()) {
         if (name->equals_ignoring_ascii_case(u"theme-color"sv)) {
             document().obtain_theme_color();
         } else if (name->equals_ignoring_ascii_case(u"color-scheme"sv)) {
@@ -82,7 +82,7 @@ void HTMLMetaElement::update_referrer_policy()
         return;
 
     // 3. If element does not have a content attribute, or that attribute's value is the empty string, then return.
-    auto content = attribute(AttributeNames::content);
+    auto content = get_attribute_ns({}, AttributeNames::content);
     if (!content.has_value() || content->is_empty())
         return;
 
@@ -237,6 +237,9 @@ void HTMLMetaElement::removed_from(IsSubtreeRoot is_subtree_root, Node* old_ance
 void HTMLMetaElement::attribute_changed(Utf16FlyString const& local_name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_)
 {
     Base::attribute_changed(local_name, old_value, value, namespace_);
+    if (namespace_.has_value())
+        return;
+
     if (local_name == HTML::AttributeNames::name) {
         update_metadata(old_value);
     } else {

@@ -69,7 +69,9 @@ namespace Web::HTML {
 
 class HTMLMediaElement::ActiveVideoSink {
 public:
-    ActiveVideoSink(Media::VideoSinkHandle handle, Painting::VideoSinkResourceId resource_id)
+    AK_ALLOC_WITH_KMALLOC;
+
+    ActiveVideoSink(Media::VideoSinkHandle handle, Compositing::VideoSinkResourceId resource_id)
         : m_handle(handle)
         , m_resource_id(resource_id)
     {
@@ -81,7 +83,7 @@ public:
     }
 
     Media::VideoSinkHandle handle() const { return m_handle; }
-    Painting::VideoSinkResourceId resource_id() const { return m_resource_id; }
+    Compositing::VideoSinkResourceId resource_id() const { return m_resource_id; }
 
     void register_with(Compositor::CompositorHost& compositor_host)
     {
@@ -102,11 +104,13 @@ public:
 
 private:
     Media::VideoSinkHandle m_handle;
-    Painting::VideoSinkResourceId m_resource_id;
+    Compositing::VideoSinkResourceId m_resource_id;
     Compositor::CompositorHost* m_compositor_host { nullptr };
 };
 
 struct HTMLMediaElement::RemoteFetchData {
+    AK_ALLOC_WITH_KMALLOC;
+
     URL::URL url_record;
     RefPtr<Media::IncrementallyPopulatedStream> stream;
     GC::Weak<Fetch::Infrastructure::FetchController> fetch_controller;
@@ -268,7 +272,7 @@ void HTMLMediaElement::attribute_changed(Utf16FlyString const& name, Optional<Ut
         if (!value.has_value())
             return;
         load_element().release_value_but_fixme_should_propagate_errors();
-    } else if (name == HTML::AttributeNames::crossorigin) {
+    } else if (!namespace_.has_value() && name == HTML::AttributeNames::crossorigin) {
         m_crossorigin = cors_setting_attribute_from_keyword(value.map([](auto const& value) { return value.utf16_view(); }));
     } else if (name == HTML::AttributeNames::controls) {
         if (value.has_value() || is_scripting_disabled())
@@ -1787,7 +1791,7 @@ Optional<Media::VideoSinkHandle> HTMLMediaElement::video_sink_handle() const
     return m_active_video_sink->handle();
 }
 
-Optional<Painting::VideoSinkResourceId> HTMLMediaElement::video_sink_resource_id() const
+Optional<Compositing::VideoSinkResourceId> HTMLMediaElement::video_sink_resource_id() const
 {
     if (!m_active_video_sink)
         return {};
@@ -1813,7 +1817,7 @@ void HTMLMediaElement::attach_selected_video_track_sink(Media::Track const& trac
     }));
     if (previous_handle.has_value())
         release_active_video_sink();
-    m_active_video_sink = make<ActiveVideoSink>(handle, Painting::allocate_video_sink_resource_id());
+    m_active_video_sink = make<ActiveVideoSink>(handle, Compositing::allocate_video_sink_resource_id());
     m_video_sink_is_ticking = true;
     add_current_video_sink(handle);
     if (document().hidden())
@@ -2026,7 +2030,7 @@ void HTMLMediaElement::on_video_track_added(Media::Track const& track)
     set_needs_repaint(InvalidateDisplayList::PaintCommands);
 }
 
-void HTMLMediaElement::on_metadata_parsed()
+void HTMLMediaElement::on_metadata_parsed(SourceType source_type)
 {
     // FIXME: Move this to setup_playback_manager()
     update_volume();
@@ -2046,13 +2050,16 @@ void HTMLMediaElement::on_metadata_parsed()
     // 4. Update the duration attribute with the time of the last frame of the resource, if known, on the media timeline established above. If it is
     //    not known (e.g. a stream that is in principle infinite), update the duration attribute to the value positive Infinity.
     // FIXME: Handle unbounded media resources.
-    set_duration(m_playback_manager->duration().to_seconds_f64());
+    // NB: In local mode, the MediaSource spec itself dictates how the duration changes.
+    if (source_type == SourceType::Remote) {
+        set_duration(m_playback_manager->duration().to_seconds_f64());
 
-    // NB: Register the duration change handler here so that we don't set the duration when the
-    //     playback manager updates the duration after parsing.
-    m_playback_manager->on_duration_change = GC::weak_callback(*this, [](auto& self, AK::Duration duration) {
-        self.set_duration(duration.to_seconds_f64());
-    });
+        // NB: Register the duration change handler here so that we don't set the duration when the
+        //     playback manager updates the duration after parsing.
+        m_playback_manager->on_duration_change = GC::weak_callback(*this, [](auto& self, AK::Duration duration) {
+            self.set_duration(duration.to_seconds_f64());
+        });
+    }
 
     // 5. For video elements, set the videoWidth and videoHeight attributes, and queue a media element task given the media element to fire an event
     //    named resize at the media element.
@@ -2131,7 +2138,7 @@ void HTMLMediaElement::set_up_playback_manager_for_remote()
 
     // -> Once enough of the media data has been fetched to determine the duration of the media resource, its dimensions, and other metadata
     m_playback_manager->on_metadata_parsed = GC::weak_callback(*this, [](auto& self) {
-        self.on_metadata_parsed();
+        self.on_metadata_parsed(SourceType::Remote);
     });
 
     // -> If the media data can be fetched but is found by inspection to be in an unsupported format, or can otherwise not be rendered at all
@@ -2229,7 +2236,7 @@ void HTMLMediaElement::set_up_playback_manager_for_local()
 
     // -> Once enough of the media data has been fetched to determine the duration of the media resource, its dimensions, and other metadata
     m_playback_manager->on_metadata_parsed = GC::weak_callback(*this, [](auto& self) {
-        self.on_metadata_parsed();
+        self.on_metadata_parsed(SourceType::Local);
     });
 
     // -> If the media data is corrupted
@@ -2542,15 +2549,15 @@ void HTMLMediaElement::update_ready_state()
     //        the buffered head.
     constexpr auto have_enough_data_duration = AK::Duration::from_seconds(5);
 
-    auto duration = m_playback_manager->duration();
     auto current_range_end = AK::Duration::zero();
     if (current_range.has_value())
         current_range_end = current_range->end;
     auto playable_duration = max(AK::Duration::zero(), current_range_end - current_time);
+    auto is_buffered_to_end_of_media = current_range_end.to_seconds_f64() >= m_duration;
 
     // -> If HTMLMediaElement's buffered contains a TimeRanges that includes the current playback position and
     //    enough data to ensure uninterrupted playback:
-    if (available_data == Media::AvailableData::Future && (playable_duration >= have_enough_data_duration || current_range_end >= duration)) {
+    if (available_data == Media::AvailableData::Future && (playable_duration >= have_enough_data_duration || is_buffered_to_end_of_media)) {
         // 1. Set the HTMLMediaElement's readyState attribute to HAVE_ENOUGH_DATA.
         set_ready_state(ReadyState::HaveEnoughData);
 

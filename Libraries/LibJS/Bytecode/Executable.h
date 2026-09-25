@@ -15,6 +15,7 @@
 #include <AK/Types.h>
 #include <AK/Utf16FlyString.h>
 #include <AK/Vector.h>
+#include <AK/kmalloc.h>
 #include <LibCore/ImmutableBytes.h>
 #include <LibGC/CellAllocator.h>
 #include <LibGC/Ptr.h>
@@ -84,14 +85,20 @@ struct PropertyLookupCache {
     };
 
     struct MonomorphicData {
+        AK_ALLOC_WITH_KMALLOC;
+
         Entry entry;
     };
 
     struct PolymorphicData {
+        AK_ALLOC_WITH_KMALLOC;
+
         AK::Array<Entry, max_number_of_shapes_to_remember> entries;
     };
 
     struct MegamorphicData {
+        AK_ALLOC_WITH_KMALLOC;
+
         // Keep the most recently used entry first so generated interpreter code can use the
         // same fast path for every cache tier. Other shapes use the bounded two-level cache.
         Entry entry;
@@ -229,11 +236,15 @@ private:
 // A PropertyLookupCache for use as a static local variable.
 // Registers itself for GC sweep since it's not owned by any Executable.
 struct StaticPropertyLookupCache : public PropertyLookupCache {
+    AK_ALLOC_WITH_KMALLOC;
+
     StaticPropertyLookupCache();
     static void sweep_all();
 };
 
 struct KeyedPropertyLookupCache {
+    AK_ALLOC_WITH_KMALLOC;
+
     static constexpr size_t number_of_entries = 2048;
 
     struct Entry {
@@ -319,11 +330,14 @@ class JS_API ObjectPropertyIteratorCacheData final : public Cell {
     GC_DECLARE_ALLOCATOR(ObjectPropertyIteratorCacheData);
 
 public:
+    // Fast-path snapshot: a cached, revalidatable key list for one shape, shared by every site that enumerates it.
     ObjectPropertyIteratorCacheData(VM&, Vector<PropertyKey>, ObjectPropertyIteratorFastPath, u32 indexed_property_count, bool receiver_has_magical_length_property, GC::Ref<Shape>, GC::Ptr<PrototypeChainValidity> = nullptr);
+    // Slow-path snapshot: a plain key list with no fast path. Enumeration filters deleted keys with
+    // has_property() at each step, so there is no shape to revalidate against.
+    ObjectPropertyIteratorCacheData(VM&, Vector<PropertyKey>);
     virtual ~ObjectPropertyIteratorCacheData() override = default;
 
     [[nodiscard]] ReadonlySpan<PropertyKey> properties() const { return m_properties.span(); }
-    [[nodiscard]] ReadonlySpan<Value> property_values() const { return m_property_values.span(); }
     [[nodiscard]] ObjectPropertyIteratorFastPath fast_path() const { return m_fast_path; }
     [[nodiscard]] u32 indexed_property_count() const { return m_indexed_property_count; }
     [[nodiscard]] bool receiver_has_magical_length_property() const { return m_receiver_has_magical_length_property; }
@@ -342,12 +356,12 @@ private:
     u32 m_indexed_property_count { 0 };
     u32 m_shape_dictionary_generation { 0 };
     bool m_receiver_has_magical_length_property { false };
+    bool m_shape_is_dictionary { false };
     ObjectPropertyIteratorFastPath m_fast_path { ObjectPropertyIteratorFastPath::None };
 };
 
 struct ObjectPropertyIteratorCache {
     GC::Ptr<ObjectPropertyIteratorCacheData> data;
-    GC::Ptr<Object> reusable_property_name_iterator;
 };
 
 struct SourceMapEntry {
@@ -377,6 +391,7 @@ public:
         size_t number_of_template_object_caches,
         size_t number_of_object_shape_caches,
         size_t number_of_object_property_iterator_caches,
+        size_t number_of_environment_shape_caches,
         size_t number_of_registers,
         Strict);
 
@@ -390,6 +405,7 @@ public:
     Vector<GC::Ref<TemplateObjectCache>> template_object_caches;
     Vector<ObjectShapeCache> object_shape_caches;
     Vector<ObjectPropertyIteratorCache> object_property_iterator_caches;
+    Vector<GC::Ptr<EnvironmentShape>> environment_shape_caches;
     NonnullOwnPtr<StringTable> string_table;
     NonnullOwnPtr<IdentifierTable> identifier_table;
     NonnullOwnPtr<PropertyKeyTable> property_key_table;

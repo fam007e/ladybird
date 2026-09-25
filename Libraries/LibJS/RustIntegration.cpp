@@ -614,6 +614,8 @@ ByteBuffer serialize_compiled_program_for_bytecode_cache(CompiledProgram const& 
 }
 
 struct BytecodeCacheBlobOwner {
+    AK_ALLOC_WITH_KMALLOC;
+
     Core::ImmutableBytes bytes;
     Core::EventLoop* event_loop { nullptr };
 };
@@ -1210,6 +1212,8 @@ void free_function_ast(void* ast)
 namespace JS::FFI {
 
 struct RustCompiledRegex {
+    AK_ALLOC_WITH_KMALLOC;
+
     Utf16String parsed_pattern;
 };
 
@@ -1410,6 +1414,7 @@ extern "C" void* rust_create_executable(
         data->template_object_cache_count,
         data->object_shape_cache_count,
         data->object_property_iterator_cache_count,
+        data->environment_shape_cache_count,
         data->number_of_registers,
         data->is_strict ? JS::Strict::Yes : JS::Strict::No);
 

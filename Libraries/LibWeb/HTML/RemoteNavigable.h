@@ -8,8 +8,8 @@
 
 #include <AK/HashTable.h>
 #include <AK/Vector.h>
+#include <LibCompositing/Types.h>
 #include <LibGC/Root.h>
-#include <LibWeb/Compositor/Types.h>
 #include <LibWeb/HTML/Navigable.h>
 #include <LibWeb/HTML/ReplicatedNavigableState.h>
 
@@ -20,8 +20,6 @@ class WEB_API RemoteNavigable final : public Navigable {
     GC_DECLARE_ALLOCATOR(RemoteNavigable);
 
 public:
-    static constexpr bool OVERRIDES_FINALIZE = true;
-
     static GC::Ref<RemoteNavigable> create(GC::Ref<Page>, CrossProcessId, GC::Ptr<Navigable> parent, ReplicatedNavigableState);
     virtual ~RemoteNavigable() override;
 
@@ -42,7 +40,7 @@ public:
     virtual bool has_been_destroyed() const override { return m_has_been_destroyed; }
     virtual void set_has_been_destroyed() override { m_has_been_destroyed = true; }
 
-    Optional<Compositor::CompositorContextId> compositor_context_id() const { return m_replicated_state.compositor_context_id; }
+    Optional<Compositing::CompositorContextId> compositor_context_id() const { return m_replicated_state.compositor_context_id; }
 
     // The WindowProxy standing for the navigable, which the page keeps across changes of the hosting process.
     GC::Ptr<WindowProxy> window_proxy() const { return m_window_proxy; }
@@ -71,10 +69,14 @@ public:
     virtual Optional<URL::Origin> active_document_top_level_origin() const override { return m_replicated_state.top_level_origin; }
     virtual bool active_document_has_cross_site_ancestor() const override { return m_replicated_state.has_cross_site_ancestor; }
     virtual OpenerPolicy const& active_document_opener_policy() const override { return m_replicated_state.opener_policy; }
+    virtual bool active_browsing_context_is_auxiliary() const override { return m_replicated_state.active_browsing_context_is_auxiliary; }
+    virtual GC::Ptr<WindowProxy> active_browsing_context_opener_window_proxy() const override;
     virtual ReplicatedContainerState container_state() const override;
 
     virtual bool has_session_history_entry_and_ready_for_navigation() const override;
     virtual bool delays_the_load_event_of_its_container() const override;
+
+    virtual GC::Ptr<DOM::Node> currently_focused_area() override;
 
 private:
     RemoteNavigable(GC::Ref<Page>, CrossProcessId, GC::Ptr<Navigable> parent, ReplicatedNavigableState);
@@ -91,6 +93,8 @@ private:
     // https://html.spec.whatwg.org/multipage/document-sequences.html#nav-wp
     GC::Ptr<WindowProxy> m_window_proxy;
     GC::Ptr<RemoteWindow> m_active_window;
+
+    mutable GC::Ptr<WindowProxy> m_active_browsing_context_opener_window_proxy;
 
     GC::Ptr<LocalNavigable> m_provisional_navigable;
 

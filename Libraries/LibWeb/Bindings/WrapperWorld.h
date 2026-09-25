@@ -26,8 +26,6 @@ class WEB_API WrapperWorld final : public GC::Cell {
     GC_DECLARE_ALLOCATOR(WrapperWorld);
 
 public:
-    static constexpr bool OVERRIDES_FINALIZE = true;
-
     using Type = WrapperWorldType;
 
     explicit WrapperWorld(Type);
@@ -69,6 +67,8 @@ WEB_API WrapperWorld const& host_defined_wrapper_world(JS::Realm const&);
 template<typename T>
 class WrapperWorldWeakValueCache {
 public:
+    AK_ALLOC_WITH_KMALLOC;
+
     [[nodiscard]] GC::Ptr<T> get(WrapperWorld const& wrapper_world)
     {
         return m_values.get(wrapper_world);

@@ -235,6 +235,7 @@ public:
 
     void append_attribute(Attr&);
     void append_attribute(QualifiedName, Utf16String value);
+    void ensure_attribute_capacity(size_t);
     void remove_attribute(Utf16FlyString const& name);
     void remove_attribute_ns(Optional<Utf16FlyString> const& namespace_, Utf16FlyString const& name);
     WebIDL::ExceptionOr<GC::Ref<Attr>> remove_attribute_node(GC::Ref<Attr>);
@@ -361,6 +362,9 @@ public:
 
     Layout::NodeWithStyle* layout_node();
     Layout::NodeWithStyle const* layout_node() const;
+
+    // The box that CSSOM View geometry describes. For a table, this is the table wrapper box.
+    Layout::NodeWithStyle const* principal_layout_node() const;
 
     Layout::NodeWithStyle* unsafe_layout_node();
     Layout::NodeWithStyle const* unsafe_layout_node() const;
@@ -561,9 +565,9 @@ public:
     bool style_uses_custom_function() const { return m_style_uses_custom_function; }
 
     bool style_uses_if_css_function() const { return m_style_uses_if_css_function; }
-    void set_style_uses_if_css_function() { m_style_uses_if_css_function = true; }
+    void set_style_uses_if_css_function();
     bool style_depends_on_viewport_metrics() const { return m_style_depends_on_viewport_metrics; }
-    void set_style_depends_on_viewport_metrics() { m_style_depends_on_viewport_metrics = true; }
+    void set_style_depends_on_viewport_metrics();
     bool style_uses_inherit_css_function() const { return m_style_uses_inherit_css_function; }
     void set_style_uses_inherit_css_function() { m_style_uses_inherit_css_function = true; }
     bool style_depends_on_size_container_query() const { return m_style_depends_on_size_container_query; }
@@ -594,7 +598,7 @@ public:
     [[nodiscard]] Vector<CSSPixelRect> get_client_rects() const;
 
     [[nodiscard]] CSSPixelRect bounding_client_rect_assuming_layout_clean() const;
-    [[nodiscard]] CSSPixelRect bounding_client_rect_assuming_layout_clean(Painting::AccumulatedVisualContextTree const&) const;
+    [[nodiscard]] CSSPixelRect bounding_client_rect_assuming_layout_clean(Compositing::AccumulatedVisualContextTree const&) const;
 
     virtual Layout::Node* create_layout_node(CSS::LayoutStyle);
 

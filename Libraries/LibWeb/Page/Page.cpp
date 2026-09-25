@@ -24,6 +24,7 @@
 #include <LibWeb/HTML/BrowsingContextGroup.h>
 #include <LibWeb/HTML/EventLoop/EventLoop.h>
 #include <LibWeb/HTML/EventNames.h>
+#include <LibWeb/HTML/Focus.h>
 #include <LibWeb/HTML/HTMLIFrameElement.h>
 #include <LibWeb/HTML/HTMLInputElement.h>
 #include <LibWeb/HTML/HTMLMediaElement.h>
@@ -116,6 +117,8 @@ void Page::visit_edges(JS::Cell::Visitor& visitor)
     visitor.visit(m_window_rect_observer);
     visitor.visit(m_on_pending_dialog_closed);
     visitor.visit(m_pending_clipboard_requests);
+    visitor.visit(m_emulated_position_data);
+    visitor.visit(m_emulated_position_data_observers);
     for (auto const& request : m_pending_geolocation_requests)
         visitor.visit(request.value.callback);
     m_pending_fullscreen_operations.for_each([&](auto const& operation) {
@@ -130,29 +133,55 @@ void Page::visit_edges(JS::Cell::Visitor& visitor)
     });
 }
 
-HTML::LocalNavigable& Page::focused_navigable()
+// The navigable keyboard input goes to in the tab, which is the top-level traversable until focus moves into another.
+GC::Ptr<HTML::Navigable> Page::focused_navigable() const
 {
-    if (m_focused_navigable)
-        return *m_focused_navigable;
-    if (has_local_traversable())
-        return local_traversable();
-    return *local_roots().first();
+    if (m_focused_navigable && !m_focused_navigable->has_been_destroyed())
+        return m_focused_navigable.ptr();
+    return m_top_level_traversable;
 }
 
-void Page::set_focused_navigable(HTML::LocalNavigable& navigable)
+GC::Ptr<HTML::LocalNavigable> Page::hosted_focused_navigable() const
+{
+    return as_if<HTML::LocalNavigable>(focused_navigable().ptr());
+}
+
+void Page::set_focused_navigable(HTML::Navigable& navigable)
 {
     if (m_focused_navigable == &navigable)
         return;
+    update_focused_navigable(navigable);
+
+    // NB: The UI process holds the tab's focused navigable and tells the other pages of the tab. A navigable hosted by
+    //     another process is focused there, and that process tells it.
+    if (is<HTML::LocalNavigable>(navigable))
+        m_client->page_did_change_focused_navigable(navigable.id());
+}
+
+void Page::focused_navigable_changed_in_another_page(HTML::CrossProcessId id)
+{
+    // NB: The focus update steps ran in the page that moved focus, for the documents it hosts. The documents this page
+    //     hosts go from the focus chain they held to the one the tab's focused navigable shows here.
+    auto root = top_level_traversable();
+    auto old_focused_area = root->currently_focused_area();
+    update_focused_navigable(navigable_with_id(id));
+    auto new_focused_area = root->currently_focused_area_shown_by_focused_navigable();
+    if (old_focused_area == new_focused_area)
+        return;
+    HTML::run_focus_update_steps(HTML::focus_chain(old_focused_area), HTML::focus_chain(new_focused_area), new_focused_area);
+}
+
+void Page::update_focused_navigable(GC::Ptr<HTML::Navigable> navigable)
+{
     invalidate_compositor_keyboard_scroll_state();
     m_focused_navigable = navigable;
-    if (has_local_traversable())
-        local_traversable()->set_needs_repaint();
+    for (auto const& root : local_roots())
+        root->set_needs_repaint();
 }
 
 void Page::navigable_document_destroyed(Badge<DOM::Document>, HTML::LocalNavigable& navigable)
 {
-    if (GC::Ref { navigable } == m_focused_navigable.ptr())
-        m_focused_navigable = nullptr;
+    // NB: The tab's focused navigable outlives the documents it shows, and is cleared when it is itself destroyed.
     if (GC::Ref { navigable } == m_mouse_event_tracking_navigable.ptr())
         m_mouse_event_tracking_navigable = nullptr;
 }
@@ -382,7 +411,7 @@ ChromeMetrics Page::chrome_metrics() const
     return ChromeMetrics { m_client->zoom_level() };
 }
 
-EventResult Page::handle_mouseup(HTML::LocalNavigable& root, DevicePixelPoint position, DevicePixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers)
+EventResult Page::handle_mouseup(HTML::LocalNavigable& root, DevicePixelPoint position, DevicePixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers, Optional<RemoteInputEventTarget>* remote_target)
 {
     // INTEROP: Releasing outside an iframe still ends selection and drag tracking in the child document where the
     //          interaction began, while the mouseup event itself remains targeted at the document under the pointer.
@@ -392,27 +421,27 @@ EventResult Page::handle_mouseup(HTML::LocalNavigable& root, DevicePixelPoint po
             navigable->event_handler().reset_mouse_input_tracking({});
         }
     };
-    return root.event_handler().handle_mouseup(device_to_css_point(position), device_to_css_point(screen_position), button, buttons, modifiers);
+    return root.event_handler().handle_mouseup(device_to_css_point(position), device_to_css_point(screen_position), button, buttons, modifiers, remote_target);
 }
 
 EventResult Page::handle_mouseup(DevicePixelPoint position, DevicePixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers)
 {
-    return handle_mouseup(local_traversable(), position, screen_position, button, buttons, modifiers);
+    return handle_mouseup(local_traversable(), position, screen_position, button, buttons, modifiers, nullptr);
 }
 
-EventResult Page::handle_mousedown(HTML::LocalNavigable& root, DevicePixelPoint position, DevicePixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers, int click_count)
+EventResult Page::handle_mousedown(HTML::LocalNavigable& root, DevicePixelPoint position, DevicePixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers, int click_count, Optional<Compositing::ScrollbarDraggedByCompositor> const& scrollbar_dragged_by_compositor, Optional<RemoteInputEventTarget>* remote_target)
 {
     if (button == UIEvents::MouseButton::Primary) {
         if (auto navigable = m_mouse_event_tracking_navigable)
             navigable->event_handler().reset_mouse_input_tracking({});
         m_mouse_event_tracking_navigable = nullptr;
     }
-    return root.event_handler().handle_mousedown(device_to_css_point(position), device_to_css_point(screen_position), button, buttons, modifiers, click_count);
+    return root.event_handler().handle_mousedown(device_to_css_point(position), device_to_css_point(screen_position), button, buttons, modifiers, click_count, scrollbar_dragged_by_compositor, remote_target);
 }
 
-EventResult Page::handle_mousedown(DevicePixelPoint position, DevicePixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers, int click_count)
+EventResult Page::handle_mousedown(DevicePixelPoint position, DevicePixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers, int click_count, Optional<Compositing::ScrollbarDraggedByCompositor> const& scrollbar_dragged_by_compositor)
 {
-    return handle_mousedown(local_traversable(), position, screen_position, button, buttons, modifiers, click_count);
+    return handle_mousedown(local_traversable(), position, screen_position, button, buttons, modifiers, click_count, scrollbar_dragged_by_compositor, nullptr);
 }
 
 void Page::set_mouse_event_tracking_navigable(Badge<EventHandler>, HTML::LocalNavigable& navigable)
@@ -425,14 +454,14 @@ void Page::set_hover_reporting_navigable(Badge<EventHandler>, GC::Ptr<HTML::Loca
     m_hover_reporting_navigable = navigable;
 }
 
-EventResult Page::handle_mousemove(HTML::LocalNavigable& root, DevicePixelPoint position, DevicePixelPoint screen_position, unsigned buttons, unsigned modifiers)
+EventResult Page::handle_mousemove(HTML::LocalNavigable& root, DevicePixelPoint position, DevicePixelPoint screen_position, unsigned buttons, unsigned modifiers, Optional<RemoteInputEventTarget>* remote_target)
 {
-    return root.event_handler().handle_mousemove(device_to_css_point(position), device_to_css_point(screen_position), buttons, modifiers);
+    return root.event_handler().handle_mousemove(device_to_css_point(position), device_to_css_point(screen_position), buttons, modifiers, remote_target);
 }
 
 EventResult Page::handle_mousemove(DevicePixelPoint position, DevicePixelPoint screen_position, unsigned buttons, unsigned modifiers)
 {
-    return handle_mousemove(local_traversable(), position, screen_position, buttons, modifiers);
+    return handle_mousemove(local_traversable(), position, screen_position, buttons, modifiers, nullptr);
 }
 
 EventResult Page::handle_mouseleave(HTML::LocalNavigable& root)
@@ -448,7 +477,10 @@ EventResult Page::handle_mouseleave()
 #if defined(AK_OS_MACOS)
 bool Page::select_word_for_dictionary_lookup(DevicePixelPoint position)
 {
-    return local_traversable()->event_handler().select_word_for_dictionary_lookup(device_to_css_point(position));
+    auto navigable = hosted_focused_navigable();
+    if (!navigable)
+        return false;
+    return navigable->local_root()->event_handler().select_word_for_dictionary_lookup(device_to_css_point(position));
 }
 #endif
 
@@ -461,14 +493,14 @@ UniqueNodeID Page::node_id_at_position(DevicePixelPoint position)
     return node->unique_id();
 }
 
-EventResult Page::handle_mousewheel(HTML::LocalNavigable& root, DevicePixelPoint position, DevicePixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers, double wheel_delta_x, double wheel_delta_y, WheelDeltaPrecision wheel_delta_precision, ScrollGesturePhase scroll_gesture_phase, bool async_scroll_performed_default_action, Optional<AsyncScrollOperation>* async_scroll_operation)
+EventResult Page::handle_mousewheel(HTML::LocalNavigable& root, DevicePixelPoint position, DevicePixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers, double wheel_delta_x, double wheel_delta_y, Compositing::WheelDeltaPrecision wheel_delta_precision, Compositing::ScrollGesturePhase scroll_gesture_phase, bool async_scroll_performed_default_action, Optional<AsyncScrollOperation>* async_scroll_operation, Optional<RemoteInputEventTarget>* remote_target)
 {
-    return root.event_handler().handle_mousewheel(device_to_css_point(position), device_to_css_point(screen_position), button, buttons, modifiers, wheel_delta_x, wheel_delta_y, wheel_delta_precision, scroll_gesture_phase, async_scroll_performed_default_action, async_scroll_operation);
+    return root.event_handler().handle_mousewheel(device_to_css_point(position), device_to_css_point(screen_position), button, buttons, modifiers, wheel_delta_x, wheel_delta_y, wheel_delta_precision, scroll_gesture_phase, async_scroll_performed_default_action, async_scroll_operation, remote_target);
 }
 
-EventResult Page::handle_mousewheel(DevicePixelPoint position, DevicePixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers, double wheel_delta_x, double wheel_delta_y, WheelDeltaPrecision wheel_delta_precision, ScrollGesturePhase scroll_gesture_phase, bool async_scroll_performed_default_action, Optional<AsyncScrollOperation>* async_scroll_operation)
+EventResult Page::handle_mousewheel(DevicePixelPoint position, DevicePixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers, double wheel_delta_x, double wheel_delta_y, Compositing::WheelDeltaPrecision wheel_delta_precision, Compositing::ScrollGesturePhase scroll_gesture_phase, bool async_scroll_performed_default_action, Optional<AsyncScrollOperation>* async_scroll_operation)
 {
-    return handle_mousewheel(local_traversable(), position, screen_position, button, buttons, modifiers, wheel_delta_x, wheel_delta_y, wheel_delta_precision, scroll_gesture_phase, async_scroll_performed_default_action, async_scroll_operation);
+    return handle_mousewheel(local_traversable(), position, screen_position, button, buttons, modifiers, wheel_delta_x, wheel_delta_y, wheel_delta_precision, scroll_gesture_phase, async_scroll_performed_default_action, async_scroll_operation, nullptr);
 }
 
 EventResult Page::handle_drag_and_drop_event(HTML::LocalNavigable& root, DragEvent::Type type, DevicePixelPoint position, DevicePixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers, Vector<HTML::SelectedFile> files)
@@ -495,14 +527,20 @@ EventResult Page::handle_keydown(UIEvents::KeyCode key, unsigned modifiers, u32 
 {
     // The compositor forwards these updates ahead of keyboard events. Both DOM listeners and a main-thread
     // fallback default action must observe the offsets that have already been presented.
-    focused_navigable().local_root()->adopt_pending_async_scroll_offsets(Compositor::AsyncScrollUpdateFreshness::Pushed);
-    return focused_navigable().event_handler().handle_keydown(key, modifiers, code_point, repeat, should_insert_text, async_scroll_performed_default_action);
+    auto navigable = hosted_focused_navigable();
+    if (!navigable)
+        return EventResult::Dropped;
+    navigable->local_root()->adopt_pending_async_scroll_offsets(Compositing::AsyncScrollUpdateFreshness::Pushed);
+    return navigable->event_handler().handle_keydown(key, modifiers, code_point, repeat, should_insert_text, async_scroll_performed_default_action);
 }
 
 EventResult Page::handle_keyup(UIEvents::KeyCode key, unsigned modifiers, u32 code_point, bool repeat)
 {
-    focused_navigable().local_root()->adopt_pending_async_scroll_offsets(Compositor::AsyncScrollUpdateFreshness::Pushed);
-    return focused_navigable().event_handler().handle_keyup(key, modifiers, code_point, repeat);
+    auto navigable = hosted_focused_navigable();
+    if (!navigable)
+        return EventResult::Dropped;
+    navigable->local_root()->adopt_pending_async_scroll_offsets(Compositing::AsyncScrollUpdateFreshness::Pushed);
+    return navigable->event_handler().handle_keyup(key, modifiers, code_point, repeat);
 }
 
 void Page::handle_sdl_input_events()
@@ -567,7 +605,7 @@ void Page::keyboard_scroll_editability_changed(DOM::Document& document)
         invalidate_compositor_keyboard_scroll_state();
 }
 
-Compositor::KeyboardScrollState Page::take_keyboard_scroll_state_for_compositor(u64 visual_context_tree_structural_epoch)
+Compositing::KeyboardScrollState Page::take_keyboard_scroll_state_for_compositor(u64 visual_context_tree_structural_epoch)
 {
     if (!m_async_scrolling_enabled || !has_local_traversable() || !local_traversable()->has_compositor_context())
         return {};
@@ -830,10 +868,62 @@ void Page::stop_hosting(HTML::LocalNavigable& local_navigable, HTML::ReplicatedN
     } else {
         VERIFY(m_top_level_traversable.ptr() == &local_navigable);
         m_top_level_traversable = remote_navigable;
-        as<HTML::LocalTraversableNavigable>(local_navigable).remove_from_user_agent_top_level_traversable_set();
     }
     local_navigable.set_has_been_destroyed();
     local_navigable.remove_from_all_local_navigables();
+}
+
+// https://fullscreen.spec.whatwg.org/#dom-element-requestfullscreen
+GC::Ptr<HTML::LocalNavigable> Page::fullscreen_element_and_its_containers(GC::Ref<DOM::Element> element, Fullscreen::RequestType request_type, ElementIsRequestedElement element_is_requested_element)
+{
+    // 11. Let fullscreenElements be an ordered set initially consisting of this.
+    auto fullscreen_elements = GC::Heap::the().allocate<GC::HeapVector<GC::Ref<DOM::Element>>>();
+    fullscreen_elements->elements().append(element);
+
+    // 12. While true:
+    while (true) {
+        // 1. Let last be the last item of fullscreenElements.
+        auto last = fullscreen_elements->elements().last();
+
+        // 2. Let container be last's node navigable's container.
+        auto container = last->navigable()->container();
+
+        // 3. If container is null, then break.
+        if (!container)
+            break;
+
+        // 4. Append container to fullscreenElements.
+        fullscreen_elements->elements().append(*container);
+    }
+
+    // 13. For each element in fullscreenElements:
+    for (auto& fullscreen_element : fullscreen_elements->elements()) {
+        // 1. Let doc be element's node document.
+        auto& doc = fullscreen_element->document();
+
+        // 2. If element is doc's fullscreen element, continue.
+        if (doc.fullscreen_element() == fullscreen_element)
+            continue;
+
+        // 3. If element is this and this is an iframe element, then set element's iframe fullscreen flag.
+        if (fullscreen_element == element && element_is_requested_element == ElementIsRequestedElement::Yes) {
+            if (auto* iframe = as_if<HTML::HTMLIFrameElement>(*fullscreen_element))
+                iframe->set_iframe_fullscreen_flag(true);
+        }
+
+        // 4. Fullscreen element within doc.
+        doc.fullscreen_element_within_doc(fullscreen_element, request_type);
+
+        // 5. Append (fullscreenchange, element) to doc's list of pending fullscreen events.
+        doc.append_pending_fullscreen_change(DOM::PendingFullscreenEvent::Type::Change, fullscreen_element, request_type);
+    }
+
+    // NB: The walk stops at the navigable whose container another process holds. That process runs these steps for
+    //     the container and the containers above it.
+    auto last_navigable = fullscreen_elements->elements().last()->navigable();
+    if (!last_navigable->container() && last_navigable->parent())
+        return last_navigable;
+    return nullptr;
 }
 
 // https://fullscreen.spec.whatwg.org/#exit-fullscreen
@@ -872,8 +962,6 @@ void Page::discard()
     for (auto const& navigable : local_roots()) {
         if (auto document = navigable->active_document())
             document->destroy_a_document_and_its_descendants();
-        if (auto* traversable = as_if<HTML::LocalTraversableNavigable>(*navigable))
-            traversable->remove_from_user_agent_top_level_traversable_set();
         navigable->set_has_been_destroyed();
         navigable->remove_from_all_local_navigables();
     }
@@ -989,6 +1077,15 @@ void Page::prompt_closed(Optional<Utf16String> response)
     }
 }
 
+// NB: A dialog blocks the whole tab, so every page of the tab holds the one a document of any of them opened.
+void Page::did_open_dialog_in_another_process(PendingDialog dialog, Utf16String const& message)
+{
+    m_pending_dialog = dialog;
+    m_pending_dialog_text.clear();
+    if (!message.is_empty())
+        m_pending_dialog_text = message;
+}
+
 void Page::dismiss_dialog(GC::Ref<GC::Function<void()>> on_dialog_closed)
 {
     m_on_pending_dialog_closed = on_dialog_closed;
@@ -1081,12 +1178,12 @@ void Page::file_picker_closed(Span<HTML::SelectedFile> selected_files)
     }
 }
 
-void Page::did_request_select_dropdown(GC::Weak<HTML::HTMLSelectElement> target, Web::CSSPixelPoint content_position, Web::CSSPixels minimum_width, Vector<Web::HTML::SelectItem> items)
+void Page::did_request_select_dropdown(GC::Weak<HTML::HTMLSelectElement> target, HTML::CrossProcessId local_root_id, Web::CSSPixelPoint content_position, Web::CSSPixels minimum_width, Vector<Web::HTML::SelectItem> items)
 {
     if (m_pending_non_blocking_dialog == PendingNonBlockingDialog::None) {
         m_pending_non_blocking_dialog = PendingNonBlockingDialog::Select;
         m_pending_non_blocking_dialog_target = move(target);
-        m_client->page_did_request_select_dropdown(content_position, minimum_width, move(items));
+        m_client->page_did_request_select_dropdown(local_root_id, content_position, minimum_width, move(items));
     }
 }
 
@@ -1115,6 +1212,35 @@ void Page::retrieved_clipboard_entries(u64 request_id, Vector<Clipboard::SystemC
 {
     if (auto request = m_pending_clipboard_requests.take(request_id); request.has_value())
         (*request)->function()(move(items));
+}
+
+// https://w3c.github.io/geolocation/#dfn-emulated-position-data
+void Page::set_emulated_position_data(Geolocation::EmulatedPositionData data)
+{
+    m_emulated_position_data = data;
+
+    GC::RootVector<GC::Ref<GC::Function<void()>>> observers;
+    for (auto& observer : m_emulated_position_data_observers)
+        observers.append(observer.value);
+    for (auto& observer : observers)
+        observer->function()();
+}
+
+void Page::set_emulated_position_data(Geolocation::CoordinatesData coordinates_data)
+{
+    set_emulated_position_data(heap().allocate<Geolocation::GeolocationCoordinates>(move(coordinates_data)));
+}
+
+u64 Page::register_emulated_position_data_observer(GC::Ref<GC::Function<void()>> observer)
+{
+    auto observer_id = m_next_emulated_position_data_observer_id++;
+    m_emulated_position_data_observers.set(observer_id, observer);
+    return observer_id;
+}
+
+void Page::unregister_emulated_position_data_observer(u64 observer_id)
+{
+    m_emulated_position_data_observers.remove(observer_id);
 }
 
 u64 Page::request_geolocation_position(GeolocationPositionCallback callback, GeolocationRequestType type)
@@ -1311,10 +1437,10 @@ Optional<Page::ContextMenuRequest> Page::take_context_menu_request()
     return request;
 }
 
-void Page::did_request_media_context_menu(UniqueNodeID media_id, CSSPixelPoint position, ByteString const& target, unsigned modifiers, MediaContextMenu const& menu)
+void Page::did_request_media_context_menu(UniqueNodeID media_id, HTML::CrossProcessId local_root_id, CSSPixelPoint position, ByteString const& target, unsigned modifiers, MediaContextMenu const& menu)
 {
     m_media_context_menu_element_id = media_id;
-    client().page_did_request_media_context_menu(position, target, modifiers, menu);
+    client().page_did_request_media_context_menu(local_root_id, position, target, modifiers, menu);
 }
 
 void Page::toggle_media_play_state()
@@ -1649,9 +1775,9 @@ void Page::enqueue_fullscreen_enter(GC::Ref<DOM::Element> element, GC::Ref<DOM::
     }));
 }
 
-void Page::enqueue_fullscreen_exit(GC::Ref<DOM::Document> doc, bool resize, GC::Ptr<WebIDL::Promise> promise)
+void Page::enqueue_fullscreen_exit(GC::Ref<DOM::Document> doc, bool resize, GC::Ptr<WebIDL::Promise> promise, Optional<HTML::CrossProcessId> requesting_navigable_id)
 {
-    m_pending_fullscreen_operations.enqueue(PendingFullscreenExit { doc, resize, promise });
+    m_pending_fullscreen_operations.enqueue(PendingFullscreenExit { doc, resize, promise, requesting_navigable_id });
     // NOTE: Processing is deferred because the spec says "run the remaining steps in parallel",
     //       meaning the caller's synchronous JS should complete before we process the operation.
     Platform::EventLoopPlugin::the().deferred_invoke(GC::create_function(GC::Heap::the(), [this]() {
@@ -1661,10 +1787,6 @@ void Page::enqueue_fullscreen_exit(GC::Ref<DOM::Document> doc, bool resize, GC::
 
 void Page::process_pending_fullscreen_operations()
 {
-    // FIXME: The Fullscreen API interacts with the top-level traversable's viewport. With site-isolation,
-    //        an iframe's content process won't have direct access to this Page, so fullscreen operations
-    //        will need to be routed through IPC to the top-level process.
-
     // NOTE: Resolving/rejecting promises during processing may trigger JS microtasks that re-enter
     //       this function (e.g., JS calls exitFullscreen() after a requestFullscreen() promise resolves).
     //       The outer call's while loop will pick up newly enqueued items.
@@ -1680,81 +1802,57 @@ void Page::process_pending_fullscreen_operations()
             [&](PendingFullscreenEnter& enter) -> bool {
                 // https://fullscreen.spec.whatwg.org/#dom-element-requestfullscreen
 
-                // 8. If error is false, then resize pendingDoc's node navigable's top-level traversable's
-                //    active document's viewport's dimensions, optionally taking into account
-                //    options["navigationUI"]:
-                if (enter.error == DOM::RequestFullscreenError::False) {
-                    if (m_viewport_is_fullscreen == ViewportIsFullscreen::No) {
-                        if (!m_fullscreen_ipc_sent_to_ui) {
-                            m_client->page_did_request_fullscreen_window();
-                            m_fullscreen_ipc_sent_to_ui = true;
-                        }
-                        // NB: Stop processing here and wait for a change in the fullscreen state if we aren't
-                        //     in the desired state yet.
-                        return false;
-                    }
-
-                    // 9. If any of the following conditions are false, then set error to true:
-                    //    * This's node document is pendingDoc.
-                    //    * The fullscreen element ready check for this returns true.
-                    if (enter.element->owner_document() != GC::Ptr { enter.pending_doc.ptr() })
-                        enter.error = DOM::RequestFullscreenError::ElementNodeDocIsNotPendingDoc;
-                    else if (!enter.element->is_element_ready_for_fullscreen())
-                        enter.error = DOM::RequestFullscreenError::ElementReadyCheckFailed;
-                }
+                // NB: The process holding the container above this one runs steps 12 and 13 for the rest of the
+                //     chain, and the promise waits for it.
+                if (enter.container_chain == ContainerChain::InAnotherProcess)
+                    return false;
 
                 auto& realm = HTML::relevant_realm(*enter.pending_doc);
                 HTML::TemporaryExecutionContext context(realm, HTML::TemporaryExecutionContext::CallbacksEnabled::Yes);
 
-                // 10. If error is true:
-                if (enter.error != DOM::RequestFullscreenError::False) {
-                    // 1. Append (fullscreenerror, this) to pendingDoc's list of pending fullscreen events.
-                    enter.pending_doc->append_pending_fullscreen_change(DOM::PendingFullscreenEvent::Type::Error, enter.element, enter.request_type);
+                if (enter.container_chain == ContainerChain::NotStarted) {
+                    // 8. If error is false, then resize pendingDoc's node navigable's top-level traversable's
+                    //    active document's viewport's dimensions, optionally taking into account
+                    //    options["navigationUI"]:
+                    if (enter.error == DOM::RequestFullscreenError::False) {
+                        if (m_viewport_is_fullscreen == ViewportIsFullscreen::No) {
+                            if (!m_fullscreen_ipc_sent_to_ui) {
+                                m_client->page_did_request_fullscreen_window();
+                                m_fullscreen_ipc_sent_to_ui = true;
+                            }
+                            // NB: Stop processing here and wait for a change in the fullscreen state if we aren't
+                            //     in the desired state yet.
+                            return false;
+                        }
 
-                    // 2. Reject promise with a TypeError exception and terminate these steps.
-                    if (enter.promise)
-                        WebIDL::reject_promise(*enter.promise, JS::TypeError::create(realm, DOM::request_fullscreen_error_to_string(enter.error)));
-                    return true;
-                }
+                        // 9. If any of the following conditions are false, then set error to true:
+                        //    * This's node document is pendingDoc.
+                        //    * The fullscreen element ready check for this returns true.
+                        if (enter.element->owner_document() != GC::Ptr { enter.pending_doc.ptr() })
+                            enter.error = DOM::RequestFullscreenError::ElementNodeDocIsNotPendingDoc;
+                        else if (!enter.element->is_element_ready_for_fullscreen())
+                            enter.error = DOM::RequestFullscreenError::ElementReadyCheckFailed;
+                    }
 
-                // 11. Let fullscreenElements be an ordered set initially consisting of this.
-                auto fullscreen_elements = GC::Heap::the().allocate<GC::HeapVector<GC::Ref<DOM::Element>>>();
-                fullscreen_elements->elements().append(enter.element);
+                    // 10. If error is true:
+                    if (enter.error != DOM::RequestFullscreenError::False) {
+                        // 1. Append (fullscreenerror, this) to pendingDoc's list of pending fullscreen events.
+                        enter.pending_doc->append_pending_fullscreen_change(DOM::PendingFullscreenEvent::Type::Error, enter.element, enter.request_type);
 
-                // 12. While true:
-                while (true) {
-                    // 1. Let last be the last item of fullscreenElements.
-                    auto last = fullscreen_elements->elements().last();
+                        // 2. Reject promise with a TypeError exception and terminate these steps.
+                        if (enter.promise)
+                            WebIDL::reject_promise(*enter.promise, JS::TypeError::create(realm, DOM::request_fullscreen_error_to_string(enter.error)));
+                        return true;
+                    }
 
-                    // 2. Let container be last's node navigable's container.
-                    auto container = last->navigable()->container();
-
-                    // 3. If container is null, then break.
-                    if (!container)
-                        break;
-
-                    // 4. Append container to fullscreenElements.
-                    fullscreen_elements->elements().append(*container);
-                }
-
-                // 13. For each element in fullscreenElements:
-                for (auto& element : fullscreen_elements->elements()) {
-                    // 1. Let doc be element's node document.
-                    auto& doc = element->document();
-
-                    // 2. If element is doc's fullscreen element, continue.
-                    if (doc.fullscreen_element() == element)
-                        continue;
-
-                    // 3. If element is this and this is an iframe element, then set element's iframe fullscreen flag.
-                    if (element == enter.element && is<HTML::HTMLIFrameElement>(*enter.element))
-                        as<HTML::HTMLIFrameElement>(*element).set_iframe_fullscreen_flag(true);
-
-                    // 4. Fullscreen element within doc.
-                    doc.fullscreen_element_within_doc(element, enter.request_type);
-
-                    // 5. Append (fullscreenchange, element) to doc's list of pending fullscreen events.
-                    doc.append_pending_fullscreen_change(DOM::PendingFullscreenEvent::Type::Change, element, enter.request_type);
+                    // 11 to 13.
+                    if (auto hosted_root = fullscreen_element_and_its_containers(*enter.element, enter.request_type, ElementIsRequestedElement::Yes)) {
+                        enter.container_chain = ContainerChain::InAnotherProcess;
+                        enter.hosted_root_id = hosted_root->id();
+                        m_client->page_did_request_container_fullscreen(hosted_root->id(), hosted_root->id(), enter.request_type);
+                        return false;
+                    }
+                    enter.container_chain = ContainerChain::Complete;
                 }
 
                 // 14. Resolve promise with undefined
@@ -1786,11 +1884,30 @@ void Page::process_pending_fullscreen_operations()
                 if (!exit.doc->fullscreen_element()) {
                     if (exit.promise)
                         WebIDL::resolve_promise(*exit.promise);
+                    if (exit.requesting_navigable_id.has_value())
+                        m_client->page_did_complete_container_unfullscreen(*exit.requesting_navigable_id);
                     return true;
                 }
 
                 // 12. Let exitDocs be the result of collecting documents to unfullscreen given doc.
                 auto exit_docs = exit.doc->collect_documents_to_unfullscreen();
+
+                // NB: The collection stops at the document whose container another process holds. That process
+                //     continues it from the container, and this exit waits for it: the resize the process holding
+                //     the top-level traversable decides on comes before any document leaves fullscreen.
+                if (exit.container_chain == ContainerChain::NotStarted) {
+                    auto& last_exit_doc = exit_docs->elements().last();
+                    auto navigable = last_exit_doc->navigable();
+                    if (last_exit_doc->is_simple_fullscreen_document() && navigable && !navigable->container() && navigable->parent()) {
+                        exit.container_chain = ContainerChain::InAnotherProcess;
+                        exit.hosted_root_id = navigable->id();
+                        m_client->page_did_request_container_unfullscreen(navigable->id());
+                        return false;
+                    }
+                    exit.container_chain = ContainerChain::Complete;
+                }
+                if (exit.container_chain == ContainerChain::InAnotherProcess)
+                    return false;
 
                 // 13. Let descendantDocs be an ordered set consisting of doc's descendant navigables' active documents
                 //     whose fullscreen element is non-null, if any, in tree order.
@@ -1820,6 +1937,10 @@ void Page::process_pending_fullscreen_operations()
                 // 16. Resolve promise with undefined.
                 if (exit.promise)
                     WebIDL::resolve_promise(*exit.promise);
+                // NB: An exit continued for a document another process holds tells that process once the documents
+                //     above it have left fullscreen.
+                if (exit.requesting_navigable_id.has_value())
+                    m_client->page_did_complete_container_unfullscreen(*exit.requesting_navigable_id);
                 return true;
             });
 
@@ -1839,38 +1960,46 @@ void Page::set_viewport_is_fullscreen(ViewportIsFullscreen is_fullscreen)
     process_pending_fullscreen_operations();
 }
 
-void PageClient::history_navigation_params_creation_finished(HTML::CrossProcessId operation_id, HTML::HistoryNavigationPopulation population)
+void Page::container_fullscreen_complete(HTML::CrossProcessId hosted_root_id)
 {
-    page().history_executor().resume_history_navigation_population(operation_id, move(population));
-}
-
-void PageClient::request_navigation_start(HTML::LocalNavigable& navigable, NavigationTarget target, URL::URL const&, Utf16String navigation_id, Optional<HTML::NavigationStartRequest> start_request)
-{
-    // A javascript: navigation runs synchronously in this process and never populates an entry; there is nothing
-    // for the embedder to retain.
-    if (!start_request.has_value())
+    if (m_pending_fullscreen_operations.is_empty())
         return;
-
-    // A page without a UI process hosts every document of its tab, so no other page has a check to run first.
-    navigable.run_navigation_unload_check(navigation_id, HTML::UnloadPromptShown::No, GC::create_function(navigable.heap(), [client = GC::Ref { *this }, navigable = GC::Ref { navigable }, target, navigation_id, start_request = start_request.release_value()](bool should_continue) mutable {
-        if (!should_continue) {
-            navigable->resume_navigation_params_creation(navigation_id, {});
-            return;
-        }
-        auto population_request = HTML::create_navigation_population_request(move(start_request), client->allocate_cross_process_id());
-        client->request_navigation_population(navigable, target, move(population_request));
-    }));
+    auto* enter = m_pending_fullscreen_operations.head().get_pointer<PendingFullscreenEnter>();
+    if (!enter || enter->container_chain != ContainerChain::InAnotherProcess || enter->hosted_root_id != hosted_root_id)
+        return;
+    enter->container_chain = ContainerChain::Complete;
+    process_pending_fullscreen_operations();
 }
 
-void PageClient::request_navigation_population(HTML::LocalNavigable& navigable, NavigationTarget, HTML::NavigationPopulationRequest request)
+void Page::container_unfullscreen_complete(HTML::CrossProcessId hosted_root_id)
 {
-    navigable.resume_navigation_params_creation(request.navigation_id, move(request));
+    if (m_pending_fullscreen_operations.is_empty())
+        return;
+    auto* exit = m_pending_fullscreen_operations.head().get_pointer<PendingFullscreenExit>();
+    if (!exit || exit->container_chain != ContainerChain::InAnotherProcess || exit->hosted_root_id != hosted_root_id)
+        return;
+    exit->container_chain = ContainerChain::Complete;
+    process_pending_fullscreen_operations();
 }
 
-void PageClient::navigation_params_creation_finished(HTML::LocalNavigable& navigable, HTML::NavigationPopulationRequest request, HTML::NavigationPopulationResult result)
+void PageClient::request_navigation_start(HTML::LocalNavigable&, NavigationTarget, URL::URL const&, Utf16String, Optional<HTML::NavigationStartRequest>)
 {
-    HTML::apply_navigation_population_result(request, result);
-    navigable.continue_navigation_at_population(move(request), move(result));
+    VERIFY_NOT_REACHED();
+}
+
+void PageClient::request_navigation_population(HTML::LocalNavigable&, NavigationTarget, HTML::NavigationPopulationRequest)
+{
+    VERIFY_NOT_REACHED();
+}
+
+void PageClient::navigation_params_creation_finished(HTML::LocalNavigable&, HTML::NavigationPopulationRequest, HTML::NavigationPopulationResult)
+{
+    VERIFY_NOT_REACHED();
+}
+
+void PageClient::history_navigation_params_creation_finished(HTML::CrossProcessId, HTML::HistoryNavigationPopulation)
+{
+    VERIFY_NOT_REACHED();
 }
 
 }

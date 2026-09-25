@@ -6,6 +6,7 @@
  */
 
 use super::*;
+use smallvec::{SmallVec, smallvec};
 
 struct FloatAvoidanceProbe {
     opportunity: Option<CssPixels>,
@@ -151,7 +152,7 @@ pub(crate) struct BlockFormattingContext<'pass> {
     pending_legend_flow_position: Cell<Option<geometry::LogicalOffset>>,
     margin_state: RefCell<BlockMarginState>,
     floats: RefCell<Vec<FloatingBox>>,
-    bands: RefCell<Vec<FloatBand>>,
+    bands: RefCell<SmallVec<[FloatBand; 4]>>,
     lowest_left_margin_edge: Cell<CssPixels>,
     lowest_right_margin_edge: Cell<CssPixels>,
     lowest_floating_descendant_bottom_margin_edge: Cell<Option<CssPixels>>,
@@ -198,7 +199,7 @@ impl<'pass> BlockFormattingContext<'pass> {
             pending_legend_flow_position: Cell::new(None),
             margin_state: RefCell::new(BlockMarginState::default()),
             floats: RefCell::new(Vec::new()),
-            bands: RefCell::new(vec![FloatBand::default()]),
+            bands: RefCell::new(smallvec![FloatBand::default()]),
             lowest_left_margin_edge: Cell::new(CssPixels::default()),
             lowest_right_margin_edge: Cell::new(CssPixels::default()),
             lowest_floating_descendant_bottom_margin_edge: Cell::new(None),
@@ -310,11 +311,11 @@ impl<'pass> BlockFormattingContext<'pass> {
     }
 
     #[track_caller]
-    fn used(&self, node: Node) -> std::rc::Rc<UsedValues> {
+    fn used(&self, node: Node) -> &'pass UsedValues {
         self.records.used_values(node)
     }
 
-    fn create_used_values(&self, node: Node, constraints: ContainingBlockConstraints) -> std::rc::Rc<UsedValues> {
+    fn create_used_values(&self, node: Node, constraints: ContainingBlockConstraints) -> &'pass UsedValues {
         self.records.create_used_values(&self.callbacks, node, constraints)
     }
 
@@ -327,7 +328,7 @@ impl<'pass> BlockFormattingContext<'pass> {
     }
 
     fn containing_block(&self, node: Node) -> Node {
-        self.callbacks.containing_block(node)
+        self.callbacks.in_flow_containing_block(node)
     }
 
     fn children(&self, node: Node) -> Vec<Node> {
@@ -343,7 +344,7 @@ impl<'pass> BlockFormattingContext<'pass> {
     }
 
     fn is_ancestor_of(&self, ancestor: Node, node: Node) -> bool {
-        self.callbacks.is_ancestor(ancestor, node)
+        self.callbacks.is_ancestor(ancestor, node, self.root)
     }
 
     fn is_inclusive_ancestor_of(&self, ancestor: Node, node: Node) -> bool {
@@ -397,11 +398,11 @@ impl<'pass> BlockFormattingContext<'pass> {
     }
 
     fn compute_and_store_baselines(&self, node: Node) {
-        let baselines = formatting_context::derive_baselines(self.records, &self.callbacks, node, false);
+        let baselines = formatting_context::derive_baselines(self.records, &self.callbacks, node);
         if node == self.root {
             self.record_derived_baselines_of_root_box(baselines);
         } else {
-            formatting_context::store_derived_baselines(&self.used(node), baselines);
+            formatting_context::store_derived_baselines(self.used(node), baselines);
         }
     }
 
@@ -1160,7 +1161,11 @@ impl<'pass> BlockFormattingContext<'pass> {
     }
 
     fn rebuild_float_bands(&self) {
-        *self.bands.borrow_mut() = vec![FloatBand::default()];
+        {
+            let mut bands = self.bands.borrow_mut();
+            bands.clear();
+            bands.push(FloatBand::default());
+        }
         self.lowest_left_margin_edge.set(CssPixels::default());
         self.lowest_right_margin_edge.set(CssPixels::default());
         let floats = self.floats.borrow();
@@ -1275,7 +1280,7 @@ impl<'pass> BlockFormattingContext<'pass> {
             };
             let space = self.intrusions_for_band_into_rect(self.band_at(border_box_block_offset_in_root), band_rect);
             let constrained = space.left > CssPixels::default() || space.right > CssPixels::default();
-            let border_box_left = self.border_box_left_of_box_avoiding_floats(node, &used, space);
+            let border_box_left = self.border_box_left_of_box_avoiding_floats(node, used, space);
             let mut must_clear = constrained
                 && border_box_left + candidate_border_box_inline_size
                     > available_space.inline_size.to_px_or_zero() - space.right;
@@ -1469,7 +1474,7 @@ impl<'pass> BlockFormattingContext<'pass> {
             );
             available_inline_size_within_containing_block -= space.left + space.right;
             // Subtracting the left margin here because it is applied again when the margin box offset is added below.
-            inline_offset = self.border_box_left_of_box_avoiding_floats(node, &used, space) - used.margin_left.get();
+            inline_offset = self.border_box_left_of_box_avoiding_floats(node, used, space) - used.margin_left.get();
         }
 
         let containing_block = self.containing_block(node);
@@ -1635,7 +1640,7 @@ impl<'pass> BlockFormattingContext<'pass> {
         let containing_block_constraints =
             sizing.constraints_for_child_context(containing_block, containing_input.containing_block_constraints);
         let mut available_space = available_space;
-        if sizing.is_anonymous_button_content_box(containing_block)
+        if self.facts(containing_block).is_anonymous_button_content_box()
             && let Some(block_size) = containing_block_constraints.percentage_basis_block_size
         {
             // NB: Percentage heights inside the anonymous content box use the button's height, including during
@@ -1700,6 +1705,13 @@ impl<'pass> BlockFormattingContext<'pass> {
         let used = self.create_used_values(node, input.containing_block_constraints);
         used.is_invisible_for_line_clamp
             .set(self.laying_out_invisible_line_clamp_content.get());
+        if facts.is_anonymous_button_content_wrapper() {
+            used.has_definite_block_size_only_for_button_content_alignment.set(
+                self.used(block_container)
+                    .has_definite_block_size_only_for_button_content_alignment
+                    .get(),
+            );
+        }
 
         self.resolve_vertical_box_model_metrics(node, block_container_inline_size);
         assert_eq!(self.containing_block(node), block_container);
@@ -2017,6 +2029,27 @@ impl<'pass> BlockFormattingContext<'pass> {
                 available_space_for_block_size_resolution,
                 input.containing_block_constraints,
                 None,
+            );
+        }
+        if !has_independent_formatting_context
+            && self.sizing().block_size_is_ratio_dependent(
+                node,
+                available_space_for_block_size_resolution,
+                input.containing_block_constraints,
+            )
+        {
+            let content_block_size = self.compute_automatic_block_size_for_block_level_element(
+                node,
+                self.used(node)
+                    .available_inner_space_or_constraints_from(available_space_for_block_size_resolution),
+                input.containing_block_constraints,
+                None,
+            );
+            self.sizing().apply_automatic_minimum_block_size_from_aspect_ratio(
+                node,
+                available_space_for_block_size_resolution,
+                input.containing_block_constraints,
+                Some(content_block_size),
             );
         }
 
@@ -2354,7 +2387,7 @@ impl<'pass> BlockFormattingContext<'pass> {
             } else if automatic_block_size.is_some() {
                 let measurement = formatting_context::MeasurementState::create(self.callbacks);
                 let measurement_root =
-                    used_values::UsedValuesCellState::capture(&self.used(self.root)).materialize_record();
+                    used_values::UsedValuesCellState::capture(self.used(self.root)).materialize_record();
                 let measurement_result = measurement.run_with_layout_mode(
                     self.root,
                     &measurement_root,
@@ -2644,7 +2677,7 @@ impl<'pass> BlockFormattingContext<'pass> {
         }
         let placement = self.place_float(
             side,
-            &self.used(node),
+            self.used(node),
             available_space,
             containing_block_rect_now,
             ceiling_in_root,
@@ -2652,7 +2685,7 @@ impl<'pass> BlockFormattingContext<'pass> {
         let content_block_offset = placement.block_start - containing_block_rect_now.y
             + self.used(node).margin_top.get()
             + self.used(node).border_box_top(false);
-        let mut margin_box_rect = Self::margin_box_rect(&self.used(node))
+        let mut margin_box_rect = Self::margin_box_rect(self.used(node))
             .translated(CssPixels::default(), content_block_offset)
             .translated(containing_block_rect.x, containing_block_rect.y);
         let floating_box = FloatingBox {

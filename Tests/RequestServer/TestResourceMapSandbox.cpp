@@ -28,12 +28,19 @@ OwnPtr<ResourceSubstitutionMap> g_resource_substitution_map;
 
 }
 
+// The sandbox refuses to apply without Landlock, so there is nothing to test on such a kernel.
+static bool landlock_is_available()
+{
+    if (syscall(SYS_landlock_create_ruleset, nullptr, 0, LANDLOCK_CREATE_RULESET_VERSION) >= 1)
+        return true;
+    warnln("Skipping resource map sandbox test: Landlock is unavailable");
+    return false;
+}
+
 TEST_CASE(resource_map_files_are_readable_without_granting_access_to_neighbors)
 {
-    if (syscall(SYS_landlock_create_ruleset, nullptr, 0, LANDLOCK_CREATE_RULESET_VERSION) < 1) {
-        warnln("Skipping resource map sandbox test: Landlock is unavailable");
+    if (!landlock_is_available())
         return;
-    }
 
     char directory_template[] = "/tmp/ladybird-resource-map-XXXXXX";
     auto* directory = mkdtemp(directory_template);
@@ -58,7 +65,7 @@ TEST_CASE(resource_map_files_are_readable_without_granting_access_to_neighbors)
     VERIFY(child >= 0);
     if (child == 0) {
         RequestServer::g_resource_substitution_map = MUST(RequestServer::ResourceSubstitutionMap::load_from_file(map_path));
-        MUST(RequestServer::apply_sandbox({}, cache_path));
+        MUST(RequestServer::apply_sandbox({}, {}, cache_path));
 
         auto mapped_file = MUST(Core::File::open(mapped_path, Core::File::OpenMode::Read));
         auto contents = MUST(mapped_file->read_until_eof());
@@ -80,6 +87,9 @@ TEST_CASE(resource_map_files_are_readable_without_granting_access_to_neighbors)
 
 TEST_CASE(vectored_io_and_permission_changes_work_in_the_sandbox)
 {
+    if (!landlock_is_available())
+        return;
+
     char directory_template[] = "/tmp/ladybird-sandbox-io-XXXXXX";
     auto* directory = mkdtemp(directory_template);
     VERIFY(directory);
@@ -91,7 +101,7 @@ TEST_CASE(vectored_io_and_permission_changes_work_in_the_sandbox)
     auto child = fork();
     VERIFY(child >= 0);
     if (child == 0) {
-        MUST(RequestServer::apply_sandbox({}, StringView { directory, strlen(directory) }));
+        MUST(RequestServer::apply_sandbox({}, {}, StringView { directory, strlen(directory) }));
 
         auto fd = open(file_path.characters(), O_CREAT | O_RDWR | O_EXCL, 0600);
         VERIFY(fd >= 0);

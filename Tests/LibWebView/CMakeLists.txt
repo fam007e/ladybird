@@ -10,10 +10,10 @@ set(TEST_SOURCES
     TestExternalURLHandler.cpp
     TestFaviconStore.cpp
     TestHistoryStore.cpp
+    TestHelperProcessEnvironment.cpp
     TestHSTSStore.cpp
     TestNavigationLoader.cpp
     TestOmnibox.cpp
-    TestPausedDebuggerOverlay.cpp
     TestProfile.cpp
     TestSessionHistory.cpp
     TestSessionHistorySnapshotStorage.cpp
@@ -26,7 +26,11 @@ set(TEST_SOURCES
 )
 
 if (APPLE OR LINUX)
-    list(APPEND TEST_SOURCES TestCrashReport.cpp)
+    list(APPEND TEST_SOURCES TestCrashReport.cpp TestFontService.cpp)
+endif()
+
+if (APPLE)
+    list(APPEND TEST_SOURCES TestProcessReaper.cpp)
 endif()
 
 foreach(source IN LISTS TEST_SOURCES)
@@ -34,8 +38,15 @@ foreach(source IN LISTS TEST_SOURCES)
     if (source STREQUAL "TestProfile.cpp" OR source STREQUAL "TestDownloadSegmentation.cpp")
         list(APPEND test_libraries LibHTTP)
     endif()
+    if (source STREQUAL "TestFontService.cpp")
+        list(APPEND test_libraries LibIPC)
+    endif()
     ladybird_test("${source}" LibWebView LIBS ${test_libraries})
 endforeach()
+
+if (TARGET TestProcessReaper)
+    add_dependencies(TestProcessReaper ProcessReaper)
+endif()
 
 if (TARGET TestCrashReport AND cpptrace_FOUND AND LADYBIRD_ENABLE_CPPTRACE)
     target_compile_definitions(TestCrashReport PRIVATE TEST_HAS_CPPTRACE=1)
@@ -69,6 +80,11 @@ endif()
 target_link_libraries(TestNavigationLoader PRIVATE LibRequests LibWeb)
 
 if (NOT WIN32)
+    ladybird_test(TestApplicationDestruction.cpp LibWebView LIBS LibCore LibDatabase LibFileSystem LibGfx LibIPC LibRequests LibURL LibWeb LibWebView)
+    if (APPLE)
+        target_compile_definitions(TestApplicationDestruction PRIVATE LADYBIRD_BINARY_PATH="$<TARGET_FILE_DIR:ladybird>")
+    endif()
+
     add_executable(TestAutocomplete TestAutocomplete.cpp)
     add_dependencies(TestAutocomplete ${ladybird_helper_processes})
     target_link_libraries(TestAutocomplete PRIVATE AK LibCore LibDiff LibFileSystem LibGfx LibImageDecoders LibImageDecoderClient LibIPC LibJS LibMain LibRequests LibURL LibWeb LibWebView)
@@ -110,6 +126,20 @@ if (NOT WIN32)
     if (APPLE)
         target_compile_definitions(TestLinkHoverStatus PRIVATE LADYBIRD_BINARY_PATH="$<TARGET_FILE_DIR:ladybird>")
     endif()
+    add_executable(TestRendererCookieAccess TestRendererCookieAccess.cpp)
+    add_dependencies(TestRendererCookieAccess ladybird_build_resource_files ${ladybird_helper_processes})
+    target_link_libraries(TestRendererCookieAccess PRIVATE AK LibCore LibFileSystem LibGfx LibHTTP LibIPC LibMain LibURL LibWeb LibWebView)
+    if (APPLE)
+        target_compile_definitions(TestRendererCookieAccess PRIVATE LADYBIRD_BINARY_PATH="$<TARGET_FILE_DIR:ladybird>")
+    endif()
+
+    add_executable(TestRequestServerClientSessions TestRequestServerClientSessions.cpp)
+    add_dependencies(TestRequestServerClientSessions ${ladybird_helper_processes})
+    target_link_libraries(TestRequestServerClientSessions PRIVATE AK LibCore LibDiff LibFileSystem LibGfx LibImageDecoders LibImageDecoderClient LibIPC LibJS LibMain LibRequests LibURL LibWeb LibWebView)
+    if (APPLE)
+        target_compile_definitions(TestRequestServerClientSessions PRIVATE LADYBIRD_BINARY_PATH="$<TARGET_FILE_DIR:ladybird>")
+    endif()
+
     add_executable(TestTabPerformanceMonitor TestTabPerformanceMonitor.cpp)
     add_dependencies(TestTabPerformanceMonitor ladybird_build_resource_files ${ladybird_helper_processes})
     target_link_libraries(TestTabPerformanceMonitor PRIVATE AK LibCore LibDiff LibFileSystem LibGfx LibImageDecoders LibImageDecoderClient LibIPC LibJS LibMain LibRequests LibURL LibWeb LibWebView)
@@ -137,6 +167,11 @@ if (BUILD_TESTING AND NOT WIN32)
             )
             set_tests_properties(Test${helper}CrashReport PROPERTIES TIMEOUT 120)
         endforeach()
+        add_test(
+            NAME TestWebDriverWorkerTerminatedWhileStarting
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-webdriver-worker-terminated-while-starting.py $<TARGET_FILE:WebDriver>
+        )
+        set_tests_properties(TestWebDriverWorkerTerminatedWhileStarting PROPERTIES TIMEOUT 120)
     endif()
 
     add_test(
@@ -192,6 +227,10 @@ if (BUILD_TESTING AND NOT WIN32)
 
     add_test(NAME TestLinkHoverStatus COMMAND $<TARGET_FILE:TestLinkHoverStatus>)
     set_tests_properties(TestLinkHoverStatus PROPERTIES TIMEOUT 60 ENVIRONMENT LADYBIRD_SOURCE_DIR=${LADYBIRD_SOURCE_DIR})
+    add_test(NAME TestRendererCookieAccess COMMAND $<TARGET_FILE:TestRendererCookieAccess>)
+    set_tests_properties(TestRendererCookieAccess PROPERTIES TIMEOUT 60 ENVIRONMENT LADYBIRD_SOURCE_DIR=${LADYBIRD_SOURCE_DIR})
+    add_test(NAME TestRequestServerClientSessions COMMAND $<TARGET_FILE:TestRequestServerClientSessions>)
+    set_tests_properties(TestRequestServerClientSessions PROPERTIES TIMEOUT 60 ENVIRONMENT LADYBIRD_SOURCE_DIR=${LADYBIRD_SOURCE_DIR})
     add_test(NAME TestTabPerformanceMonitor COMMAND $<TARGET_FILE:TestTabPerformanceMonitor>)
     set_tests_properties(TestTabPerformanceMonitor PROPERTIES TIMEOUT 60 ENVIRONMENT LADYBIRD_SOURCE_DIR=${LADYBIRD_SOURCE_DIR})
 endif()

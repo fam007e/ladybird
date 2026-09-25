@@ -145,7 +145,7 @@ Optional<AbstractElement> AbstractElement::walk_layout_tree(WalkMethod walk_meth
     auto slot = Layout::Node::slot_id(start_node);
     while (true) {
         slot = Layout::RustFFI::layout_arena_previous_dom_backed_or_generated_node(arena_handle, slot, walk_method == WalkMethod::PreviousSibling);
-        if (slot.index == Layout::RustFFI::INVALID_NODE_SLOT_INDEX)
+        if (slot.index == Compositing::RustFFI::INVALID_NODE_SLOT_INDEX)
             return OptionalNone {};
 
         if (auto* previous_element = as_if<Element>(static_cast<Node*>(Layout::RustFFI::layout_arena_node_dom_node(arena_handle, slot))))
@@ -158,6 +158,18 @@ Optional<AbstractElement> AbstractElement::walk_layout_tree(WalkMethod walk_meth
                 return AbstractElement { *generated_node->pseudo_element_generator(), pseudo_element };
         }
     }
+}
+
+GC::Ptr<Node> AbstractElement::root()
+{
+    if (m_pseudo_element.has_value()) {
+        if (auto pseudo_element = m_element->get_pseudo_element(*m_pseudo_element); pseudo_element.has_value())
+            return pseudo_element->root();
+
+        return nullptr;
+    }
+
+    return m_element->root();
 }
 
 bool AbstractElement::is_before(AbstractElement const& other) const

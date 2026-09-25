@@ -9,10 +9,10 @@
 #include <AK/Optional.h>
 #include <AK/Utf16FlyString.h>
 #include <AK/Utf16String.h>
+#include <LibCompositing/Types.h>
 #include <LibIPC/Forward.h>
 #include <LibURL/Origin.h>
 #include <LibURL/URL.h>
-#include <LibWeb/Compositor/Types.h>
 #include <LibWeb/Export.h>
 #include <LibWeb/HTML/CrossOrigin/OpenerPolicy.h>
 #include <LibWeb/HTML/CrossProcessId.h>
@@ -51,6 +51,9 @@ struct ReplicatedNavigableState {
     bool has_cross_site_ancestor { false };
 
     OpenerPolicy opener_policy;
+    bool active_browsing_context_is_auxiliary { false };
+    bool active_browsing_context_has_opener { false };
+    Optional<CrossProcessId> opener_navigable_id {};
 
     bool active_document_is_completely_loaded { false };
     bool is_closing { false };
@@ -60,7 +63,7 @@ struct ReplicatedNavigableState {
     bool delays_the_load_event_of_its_container { false };
     bool has_session_history_entry_and_ready_for_navigation { false };
 
-    Optional<Compositor::CompositorContextId> compositor_context_id;
+    Optional<Compositing::CompositorContextId> compositor_context_id;
 };
 
 struct RemoteNavigableDescriptor {

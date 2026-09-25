@@ -276,7 +276,7 @@ static HistoryOperationResult run_canonical_history_operation(WebView::Canonical
     Optional<HistoryOperationResult> result;
     auto queue_promise = Core::Promise<Empty>::construct();
     traversable.run_history_operation_at_queue_position(
-        operation_id, move(request), nullptr, 0, {},
+        operation_id, move(request), {}, {},
         [&](auto operation_result, auto committed_step) {
             result = HistoryOperationResult { operation_result, committed_step };
         },
@@ -311,7 +311,7 @@ static void expect_entry_state(Web::HTML::SessionHistoryEntryDescriptor const& e
     EXPECT_EQ(entry.scroll_restoration_mode, expected_scroll_restoration_mode);
 }
 
-static void expect_entry_viewport_scroll_position(Web::HTML::SessionHistoryEntryDescriptor const& entry, Web::CSSPixelPoint expected_viewport_scroll_position)
+static void expect_entry_viewport_scroll_position(Web::HTML::SessionHistoryEntryDescriptor const& entry, Compositing::CSSPixelPoint expected_viewport_scroll_position)
 {
     VERIFY(entry.scroll_position_data.viewport_scroll_position.has_value());
     EXPECT_EQ(*entry.scroll_position_data.viewport_scroll_position, expected_viewport_scroll_position);
@@ -414,7 +414,7 @@ TEST_CASE(persisted_state_updates_require_entry_and_document_state_identity)
             .document_state_id = test_document_state_id(11),
             .navigation_api_id = Utf16String::from_utf8("current-id"sv),
         },
-        .scroll_position_data = { .viewport_scroll_position = Web::CSSPixelPoint { 0, 100 } },
+        .scroll_position_data = { .viewport_scroll_position = Compositing::CSSPixelPoint { 0, 100 } },
     };
     EXPECT(!history.update_entry_persisted_state({}, persisted_state));
 
@@ -898,7 +898,7 @@ TEST_CASE(nested_cross_document_push_updates_copied_session_histories)
 {
     WebView::CanonicalTraversable traversable;
     traversable.set_id({ 9, 1 });
-    auto& child = traversable.append_child(make<WebView::CanonicalNavigable>(navigable_id("frame"sv), traversable.id(), nullptr, 0));
+    auto& child = traversable.append_child(make<WebView::CanonicalNavigable>(navigable_id("frame"sv), RefPtr<WebView::WebContentPage> {}));
     WebView::TraversableSessionHistory history;
 
     auto child_entry = entry(0, "https://frame.example/first"sv, 20, ""sv);
@@ -932,7 +932,7 @@ TEST_CASE(nested_cross_document_replacement_updates_copied_session_histories)
 {
     WebView::CanonicalTraversable traversable;
     traversable.set_id({ 9, 1 });
-    auto& child = traversable.append_child(make<WebView::CanonicalNavigable>(navigable_id("frame"sv), traversable.id(), nullptr, 0));
+    auto& child = traversable.append_child(make<WebView::CanonicalNavigable>(navigable_id("frame"sv), RefPtr<WebView::WebContentPage> {}));
     WebView::TraversableSessionHistory history;
 
     auto child_entry = entry(0, "https://frame.example/first"sv, 20, ""sv);
@@ -1005,7 +1005,7 @@ TEST_CASE(failed_nested_same_document_push_preserves_forward_history)
     Core::EventLoop event_loop;
     WebView::CanonicalTraversable traversable;
     traversable.set_id({ 9, 1 });
-    auto& child = traversable.append_child(make<WebView::CanonicalNavigable>(navigable_id("frame"sv), traversable.id(), nullptr, 0));
+    auto& child = traversable.append_child(make<WebView::CanonicalNavigable>(navigable_id("frame"sv), RefPtr<WebView::WebContentPage> {}));
 
     auto nested_entry = entry(1, "https://frame.example/current"sv, 20, ""sv);
     auto update_result = traversable.initialize_session_history_for_testing(
@@ -1045,7 +1045,7 @@ TEST_CASE(failed_nested_cross_document_push_preserves_forward_history)
 {
     WebView::CanonicalTraversable traversable;
     traversable.set_id({ 9, 1 });
-    auto& child = traversable.append_child(make<WebView::CanonicalNavigable>(navigable_id("frame"sv), traversable.id(), nullptr, 0));
+    auto& child = traversable.append_child(make<WebView::CanonicalNavigable>(navigable_id("frame"sv), RefPtr<WebView::WebContentPage> {}));
     WebView::TraversableSessionHistory history;
 
     auto update_result = history.initialize_for_testing(
@@ -1112,7 +1112,7 @@ TEST_CASE(nested_finalization_rejects_a_changed_initial_entry_identity)
 {
     WebView::CanonicalTraversable traversable;
     traversable.set_id({ 9, 1 });
-    auto& child = traversable.append_child(make<WebView::CanonicalNavigable>(navigable_id("frame"sv), traversable.id(), nullptr, 0));
+    auto& child = traversable.append_child(make<WebView::CanonicalNavigable>(navigable_id("frame"sv), RefPtr<WebView::WebContentPage> {}));
     WebView::TraversableSessionHistory history;
     auto initial_entry = entry(0, "about:blank"sv);
     initial_entry.navigation_api_key = Utf16String::from_utf8("canonical-initial"sv);
@@ -1143,7 +1143,7 @@ TEST_CASE(nested_finalization_rejects_wrong_active_entry_for_populated_history)
 {
     WebView::CanonicalTraversable traversable;
     traversable.set_id({ 9, 1 });
-    auto& child = traversable.append_child(make<WebView::CanonicalNavigable>(navigable_id("frame"sv), traversable.id(), nullptr, 0));
+    auto& child = traversable.append_child(make<WebView::CanonicalNavigable>(navigable_id("frame"sv), RefPtr<WebView::WebContentPage> {}));
     WebView::TraversableSessionHistory history;
     auto populated_entry = entry(0, "https://frame.example/first"sv, 2, ""sv);
     populated_entry.navigation_api_key = Utf16String::from_utf8("canonical"sv);

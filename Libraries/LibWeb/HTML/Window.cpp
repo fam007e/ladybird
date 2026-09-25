@@ -70,6 +70,7 @@
 #include <LibWeb/HTML/Navigator.h>
 #include <LibWeb/HTML/PageTransitionEvent.h>
 #include <LibWeb/HTML/Parser/HTMLParser.h>
+#include <LibWeb/HTML/RemoteNavigable.h>
 #include <LibWeb/HTML/RemoteWindow.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/Scripting/ExceptionReporter.h>
@@ -547,11 +548,16 @@ WebIDL::ExceptionOr<Window::OpenedWindow> Window::window_open_steps_internal(Utf
             TRY(target_navigable->navigate({ .url = url_record.release_value(), .source_document = source_document, .exceptions_enabled = true, .referrer_policy = referrer_policy }));
 
         // 2. If noopener is false, then set targetNavigable's active browsing context's opener browsing context to sourceDocument's browsing context.
-        // FIXME: The browsing context of a navigable another process hosts is there. Its opener would be a fact the
-        //        UI process carries to that process, where sourceDocument's browsing context is its navigable's
-        //        WindowProxy.
-        if (no_opener == TokenizedFeature::NoOpener::No)
-            as<LocalNavigable>(*target_navigable).active_browsing_context()->set_opener_browsing_context(source_document.browsing_context());
+        if (no_opener == TokenizedFeature::NoOpener::No) {
+            if (auto* local_target_navigable = as_if<LocalNavigable>(*target_navigable)) {
+                local_target_navigable->active_browsing_context()->set_opener_browsing_context(source_document.browsing_context());
+                local_target_navigable->report_replicated_state();
+            } else {
+                // NB: That browsing context is in the process hosting targetNavigable, which the UI process asks to set
+                //     it to the one active in sourceDocument's node navigable.
+                source_document.page().client().request_set_opener_of_remote_navigable(as<RemoteNavigable>(*target_navigable), *source_document.navigable());
+            }
+        }
     }
 
     // NOTE: Steps 17 and 18 are implemented in window_open_steps().
@@ -895,6 +901,17 @@ void Window::consume_history_action_user_activation()
     //     those it hosts.
     consume_user_activation_of_windows_hosted_by(page(), UserActivationConsumption::HistoryAction);
     page().client().page_did_consume_user_activation(UserActivationConsumption::HistoryAction);
+}
+
+// https://html.spec.whatwg.org/multipage/interaction.html#activation-notification
+// Steps 5.1 and 5.2 for one of the windows.
+void Window::notify_about_user_activation()
+{
+    // 5.1. Set window's last activation timestamp to the current high resolution time.
+    m_last_activation_timestamp = HighResolutionTime::current_high_resolution_time(relevant_global_object(*this));
+
+    // 5.2. Notify the close watcher manager about user activation given window.
+    close_watcher_manager()->notify_about_user_activation();
 }
 
 // https://html.spec.whatwg.org/multipage/interaction.html#consume-user-activation
@@ -1390,20 +1407,19 @@ GC::Ptr<WindowProxy const> Window::opener() const
         return {};
 
     // 3. If current's opener browsing context is null, then return null.
-    auto opener_browsing_context = current->opener_browsing_context();
-    if (!opener_browsing_context)
-        return {};
-
     // 4. Return current's opener browsing context's WindowProxy object.
-    return opener_browsing_context->window_proxy();
+    return current->opener_browsing_context_window_proxy();
 }
 
 WebIDL::ExceptionOr<void> Window::set_opener(JS::Value value)
 {
     // 1. If the given value is null and this's browsing context is non-null, then set this's browsing context's opener browsing context to null.
     auto browsing_context = this->browsing_context();
-    if (value.is_null() && browsing_context)
+    if (value.is_null() && browsing_context) {
         browsing_context->set_opener_browsing_context(nullptr);
+        if (auto navigable = this->navigable(); navigable && navigable->active_browsing_context() == browsing_context)
+            navigable->report_replicated_state();
+    }
 
     // 2. If the given value is non-null, then perform ? DefinePropertyOrThrow(this, "opener", { [[Value]]: the given value, [[Writable]]: true, [[Enumerable]]: true, [[Configurable]]: true }).
     if (!value.is_null()) {
@@ -2263,6 +2279,13 @@ OrderedHashMap<Utf16FlyString, GC::Ref<Navigable>> Window::document_tree_child_n
 }
 
 // https://html.spec.whatwg.org/multipage/nav-history-apis.html#named-access-on-the-window-object
+// NB: A Window exposes a narrower set of elements by name than a Document does. Document's named-element filter also
+//     includes iframe, which a Window instead exposes through its content navigable's target name.
+static bool is_named_element_by_name(DOM::Element const& element)
+{
+    return is<HTMLEmbedElement>(element) || is<HTMLFormElement>(element) || is<HTMLImageElement>(element) || is<HTMLObjectElement>(element);
+}
+
 Vector<Utf16FlyString> Window::supported_property_names() const
 {
     // FIXME: Make the const-correctness of the methods this method calls less cowboy.
@@ -2284,6 +2307,8 @@ Vector<Utf16FlyString> Window::supported_property_names() const
     // - the value of the id content attribute for all HTML elements that have a non-empty id content attribute
     //   and are in a document tree with window's associated Document as their root.
     for (auto element : associated_document().potentially_named_elements()) {
+        if (!is_named_element_by_name(*element))
+            continue;
         if (auto name = element->name(); name.has_value())
             property_names.set(*name, AK::HashSetExistingEntryBehavior::Keep);
     }
@@ -2306,7 +2331,7 @@ bool Window::is_supported_property_name(Utf16FlyString const& name) const
     if (document.element_by_id().contains(name))
         return true;
     for (auto element : document.potentially_named_elements()) {
-        if (element->name() == name)
+        if (is_named_element_by_name(*element) && element->name() == name)
             return true;
     }
     return const_cast<Window&>(*this).document_tree_child_navigable_target_name_property_set().contains(name);
@@ -2352,8 +2377,7 @@ Variant<Empty, GC::Ref<WindowProxy>, GC::Ref<DOM::Element>, GC::Ref<DOM::HTMLCol
     // 4. Otherwise return an HTMLCollection rooted at window's associated Document,
     //    whose filter matches only named objects of window with the name name. (By definition, these will all be elements.)
     auto collection = DOM::HTMLCollection::create(mutable_this.associated_document(), DOM::HTMLCollection::Scope::Descendants, [name](auto& element) -> bool {
-        if ((is<HTMLEmbedElement>(element) || is<HTMLFormElement>(element) || is<HTMLImageElement>(element) || is<HTMLObjectElement>(element))
-            && (element.name() == name))
+        if (is_named_element_by_name(element) && element.name() == name)
             return true;
         return element.id() == name; }, DOM::HTMLCollection::AttributeInvalidationType::IdOrName);
     return collection;
@@ -2384,6 +2408,8 @@ Window::NamedObjects Window::named_objects(Utf16View name)
             // NOTE: The element will be added when we iterate over the element_by_id() map below.
             continue;
         }
+        if (!is_named_element_by_name(*element))
+            continue;
         if (auto element_name = element->name(); element_name.has_value() && element_name->view() == name)
             objects.elements.append(*element);
     }

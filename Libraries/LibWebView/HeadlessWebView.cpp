@@ -9,36 +9,37 @@
 
 namespace WebView {
 
-static Web::DevicePixelRect const screen_rect { 0, 0, 1920, 1080 };
+static Compositing::DevicePixelRect const screen_rect { 0, 0, 1920, 1080 };
 static constexpr auto child_close_timeout_ms = 1000;
 
-NonnullOwnPtr<HeadlessWebView> HeadlessWebView::create(Core::AnonymousBuffer theme, Web::DevicePixelSize window_size)
+NonnullOwnPtr<HeadlessWebView> HeadlessWebView::create(Core::AnonymousBuffer theme, Compositing::DevicePixelSize window_size, IsPrivate is_private)
 {
-    auto view = adopt_own(*new HeadlessWebView(move(theme), window_size));
+    auto view = adopt_own(*new HeadlessWebView(move(theme), window_size, is_private));
     view->initialize_client(CreateNewClient::Yes);
 
     return view;
 }
 
-NonnullOwnPtr<HeadlessWebView> HeadlessWebView::create_child(HeadlessWebView& parent, Web::PageId page_index)
+NonnullOwnPtr<HeadlessWebView> HeadlessWebView::create_child(HeadlessWebView& parent, WebContentClient& page_process, Compositing::PageId page_index)
 {
-    auto view = adopt_own(*new HeadlessWebView(parent.m_theme, parent.m_viewport_size));
+    // The child shares the WebContent client hosting its page, and with it that client's browsing session.
+    auto view = adopt_own(*new HeadlessWebView(parent.m_theme, parent.m_viewport_size, parent.is_private()));
 
-    view->m_client_state.client = parent.client();
-    view->m_client_state.page_index = page_index;
+    page_process.register_view(page_index, *view);
     view->initialize_client(CreateNewClient::No);
 
     return view;
 }
 
-HeadlessWebView::HeadlessWebView(Core::AnonymousBuffer theme, Web::DevicePixelSize viewport_size)
-    : m_theme(move(theme))
+HeadlessWebView::HeadlessWebView(Core::AnonymousBuffer theme, Compositing::DevicePixelSize viewport_size, IsPrivate is_private)
+    : ViewImplementation(is_private)
+    , m_theme(move(theme))
     , m_viewport_size(viewport_size)
 {
-    on_new_web_view = [this](auto, auto, Optional<Web::PageId> page_index) {
+    on_new_web_view = [this](auto, auto, WebContentClient& page_process, Optional<Compositing::PageId> page_index) {
         auto web_view = page_index.has_value()
-            ? HeadlessWebView::create_child(*this, *page_index)
-            : HeadlessWebView::create(m_theme, m_viewport_size);
+            ? HeadlessWebView::create_child(*this, page_process, *page_index)
+            : HeadlessWebView::create(m_theme, m_viewport_size, this->is_private());
 
         auto* child_web_view = web_view.ptr();
         auto weak_this = make_weak_ptr<HeadlessWebView>();
@@ -61,14 +62,14 @@ HeadlessWebView::HeadlessWebView(Core::AnonymousBuffer theme, Web::DevicePixelSi
     };
 
     on_reposition_window = [this](auto position) {
-        m_previous_dimensions.set_location(position.template to_type<Web::DevicePixels>());
-        client().async_set_window_position(m_client_state.page_index, position.template to_type<Web::DevicePixels>());
+        m_previous_dimensions.set_location(position.template to_type<Compositing::DevicePixels>());
+        client().async_set_window_position(page_id(), position.template to_type<Compositing::DevicePixels>());
     };
 
     on_resize_window = [this](auto size) {
-        m_viewport_size = size.template to_type<Web::DevicePixels>();
+        m_viewport_size = size.template to_type<Compositing::DevicePixels>();
 
-        client().async_set_window_size(m_client_state.page_index, m_viewport_size);
+        client().async_set_window_size(page_id(), m_viewport_size);
         handle_resize();
     };
 
@@ -84,28 +85,26 @@ HeadlessWebView::HeadlessWebView(Core::AnonymousBuffer theme, Web::DevicePixelSi
         m_viewport_size = screen_rect.size();
         m_previous_dimensions = screen_rect;
 
-        client().async_set_window_position(m_client_state.page_index, screen_rect.location());
-        client().async_set_window_size(m_client_state.page_index, screen_rect.size());
+        client().async_set_window_position(page_id(), screen_rect.location());
+        client().async_set_window_size(page_id(), screen_rect.size());
         handle_resize();
     };
 
     on_fullscreen_window = [this]() {
         m_previous_dimensions.set_size(m_viewport_size);
         m_viewport_size = screen_rect.size();
-        m_is_fullscreen = Web::ViewportIsFullscreen::Yes;
 
-        client().async_set_window_position(m_client_state.page_index, screen_rect.location());
-        client().async_set_window_size(m_client_state.page_index, screen_rect.size());
-        handle_resize();
+        client().async_set_window_position(page_id(), screen_rect.location());
+        client().async_set_window_size(page_id(), screen_rect.size());
+        set_is_fullscreen(Web::ViewportIsFullscreen::Yes);
     };
 
     on_exit_fullscreen_window = [this]() {
         m_viewport_size = m_previous_dimensions.size();
-        m_is_fullscreen = Web::ViewportIsFullscreen::No;
 
-        client().async_set_window_position(m_client_state.page_index, m_previous_dimensions.location());
-        client().async_set_window_size(m_client_state.page_index, m_previous_dimensions.size());
-        handle_resize();
+        client().async_set_window_position(page_id(), m_previous_dimensions.location());
+        client().async_set_window_size(page_id(), m_previous_dimensions.size());
+        set_is_fullscreen(Web::ViewportIsFullscreen::No);
     };
 
     on_request_alert = [this](auto const&) {
@@ -211,17 +210,17 @@ void HeadlessWebView::initialize_client(CreateNewClient create_new_client, Optio
 {
     ViewImplementation::initialize_client(create_new_client, initial_document_state_id);
 
-    client().async_update_system_theme(m_client_state.page_index, m_theme);
+    client().async_update_system_theme(page_id(), m_theme);
     handle_resize();
-    client().async_set_window_size(m_client_state.page_index, viewport_size());
-    client().async_update_screen_rects(m_client_state.page_index, { { screen_rect } }, 0);
+    client().async_set_window_size(page_id(), viewport_size());
+    client().async_update_screen_rects(page_id(), { { screen_rect } }, 0);
 }
 
-void HeadlessWebView::reset_viewport_size(Web::DevicePixelSize size)
+void HeadlessWebView::reset_viewport_size(Compositing::DevicePixelSize size)
 {
     m_viewport_size = size;
 
-    client().async_set_window_size(m_client_state.page_index, m_viewport_size);
+    client().async_set_window_size(page_id(), m_viewport_size);
     handle_resize();
 }
 

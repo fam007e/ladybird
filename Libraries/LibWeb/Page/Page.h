@@ -15,6 +15,8 @@
 #include <AK/Queue.h>
 #include <AK/Utf16String.h>
 #include <AK/Variant.h>
+#include <LibCompositing/InputEvent.h>
+#include <LibCompositing/Types.h>
 #include <LibGC/Root.h>
 #include <LibGC/Weak.h>
 #include <LibGfx/Cursor.h>
@@ -40,12 +42,12 @@
 #include <LibWeb/CSS/PreferredColorScheme.h>
 #include <LibWeb/CSS/PreferredContrast.h>
 #include <LibWeb/CSS/PreferredMotion.h>
-#include <LibWeb/Compositor/Types.h>
 #include <LibWeb/DOM/RequestFullscreenError.h>
 #include <LibWeb/Export.h>
 #include <LibWeb/FileAPI/SerializedBlobURLEntry.h>
 #include <LibWeb/Forward.h>
 #include <LibWeb/Fullscreen/FullscreenRequestType.h>
+#include <LibWeb/Geolocation/Geolocation.h>
 #include <LibWeb/Geolocation/GeolocationCoordinates.h>
 #include <LibWeb/Geolocation/GeolocationPositionError.h>
 #include <LibWeb/HTML/ActivateTab.h>
@@ -53,6 +55,7 @@
 #include <LibWeb/HTML/ColorPickerUpdateState.h>
 #include <LibWeb/HTML/CrossProcessId.h>
 #include <LibWeb/HTML/FileFilter.h>
+#include <LibWeb/HTML/Focus.h>
 #include <LibWeb/HTML/HistoryHandlingBehavior.h>
 #include <LibWeb/HTML/HistoryOperation.h>
 #include <LibWeb/HTML/NavigationSourceSnapshot.h>
@@ -73,8 +76,8 @@
 #include <LibWeb/IndexedDB/TransactionChanges.h>
 #include <LibWeb/Loader/FileRequest.h>
 #include <LibWeb/Page/EventResult.h>
-#include <LibWeb/Page/InputEvent.h>
 #include <LibWeb/Page/PageId.h>
+#include <LibWeb/Page/QueuedInputEvent.h>
 #include <LibWeb/Page/ScreenWakeLockHandle.h>
 #include <LibWeb/Page/ViewportIsFullscreen.h>
 #include <LibWeb/Painting/ChromeMetrics.h>
@@ -134,6 +137,11 @@ public:
     void stop_hosting(HTML::LocalNavigable&, HTML::ReplicatedNavigableState);
     void host_navigable(HTML::CrossProcessId, HTML::SessionHistoryEntryDescriptor const& current_history_entry, HTML::VisibilityState system_visibility_state);
     void unfullscreen_descendant_documents(Vector<GC::Root<HTML::Navigable>> const&);
+    enum class ElementIsRequestedElement : u8 {
+        No,
+        Yes,
+    };
+    GC::Ptr<HTML::LocalNavigable> fullscreen_element_and_its_containers(GC::Ref<DOM::Element>, Fullscreen::RequestType, ElementIsRequestedElement);
 
     void discard();
 
@@ -145,10 +153,10 @@ public:
 
     HTML::HistoryExecutor& history_executor();
 
-    HTML::LocalNavigable& focused_navigable();
-    HTML::LocalNavigable const& focused_navigable() const { return const_cast<Page*>(this)->focused_navigable(); }
-
-    void set_focused_navigable(HTML::LocalNavigable&);
+    GC::Ptr<HTML::Navigable> focused_navigable() const;
+    GC::Ptr<HTML::LocalNavigable> hosted_focused_navigable() const;
+    void set_focused_navigable(HTML::Navigable&);
+    void focused_navigable_changed_in_another_page(HTML::CrossProcessId);
     void navigable_document_destroyed(Badge<DOM::Document>, HTML::LocalNavigable&);
 
     void load(URL::URL const&, Bindings::NavigationHistoryBehavior, Utf16String navigation_id);
@@ -168,16 +176,16 @@ public:
     DevicePixelRect rounded_device_rect(CSSPixelRect) const;
     ChromeMetrics chrome_metrics() const;
 
-    EventResult handle_mouseup(HTML::LocalNavigable& root, DevicePixelPoint, DevicePixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers);
-    EventResult handle_mousedown(HTML::LocalNavigable& root, DevicePixelPoint, DevicePixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers, int click_count);
-    EventResult handle_mousemove(HTML::LocalNavigable& root, DevicePixelPoint, DevicePixelPoint screen_position, unsigned buttons, unsigned modifiers);
+    EventResult handle_mouseup(HTML::LocalNavigable& root, DevicePixelPoint, DevicePixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers, Optional<RemoteInputEventTarget>* remote_target);
+    EventResult handle_mousedown(HTML::LocalNavigable& root, DevicePixelPoint, DevicePixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers, int click_count, Optional<Compositing::ScrollbarDraggedByCompositor> const&, Optional<RemoteInputEventTarget>* remote_target);
+    EventResult handle_mousemove(HTML::LocalNavigable& root, DevicePixelPoint, DevicePixelPoint screen_position, unsigned buttons, unsigned modifiers, Optional<RemoteInputEventTarget>* remote_target);
     EventResult handle_mouseleave(HTML::LocalNavigable& root);
-    EventResult handle_mousewheel(HTML::LocalNavigable& root, DevicePixelPoint, DevicePixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers, double wheel_delta_x, double wheel_delta_y, WheelDeltaPrecision, ScrollGesturePhase, bool async_scroll_performed_default_action, Optional<AsyncScrollOperation>* async_scroll_operation);
+    EventResult handle_mousewheel(HTML::LocalNavigable& root, DevicePixelPoint, DevicePixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers, double wheel_delta_x, double wheel_delta_y, Compositing::WheelDeltaPrecision, Compositing::ScrollGesturePhase, bool async_scroll_performed_default_action, Optional<AsyncScrollOperation>* async_scroll_operation, Optional<RemoteInputEventTarget>* remote_target);
     EventResult handle_drag_and_drop_event(HTML::LocalNavigable& root, DragEvent::Type, DevicePixelPoint, DevicePixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers, Vector<HTML::SelectedFile> files);
     EventResult handle_pinch_event(HTML::LocalNavigable& root, DevicePixelPoint point, unsigned modifiers, double scale);
 
     EventResult handle_mouseup(DevicePixelPoint, DevicePixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers);
-    EventResult handle_mousedown(DevicePixelPoint, DevicePixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers, int click_count);
+    EventResult handle_mousedown(DevicePixelPoint, DevicePixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers, int click_count, Optional<Compositing::ScrollbarDraggedByCompositor> const& = {});
     EventResult handle_mousemove(DevicePixelPoint, DevicePixelPoint screen_position, unsigned buttons, unsigned modifiers);
     EventResult handle_mouseleave();
     void set_mouse_event_tracking_navigable(Badge<EventHandler>, HTML::LocalNavigable&);
@@ -185,7 +193,7 @@ public:
     bool select_word_for_dictionary_lookup(DevicePixelPoint);
 #endif
     UniqueNodeID node_id_at_position(DevicePixelPoint);
-    EventResult handle_mousewheel(DevicePixelPoint, DevicePixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers, double wheel_delta_x, double wheel_delta_y, WheelDeltaPrecision = WheelDeltaPrecision::Discrete, ScrollGesturePhase = ScrollGesturePhase::None, bool async_scroll_performed_default_action = false, Optional<AsyncScrollOperation>* async_scroll_operation = nullptr);
+    EventResult handle_mousewheel(DevicePixelPoint, DevicePixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers, double wheel_delta_x, double wheel_delta_y, Compositing::WheelDeltaPrecision = Compositing::WheelDeltaPrecision::Discrete, Compositing::ScrollGesturePhase = Compositing::ScrollGesturePhase::None, bool async_scroll_performed_default_action = false, Optional<AsyncScrollOperation>* async_scroll_operation = nullptr);
 
     EventResult handle_drag_and_drop_event(DragEvent::Type, DevicePixelPoint, DevicePixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers, Vector<HTML::SelectedFile> files);
     EventResult handle_pinch_event(DevicePixelPoint point, unsigned modifiers, double scale);
@@ -224,7 +232,7 @@ public:
     void keyboard_scroll_event_path_changed(DOM::EventTarget const&);
     void keyboard_scroll_dom_tree_changed(DOM::Node const&);
     void keyboard_scroll_editability_changed(DOM::Document&);
-    Compositor::KeyboardScrollState take_keyboard_scroll_state_for_compositor(u64 visual_context_tree_structural_epoch);
+    Compositing::KeyboardScrollState take_keyboard_scroll_state_for_compositor(u64 visual_context_tree_structural_epoch);
     bool needs_beforeunload_check() const { return m_needs_beforeunload_check; }
     void update_needs_beforeunload_check();
 
@@ -267,6 +275,7 @@ public:
         Confirm,
         Prompt,
     };
+    void did_open_dialog_in_another_process(PendingDialog, Utf16String const& message);
     bool has_pending_dialog() const { return m_pending_dialog != PendingDialog::None; }
     PendingDialog pending_dialog() const { return m_pending_dialog; }
     Optional<Utf16String> const& pending_dialog_text() const { return m_pending_dialog_text; }
@@ -279,7 +288,7 @@ public:
     void did_request_file_picker(GC::Weak<HTML::HTMLInputElement> target, HTML::FileFilter const& accepted_file_types, HTML::AllowMultipleFiles);
     void file_picker_closed(Span<HTML::SelectedFile> selected_files);
 
-    void did_request_select_dropdown(GC::Weak<HTML::HTMLSelectElement> target, Web::CSSPixelPoint content_position, Web::CSSPixels minimum_width, Vector<Web::HTML::SelectItem> items);
+    void did_request_select_dropdown(GC::Weak<HTML::HTMLSelectElement> target, HTML::CrossProcessId local_root_id, Web::CSSPixelPoint content_position, Web::CSSPixels minimum_width, Vector<Web::HTML::SelectItem> items);
     void select_dropdown_closed(Optional<u32> const& selected_item_id);
 
     using ClipboardRequest = GC::Ref<GC::Function<void(Vector<Clipboard::SystemClipboardItem>)>>;
@@ -295,6 +304,14 @@ public:
     u64 request_geolocation_position(GeolocationPositionCallback, GeolocationRequestType = GeolocationRequestType::OneShot);
     void cancel_geolocation_position_request(u64 request_id);
     void receive_geolocation_position(u64 request_id, GeolocationPositionResult);
+
+    // https://w3c.github.io/geolocation/#dfn-emulated-position-data
+    // NB: The top-level traversable's, which the UI process tells every page representing it.
+    Geolocation::EmulatedPositionData const& emulated_position_data() const { return m_emulated_position_data; }
+    void set_emulated_position_data(Geolocation::EmulatedPositionData);
+    void set_emulated_position_data(Geolocation::CoordinatesData);
+    u64 register_emulated_position_data_observer(GC::Ref<GC::Function<void()>>);
+    void unregister_emulated_position_data_observer(u64 observer_id);
 
     enum class PendingNonBlockingDialog {
         None,
@@ -341,7 +358,7 @@ public:
         bool is_looping { false };
         bool is_fullscreen { false };
     };
-    void did_request_media_context_menu(UniqueNodeID media_id, CSSPixelPoint, ByteString const& target, unsigned modifiers, MediaContextMenu const&);
+    void did_request_media_context_menu(UniqueNodeID media_id, HTML::CrossProcessId local_root_id, CSSPixelPoint, ByteString const& target, unsigned modifiers, MediaContextMenu const&);
     void toggle_media_play_state();
     void toggle_media_mute_state();
     void toggle_media_loop_state();
@@ -388,8 +405,10 @@ public:
     void set_listen_for_dom_mutations(bool listen_for_dom_mutations) { m_listen_for_dom_mutations = listen_for_dom_mutations; }
 
     void enqueue_fullscreen_enter(GC::Ref<DOM::Element>, GC::Ref<DOM::Document>, DOM::RequestFullscreenError, GC::Ptr<WebIDL::Promise>, Fullscreen::RequestType);
-    void enqueue_fullscreen_exit(GC::Ref<DOM::Document> doc, bool resize, GC::Ptr<WebIDL::Promise>);
+    void enqueue_fullscreen_exit(GC::Ref<DOM::Document> doc, bool resize, GC::Ptr<WebIDL::Promise>, Optional<HTML::CrossProcessId> requesting_navigable_id = {});
     void process_pending_fullscreen_operations();
+    void container_fullscreen_complete(HTML::CrossProcessId hosted_root_id);
+    void container_unfullscreen_complete(HTML::CrossProcessId hosted_root_id);
 
     ViewportIsFullscreen viewport_is_fullscreen() const { return m_viewport_is_fullscreen; }
     void set_viewport_is_fullscreen(ViewportIsFullscreen);
@@ -397,6 +416,8 @@ public:
 private:
     explicit Page(GC::Ref<PageClient>);
     virtual void visit_edges(Visitor&) override;
+
+    void update_focused_navigable(GC::Ptr<HTML::Navigable>);
 
     GC::Ptr<HTML::HTMLMediaElement> media_context_menu_element();
 
@@ -420,7 +441,7 @@ private:
 
     GC::Ref<PageClient> m_client;
 
-    GC::Weak<HTML::LocalNavigable> m_focused_navigable;
+    GC::Weak<HTML::Navigable> m_focused_navigable;
     // Mouse events are hit-tested independently, so a release can target an ancestor document after a press began in
     // a child navigable. Retain the interaction owner separately from focus to clear its non-DOM input state.
     GC::Weak<HTML::LocalNavigable> m_mouse_event_tracking_navigable;
@@ -487,6 +508,12 @@ private:
     u64 m_next_geolocation_request_id { 0 };
     Optional<u64> m_active_geolocation_request_id;
 
+    // AD-HOC: Denied until the UI process sends the browser-wide setting, so a request cannot observe the test
+    //         position in the short window before that arrives.
+    Geolocation::EmulatedPositionData m_emulated_position_data { Geolocation::GeolocationPositionError::ErrorCode::PermissionDenied };
+    HashMap<u64, GC::Ref<GC::Function<void()>>> m_emulated_position_data_observers;
+    u64 m_next_emulated_position_data_observer_id { 0 };
+
     Vector<UniqueNodeID> m_media_elements;
     Vector<UniqueNodeID> m_canvas_elements;
     Optional<UniqueNodeID> m_media_context_menu_element_id;
@@ -511,18 +538,31 @@ private:
     bool m_listen_for_dom_mutations { false };
     Optional<CSS::PreferredColorScheme> m_preferred_color_scheme_override_for_testing;
 
+    // The chain of containers above a document leaves this process at a hosted root, and the process holding the
+    // container above runs the steps for the rest of it.
+    enum class ContainerChain : u8 {
+        NotStarted,
+        InAnotherProcess,
+        Complete,
+    };
+
     struct PendingFullscreenEnter {
         GC::Ref<DOM::Element> element;
         GC::Ref<DOM::Document> pending_doc;
         DOM::RequestFullscreenError error;
         GC::Ptr<WebIDL::Promise> promise;
         Fullscreen::RequestType request_type;
+        ContainerChain container_chain { ContainerChain::NotStarted };
+        Optional<HTML::CrossProcessId> hosted_root_id {};
     };
 
     struct PendingFullscreenExit {
         GC::Ref<DOM::Document> doc;
         bool resize;
         GC::Ptr<WebIDL::Promise> promise;
+        Optional<HTML::CrossProcessId> requesting_navigable_id;
+        ContainerChain container_chain { ContainerChain::NotStarted };
+        Optional<HTML::CrossProcessId> hosted_root_id {};
     };
 
     using PendingFullscreenOperation = Variant<PendingFullscreenEnter, PendingFullscreenExit>;
@@ -559,6 +599,9 @@ public:
     virtual void request_navigation_of_remote_navigable(HTML::RemoteNavigable&, HTML::PreparedNavigationDescriptor) { VERIFY_NOT_REACHED(); }
     virtual void request_post_message_to_remote_navigable(HTML::RemoteNavigable&, HTML::PostedMessageDescriptor) { VERIFY_NOT_REACHED(); }
     virtual void request_close_of_remote_traversable(HTML::RemoteNavigable&, HTML::LocalNavigable const&) { VERIFY_NOT_REACHED(); }
+    virtual void request_focusing_steps_for_remote_navigable(HTML::RemoteNavigable&, HTML::FocusTrigger) { VERIFY_NOT_REACHED(); }
+    virtual void request_window_focus_of_remote_navigable(HTML::RemoteNavigable&) { VERIFY_NOT_REACHED(); }
+    virtual void request_set_opener_of_remote_navigable(HTML::RemoteNavigable&, HTML::Navigable const&) { VERIFY_NOT_REACHED(); }
     virtual void navigation_params_creation_finished(HTML::LocalNavigable&, HTML::NavigationPopulationRequest, HTML::NavigationPopulationResult);
     virtual void history_navigation_params_creation_finished(HTML::CrossProcessId operation_id, HTML::HistoryNavigationPopulation);
     virtual void navigation_population_failed(HTML::CrossProcessId, Utf16String const&) { }
@@ -566,7 +609,7 @@ public:
     virtual void page_did_change_replicated_navigable_state([[maybe_unused]] HTML::CrossProcessId navigable_id, [[maybe_unused]] HTML::ReplicatedNavigableState const& state) { }
     virtual void page_did_completely_finish_loading([[maybe_unused]] HTML::CrossProcessId navigable_id) { }
     virtual void page_did_change_navigable_container_state([[maybe_unused]] HTML::CrossProcessId navigable_id, [[maybe_unused]] HTML::ReplicatedContainerState const& state) { }
-    virtual void page_did_update_child_frame_viewport(HTML::CrossProcessId, CSSPixelRect) { }
+    virtual void page_did_update_child_frame_viewport(HTML::CrossProcessId, [[maybe_unused]] DevicePixelRect viewport_rect, [[maybe_unused]] DevicePixelRect viewport_intersection) { }
     virtual void page_did_destroy_child_frame(HTML::CrossProcessId) { }
     virtual String dump_site_isolation_process_tree_for_testing() { return {}; }
     virtual void crash_remote_frame_processes_for_testing() { }
@@ -583,11 +626,13 @@ public:
     virtual size_t screen_count() const = 0;
     virtual Queue<QueuedInputEvent>& input_event_queue() = 0;
     virtual void did_handle_input_event([[maybe_unused]] Web::PageId page_id, [[maybe_unused]] InputEvent const&) { }
-    virtual void report_finished_handling_input_event(Web::PageId page_id, EventResult event_was_handled) = 0;
-    virtual Compositor::CompositorContextId allocate_compositor_context_id(Compositor::PagePresentationRegistration page_presentation_registration)
+    virtual void report_finished_handling_input_event(Web::PageId page_id, u64 event_id, EventResult event_was_handled) = 0;
+    // The event lands on content another process hosts, which handles it and finishes it.
+    virtual void forward_mouse_event_to_remote_navigable([[maybe_unused]] Web::PageId page_id, [[maybe_unused]] HTML::CrossProcessId navigable_id, [[maybe_unused]] Compositing::MouseEvent) { }
+    virtual Compositing::CompositorContextId allocate_compositor_context_id(Compositing::PagePresentationRegistration page_presentation_registration)
     {
-        if (page_presentation_registration == Compositor::PagePresentationRegistration::Yes)
-            return Compositor::compositor_context_id_for_page(id());
+        if (page_presentation_registration == Compositing::PagePresentationRegistration::Yes)
+            return Compositing::compositor_context_id_for_page(id());
         VERIFY_NOT_REACHED();
     }
     virtual HTML::CrossProcessId allocate_cross_process_id()
@@ -640,10 +685,10 @@ public:
     virtual void page_did_unregister_download([[maybe_unused]] u64 download_id) { }
     virtual bool page_is_download_canceled([[maybe_unused]] u64 download_id) const { return false; }
     virtual void page_did_request_cursor_change(Gfx::Cursor const&) { }
-    virtual void page_did_request_context_menu(CSSPixelPoint, ContextMenuForInputEventsTarget) { }
-    virtual void page_did_request_link_context_menu(CSSPixelPoint, URL::URL const&, [[maybe_unused]] ByteString const& target, [[maybe_unused]] unsigned modifiers) { }
-    virtual void page_did_request_image_context_menu(CSSPixelPoint, URL::URL const&, [[maybe_unused]] ByteString const& target, [[maybe_unused]] unsigned modifiers, Optional<Gfx::Bitmap const*>) { }
-    virtual void page_did_request_media_context_menu(CSSPixelPoint, [[maybe_unused]] ByteString const& target, [[maybe_unused]] unsigned modifiers, Page::MediaContextMenu const&) { }
+    virtual void page_did_request_context_menu([[maybe_unused]] HTML::CrossProcessId local_root_id, CSSPixelPoint, ContextMenuForInputEventsTarget) { }
+    virtual void page_did_request_link_context_menu([[maybe_unused]] HTML::CrossProcessId local_root_id, CSSPixelPoint, URL::URL const&, [[maybe_unused]] ByteString const& target, [[maybe_unused]] unsigned modifiers) { }
+    virtual void page_did_request_image_context_menu([[maybe_unused]] HTML::CrossProcessId local_root_id, CSSPixelPoint, URL::URL const&, [[maybe_unused]] ByteString const& target, [[maybe_unused]] unsigned modifiers, Optional<Gfx::Bitmap const*>) { }
+    virtual void page_did_request_media_context_menu([[maybe_unused]] HTML::CrossProcessId local_root_id, CSSPixelPoint, [[maybe_unused]] ByteString const& target, [[maybe_unused]] unsigned modifiers, Page::MediaContextMenu const&) { }
     virtual void page_did_click_link(URL::URL const&, [[maybe_unused]] ByteString const& target, [[maybe_unused]] unsigned modifiers) { }
     virtual void page_did_middle_click_link(URL::URL const&, [[maybe_unused]] ByteString const& target, [[maybe_unused]] unsigned modifiers) { }
     virtual void page_did_request_external_url([[maybe_unused]] URL::URL const& url, [[maybe_unused]] URL::Origin const& initiator_origin, [[maybe_unused]] bool has_transient_activation) { }
@@ -674,7 +719,7 @@ public:
     virtual void page_did_delete_all_cookies(URL::URL const&, GC::Ref<WebIDL::Promise>) { }
     virtual void page_did_lose_request_server_connection() { }
     virtual void page_did_simulate_worker_request_server_connection_loss() { }
-    virtual void page_did_store_hsts_policy(String const&, HTTP::HSTS::ParsedHSTSPolicy const&) { }
+    virtual void page_did_store_hsts_policy_for_testing(String const&, HTTP::HSTS::ParsedHSTSPolicy const&) { }
     virtual bool page_did_is_known_hsts_host(String const&) { return false; }
     virtual Optional<Utf16String> page_did_request_storage_item([[maybe_unused]] Web::StorageAPI::StorageEndpointType storage_endpoint, [[maybe_unused]] String const& storage_key, [[maybe_unused]] Utf16String const& bottle_key) { return {}; }
     virtual WebView::StorageSetResult page_did_set_storage_item([[maybe_unused]] Web::StorageAPI::StorageEndpointType storage_endpoint, [[maybe_unused]] String const& storage_key, [[maybe_unused]] Utf16String const& bottle_key, [[maybe_unused]] Utf16String const& value) { return WebView::StorageOperationError::QuotaExceededError; }
@@ -703,6 +748,10 @@ public:
     virtual void page_did_update_session_history_entry_scroll_restoration_mode([[maybe_unused]] HTML::CrossProcessId navigable_id, [[maybe_unused]] HTML::SessionHistoryEntryIdentity const& entry_identity, [[maybe_unused]] HTML::ScrollRestorationMode scroll_restoration_mode) { }
     virtual void page_did_update_session_history_entry_document_state_navigable_target_name([[maybe_unused]] HTML::CrossProcessId navigable_id, [[maybe_unused]] HTML::SessionHistoryEntryIdentity const& entry_identity, [[maybe_unused]] Utf16String const& navigable_target_name) { }
     virtual void page_did_set_session_history_entry_document_state_reload_pending([[maybe_unused]] HTML::CrossProcessId navigable_id, [[maybe_unused]] Utf16String const& navigation_api_key, [[maybe_unused]] bool reload_pending) { }
+    virtual void page_did_request_set_system_focus([[maybe_unused]] bool has_system_focus) { }
+    virtual void page_did_change_focused_navigable([[maybe_unused]] HTML::CrossProcessId navigable_id) { }
+    virtual void page_did_request_key_event_for_testing([[maybe_unused]] Compositing::KeyEvent event) { }
+    virtual void page_did_request_webdriver_mouse_event([[maybe_unused]] HTML::CrossProcessId local_root_id, [[maybe_unused]] Compositing::MouseEvent event, GC::Ref<GC::Function<void()>> on_handled) { on_handled->function()(); }
     virtual void page_did_request_set_system_visibility_state([[maybe_unused]] HTML::VisibilityState visibility_state) { }
     virtual String page_did_request_ui_process_session_history_for_testing() { return "{}"_string; }
     virtual bool page_did_request_capture_session_history_snapshot_for_testing() { return false; }
@@ -713,6 +762,10 @@ public:
     virtual void page_did_request_child_navigable_unload([[maybe_unused]] HTML::CrossProcessId navigable_id) { }
     virtual void page_did_request_remote_document_abort([[maybe_unused]] HTML::CrossProcessId navigable_id) { }
     virtual void page_did_request_remote_document_unfullscreen([[maybe_unused]] HTML::CrossProcessId navigable_id) { }
+    virtual void page_did_request_container_fullscreen([[maybe_unused]] HTML::CrossProcessId navigable_id, [[maybe_unused]] HTML::CrossProcessId requesting_navigable_id, [[maybe_unused]] Fullscreen::RequestType request_type) { }
+    virtual void page_did_request_container_unfullscreen([[maybe_unused]] HTML::CrossProcessId navigable_id) { }
+    virtual void page_did_complete_container_unfullscreen([[maybe_unused]] HTML::CrossProcessId requesting_navigable_id) { }
+    virtual void page_did_request_fully_exit_fullscreen() { }
     virtual void page_did_request_unload_check(HTML::CrossProcessId, GC::Ref<GC::Function<void(HTML::CheckIfUnloadingIsCanceledResult)>>) { VERIFY_NOT_REACHED(); }
     virtual void page_did_change_needs_beforeunload_check([[maybe_unused]] bool needs_beforeunload_check) { }
     virtual void page_did_consume_user_activation([[maybe_unused]] HTML::UserActivationConsumption consumption) { }
@@ -722,7 +775,7 @@ public:
     // https://html.spec.whatwg.org/multipage/input.html#show-the-picker,-if-applicable
     virtual void page_did_request_color_picker([[maybe_unused]] Color current_color) { }
     virtual void page_did_request_file_picker([[maybe_unused]] HTML::FileFilter const& accepted_file_types, Web::HTML::AllowMultipleFiles) { }
-    virtual void page_did_request_select_dropdown([[maybe_unused]] Web::CSSPixelPoint content_position, [[maybe_unused]] Web::CSSPixels minimum_width, [[maybe_unused]] Vector<Web::HTML::SelectItem> items) { }
+    virtual void page_did_request_select_dropdown([[maybe_unused]] HTML::CrossProcessId local_root_id, [[maybe_unused]] Web::CSSPixelPoint content_position, [[maybe_unused]] Web::CSSPixels minimum_width, [[maybe_unused]] Vector<Web::HTML::SelectItem> items) { }
     virtual void page_did_request_geolocation_position([[maybe_unused]] u64 request_id) { }
     virtual void page_did_cancel_geolocation_position_request([[maybe_unused]] u64 request_id) { }
     virtual void page_did_start_geolocation_position_watch([[maybe_unused]] u64 request_id) { }

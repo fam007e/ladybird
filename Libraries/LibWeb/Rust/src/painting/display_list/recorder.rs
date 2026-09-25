@@ -730,7 +730,7 @@ impl DisplayListRecorder {
 
     pub fn draw_composited_context(
         &mut self,
-        dst_rect: IntRect,
+        dst_rect: FloatRect,
         child_context_id: CompositorContextId,
         scaling_mode: ScalingMode,
     ) {
@@ -1309,7 +1309,7 @@ impl DisplayListRecorder {
         self.append_command(&region, &[]);
     }
 
-    pub fn compositor_viewport_scrollbar(&mut self, scrollbar: CompositorViewportScrollbar) {
+    pub fn compositor_scrollbar(&mut self, scrollbar: CompositorScrollbar) {
         self.append_command(&scrollbar, &[]);
     }
 

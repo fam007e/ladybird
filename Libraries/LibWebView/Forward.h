@@ -21,9 +21,11 @@ class BrowsingSession;
 class BookmarkStore;
 class CanonicalBrowsingContext;
 class CanonicalBrowsingContextGroup;
+class CanonicalDocument;
 class CanonicalNavigable;
 class CanonicalSimilarOriginWindowAgent;
 class CanonicalTraversable;
+class CanonicalWindow;
 class CompositorClient;
 class CompositorFontServiceConnection;
 class CompositorConnection;
@@ -50,8 +52,6 @@ class WebContentTestClient;
 class WebDriverBrowserConnection;
 class WebWorkerClient;
 class WebUI;
-
-enum class PausedDebuggerOverlayAction : u8;
 
 struct Attribute;
 struct DownloadRecord;
@@ -81,6 +81,7 @@ struct Mutation;
 struct ProcessHandle;
 struct SearchEngine;
 struct WebContentOptions;
+class WebContentPage;
 
 }
 

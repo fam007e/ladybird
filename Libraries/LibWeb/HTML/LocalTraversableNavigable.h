@@ -14,7 +14,6 @@
 #include <AK/Vector.h>
 #include <LibWeb/Bindings/NavigationType.h>
 #include <LibWeb/Export.h>
-#include <LibWeb/Geolocation/Geolocation.h>
 #include <LibWeb/HTML/ApplyHistoryStep.h>
 #include <LibWeb/HTML/LocalNavigable.h>
 #include <LibWeb/HTML/VisibilityState.h>
@@ -29,7 +28,7 @@ class WEB_API LocalTraversableNavigable final : public LocalNavigable {
 
 public:
     static GC::Ref<LocalTraversableNavigable> create_a_new_top_level_traversable(GC::Ref<Page>, GC::Ptr<BrowsingContext> opener, Optional<SessionHistoryEntryDescriptor> initial_history_entry = {}, VisibilityState system_visibility_state = VisibilityState::Hidden);
-    static GC::Ref<LocalTraversableNavigable> create_a_fresh_top_level_traversable(GC::Ref<Page>, URL::URL const& initial_navigation_url, DocumentResource, SessionHistoryEntryDescriptor initial_history_entry, VisibilityState system_visibility_state);
+    static GC::Ref<LocalTraversableNavigable> create_a_fresh_top_level_traversable(GC::Ref<Page>, SessionHistoryEntryDescriptor initial_history_entry, VisibilityState system_visibility_state);
 
     virtual ~LocalTraversableNavigable() override;
 
@@ -51,7 +50,6 @@ public:
     };
     void close_top_level_traversable(PromptToUnload = PromptToUnload::Yes);
     void close_top_level_traversable_from_script(Navigable const& source);
-    void remove_from_user_agent_top_level_traversable_set();
     void definitely_close_top_level_traversable(PromptToUnload = PromptToUnload::Yes);
     void run_ui_traversable_close_unload_task();
     void destroy_top_level_traversable();
@@ -59,19 +57,10 @@ public:
     Utf16String const& window_handle() const { return m_window_handle; }
     void set_window_handle(Utf16String window_handle) { m_window_handle = move(window_handle); }
 
-    // https://w3c.github.io/geolocation/#dfn-emulated-position-data
-    Geolocation::EmulatedPositionData const& emulated_position_data() const;
-    void set_emulated_position_data(Geolocation::EmulatedPositionData data);
-    void set_emulated_position_data(Geolocation::CoordinatesData);
-    u64 register_emulated_position_data_observer(GC::Ref<GC::Function<void()>>);
-    void unregister_emulated_position_data_observer(u64 observer_id);
-
 private:
     LocalTraversableNavigable(GC::Ref<Page>);
 
     virtual bool is_traversable() const override { return true; }
-
-    virtual void visit_edges(Cell::Visitor&) override;
 
     // WebContent needs the canonical top-level entry count synchronously for is_script_closable().
     u64 m_session_history_entry_count { 1 };
@@ -83,11 +72,6 @@ private:
     bool m_close_steps_have_been_appended { false };
 
     Utf16String m_window_handle;
-
-    // https://w3c.github.io/geolocation/#dfn-emulated-position-data
-    Geolocation::EmulatedPositionData m_emulated_position_data;
-    HashMap<u64, GC::Ref<GC::Function<void()>>> m_emulated_position_data_observers;
-    u64 m_next_emulated_position_data_observer_id { 0 };
 };
 
 struct BrowsingContextAndDocument {
