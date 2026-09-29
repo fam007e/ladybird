@@ -17,15 +17,14 @@ namespace Compositor {
 
 static constexpr int gpu_completion_check_interval_ms = 1;
 
-NonnullRefPtr<CompositorState> CompositorState::create(RefPtr<Gfx::SkiaBackendContext> skia_backend_context, bool async_scrolling_enabled)
+NonnullRefPtr<CompositorState> CompositorState::create(RefPtr<Gfx::SkiaBackendContext> skia_backend_context)
 {
-    return adopt_ref(*new CompositorState(move(skia_backend_context), async_scrolling_enabled));
+    return adopt_ref(*new CompositorState(move(skia_backend_context)));
 }
 
-CompositorState::CompositorState(RefPtr<Gfx::SkiaBackendContext> skia_backend_context, bool async_scrolling_enabled)
+CompositorState::CompositorState(RefPtr<Gfx::SkiaBackendContext> skia_backend_context)
     : m_skia_backend_context(move(skia_backend_context))
     , m_display_list_player(make<Compositing::DisplayListPlayerSkia>(m_skia_backend_context))
-    , m_async_scrolling_enabled(async_scrolling_enabled)
 {
 }
 
@@ -135,7 +134,7 @@ void CompositorState::create_context(Compositing::CompositorContextId context_id
         VERIFY(context_id == Compositing::compositor_context_id_for_page(*page_id));
 
     auto& context = *m_contexts.ensure(context_id, [&] {
-        return make<ContextState>(context_id, page_id, web_content_client, m_canvas_surface_registry, m_async_scrolling_enabled, [this, context_id](Gfx::IntRect damage_rect) {
+        return make<ContextState>(context_id, page_id, web_content_client, m_canvas_surface_registry, [this, context_id](Gfx::IntRect damage_rect) {
             schedule_caret_repaint(context_id, damage_rect);
         });
     });
@@ -517,43 +516,49 @@ bool CompositorState::dispatch_key_event_to_web_content(Compositing::CompositorC
     return true;
 }
 
-Compositing::MouseEventHandlingResult CompositorState::handle_mouse_event(Compositing::CompositorContextId context_id, Compositing::MouseEvent const& event)
+void CompositorState::handle_and_dispatch_mouse_event(Compositing::CompositorContextId context_id, Compositing::MouseEvent event)
 {
+    VERIFY(m_client);
     auto* context = context_if_present(context_id);
-    if (!context)
-        return {};
+    if (!context || !context->can_dispatch_input_to_web_content()) {
+        m_client->did_not_dispatch_input_event(context_id, event.id);
+        return;
+    }
 
-    auto result = context->handle_mouse_event(event);
-    return {
-        .handled = apply_context_update_result(context_id, *context, result),
-        .scrollbar_dragged_by_compositor = result.scrollbar_dragged_by_compositor,
-    };
-}
+    auto is_wheel_event = event.type == Compositing::MouseEvent::Type::MouseWheel;
+    ContextState::ContextUpdateResult result;
+    if (is_wheel_event)
+        result = context->handle_wheel_event(event);
+    else
+        result = context->handle_mouse_event(event);
 
-bool CompositorState::dispatch_mouse_event_to_web_content(Compositing::CompositorContextId context_id, Compositing::MouseEvent const& event)
-{
-    auto* context = context_if_present(context_id);
-    if (!context)
-        return false;
-
+    // Schedules the present, publishes the scroll updates the event produced and asks for a rendering update, all of
+    // which reach WebContent ahead of the event itself on the same connection.
+    auto handled = apply_context_update_result(context_id, *context, result);
+    if (is_wheel_event) {
+        event.async_scroll_performed_default_action = handled;
+    } else if (handled) {
+        // The page still sees the events of a drag the compositor scrolls for a scrollbar the display list paints.
+        if (!result.scrollbar_dragged_by_compositor.has_value()) {
+            m_client->did_consume_input_event(context_id, event.id);
+            return;
+        }
+        event.scrollbar_dragged_by_compositor = result.scrollbar_dragged_by_compositor;
+    }
     context->dispatch_mouse_event_to_web_content(event);
-    return true;
 }
 
-bool CompositorState::handle_pinch_event(Compositing::CompositorContextId context_id, Compositing::PinchEvent const& event)
+void CompositorState::handle_pinch_event(Compositing::CompositorContextId context_id, Compositing::PinchEvent const& event)
 {
     auto* context = context_if_present(context_id);
     if (!context)
-        return false;
+        return;
 
-    return apply_context_update_result(context_id, *context, context->handle_pinch_event(event));
+    apply_context_update_result(context_id, *context, context->handle_pinch_event(event));
 }
 
 Compositing::AsyncScrollEnqueueResult CompositorState::async_scroll_by(Compositing::CompositorContextId context_id, Compositing::UniqueNodeID expected_document_id, Gfx::FloatPoint position, Gfx::FloatPoint delta, Gfx::IntRect viewport_rect, Compositing::WheelDeltaPrecision wheel_delta_precision, Compositing::ScrollGesturePhase scroll_gesture_phase, u32 modifiers, Compositing::AsyncScrollOperationTracking operation_tracking)
 {
-    if (!m_async_scrolling_enabled)
-        return {};
-
     auto* context = context_if_present(context_id);
     VERIFY(context);
 
@@ -571,9 +576,6 @@ Compositing::AsyncScrollEnqueueResult CompositorState::async_scroll_by(Compositi
 
 Compositing::AsyncScrollEnqueueResult CompositorState::smooth_scroll_to(Compositing::CompositorContextId context_id, Compositing::AsyncScrollNodeStableID stable_node_id, Gfx::FloatPoint offset, Gfx::FloatPoint main_thread_offset, Gfx::IntRect viewport_rect, Compositing::ScrollAnimationKind animation_kind, Compositing::SmoothScrollInitiator initiator)
 {
-    if (!m_async_scrolling_enabled)
-        return {};
-
     auto* context = context_if_present(context_id);
     VERIFY(context);
 
@@ -591,18 +593,6 @@ void CompositorState::cancel_smooth_scroll(Compositing::CompositorContextId cont
         return;
     context->cancel_smooth_scroll(stable_node_id);
     publish_pending_async_scroll_updates(context_id, *context);
-}
-
-bool CompositorState::async_scroll_by(Compositing::CompositorContextId context_id, Gfx::FloatPoint position, Gfx::FloatPoint delta, Compositing::WheelDeltaPrecision wheel_delta_precision, Compositing::ScrollGesturePhase scroll_gesture_phase, u32 modifiers)
-{
-    if (!m_async_scrolling_enabled)
-        return false;
-
-    auto* context = context_if_present(context_id);
-    if (!context)
-        return false;
-
-    return apply_context_update_result(context_id, *context, context->async_scroll_by(position, delta, wheel_delta_precision, scroll_gesture_phase, modifiers));
 }
 
 Compositing::PendingAsyncScrollUpdates CompositorState::take_pending_async_scroll_updates(Compositing::CompositorContextId context_id)

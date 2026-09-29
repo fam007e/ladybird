@@ -55,6 +55,7 @@ public:
     virtual u32 ttc_index() const override { return m_ttc_index; }
 
     SkTypeface const* sk_typeface() const;
+    u32 platform_typeface_id() const;
 
 protected:
     virtual void encode_font_data_for_ipc(IPC::Encoder&) const override;
@@ -77,6 +78,7 @@ private:
     ReadonlyBytes m_buffer;
     u32 m_ttc_index { 0 };
 
+    mutable OnceFlag m_family_once;
     mutable Optional<FlyString> m_family;
 
     // This cache stores information per code point.
@@ -88,10 +90,8 @@ private:
         u16 glyph_ids[glyphs_per_page];
     };
 
-    // Fast cache for GlyphPage #0 (code points 0-255) to avoid hash lookups for all of ASCII and Latin-1.
-    OwnPtr<GlyphPage> mutable m_glyph_page_zero;
-
-    HashMap<size_t, NonnullOwnPtr<GlyphPage>> mutable m_glyph_pages;
+    // Addresses can be reused after destruction, so per-thread caches use a monotonic identity.
+    u64 m_glyph_cache_id { 0 };
 
     [[nodiscard]] GlyphPage const& glyph_page(size_t page_index) const;
     void populate_glyph_page(GlyphPage&, size_t page_index) const;

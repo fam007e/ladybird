@@ -334,7 +334,6 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
     bool force_fontconfig = false;
     bool collect_garbage_on_every_allocation = false;
     bool disable_scrollbar_painting = false;
-    bool disable_async_scrolling = false;
     bool file_scheme_urls_have_tuple_origins = false;
 
     Core::ArgsParser args_parser;
@@ -439,7 +438,6 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
     args_parser.add_option(force_fontconfig, "Force using fontconfig for font loading", "force-fontconfig");
     args_parser.add_option(collect_garbage_on_every_allocation, "Collect garbage after every JS heap allocation", "collect-garbage-on-every-allocation", 'g');
     args_parser.add_option(disable_scrollbar_painting, "Don't paint horizontal or vertical scrollbars on the main viewport", "disable-scrollbar-painting");
-    args_parser.add_option(disable_async_scrolling, "Disable async scrolling", "disable-async-scrolling");
     args_parser.add_option(dns_server_address, "Set the DNS server address", "dns-server", 0, "host|address");
     args_parser.add_option(dns_server_port, "Set the DNS server port", "dns-port", 0, "port (default: 53 or 853 if --dot)");
     args_parser.add_option(use_dns_over_tls, "Use DNS over TLS", "dot");
@@ -657,7 +655,6 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
         .enable_autoplay = enable_autoplay ? EnableAutoplay::Yes : EnableAutoplay::No,
         .collect_garbage_on_every_allocation = collect_garbage_on_every_allocation ? CollectGarbageOnEveryAllocation::Yes : CollectGarbageOnEveryAllocation::No,
         .paint_viewport_scrollbars = disable_scrollbar_painting ? PaintViewportScrollbars::No : PaintViewportScrollbars::Yes,
-        .enable_async_scrolling = disable_async_scrolling ? EnableAsyncScrolling::No : EnableAsyncScrolling::Yes,
         .file_scheme_urls_have_tuple_origins = file_scheme_urls_have_tuple_origins ? FileSchemeUrlsHaveTupleOrigins::Yes : FileSchemeUrlsHaveTupleOrigins::No,
         .default_time_zone = default_time_zone,
     };
@@ -1043,9 +1040,15 @@ ErrorOr<NonnullRefPtr<WebContentClient>> Application::create_web_content_client(
 
     // A view's first process creates its traversable from this entry. A process hosting a navigable of an existing tab
     // stands in for the canonical current entry.
-    auto initial_history_entry = canonical_initial_history_entry.has_value()
-        ? canonical_initial_history_entry.release_value()
-        : Web::HTML::create_initial_session_history_entry_descriptor(*initial_document_state_id, {}, {});
+    auto initial_history_entry = [&] {
+        if (canonical_initial_history_entry.has_value())
+            return canonical_initial_history_entry.release_value();
+        // The UI process determines the origin of the traversable's first document, which has no creator, before the
+        // process creates it.
+        auto entry = Web::HTML::create_initial_session_history_entry_descriptor(*initial_document_state_id, {}, {});
+        entry.document_state.origin = URL::Origin::create_opaque();
+        return entry;
+    }();
     client->async_initialize(initial_page_id, move(remote_navigables), root_navigable_id, cross_process_id_allocator, initial_history_entry, system_visibility_state);
 
     if (!navigable_to_adopt.has_value())
@@ -1347,17 +1350,6 @@ void Application::update_compositor_context_visibility(Compositing::CompositorCo
     m_compositor_client->async_set_context_visibility(context_id, context_visibility);
 }
 
-bool Application::send_async_scroll_to_compositor(Compositing::CompositorContextId context_id, Gfx::FloatPoint position, Gfx::FloatPoint delta_in_device_pixels, Compositing::WheelDeltaPrecision wheel_delta_precision, Compositing::ScrollGesturePhase scroll_gesture_phase, u32 modifiers)
-{
-    if (!can_send_compositor_process_ipc(m_compositor_client))
-        return false;
-
-    auto result = m_compositor_client->try_async_scroll_by(context_id, position, delta_in_device_pixels, wheel_delta_precision, scroll_gesture_phase, modifiers);
-    if (result.is_error())
-        return false;
-    return result.release_value();
-}
-
 bool Application::handle_key_event_in_compositor(Compositing::CompositorContextId context_id, Compositing::KeyEvent const& event)
 {
     if (!can_send_compositor_process_ipc(m_compositor_client))
@@ -1374,38 +1366,22 @@ bool Application::dispatch_key_event_to_web_content(Compositing::CompositorConte
     return !result.is_error() && result.release_value();
 }
 
-Compositing::MouseEventHandlingResult Application::handle_mouse_event_in_compositor(Compositing::CompositorContextId context_id, Compositing::MouseEvent const& event)
+void Application::handle_pinch_event_in_compositor(Compositing::CompositorContextId context_id, Compositing::PinchEvent const& event)
 {
     if (!can_send_compositor_process_ipc(m_compositor_client))
-        return {};
+        return;
 
-    auto result = m_compositor_client->try_handle_mouse_event(context_id, event.clone_without_browser_data());
-    if (result.is_error())
-        return {};
-    return result.release_value();
+    m_compositor_client->async_handle_pinch_event(context_id, event);
 }
 
-bool Application::handle_pinch_event_in_compositor(Compositing::CompositorContextId context_id, Compositing::PinchEvent const& event)
-{
-    if (!can_send_compositor_process_ipc(m_compositor_client))
-        return false;
-
-    auto result = m_compositor_client->try_handle_pinch_event(context_id, event);
-    if (result.is_error())
-        return false;
-    return result.release_value();
-}
-
-bool Application::dispatch_mouse_event_to_web_content(Compositing::CompositorContextId context_id, Compositing::MouseEvent const& event)
+bool Application::handle_and_dispatch_mouse_event_in_compositor(Compositing::CompositorContextId context_id, Compositing::MouseEvent const& event)
 {
     if (!can_send_compositor_process_ipc(m_compositor_client))
         return false;
     VERIFY(m_compositor_client);
 
-    auto result = m_compositor_client->try_dispatch_mouse_event_to_web_content(context_id, event.clone_without_browser_data());
-    if (result.is_error())
-        return false;
-    return result.release_value();
+    m_compositor_client->async_handle_and_dispatch_mouse_event(context_id, event.clone_without_browser_data());
+    return true;
 }
 
 void Application::notify_compositor_presented_bitmap_ready_to_paint(Compositing::CompositorContextId context_id, i32 bitmap_id)
@@ -1703,6 +1679,16 @@ void Application::handle_compositor_process_death()
 {
     m_compositor_client = nullptr;
     m_compositor_font_service_connection = nullptr;
+
+    // Nothing will forward or hand back the input events the dead compositor still held.
+    WebContentClient::for_each_client([](WebContentClient& client) {
+        client.for_each_page([](WebContentPage& page) {
+            if (page.displays_tab())
+                page.view().discard_input_events_routed_through_lost_compositor({});
+            return IterationDecision::Continue;
+        });
+        return IterationDecision::Continue;
+    });
 
     if (Core::EventLoop::current().was_exit_requested())
         return;

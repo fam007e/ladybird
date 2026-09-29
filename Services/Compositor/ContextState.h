@@ -15,6 +15,7 @@
 #include <AK/Span.h>
 #include <AK/Vector.h>
 #include <Compositor/BackingStoreManager.h>
+#include <Compositor/FramePacer.h>
 #include <Compositor/ScrollSnapController.h>
 #include <Compositor/ScrollbarController.h>
 #include <LibCompositing/DisplayList/AccumulatedVisualContext.h>
@@ -94,7 +95,7 @@ public:
         Gfx::IntRect damage_rect;
     };
 
-    ContextState(Compositing::CompositorContextId, Optional<u64> page_id, CompositorStateWebContentClient&, Compositing::CanvasSurfaceRegistry const&, bool async_scrolling_enabled, Function<void(Gfx::IntRect)> schedule_caret_repaint = {});
+    ContextState(Compositing::CompositorContextId, Optional<u64> page_id, CompositorStateWebContentClient&, Compositing::CanvasSurfaceRegistry const&, Function<void(Gfx::IntRect)> schedule_caret_repaint = {});
     ~ContextState();
 
     bool is_owned_by(CompositorStateWebContentClient const&) const;
@@ -102,6 +103,7 @@ public:
     void request_rendering_update();
     void dispatch_mouse_event_to_web_content(Compositing::MouseEvent const&);
     void dispatch_key_event_to_web_content(Compositing::KeyEvent const&);
+    bool can_dispatch_input_to_web_content() const { return m_page_id.has_value(); }
 
     bool presents_to_client() const { return m_presents_to_client; }
     void stop_presenting_to_client();
@@ -127,6 +129,8 @@ public:
     void invalidate_keyboard_scroll_state(u64 generation);
     ContextUpdateResult handle_key_event(Compositing::KeyEvent const&);
     ContextUpdateResult handle_mouse_event(Compositing::MouseEvent const&);
+    // The UI's wheel deltas are in CSS pixels; this scales them for the scroll tree, which works in device pixels.
+    ContextUpdateResult handle_wheel_event(Compositing::MouseEvent const&, Optional<MonotonicTime> now_for_testing = {});
     ContextUpdateResult handle_pinch_event(Compositing::PinchEvent const&);
     AsyncScrollResult async_scroll_by(
         Compositing::UniqueNodeID document_id,
@@ -279,7 +283,6 @@ private:
     Compositing::CanvasSurfaceRegistry const& m_canvas_surface_registry;
     Compositing::CompositorContextId m_context_id;
     Optional<u64> m_page_id;
-    bool const m_async_scrolling_enabled { true };
 
     bool m_presents_to_client { false };
     Optional<Compositing::CompositorContextId> m_parent_context_id;
@@ -350,8 +353,7 @@ private:
     Compositing::ContextVisibility m_visibility { Compositing::ContextVisibility::Visible };
 
     bool m_rendering_opportunity_requested { false };
-    double m_maximum_rendering_frames_per_second { 60.0 };
-    Optional<i64> m_last_rendering_opportunity_time_nanoseconds;
+    FramePacer m_rendering_opportunity_pacer;
 
     Optional<PendingFrame> m_pending_present_frame;
     bool m_pending_present_frame_scheduled { false };
