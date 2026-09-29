@@ -31,15 +31,15 @@
 #include <LibMain/Main.h>
 #include <LibRequests/Forward.h>
 #include <LibURL/URL.h>
-#include <LibWeb/CSS/PreferredColorScheme.h>
-#include <LibWeb/CSS/PreferredContrast.h>
-#include <LibWeb/CSS/PreferredMotion.h>
-#include <LibWeb/Clipboard/SystemClipboard.h>
-#include <LibWeb/HTML/ActivateTab.h>
-#include <LibWeb/HTML/CrossProcessId.h>
-#include <LibWeb/HTML/ReplicatedNavigableState.h>
-#include <LibWeb/HTML/SessionHistoryEntry.h>
-#include <LibWeb/HTML/VisibilityState.h>
+#include <LibWebCommon/CSS/PreferredColorScheme.h>
+#include <LibWebCommon/CSS/PreferredContrast.h>
+#include <LibWebCommon/CSS/PreferredMotion.h>
+#include <LibWebCommon/Clipboard/SystemClipboard.h>
+#include <LibWebCommon/HTML/ActivateTab.h>
+#include <LibWebCommon/HTML/CrossProcessId.h>
+#include <LibWebCommon/HTML/ReplicatedNavigableState.h>
+#include <LibWebCommon/HTML/SessionHistoryEntryDescriptor.h>
+#include <LibWebCommon/HTML/VisibilityState.h>
 #include <LibWebView/BlobURLStore.h>
 #include <LibWebView/BookmarkStore.h>
 #include <LibWebView/BrowserProcess.h>
@@ -182,12 +182,12 @@ public:
     ErrorOr<Core::GeolocationProvider::WatchId, Core::GeolocationError> start_watching_geolocation_position(Core::GeolocationProvider::SuccessCallback on_success, Core::GeolocationProvider::ErrorCallback on_error);
     void stop_watching_geolocation_position(Core::GeolocationProvider::WatchId);
 
-    ErrorOr<NonnullRefPtr<WebContentClient>> launch_web_content_process(ViewImplementation&, Optional<Web::HTML::CrossProcessId> navigable_to_adopt = {}, Optional<Web::HTML::CrossProcessId> initial_document_state_id = {});
+    ErrorOr<NonnullRefPtr<WebContentClient>> launch_web_content_process(ViewImplementation&);
     struct ChildFrameWebContentProcess {
         NonnullRefPtr<WebContentClient> client;
         Compositing::PageId page_id { 0 };
     };
-    ErrorOr<ChildFrameWebContentProcess> launch_child_frame_web_content_process(IsPrivate, Vector<Web::HTML::RemoteNavigableDescriptor> remote_navigables, Web::HTML::CrossProcessId root_navigable_id, Web::HTML::SessionHistoryEntryDescriptor initial_history_entry);
+    ErrorOr<ChildFrameWebContentProcess> launch_child_frame_web_content_process(IsPrivate, Vector<Web::HTML::RemoteNavigableDescriptor> remote_navigables, Web::HTML::CrossProcessId root_navigable_id, Web::HTML::SessionHistoryEntryDescriptor initial_history_entry, Web::HTML::VisibilityState system_visibility_state);
     Compositing::PageId allocate_page_id();
     Web::HTML::CrossProcessIdAllocator allocate_cross_process_id_allocator();
     Web::HTML::CrossProcessId allocate_ui_process_cross_process_id();
@@ -336,7 +336,7 @@ public:
 
     FileDownloader& file_downloader() { return m_file_downloader; }
 
-    void apply_view_options(Badge<ViewImplementation>, ViewImplementation&);
+    void apply_view_options(Badge<ViewImplementation>, ViewImplementation&, WebContentPage&);
 
     ErrorOr<void> toggle_devtools_enabled();
     ErrorOr<void> launch_devtools_client();
@@ -382,7 +382,7 @@ protected:
     bool has_spare_web_content_process() const { return m_spare_web_content_process; }
 
 private:
-    ErrorOr<NonnullRefPtr<WebContentClient>> create_web_content_client(Optional<ViewImplementation&>, IsPrivate, Compositing::PageId initial_page_id, Optional<Web::HTML::CrossProcessId> navigable_to_adopt = {}, Optional<Web::HTML::CrossProcessId> initial_document_state_id = {}, Vector<Web::HTML::RemoteNavigableDescriptor> remote_navigables = {}, Optional<Web::HTML::SessionHistoryEntryDescriptor> canonical_initial_history_entry = {});
+    ErrorOr<NonnullRefPtr<WebContentClient>> create_web_content_client(Optional<ViewImplementation&>, IsPrivate, Compositing::PageId initial_page_id, Optional<Web::HTML::CrossProcessId> navigable_to_adopt = {}, Optional<Web::HTML::CrossProcessId> initial_document_state_id = {}, Vector<Web::HTML::RemoteNavigableDescriptor> remote_navigables = {}, Optional<Web::HTML::SessionHistoryEntryDescriptor> canonical_initial_history_entry = {}, Web::HTML::VisibilityState system_visibility_state = Web::HTML::VisibilityState::Hidden);
     ErrorOr<void> launch_services();
     void launch_spare_web_content_process();
     ErrorOr<void> launch_compositor_process();
@@ -484,7 +484,7 @@ private:
     virtual void listen_for_style_sheet_sources(DevTools::TabDescription const&, OnStyleSheetSourceReceived) const override;
     virtual void stop_listening_for_style_sheet_sources(DevTools::TabDescription const&) const override;
     virtual void retrieve_sources(DevTools::TabDescription const&, OnSourcesReceived) const override;
-    virtual void retrieve_source(DevTools::TabDescription const&, Web::HTML::ScriptRegistry::Identifier, OnSourceReceived) const override;
+    virtual void retrieve_source(DevTools::TabDescription const&, Web::HTML::ScriptRegistryIdentifier, OnSourceReceived) const override;
     virtual void listen_for_sources(DevTools::TabDescription const&, OnSourceAvailable) const override;
     virtual void stop_listening_for_sources(DevTools::TabDescription const&) const override;
     virtual void attach_debugger(DevTools::TabDescription const&, OnDebuggerPaused, OnDebuggerResumed) const override;
@@ -498,7 +498,7 @@ private:
     virtual void retrieve_debugger_environments(DevTools::TabDescription const&, u64 frame_id, OnDebuggerEnvironmentsReceived) const override;
     virtual void evaluate_javascript_in_debugger_frame(DevTools::TabDescription const&, u64 frame_id, String const&, OnDebuggerEvaluationComplete) const override;
     virtual void retrieve_debugger_object_properties(DevTools::TabDescription const&, u64 object_id, OnDebuggerObjectPropertiesReceived) const override;
-    virtual void retrieve_debugger_source_positions(DevTools::TabDescription const&, Web::HTML::ScriptRegistry::Identifier, OnDebuggerSourcePositionsReceived) const override;
+    virtual void retrieve_debugger_source_positions(DevTools::TabDescription const&, Web::HTML::ScriptRegistryIdentifier, OnDebuggerSourcePositionsReceived) const override;
     virtual void resolve_dom_node_url(DevTools::TabDescription const&, Optional<Compositing::UniqueNodeID>, String const&, OnResolvedURLReceived) const override;
     virtual void evaluate_javascript(DevTools::TabDescription const&, String const&, OnScriptEvaluationComplete) const override;
     virtual void listen_for_console_messages(DevTools::TabDescription const&, OnConsoleMessage) const override;

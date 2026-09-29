@@ -19,7 +19,6 @@
 #include <LibWeb/CSS/ComputedValues.h>
 #include <LibWeb/CSS/VisualViewport.h>
 #include <LibWeb/Clipboard/ClipboardEvent.h>
-#include <LibWeb/Clipboard/SystemClipboard.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/Element.h>
 #include <LibWeb/DOM/Range.h>
@@ -52,7 +51,6 @@
 #include <LibWeb/HTML/PaintConfig.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HighResolutionTime/TimeOrigin.h>
-#include <LibWeb/Infra/Strings.h>
 #include <LibWeb/Layout/TextNode.h>
 #include <LibWeb/Layout/Viewport.h>
 #include <LibWeb/Page/AutoScrollHandler.h>
@@ -70,11 +68,13 @@
 #include <LibWeb/UIEvents/InputEvent.h>
 #include <LibWeb/UIEvents/InputTypes.h>
 #include <LibWeb/UIEvents/KeyboardEvent.h>
-#include <LibWeb/UIEvents/MouseButton.h>
 #include <LibWeb/UIEvents/MouseEvent.h>
 #include <LibWeb/UIEvents/PointerEvent.h>
 #include <LibWeb/UIEvents/TextEvent.h>
 #include <LibWeb/UIEvents/WheelEvent.h>
+#include <LibWebCommon/Clipboard/SystemClipboard.h>
+#include <LibWebCommon/Infra/Strings.h>
+#include <LibWebCommon/UIEvents/MouseButton.h>
 
 #include <SDL3/SDL_events.h>
 #include <SDL3/SDL_joystick.h>
@@ -1633,9 +1633,7 @@ EventResult EventHandler::handle_keydown(UIEvents::KeyCode key, u32 modifiers, u
         hold_scroll_gesture_until_key_release(intent);
         if (perform_scroll_step_for_key_input({ delta_x, delta_y }, intent))
             return;
-        if (scroll_container_of_scroll_target_by(delta_x.to_double(), delta_y.to_double(), Painting::ScrollKind::Relative))
-            return;
-        m_navigable->scroll_viewport_by_delta({ delta_x, delta_y }, Bindings::ScrollBehavior::Auto, Painting::ScrollKind::Relative);
+        m_navigable->scroll_viewport_by_delta({ delta_x, delta_y }, Bindings::ScrollBehavior::Smooth, Painting::ScrollKind::Relative);
     };
     auto scroll_to_the_beginning_for_key_input = [&] {
         hold_scroll_gesture_until_key_release(Compositing::SnapSelectionStrategy::Type::EndPosition);

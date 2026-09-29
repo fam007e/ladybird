@@ -16,13 +16,13 @@
 #include <LibWeb/Bindings/Navigation.h>
 #include <LibWeb/ContentSecurityPolicy/Directives/Directive.h>
 #include <LibWeb/Forward.h>
-#include <LibWeb/HTML/InitialInsertion.h>
-#include <LibWeb/HTML/POSTResource.h>
 #include <LibWeb/HTML/SourceSnapshotParams.h>
 #include <LibWeb/HTML/StructuredSerializeTypes.h>
 #include <LibWeb/HTML/UserNavigationInvolvement.h>
-#include <LibWeb/ReferrerPolicy/ReferrerPolicy.h>
 #include <LibWeb/XHR/FormDataEntry.h>
+#include <LibWebCommon/HTML/InitialInsertion.h>
+#include <LibWebCommon/HTML/POSTResource.h>
+#include <LibWebCommon/ReferrerPolicy/ReferrerPolicy.h>
 
 namespace Web::HTML {
 
@@ -38,9 +38,6 @@ struct NavigateParams {
     Optional<Vector<XHR::FormDataEntry>> form_data_entry_list = {};
     ReferrerPolicy::ReferrerPolicy referrer_policy = ReferrerPolicy::ReferrerPolicy::EmptyString;
     UserNavigationInvolvement user_involvement = UserNavigationInvolvement::None;
-    // NB: A load requested by the UI process carries the ID the UI generated when it recorded the
-    //     navigation; otherwise step 7 of the navigate algorithm generates one.
-    Optional<Utf16String> navigation_id = {};
     GC::Ptr<DOM::Element> source_element = nullptr;
     InitialInsertion initial_insertion = InitialInsertion::No;
     GC::Ptr<NavigationAPIMethodTracker> api_method_tracker = nullptr;

@@ -18,15 +18,15 @@
 #include <LibWeb/Export.h>
 #include <LibWeb/Forward.h>
 #include <LibWeb/HTML/ApplyHistoryStep.h>
-#include <LibWeb/HTML/CrossProcessId.h>
-#include <LibWeb/HTML/HistoryHandlingBehavior.h>
-#include <LibWeb/HTML/HistoryOperation.h>
-#include <LibWeb/HTML/NavigationPopulationRequest.h>
 #include <LibWeb/HTML/NavigationSourceSnapshot.h>
-#include <LibWeb/HTML/ReplicatedNavigableState.h>
 #include <LibWeb/HTML/SessionHistoryEntry.h>
 #include <LibWeb/HTML/UserNavigationInvolvement.h>
-#include <LibWeb/HTML/VisibilityState.h>
+#include <LibWebCommon/HTML/CrossProcessId.h>
+#include <LibWebCommon/HTML/HistoryHandlingBehavior.h>
+#include <LibWebCommon/HTML/HistoryOperation.h>
+#include <LibWebCommon/HTML/NavigationPopulationRequest.h>
+#include <LibWebCommon/HTML/ReplicatedNavigableState.h>
+#include <LibWebCommon/HTML/VisibilityState.h>
 
 namespace Web::HTML {
 
@@ -42,7 +42,7 @@ class WEB_API HistoryExecutor final : public GC::Cell {
 
 public:
     using OnHistoryOperationReady = GC::Function<void(Web::HistoryOperationReadyResult)>;
-    using OnHistoryOperationPreSteps = GC::Function<void(Optional<Web::ReconstructedChildNavigation>, GC::Ref<OnHistoryOperationReady>)>;
+    using OnHistoryOperationPreSteps = GC::Function<void(GC::Ref<OnHistoryOperationReady>)>;
     struct HistoryOperationState {
         GC::Ptr<DOM::Document> pending_document {};
         GC::Ptr<LocalNavigable> expected_ongoing_navigation_navigable {};
@@ -65,7 +65,7 @@ public:
 
     void request_history_operation(HistoryOperationParameters);
     void request_history_operation(HistoryOperationParameters, HistoryOperationState);
-    void handle_ui_history_operation_started(CrossProcessId operation_id, Optional<Web::ReconstructedChildNavigation>, GC::Ref<OnHistoryOperationReady>);
+    void handle_ui_history_operation_started(CrossProcessId operation_id, GC::Ref<OnHistoryOperationReady>);
     void complete_ui_history_operation(CrossProcessId operation_id, HistoryStepResult, Optional<i32> committed_step);
 
     void traverse_the_history_by_delta(int delta, GC::Ptr<DOM::Document> source_document = {});
@@ -75,7 +75,7 @@ public:
     void run_ui_changing_navigable_history_job(CrossProcessId operation_id, CrossProcessId navigable_id, SessionHistoryEntryDescriptor target_entry, UserNavigationInvolvement, Optional<Bindings::NavigationType>, TraversalYieldsTo, Optional<Utf16String> canceled_navigation_id, GC::Ref<OnChangingNavigableHistoryStepJobComplete>, Optional<HistoryNavigationPopulation> = {});
     bool resume_history_navigation_population(CrossProcessId operation_id, HistoryNavigationPopulation&&);
     void prepare_ui_changing_navigable_for_unload(CrossProcessId operation_id, CrossProcessId navigable_id, GC::Ref<GC::Function<void()>> on_complete);
-    void apply_ui_changing_navigable_continuation(CrossProcessId operation_id, CrossProcessId navigable_id, HistoryObjectLengthAndIndex, Vector<SessionHistoryEntryDescriptor> entries_for_navigation_api, VisibilityState, UnloadDisplayedDocument, GC::Ref<GC::Function<void(Optional<ReplicatedNavigableState>, Optional<SessionHistoryEntryPersistedState>)>>);
+    void apply_ui_changing_navigable_continuation(CrossProcessId operation_id, CrossProcessId navigable_id, HistoryObjectLengthAndIndex, Vector<SessionHistoryEntryDescriptor> entries_for_navigation_api, UnloadDisplayedDocument, GC::Ref<GC::Function<void(Optional<HostedNavigableState>, Optional<SessionHistoryEntryPersistedState>)>>);
 
 private:
     explicit HistoryExecutor(Page&);
@@ -105,10 +105,9 @@ private:
     struct LocalApplyChangingNavigableHistoryStepContinuation {
         HistoryObjectLengthAndIndex history_object_length_and_index;
         Vector<NonnullRefPtr<SessionHistoryEntry>> entries_for_navigation_api;
-        VisibilityState system_visibility_state { VisibilityState::Hidden };
     };
     bool run_changing_navigable_history_step_job_impl(ChangingNavigableHistoryStepJob, GC::Ptr<SourceSnapshotParams>, GC::Ptr<DOM::Document> pending_document, GC::Ref<OnLocalChangingNavigableHistoryStepJobComplete>);
-    void apply_changing_navigable_history_step_continuation_impl(GC::Ref<ChangingNavigableContinuationState>, LocalApplyChangingNavigableHistoryStepContinuation, UnloadDisplayedDocument, GC::Ref<GC::Function<void(Optional<ReplicatedNavigableState>, Optional<SessionHistoryEntryPersistedState>)>> on_complete);
+    void apply_changing_navigable_history_step_continuation_impl(GC::Ref<ChangingNavigableContinuationState>, LocalApplyChangingNavigableHistoryStepContinuation, UnloadDisplayedDocument, GC::Ref<GC::Function<void(Optional<HostedNavigableState>, Optional<SessionHistoryEntryPersistedState>)>> on_complete);
 
     GC::Ref<Page> m_page;
 

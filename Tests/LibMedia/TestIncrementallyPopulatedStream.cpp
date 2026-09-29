@@ -5,6 +5,7 @@
  */
 
 #include <AK/ByteBuffer.h>
+#include <AK/Function.h>
 #include <LibCore/EventLoop.h>
 #include <LibMedia/IncrementallyPopulatedStream.h>
 #include <LibTest/TestCase.h>
@@ -185,7 +186,7 @@ TEST_CASE(add_chunk_at_offset)
 
     auto stream = Media::IncrementallyPopulatedStream::create_empty();
     stream->set_expected_size(100);
-    stream->set_data_request_callback([](u64) { });
+    stream->set_data_request_callback([](Optional<u64>) { });
 
     auto data = make_test_data(80);
     stream->add_chunk_at(0, data.bytes().trim(30));
@@ -558,11 +559,11 @@ TEST_CASE(data_request_callback_invoked)
     bool callback_invoked { false };
     u64 requested_offset { 0 };
 
-    stream->set_data_request_callback([&](u64 offset) {
+    stream->set_data_request_callback([&](Optional<u64> offset) {
         auto data = make_test_data(100);
         stream->add_chunk_at(seek_position, data.bytes());
         callback_invoked = true;
-        requested_offset = offset;
+        requested_offset = offset.value();
     });
 
     auto cursor = stream->create_cursor();
@@ -585,5 +586,262 @@ TEST_CASE(data_request_callback_invoked)
     EXPECT(callback_invoked);
     EXPECT(requested_offset >= initial_chunk_size);
 
+    MUST(thread->join());
+}
+
+TEST_CASE(close_crossing_a_new_request_keeps_the_end_of_the_closing_fetch)
+{
+    auto& loop = never_destroyed_event_loop();
+
+    static constexpr u64 stream_size = 2 * MiB;
+    static constexpr u64 tail_position = stream_size - 100;
+    auto data = make_test_data(stream_size);
+
+    IGNORE_USE_IN_ESCAPING_LAMBDA auto stream = Media::IncrementallyPopulatedStream::create_empty();
+    stream->set_expected_size(stream_size);
+    stream->add_chunk_at(0, data.bytes().trim(100));
+
+    IGNORE_USE_IN_ESCAPING_LAMBDA Vector<u64> requested_offsets;
+    stream->set_data_request_callback([&](Optional<u64> offset) {
+        if (!offset.has_value())
+            return;
+        requested_offsets.append(*offset);
+        if (requested_offsets.size() == 1) {
+            // The fetch from the requested offset runs to the end of the resource.
+            stream->add_chunk_at(*offset, data.bytes().slice(*offset));
+            return;
+        }
+        // The first fetch's close arrives after the stream has already requested data elsewhere.
+        stream->close();
+        stream->add_chunk_at(*offset, data.bytes().slice(*offset, 200));
+    });
+
+    auto read_on_thread = [&](u64 position) {
+        IGNORE_USE_IN_ESCAPING_LAMBDA auto cursor = stream->create_cursor();
+        MUST(cursor->seek(position, SeekMode::SetPosition));
+        IGNORE_USE_IN_ESCAPING_LAMBDA Optional<Media::DecoderErrorOr<size_t>> result;
+        IGNORE_USE_IN_ESCAPING_LAMBDA Atomic<bool> finished { false };
+        auto thread = Threading::Thread::construct("TestRead"sv, [&]() -> intptr_t {
+            Array<u8, 10> buffer;
+            result = cursor->read_into(buffer);
+            finished = true;
+            return 0;
+        });
+        thread->start();
+        auto start_time = MonotonicTime::now_coarse();
+        while (!finished && MonotonicTime::now_coarse() - start_time < AK::Duration::from_seconds(1))
+            loop.pump(Core::EventLoop::WaitMode::PollForEvents);
+        if (!finished)
+            cursor->abort();
+        MUST(thread->join());
+        return result.release_value();
+    };
+
+    EXPECT_EQ(MUST(read_on_thread(tail_position)), 10u);
+    EXPECT_EQ(requested_offsets.size(), 1u);
+
+    auto result = read_on_thread(100);
+    EXPECT_EQ(requested_offsets.size(), 2u);
+    EXPECT(!result.is_error());
+    EXPECT_EQ(stream->expected_size().value(), stream_size);
+}
+
+TEST_CASE(chunks_past_the_end_are_dropped_once_closed)
+{
+    auto stream = Media::IncrementallyPopulatedStream::create_empty();
+    auto data = make_test_data(100);
+
+    stream->add_chunk_at(0, data.bytes());
+    stream->close();
+    EXPECT_EQ(stream->expected_size().value(), 100u);
+
+    auto extra_data = make_test_data(50);
+    stream->add_chunk_at(100, extra_data.bytes());
+
+    auto ranges = stream->available_byte_ranges();
+    EXPECT_EQ(ranges.size(), 1u);
+    EXPECT_EQ(ranges[0].start, 0u);
+    EXPECT_EQ(ranges[0].end, 100u);
+
+    // A chunk straddling the end is cut at the end.
+    stream->add_chunk_at(90, extra_data.bytes().trim(20));
+
+    ranges = stream->available_byte_ranges();
+    EXPECT_EQ(ranges.size(), 1u);
+    EXPECT_EQ(ranges[0].end, 100u);
+
+    auto cursor = stream->create_cursor();
+    MUST(cursor->seek(90, SeekMode::SetPosition));
+
+    Array<u8, 10> buffer;
+    EXPECT_EQ(MUST(cursor->read_into(buffer)), 10u);
+    for (size_t i = 0; i < 10; i++)
+        EXPECT_EQ(buffer[i], static_cast<u8>(90 + i));
+
+    auto result = cursor->read_into(buffer);
+    EXPECT(result.is_error());
+    EXPECT_EQ(result.error().category(), Media::DecoderErrorCategory::EndOfStream);
+}
+
+TEST_CASE(chunks_before_the_end_are_accepted_once_closed)
+{
+    auto stream = Media::IncrementallyPopulatedStream::create_empty();
+    auto data = make_test_data(100);
+
+    stream->add_chunk_at(60, data.bytes().slice(60));
+    stream->close();
+    EXPECT_EQ(stream->expected_size().value(), 100u);
+
+    stream->add_chunk_at(0, data.bytes().trim(60));
+
+    auto ranges = stream->available_byte_ranges();
+    EXPECT_EQ(ranges.size(), 1u);
+    EXPECT_EQ(ranges[0].start, 0u);
+    EXPECT_EQ(ranges[0].end, 100u);
+    EXPECT_EQ(stream->expected_size().value(), 100u);
+
+    auto cursor = stream->create_cursor();
+    Array<u8, 100> buffer;
+    EXPECT_EQ(MUST(cursor->read_into(buffer)), 100u);
+    for (size_t i = 0; i < 100; i++)
+        EXPECT_EQ(buffer[i], static_cast<u8>(i));
+}
+
+TEST_CASE(idling_stops_the_request_once_no_read_is_waiting)
+{
+    auto& loop = never_destroyed_event_loop();
+
+    auto stream = Media::IncrementallyPopulatedStream::create_empty();
+    stream->set_expected_size(100);
+
+    Vector<Optional<u64>> requests;
+    stream->set_data_request_callback([&](Optional<u64> offset) {
+        requests.append(offset);
+    });
+
+    auto cursor = stream->create_cursor();
+    IGNORE_USE_IN_ESCAPING_LAMBDA Atomic<bool> read_blocked { false };
+    cursor->set_blocked_change_handler([&](Media::ReadBlocked blocked) {
+        read_blocked = blocked == Media::ReadBlocked::Yes;
+    });
+    auto thread = Threading::Thread::construct("TestIdle"sv, [cursor]() -> intptr_t {
+        Array<u8, 10> buffer;
+        MUST(cursor->read_into(buffer));
+        return 0;
+    });
+    thread->start();
+    while (!read_blocked.load())
+        ;
+
+    // The initial fetch keeps going while the read waits on it.
+    stream->set_may_idle(true);
+    loop.pump(Core::EventLoop::WaitMode::PollForEvents);
+    EXPECT(requests.is_empty());
+
+    auto data = make_test_data(100);
+    stream->add_chunk_at(0, data.bytes());
+    MUST(thread->join());
+    loop.pump(Core::EventLoop::WaitMode::PollForEvents);
+    EXPECT_EQ(requests.size(), 1u);
+    EXPECT(!requests[0].has_value());
+
+    // Nothing is waiting, so withdrawing the permission asks for nothing.
+    stream->set_may_idle(false);
+    stream->set_may_idle(true);
+    loop.pump(Core::EventLoop::WaitMode::PollForEvents);
+    EXPECT_EQ(requests.size(), 1u);
+}
+
+TEST_CASE(withdrawing_idle_asks_for_the_data_a_read_is_waiting_on)
+{
+    auto& loop = never_destroyed_event_loop();
+
+    static constexpr u64 stream_size = 2 * MiB;
+    static constexpr u64 seek_position = stream_size - 100;
+
+    auto stream = Media::IncrementallyPopulatedStream::create_empty();
+    stream->set_expected_size(stream_size);
+    auto initial_data = make_test_data(100);
+    stream->add_chunk_at(0, initial_data.bytes());
+
+    Vector<Optional<u64>> requests;
+    stream->set_data_request_callback([&](Optional<u64> offset) {
+        requests.append(offset);
+    });
+
+    stream->set_may_idle(true);
+    loop.pump(Core::EventLoop::WaitMode::PollForEvents);
+    EXPECT_EQ(requests.size(), 1u);
+    EXPECT(!requests[0].has_value());
+
+    auto cursor = stream->create_cursor();
+    IGNORE_USE_IN_ESCAPING_LAMBDA Atomic<bool> read_blocked { false };
+    cursor->set_blocked_change_handler([&](Media::ReadBlocked blocked) {
+        read_blocked = blocked == Media::ReadBlocked::Yes;
+    });
+    MUST(cursor->seek(seek_position, SeekMode::SetPosition));
+    auto thread = Threading::Thread::construct("TestWithdraw"sv, [cursor]() -> intptr_t {
+        Array<u8, 10> buffer;
+        MUST(cursor->read_into(buffer));
+        return 0;
+    });
+    thread->start();
+    while (!read_blocked.load())
+        ;
+
+    // A read that starts waiting while idle is allowed does not ask for data.
+    loop.pump(Core::EventLoop::WaitMode::PollForEvents);
+    EXPECT_EQ(requests.size(), 1u);
+
+    stream->set_may_idle(false);
+    loop.pump(Core::EventLoop::WaitMode::PollForEvents);
+    EXPECT_EQ(requests.size(), 2u);
+    EXPECT(requests[1].has_value());
+    EXPECT(requests[1].value() >= 100u);
+    EXPECT(requests[1].value() <= seek_position);
+
+    auto data = make_test_data(100);
+    stream->add_chunk_at(seek_position, data.bytes());
+    MUST(thread->join());
+}
+
+TEST_CASE(withdrawing_idle_asks_for_data_before_any_arrived)
+{
+    auto& loop = never_destroyed_event_loop();
+
+    auto stream = Media::IncrementallyPopulatedStream::create_empty();
+    stream->set_expected_size(100);
+
+    Vector<Optional<u64>> requests;
+    stream->set_data_request_callback([&](Optional<u64> offset) {
+        requests.append(offset);
+    });
+
+    stream->set_may_idle(true);
+    loop.pump(Core::EventLoop::WaitMode::PollForEvents);
+    EXPECT_EQ(requests.size(), 1u);
+    EXPECT(!requests[0].has_value());
+
+    auto cursor = stream->create_cursor();
+    IGNORE_USE_IN_ESCAPING_LAMBDA Atomic<bool> read_blocked { false };
+    cursor->set_blocked_change_handler([&](Media::ReadBlocked blocked) {
+        read_blocked = blocked == Media::ReadBlocked::Yes;
+    });
+    auto thread = Threading::Thread::construct("TestWithdrawEmpty"sv, [cursor]() -> intptr_t {
+        Array<u8, 10> buffer;
+        MUST(cursor->read_into(buffer));
+        return 0;
+    });
+    thread->start();
+    while (!read_blocked.load())
+        ;
+
+    stream->set_may_idle(false);
+    loop.pump(Core::EventLoop::WaitMode::PollForEvents);
+    EXPECT_EQ(requests.size(), 2u);
+    EXPECT_EQ(requests[1], 0u);
+
+    auto data = make_test_data(100);
+    stream->add_chunk_at(0, data.bytes());
     MUST(thread->join());
 }

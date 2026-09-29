@@ -5,6 +5,7 @@ set(TEST_SOURCES
     TestADTSFrameHeader.cpp
     TestADTSReader.cpp
     TestAudioBlockTimingRing.cpp
+    TestAudioDiscardIntervals.cpp
     TestAudioServerPath.cpp
     TestBitReader.cpp
     TestBufferedRanges.cpp
@@ -36,6 +37,7 @@ set(TEST_SOURCES
     TestRemoteVideoNode.cpp
     TestSpscAudioFrameRing.cpp
     TestTimeRanges.cpp
+    TestTrackBufferDemuxer.cpp
     TestVideoEdgeQueue.cpp
     TestVideoFramePool.cpp
     TestVorbisDecode.cpp

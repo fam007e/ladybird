@@ -12,7 +12,6 @@
 #include <LibCore/Forward.h>
 #include <LibCore/Timer.h>
 #include <LibGfx/Forward.h>
-#include <LibWeb/Page/Page.h>
 #include <LibWebView/Forward.h>
 #include <LibWebView/ViewImplementation.h>
 
@@ -56,7 +55,7 @@ protected:
     void propagate_web_content_crash(WebContentCrashReason);
     void discard_child_web_view(HeadlessWebView&);
     void schedule_forced_close();
-    void initialize_client(CreateNewClient, Optional<Web::HTML::CrossProcessId> initial_document_state_id = {}) override;
+    void prepare_page_for_tab(WebContentPage&) override;
     void update_zoom() override;
 
     virtual Compositing::DevicePixelSize viewport_size() const override { return m_viewport_size; }
@@ -66,7 +65,7 @@ protected:
     Core::AnonymousBuffer m_theme;
     Compositing::DevicePixelSize m_viewport_size;
 
-    Web::Page::PendingDialog m_pending_dialog { Web::Page::PendingDialog::None };
+    Web::PendingDialog m_pending_dialog { Web::PendingDialog::None };
     Optional<Utf16String> m_pending_prompt_text;
 
     // When restoring from fullscreen, we need to know to what dimension.

@@ -23,23 +23,25 @@
 #include <LibJS/Forward.h>
 #include <LibWeb/Bindings/Navigation.h>
 #include <LibWeb/Bindings/NavigationType.h>
-#include <LibWeb/CSS/PreferredColorScheme.h>
-#include <LibWeb/CSS/PreferredContrast.h>
-#include <LibWeb/CSS/PreferredMotion.h>
+#include <LibWeb/ContentSecurityPolicy/Directives/Directive.h>
 #include <LibWeb/Forward.h>
-#include <LibWeb/HTML/AutoplayPolicy.h>
 #include <LibWeb/HTML/SessionHistoryEntry.h>
-#include <LibWeb/HTML/WorkerAgentTypes.h>
 #include <LibWeb/Loader/FileRequest.h>
-#include <LibWeb/Page/EventResult.h>
-#include <LibWeb/Page/QueuedInputEvent.h>
-#include <LibWeb/Page/ViewportIsFullscreen.h>
+#include <LibWeb/Page/Page.h>
 #include <LibWeb/Platform/Timer.h>
-#include <LibWebView/DOMNodeProperties.h>
-#include <LibWebView/Debugger.h>
-#include <LibWebView/Forward.h>
-#include <LibWebView/Geolocation.h>
-#include <LibWebView/PageInfo.h>
+#include <LibWebCommon/CSS/PreferredColorScheme.h>
+#include <LibWebCommon/CSS/PreferredContrast.h>
+#include <LibWebCommon/CSS/PreferredMotion.h>
+#include <LibWebCommon/Forward.h>
+#include <LibWebCommon/HTML/AutoplayPolicy.h>
+#include <LibWebCommon/HTML/WorkerAgentTypes.h>
+#include <LibWebCommon/Page/EventResult.h>
+#include <LibWebCommon/Page/QueuedInputEvent.h>
+#include <LibWebCommon/Page/ViewportIsFullscreen.h>
+#include <LibWebCommon/WebView/DOMNodeProperties.h>
+#include <LibWebCommon/WebView/Debugger.h>
+#include <LibWebCommon/WebView/Geolocation.h>
+#include <LibWebCommon/WebView/PageInfo.h>
 #include <WebContent/Forward.h>
 #include <WebContent/WebContentClientEndpoint.h>
 #include <WebContent/WebContentConsoleClient.h>
@@ -68,11 +70,14 @@ public:
 
     PageHost& page_host() { return *m_page_host; }
     PageHost const& page_host() const { return *m_page_host; }
-    WebView::CompositorConnection* compositor_process_connection() const;
+    Web::Compositor::CompositorConnection* compositor_process_connection() const;
     void did_destroy_compositor_context(Compositing::CompositorContextId);
 
     Function<void(IPC::TransportHandle const&)> on_request_server_connection;
     Function<void(IPC::TransportHandle const&)> on_image_decoder_connection;
+
+    // Asks the Browser to spawn this process's MediaServer if it has none, and to connect a client to it.
+    ErrorOr<NonnullOwnPtr<IPC::Transport>> request_media_server_transport();
 #if defined(HAVE_WASM_COMPILER_SERVICE)
     Function<void(IPC::TransportHandle)> on_wasm_compiler_connection;
 #endif
@@ -117,12 +122,12 @@ private:
     virtual void compositor_process_reconnected() override;
     virtual void update_system_theme(Compositing::PageId page_id, Core::AnonymousBuffer) override;
     virtual void update_screen_rects(Compositing::PageId page_id, Vector<Compositing::DevicePixelRect>, u32) override;
-    virtual void load_url(Compositing::PageId page_id, URL::URL, Web::Bindings::NavigationHistoryBehavior, Utf16String navigation_id) override;
     virtual void populate_navigation(Compositing::PageId page_id, Web::HTML::NavigationPopulationRequest, Web::HTML::NavigationPopulationResult) override;
-    virtual void load_html(Compositing::PageId page_id, ByteString, Utf16String navigation_id) override;
-    virtual void reload(Compositing::PageId page_id) override;
     virtual void stop_loading(Compositing::PageId page_id) override;
     virtual void cancel_download(Compositing::PageId page_id, u64 download_id) override;
+    virtual void set_ongoing_navigation(Compositing::PageId page_id, Web::HTML::CrossProcessId navigable_id, Utf16String navigation_id) override;
+    virtual void navigate_to_a_fragment(Compositing::PageId page_id, Web::HTML::CrossProcessId navigable_id, URL::URL url, Web::HTML::HistoryHandlingBehavior, Web::HTML::UserNavigationInvolvement, Utf16String navigation_id) override;
+    virtual void navigate_to_a_javascript_url(Compositing::PageId page_id, Web::HTML::CrossProcessId navigable_id, URL::URL url, Web::HTML::HistoryHandlingBehavior, URL::Origin initiator_origin, Web::HTML::NavigationSourceSnapshot source_snapshot_params, Web::HTML::UserNavigationInvolvement, Web::ContentSecurityPolicy::Directives::Directive::NavigationType csp_navigation_type, Utf16String navigation_id) override;
     virtual void run_navigation_unload_check(Compositing::PageId page_id, Web::HTML::CrossProcessId navigable_id, Utf16String navigation_id, Web::HTML::UnloadPromptShown) override;
     virtual void create_navigation_params(Compositing::PageId page_id, Web::HTML::NavigationPopulationRequest) override;
     virtual void cancel_navigation_params_creation(Compositing::PageId page_id, Web::HTML::CrossProcessId navigable_id, Utf16String navigation_id) override;
@@ -135,16 +140,16 @@ private:
     virtual void begin_hosting_navigable(Compositing::PageId page_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::SessionHistoryEntryDescriptor, Web::HTML::VisibilityState) override;
     virtual void discard_provisional_navigable(Compositing::PageId page_id, Web::HTML::CrossProcessId navigable_id) override;
     virtual void stop_hosting_navigable(Compositing::PageId page_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::ReplicatedNavigableState) override;
-    virtual void host_navigable(Compositing::PageId page_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::SessionHistoryEntryDescriptor, Web::HTML::VisibilityState) override;
     virtual void set_hosted_root_viewport(Compositing::PageId page_id, Web::HTML::CrossProcessId navigable_id, Compositing::DevicePixelSize, Compositing::DevicePixelRect viewport_intersection, double device_pixel_ratio) override;
-    virtual void history_operation_started(Compositing::PageId page_id, Web::HTML::CrossProcessId operation_id, Optional<Web::ReconstructedChildNavigation> reconstructed_child_navigation) override;
+    virtual void history_operation_started(Compositing::PageId page_id, Web::HTML::CrossProcessId operation_id) override;
+    virtual void reconstruct_child_navigable_history(Compositing::PageId page_id, Web::HTML::CrossProcessId navigable_id, Web::ReconstructedChildNavigation navigation) override;
     virtual void run_history_step_unload_cancelation_job(Compositing::PageId page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::SessionHistoryEntryDescriptor target_entry, Vector<Web::HTML::CrossProcessId> navigables_crossing_documents, Web::HTML::UserNavigationInvolvement user_involvement) override;
     virtual void run_beforeunload_check(Compositing::PageId page_id, Web::HTML::CrossProcessId operation_id, Vector<Web::HTML::CrossProcessId> navigable_ids, Web::HTML::UnloadPromptShown unload_prompt_shown) override;
     virtual void discard_embedded_page(Compositing::PageId page_id) override;
     virtual void queue_navigation_api_state_clear_task(Compositing::PageId page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id) override;
     virtual void run_changing_navigable_history_job(Compositing::PageId page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::SessionHistoryEntryDescriptor target_entry, Web::HTML::UserNavigationInvolvement user_involvement, Optional<Web::Bindings::NavigationType> navigation_type, Web::HTML::TraversalYieldsTo traversal_yields_to, Optional<Utf16String> canceled_navigation_id) override;
     virtual void prepare_changing_navigable_for_unload(Compositing::PageId page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id) override;
-    virtual void apply_changing_navigable_continuation(Compositing::PageId page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id, u64 script_history_length, u64 script_history_index, Vector<Web::HTML::SessionHistoryEntryDescriptor> entries_for_navigation_api, Web::HTML::VisibilityState system_visibility_state, Web::HTML::UnloadDisplayedDocument unload_displayed_document) override;
+    virtual void apply_changing_navigable_continuation(Compositing::PageId page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id, u64 script_history_length, u64 script_history_index, Vector<Web::HTML::SessionHistoryEntryDescriptor> entries_for_navigation_api, Web::HTML::UnloadDisplayedDocument unload_displayed_document) override;
     virtual void run_descendant_unload_task(Compositing::PageId page_id, Web::HTML::CrossProcessId unload_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::ChildNavigableDestruction, Web::HTML::StopHostingAfterUnload) override;
     virtual void continue_child_navigable_destruction(Compositing::PageId page_id, Web::HTML::CrossProcessId navigable_id) override;
     virtual void abort_navigable_document(Compositing::PageId page_id, Web::HTML::CrossProcessId navigable_id) override;
@@ -246,6 +251,7 @@ private:
     virtual void handle_file_return(Compositing::PageId page_id, i32 error, Optional<IPC::File> file, i32 request_id) override;
     virtual void blob_url_entry_removed(Utf16String url) override;
     virtual void did_delete_all_cookies(Compositing::PageId page_id, u64 request_id) override;
+    virtual void set_system_visibility_state(Compositing::PageId page_id, Web::HTML::VisibilityState) override;
     virtual void update_visibility_state(Compositing::PageId page_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::VisibilityState) override;
     virtual void reset_zoom(Compositing::PageId page_id) override;
 
@@ -313,7 +319,7 @@ private:
     virtual void exit_fullscreen(Compositing::PageId page_id) override;
 
     RefPtr<TestConnection> m_test_connection;
-    RefPtr<WebView::CompositorConnection> m_compositor_connection;
+    RefPtr<Web::Compositor::CompositorConnection> m_compositor_connection;
     NonnullOwnPtr<PageHost> m_page_host;
     OwnPtr<DevToolsDebugger> m_devtools_debugger;
 

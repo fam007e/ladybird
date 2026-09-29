@@ -53,6 +53,10 @@ private:
     virtual void update_canvas_2d_stream(Vector<Compositing::Canvas2DCommandStreamSegment>, Vector<Compositing::DisplayListFontResource>) override;
     virtual void destroy_canvas_context(Compositing::CanvasId) override;
     virtual Messages::CompositorWebContentServer::GetCanvasPixelsResponse get_canvas_pixels(Compositing::CanvasId, Gfx::IntRect) override;
+    virtual Messages::CompositorWebContentServer::AllocatePlaceholderCanvasResponse allocate_placeholder_canvas() override;
+    virtual void release_placeholder_canvas(Compositing::CanvasId) override;
+    virtual void commit_placeholder_canvas(Compositing::CanvasId, u64 secret, Optional<Compositing::CanvasId> source_canvas_id, Gfx::IntSize, bool origin_clean) override;
+    virtual Messages::CompositorWebContentServer::GetPlaceholderCanvasPixelsResponse get_placeholder_canvas_pixels(Compositing::CanvasId, Gfx::IntRect) override;
 
     virtual Messages::CompositorWebContentServer::CreateWebglContextResponse create_webgl_context(Compositing::WebGL::WebGLVersion webgl_version, Gfx::IntSize size, bool depth, bool stencil, bool antialias) override;
     virtual void webgl_set_command_buffer(Compositing::CanvasId canvas_id, Core::AnonymousBuffer command_buffer) override;
@@ -60,13 +64,14 @@ private:
     virtual void webgl_drain_command_buffer(Compositing::CanvasId canvas_id) override;
     virtual void webgl_commands(Compositing::CanvasId canvas_id, Core::AnonymousBuffer commands, Vector<Gfx::DecodedImageFrame> bitmaps) override;
     virtual void webgl_present_canvas(Compositing::CanvasId canvas_id, bool preserve_drawing_buffer) override;
+    virtual void webgl_clear_drawing_buffer(Compositing::CanvasId canvas_id) override;
     virtual Messages::CompositorWebContentServer::WebglSyncCallResponse webgl_sync_call(Compositing::CanvasId canvas_id, ByteBuffer request) override;
     virtual Messages::CompositorWebContentServer::WebglReadPixelsResponse webgl_read_pixels(Compositing::CanvasId canvas_id, i32 x, i32 y, i32 width, i32 height, u32 format, u32 type, i32 buf_size, Core::AnonymousBuffer pixels) override;
     virtual Messages::CompositorWebContentServer::WebglReadBufferSubDataResponse webgl_read_buffer_sub_data(Compositing::CanvasId canvas_id, u32 target, i64 offset, i64 size, Core::AnonymousBuffer data) override;
     virtual void invalidate_wheel_event_listener_state(Compositing::CompositorContextId, u64 generation) override;
     virtual void invalidate_keyboard_scroll_state(Compositing::CompositorContextId, u64 generation) override;
     virtual Messages::CompositorWebContentServer::AsyncScrollByResponse async_scroll_by(Compositing::CompositorContextId, Compositing::UniqueNodeID document_id, Gfx::FloatPoint position, Gfx::FloatPoint delta, Gfx::IntRect viewport_rect, Compositing::WheelDeltaPrecision, Compositing::ScrollGesturePhase, u32 modifiers, Compositing::AsyncScrollOperationTracking) override;
-    virtual Messages::CompositorWebContentServer::SmoothScrollToResponse smooth_scroll_to(Compositing::CompositorContextId, Compositing::AsyncScrollNodeStableID, Gfx::FloatPoint offset, Gfx::FloatPoint main_thread_offset, Gfx::IntRect viewport_rect, Compositing::ScrollAnimationKind) override;
+    virtual Messages::CompositorWebContentServer::SmoothScrollToResponse smooth_scroll_to(Compositing::CompositorContextId, Compositing::AsyncScrollNodeStableID, Gfx::FloatPoint offset, Gfx::FloatPoint main_thread_offset, Gfx::IntRect viewport_rect, Compositing::ScrollAnimationKind, Compositing::SmoothScrollInitiator) override;
     virtual void cancel_smooth_scroll(Compositing::CompositorContextId, Compositing::AsyncScrollNodeStableID) override;
     virtual Messages::CompositorWebContentServer::TakePendingAsyncScrollUpdatesResponse take_pending_async_scroll_updates(Compositing::CompositorContextId) override;
     virtual void viewport_size_updated(Compositing::CompositorContextId, Gfx::IntSize viewport_size, Compositing::WindowResizingInProgress) override;
@@ -82,6 +87,7 @@ private:
     virtual void async_scroll_updates(Compositing::CompositorContextId, Compositing::PendingAsyncScrollUpdates const&) override;
     virtual void create_video_edge(Media::VideoSinkHandle) override;
     virtual void release_video_edge(Media::VideoSinkHandle) override;
+    virtual void placeholder_canvas_committed(Compositing::CanvasId, Gfx::IntSize, bool origin_clean) override;
     bool context_is_owned_by_this_connection(Compositing::CompositorContextId);
 
     NonnullRefPtr<CompositorState> m_compositor_state;

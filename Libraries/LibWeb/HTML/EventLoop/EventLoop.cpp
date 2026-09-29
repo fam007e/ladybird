@@ -5,6 +5,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/AnyOf.h>
 #include <AK/Debug.h>
 #include <AK/TemporaryChange.h>
 #include <LibCore/EventLoop.h>
@@ -19,6 +20,7 @@
 #include <LibWeb/HTML/EventLoop/EventLoop.h>
 #include <LibWeb/HTML/HTMLMediaElement.h>
 #include <LibWeb/HTML/LocalTraversableNavigable.h>
+#include <LibWeb/HTML/NavigableContainer.h>
 #include <LibWeb/HTML/Scripting/Agent.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/Scripting/TemporaryExecutionContext.h>
@@ -29,11 +31,11 @@
 #include <LibWeb/IndexedDB/Internal/Algorithms.h>
 #include <LibWeb/Layout/Node.h>
 #include <LibWeb/Page/Page.h>
-#include <LibWeb/Page/QueuedInputEvent.h>
 #include <LibWeb/Painting/BoxViews.h>
 #include <LibWeb/Painting/DocumentPaintState.h>
 #include <LibWeb/Platform/EventLoopPlugin.h>
 #include <LibWeb/Platform/Timer.h>
+#include <LibWebCommon/Page/QueuedInputEvent.h>
 
 namespace Web::HTML {
 
@@ -771,6 +773,14 @@ void EventLoop::update_the_rendering()
         ++m_rendering_scheduler_counters.paints;
         if (navigable->is_local_root())
             navigable->page().process_screenshot_requests();
+    }
+
+    // AD-HOC: Any scroll or layout of a document between a navigable container and its local root moves the rect the
+    //         UI process routes input over the container's content navigable by. Report the rects of the containers
+    //         in docs, whose layout is up to date along with that of every document above them.
+    for (auto* container : NavigableContainer::all_instances()) {
+        if (any_of(docs, [&](auto const& document) { return document.ptr() == &container->document(); }))
+            container->report_content_navigable_viewport_rect();
     }
 
     // 23. For each doc of docs, process top layer removals given doc.

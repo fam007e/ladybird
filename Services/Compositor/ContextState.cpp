@@ -823,7 +823,7 @@ ContextState::AsyncScrollResult ContextState::async_scroll_by(
     };
 }
 
-ContextState::AsyncScrollResult ContextState::smooth_scroll_to(Compositing::AsyncScrollNodeStableID stable_node_id, Gfx::FloatPoint destination_offset, Gfx::FloatPoint main_thread_offset, Gfx::IntRect viewport_rect, Compositing::ScrollAnimationKind animation_kind)
+ContextState::AsyncScrollResult ContextState::smooth_scroll_to(Compositing::AsyncScrollNodeStableID stable_node_id, Gfx::FloatPoint destination_offset, Gfx::FloatPoint main_thread_offset, Gfx::IntRect viewport_rect, Compositing::ScrollAnimationKind animation_kind, Compositing::SmoothScrollInitiator initiator)
 {
     if (!m_has_async_scrolling_state)
         return {};
@@ -859,6 +859,7 @@ ContextState::AsyncScrollResult ContextState::smooth_scroll_to(Compositing::Asyn
         .operation_id = operation_id,
         .animation = move(animation),
         .started_at = MonotonicTime::now(),
+        .is_user_scroll = initiator == Compositing::SmoothScrollInitiator::UserInput,
     });
     m_async_scrolling_viewport_rect = viewport_rect;
     return {
@@ -1371,13 +1372,18 @@ Optional<Gfx::IntRect> ContextState::frame_rect_to_repaint() const
     return m_presented_frame;
 }
 
-Optional<Gfx::IntRect> ContextState::video_present_rect() const
+Optional<Gfx::IntRect> ContextState::self_present_rect() const
 {
     if (m_presented_frame.has_value())
         return m_presented_frame;
     if (!m_viewport_size.is_empty())
         return Gfx::IntRect { {}, m_viewport_size };
     return {};
+}
+
+bool ContextState::draws_canvas(Compositing::CanvasId canvas_id) const
+{
+    return m_last_rasterized_frame.has_value() && m_last_rasterized_frame->canvas_content_generations.contains(canvas_id);
 }
 
 Optional<ContextState::PreparedFrame> ContextState::prepare_frame(Compositing::DisplayListPlayerSkia& display_list_player, PendingFrame pending_frame, CompositedContextResolver const* composited_context_resolver)

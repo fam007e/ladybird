@@ -89,7 +89,6 @@
 #include <LibWeb/CSS/StyleValues/RandomValueSharingStyleValue.h>
 #include <LibWeb/CSS/StyleValues/StyleValueList.h>
 #include <LibWeb/CSS/StyleValues/TransformationStyleValue.h>
-#include <LibWeb/CSS/SystemColor.h>
 #include <LibWeb/CSS/TransitionEvent.h>
 #include <LibWeb/CSS/VisualViewport.h>
 #include <LibWeb/ComputedValuesRustFFI.h>
@@ -210,9 +209,7 @@
 #include <LibWeb/HTML/WindowProxy.h>
 #include <LibWeb/HighResolutionTime/Performance.h>
 #include <LibWeb/HighResolutionTime/TimeOrigin.h>
-#include <LibWeb/Infra/CharacterTypes.h>
 #include <LibWeb/Infra/SerializedURL.h>
-#include <LibWeb/Infra/Strings.h>
 #include <LibWeb/IntersectionObserver/IntersectionObserver.h>
 #include <LibWeb/Layout/LayoutRustBridge.h>
 #include <LibWeb/Layout/NodeArena.h>
@@ -248,15 +245,12 @@
 #include <LibWeb/UIEvents/CompositionEvent.h>
 #include <LibWeb/UIEvents/EventNames.h>
 #include <LibWeb/UIEvents/FocusEvent.h>
-#include <LibWeb/UIEvents/KeyCode.h>
 #include <LibWeb/UIEvents/KeyboardEvent.h>
-#include <LibWeb/UIEvents/MouseButton.h>
 #include <LibWeb/UIEvents/MouseEvent.h>
 #include <LibWeb/UIEvents/PointerEvent.h>
 #include <LibWeb/UIEvents/PointerTypes.h>
 #include <LibWeb/UIEvents/TextEvent.h>
 #include <LibWeb/ViewTransition/ViewTransition.h>
-#include <LibWeb/WebDriver/UserPrompt.h>
 #include <LibWeb/WebIDL/AbstractOperations.h>
 #include <LibWeb/WebIDL/DOMException.h>
 #include <LibWeb/WebIDL/ExceptionOr.h>
@@ -264,6 +258,12 @@
 #include <LibWeb/WebIDL/Promise.h>
 #include <LibWeb/XHR/XMLHttpRequest.h>
 #include <LibWeb/XPath/XPath.h>
+#include <LibWebCommon/CSS/SystemColor.h>
+#include <LibWebCommon/Infra/CharacterTypes.h>
+#include <LibWebCommon/Infra/Strings.h>
+#include <LibWebCommon/UIEvents/KeyCode.h>
+#include <LibWebCommon/UIEvents/MouseButton.h>
+#include <LibWebCommon/WebDriver/UserPrompt.h>
 
 namespace Web::DOM {
 
@@ -4356,7 +4356,7 @@ void Document::completely_finish_loading()
     }
     m_completely_loaded_deferred = false;
 
-    navigable->page().client().page_did_change_replicated_navigable_state(navigable->id(), navigable->replicated_state());
+    navigable->page().client().page_did_change_hosted_navigable_state(navigable->id(), navigable->hosted_state());
 
     ScopeGuard notify_observers = [this] {
         notify_each_document_observer([&](auto const& document_observer) {
@@ -4375,11 +4375,10 @@ void Document::completely_finish_loading()
     auto container = navigable->container();
 
     // NB: The container runs steps 4 and 5 where its document is: here, or in the process hosting the parent's
-    //     document, reached through the UI process.
+    //     document, reached through the UI process, which mirrors that the document is completely loaded.
     if (container)
         container->content_navigable_completely_finished_loading();
-    else if (navigable->parent())
-        navigable->page().client().page_did_completely_finish_loading(navigable->id());
+    navigable->page().client().page_did_completely_finish_loading(navigable->id());
 }
 
 // https://html.spec.whatwg.org/multipage/dom.html#dom-document-cookie

@@ -39,58 +39,63 @@
 #include <LibURL/URL.h>
 #include <LibWeb/Bindings/AgentType.h>
 #include <LibWeb/Bindings/Navigation.h>
-#include <LibWeb/CSS/PreferredColorScheme.h>
-#include <LibWeb/CSS/PreferredContrast.h>
-#include <LibWeb/CSS/PreferredMotion.h>
 #include <LibWeb/DOM/RequestFullscreenError.h>
 #include <LibWeb/Export.h>
-#include <LibWeb/FileAPI/SerializedBlobURLEntry.h>
 #include <LibWeb/Forward.h>
-#include <LibWeb/Fullscreen/FullscreenRequestType.h>
 #include <LibWeb/Geolocation/Geolocation.h>
 #include <LibWeb/Geolocation/GeolocationCoordinates.h>
 #include <LibWeb/Geolocation/GeolocationPositionError.h>
-#include <LibWeb/HTML/ActivateTab.h>
-#include <LibWeb/HTML/AudioPlayState.h>
-#include <LibWeb/HTML/ColorPickerUpdateState.h>
-#include <LibWeb/HTML/CrossProcessId.h>
-#include <LibWeb/HTML/FileFilter.h>
 #include <LibWeb/HTML/Focus.h>
-#include <LibWeb/HTML/HistoryHandlingBehavior.h>
-#include <LibWeb/HTML/HistoryOperation.h>
 #include <LibWeb/HTML/NavigationSourceSnapshot.h>
-#include <LibWeb/HTML/POSTResource.h>
-#include <LibWeb/HTML/PostedMessageDescriptor.h>
 #include <LibWeb/HTML/PreparedNavigationDescriptor.h>
-#include <LibWeb/HTML/ReplicatedNavigableState.h>
 #include <LibWeb/HTML/SameDocumentNavigationEntry.h>
 #include <LibWeb/HTML/Scripting/ScriptRegistry.h>
-#include <LibWeb/HTML/SelectItem.h>
 #include <LibWeb/HTML/SessionHistoryEntry.h>
 #include <LibWeb/HTML/TokenizedFeatures.h>
-#include <LibWeb/HTML/UserActivationConsumption.h>
 #include <LibWeb/HTML/UserNavigationInvolvement.h>
-#include <LibWeb/HTML/VisibilityState.h>
 #include <LibWeb/HTML/WebViewHints.h>
-#include <LibWeb/HTML/WorkerAgentForward.h>
-#include <LibWeb/IndexedDB/TransactionChanges.h>
 #include <LibWeb/Loader/FileRequest.h>
-#include <LibWeb/Page/EventResult.h>
-#include <LibWeb/Page/PageId.h>
-#include <LibWeb/Page/QueuedInputEvent.h>
 #include <LibWeb/Page/ScreenWakeLockHandle.h>
-#include <LibWeb/Page/ViewportIsFullscreen.h>
 #include <LibWeb/Painting/ChromeMetrics.h>
-#include <LibWeb/PixelUnits.h>
-#include <LibWeb/StorageAPI/StorageEndpoint.h>
-#include <LibWeb/UIEvents/KeyCode.h>
-#include <LibWebView/StorageSetResult.h>
+#include <LibWebCommon/CSS/PreferredColorScheme.h>
+#include <LibWebCommon/CSS/PreferredContrast.h>
+#include <LibWebCommon/CSS/PreferredMotion.h>
+#include <LibWebCommon/FileAPI/SerializedBlobURLEntry.h>
+#include <LibWebCommon/Fullscreen/FullscreenRequestType.h>
+#include <LibWebCommon/HTML/ActivateTab.h>
+#include <LibWebCommon/HTML/AudioPlayState.h>
+#include <LibWebCommon/HTML/ColorPickerUpdateState.h>
+#include <LibWebCommon/HTML/CrossProcessId.h>
+#include <LibWebCommon/HTML/FileFilter.h>
+#include <LibWebCommon/HTML/HistoryHandlingBehavior.h>
+#include <LibWebCommon/HTML/HistoryOperation.h>
+#include <LibWebCommon/HTML/POSTResource.h>
+#include <LibWebCommon/HTML/PostedMessageDescriptor.h>
+#include <LibWebCommon/HTML/ReplicatedNavigableState.h>
+#include <LibWebCommon/HTML/SelectItem.h>
+#include <LibWebCommon/HTML/UserActivationConsumption.h>
+#include <LibWebCommon/HTML/VisibilityState.h>
+#include <LibWebCommon/HTML/WorkerAgentForward.h>
+#include <LibWebCommon/IndexedDB/TransactionChanges.h>
+#include <LibWebCommon/Page/ContextMenuForInputEventsTarget.h>
+#include <LibWebCommon/Page/EventResult.h>
+#include <LibWebCommon/Page/MediaContextMenu.h>
+#include <LibWebCommon/Page/NavigationTarget.h>
+#include <LibWebCommon/Page/PageId.h>
+#include <LibWebCommon/Page/PendingDialog.h>
+#include <LibWebCommon/Page/QueuedInputEvent.h>
+#include <LibWebCommon/Page/ViewportIsFullscreen.h>
+#include <LibWebCommon/PixelUnits.h>
+#include <LibWebCommon/StorageAPI/StorageEndpoint.h>
+#include <LibWebCommon/UIEvents/KeyCode.h>
+#include <LibWebCommon/WebView/StorageSetResult.h>
 
 namespace Web {
 
 class PageClient;
 namespace Compositor {
 
+class CompositorContextHandle;
 class CompositorHost;
 
 }
@@ -111,6 +116,9 @@ public:
     bool is_screen_wake_lock_active() const { return m_active_screen_wake_lock_count > 0; }
     bool has_compositor_host() const;
     void ensure_compositor_host();
+    void retire_page_compositor_context(OwnPtr<Compositor::CompositorContextHandle>);
+    OwnPtr<Compositor::CompositorContextHandle> take_retired_page_compositor_context();
+    void drop_retired_page_compositor_context();
     Compositor::CompositorHost& compositor_host();
     Compositor::CompositorHost const& compositor_host() const;
 
@@ -124,18 +132,23 @@ public:
     Vector<GC::Root<HTML::LocalNavigable>> hosted_navigables() const;
     GC::Ptr<HTML::Navigable> navigable_with_id(HTML::CrossProcessId) const;
 
+    void hold_navigable_being_destroyed(Badge<HTML::NavigableContainer>, GC::Ref<HTML::Navigable>);
+    void release_navigable_being_destroyed(Badge<HTML::NavigableContainer>, HTML::Navigable&);
+
     void create_remote_navigable_graph(Vector<HTML::RemoteNavigableDescriptor>);
     void insert_remote_navigable(HTML::RemoteNavigableDescriptor);
     void remove_remote_navigable(HTML::CrossProcessId);
     void update_remote_navigable(HTML::CrossProcessId, HTML::ReplicatedNavigableState);
     void content_navigable_completely_finished_loading(HTML::CrossProcessId);
 
-    GC::Ref<HTML::LocalNavigable> begin_hosting(HTML::CrossProcessId, HTML::SessionHistoryEntryDescriptor const& current_history_entry, HTML::VisibilityState system_visibility_state);
+    GC::Ref<HTML::LocalNavigable> begin_hosting(HTML::CrossProcessId, HTML::SessionHistoryEntryDescriptor const& current_history_entry);
     void adopt_hosted(HTML::LocalNavigable&);
     void discard_provisional_navigable(HTML::CrossProcessId);
     void stop_hosting(HTML::CrossProcessId, HTML::ReplicatedNavigableState);
     void stop_hosting(HTML::LocalNavigable&, HTML::ReplicatedNavigableState);
-    void host_navigable(HTML::CrossProcessId, HTML::SessionHistoryEntryDescriptor const& current_history_entry, HTML::VisibilityState system_visibility_state);
+
+    HTML::VisibilityState system_visibility_state() const { return m_system_visibility_state; }
+    void set_system_visibility_state(HTML::VisibilityState visibility_state) { m_system_visibility_state = visibility_state; }
     void unfullscreen_descendant_documents(Vector<GC::Root<HTML::Navigable>> const&);
     enum class ElementIsRequestedElement : u8 {
         No,
@@ -158,11 +171,6 @@ public:
     void set_focused_navigable(HTML::Navigable&);
     void focused_navigable_changed_in_another_page(HTML::CrossProcessId);
     void navigable_document_destroyed(Badge<DOM::Document>, HTML::LocalNavigable&);
-
-    void load(URL::URL const&, Bindings::NavigationHistoryBehavior, Utf16String navigation_id);
-    void load_html(StringView, Utf16String navigation_id);
-
-    void reload();
 
     void queue_screenshot_task(Optional<UniqueNodeID> node_id);
     void process_screenshot_requests();
@@ -269,12 +277,7 @@ public:
     Optional<Utf16String> did_request_prompt(Utf16String const& message, Utf16String const& default_);
     void prompt_closed(Optional<Utf16String> response);
 
-    enum class PendingDialog {
-        None,
-        Alert,
-        Confirm,
-        Prompt,
-    };
+    using PendingDialog = Web::PendingDialog;
     void did_open_dialog_in_another_process(PendingDialog, Utf16String const& message);
     bool has_pending_dialog() const { return m_pending_dialog != PendingDialog::None; }
     PendingDialog pending_dialog() const { return m_pending_dialog; }
@@ -330,6 +333,7 @@ public:
 
     void register_canvas_element(Badge<HTML::HTMLCanvasElement>, UniqueNodeID canvas_id);
     void unregister_canvas_element(Badge<HTML::HTMLCanvasElement>, UniqueNodeID canvas_id);
+    void enqueue_offscreen_canvas_placeholder_commit(Badge<HTML::OffscreenCanvas>, HTML::OffscreenCanvas&);
 
     void prepare_canvas_contexts_for_compositing();
     void notify_all_canvas_elements_of_lost_backing_storage();
@@ -349,15 +353,7 @@ public:
     void clear_context_menu_request() { m_context_menu_request.clear(); }
     Optional<ContextMenuRequest> take_context_menu_request();
 
-    struct MediaContextMenu {
-        URL::URL media_url;
-        bool is_video { false };
-        bool is_playing { false };
-        bool is_muted { false };
-        bool has_user_agent_controls { false };
-        bool is_looping { false };
-        bool is_fullscreen { false };
-    };
+    using MediaContextMenu = Web::MediaContextMenu;
     void did_request_media_context_menu(UniqueNodeID media_id, HTML::CrossProcessId local_root_id, CSSPixelPoint, ByteString const& target, unsigned modifiers, MediaContextMenu const&);
     void toggle_media_play_state();
     void toggle_media_mute_state();
@@ -451,6 +447,10 @@ private:
     GC::Weak<HTML::LocalNavigable> m_hover_reporting_navigable;
 
     GC::Ptr<HTML::Navigable> m_top_level_traversable;
+    OwnPtr<Compositor::CompositorContextHandle> m_retired_page_compositor_context;
+    Vector<GC::Ref<HTML::Navigable>> m_navigables_being_destroyed;
+
+    HTML::VisibilityState m_system_visibility_state { HTML::VisibilityState::Hidden };
     GC::Ptr<HTML::BrowsingContextGroup> m_browsing_context_group;
 
     GC::Ref<HTML::HistoryExecutor> m_history_executor;
@@ -516,6 +516,7 @@ private:
 
     Vector<UniqueNodeID> m_media_elements;
     Vector<UniqueNodeID> m_canvas_elements;
+    Vector<GC::Ref<HTML::OffscreenCanvas>> m_offscreen_canvases_pending_placeholder_commit;
     Optional<UniqueNodeID> m_media_context_menu_element_id;
 
     Web::HTML::MuteState m_mute_state { Web::HTML::MuteState::Unmuted };
@@ -573,16 +574,6 @@ private:
     bool m_processing_fullscreen_operations { false };
 };
 
-enum class ContextMenuForInputEventsTarget : u8 {
-    No,
-    Yes,
-};
-
-enum class NavigationTarget : u8 {
-    TopLevel,
-    IFrame,
-};
-
 class WEB_API PageClient : public JS::Cell {
     GC_CELL(PageClient, JS::Cell);
 
@@ -596,7 +587,7 @@ public:
     virtual bool has_active_devtools_client() const { return false; }
     virtual void request_navigation_start(HTML::LocalNavigable&, NavigationTarget, URL::URL const& url, Utf16String navigation_id, Optional<HTML::NavigationStartRequest>);
     virtual void request_navigation_population(HTML::LocalNavigable&, NavigationTarget, HTML::NavigationPopulationRequest);
-    virtual void request_navigation_of_remote_navigable(HTML::RemoteNavigable&, HTML::PreparedNavigationDescriptor) { VERIFY_NOT_REACHED(); }
+    virtual void request_navigation_of_navigable(HTML::Navigable&, HTML::PreparedNavigationDescriptor) { VERIFY_NOT_REACHED(); }
     virtual void request_post_message_to_remote_navigable(HTML::RemoteNavigable&, HTML::PostedMessageDescriptor) { VERIFY_NOT_REACHED(); }
     virtual void request_close_of_remote_traversable(HTML::RemoteNavigable&, HTML::LocalNavigable const&) { VERIFY_NOT_REACHED(); }
     virtual void request_focusing_steps_for_remote_navigable(HTML::RemoteNavigable&, HTML::FocusTrigger) { VERIFY_NOT_REACHED(); }
@@ -605,8 +596,9 @@ public:
     virtual void navigation_params_creation_finished(HTML::LocalNavigable&, HTML::NavigationPopulationRequest, HTML::NavigationPopulationResult);
     virtual void history_navigation_params_creation_finished(HTML::CrossProcessId operation_id, HTML::HistoryNavigationPopulation);
     virtual void navigation_population_failed(HTML::CrossProcessId, Utf16String const&) { }
-    virtual void page_did_create_child_frame(HTML::CrossProcessId, HTML::CrossProcessId, HTML::ReplicatedNavigableState const&) { }
-    virtual void page_did_change_replicated_navigable_state([[maybe_unused]] HTML::CrossProcessId navigable_id, [[maybe_unused]] HTML::ReplicatedNavigableState const& state) { }
+    virtual void page_did_create_child_frame(HTML::CrossProcessId, HTML::CrossProcessId, HTML::HostedNavigableState const&, HTML::PendingSessionHistoryEntryDescriptor const&) { }
+    virtual void page_did_change_hosted_navigable_state([[maybe_unused]] HTML::CrossProcessId navigable_id, [[maybe_unused]] HTML::HostedNavigableState const& state) { }
+    virtual void page_did_set_opener_browsing_context([[maybe_unused]] HTML::CrossProcessId navigable_id, [[maybe_unused]] Optional<HTML::CrossProcessId> opener_navigable_id) { }
     virtual void page_did_completely_finish_loading([[maybe_unused]] HTML::CrossProcessId navigable_id) { }
     virtual void page_did_change_navigable_container_state([[maybe_unused]] HTML::CrossProcessId navigable_id, [[maybe_unused]] HTML::ReplicatedContainerState const& state) { }
     virtual void page_did_update_child_frame_viewport(HTML::CrossProcessId, [[maybe_unused]] DevicePixelRect viewport_rect, [[maybe_unused]] DevicePixelRect viewport_intersection) { }
@@ -737,11 +729,10 @@ public:
     virtual void page_did_update_resource_count(i32) { }
     struct NewWebViewResult {
         GC::Ptr<Page> page;
-        HTML::VisibilityState system_visibility_state { HTML::VisibilityState::Hidden };
         String window_handle;
         Optional<HTML::SessionHistoryEntryDescriptor> initial_history_entry;
     };
-    virtual NewWebViewResult page_did_request_new_web_view(HTML::ActivateTab, HTML::WebViewHints, [[maybe_unused]] Optional<HTML::CrossProcessId> opener_navigable_id, [[maybe_unused]] Optional<URL::URL> opener_base_url, [[maybe_unused]] Utf16String const& target_name) { return {}; }
+    virtual NewWebViewResult page_did_request_new_web_view(HTML::ActivateTab, HTML::WebViewHints, [[maybe_unused]] Optional<HTML::CrossProcessId> opener_navigable_id, [[maybe_unused]] Optional<URL::URL> opener_base_url, [[maybe_unused]] Utf16String const& target_name, [[maybe_unused]] HTML::SandboxingFlagSet popup_sandboxing_flag_set) { return {}; }
     virtual void page_did_request_activate_tab() { }
     virtual void page_did_close() { }
     virtual void page_did_update_session_history_entry_navigation_api_state([[maybe_unused]] HTML::CrossProcessId navigable_id, [[maybe_unused]] HTML::SessionHistoryEntryIdentity const& entry_identity, [[maybe_unused]] HTML::StorageSerializationRecord const& navigation_api_state) { }
@@ -829,15 +820,5 @@ public:
 protected:
     virtual ~PageClient() = default;
 };
-
-}
-
-namespace IPC {
-
-template<>
-WEB_API ErrorOr<void> encode(Encoder&, Web::Page::MediaContextMenu const&);
-
-template<>
-WEB_API ErrorOr<Web::Page::MediaContextMenu> decode(Decoder&);
 
 }

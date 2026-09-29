@@ -42,37 +42,37 @@
 #include <LibRequests/Forward.h>
 #include <LibRequests/NetworkError.h>
 #include <LibURL/Origin.h>
-#include <LibWeb/Bindings/Navigation.h>
-#include <LibWeb/Fetch/Infrastructure/HTTP/Requests.h>
-#include <LibWeb/Forward.h>
-#include <LibWeb/HTML/ActivateTab.h>
-#include <LibWeb/HTML/AudioPlayState.h>
-#include <LibWeb/HTML/ColorPickerUpdateState.h>
-#include <LibWeb/HTML/FileFilter.h>
-#include <LibWeb/HTML/HistoryOperation.h>
-#include <LibWeb/HTML/Scripting/ScriptRegistry.h>
-#include <LibWeb/HTML/SelectItem.h>
-#include <LibWeb/Page/DragEvent.h>
-#include <LibWeb/Page/EventResult.h>
-#include <LibWeb/Page/QueuedInputEvent.h>
-#include <LibWeb/Page/ScreenWakeLockHandle.h>
-#include <LibWeb/Page/ViewportIsFullscreen.h>
-#include <LibWeb/WebDriver/Contexts.h>
-#include <LibWeb/WebDriver/Response.h>
+#include <LibWebCommon/Bindings/Navigation.h>
+#include <LibWebCommon/Fetch/Infrastructure/HTTP/RequestPriority.h>
+#include <LibWebCommon/Forward.h>
+#include <LibWebCommon/HTML/ActivateTab.h>
+#include <LibWebCommon/HTML/AudioPlayState.h>
+#include <LibWebCommon/HTML/ColorPickerUpdateState.h>
+#include <LibWebCommon/HTML/FileFilter.h>
+#include <LibWebCommon/HTML/HistoryOperation.h>
+#include <LibWebCommon/HTML/Scripting/ScriptRegistryTypes.h>
+#include <LibWebCommon/HTML/SelectItem.h>
+#include <LibWebCommon/Page/DragEvent.h>
+#include <LibWebCommon/Page/EventResult.h>
+#include <LibWebCommon/Page/QueuedInputEvent.h>
+#include <LibWebCommon/Page/ScreenWakeLockState.h>
+#include <LibWebCommon/Page/ViewportIsFullscreen.h>
+#include <LibWebCommon/WebDriver/Response.h>
+#include <LibWebCommon/WebDriver/SessionBrowsingContext.h>
+#include <LibWebCommon/WebView/DOMNodeProperties.h>
+#include <LibWebCommon/WebView/Debugger.h>
+#include <LibWebCommon/WebView/DictionaryLookup.h>
+#include <LibWebCommon/WebView/PageInfo.h>
+#include <LibWebCommon/WebView/StorageSetResult.h>
 #include <LibWebView/BookmarkStore.h>
 #include <LibWebView/BrowsingSession.h>
 #include <LibWebView/CanonicalTraversable.h>
-#include <LibWebView/DOMNodeProperties.h>
-#include <LibWebView/Debugger.h>
-#include <LibWebView/DictionaryLookup.h>
 #include <LibWebView/ExternalURLHandler.h>
 #include <LibWebView/Forward.h>
 #include <LibWebView/HistoryVisitTransition.h>
-#include <LibWebView/PageInfo.h>
 #include <LibWebView/SessionHistory.h>
 #include <LibWebView/SessionStore.h>
 #include <LibWebView/Settings.h>
-#include <LibWebView/StorageSetResult.h>
 #include <LibWebView/TabPerformanceStats.h>
 #include <LibWebView/WebContentClient.h>
 #include <LibWebView/WebContentPage.h>
@@ -106,8 +106,11 @@ public:
 
     u64 view_id() const { return m_view_id; }
 
-    CanonicalTraversable& traversable() { return m_top_level_traversable; }
-    CanonicalTraversable const& traversable() const { return m_top_level_traversable; }
+    CanonicalTraversable& traversable() const;
+    void display_traversable(Badge<WebContentClient>, CanonicalTraversable&);
+    bool has_display_page() const;
+    virtual void prepare_page_for_tab(WebContentPage&);
+    void did_change_display_page(Badge<CanonicalNavigable>, RefPtr<WebContentPage> previous_page);
 
     void set_url(Badge<WebContentPage>, URL::URL url) { set_url(move(url)); }
     URL::URL const& url() const { return m_url; }
@@ -120,13 +123,11 @@ public:
 
     String const& handle() const { return m_client_state.client_handle; }
 
-    bool create_new_process_for_cross_site_navigation(Utf16String const& navigation_id);
-    void replace_web_content_process_for_history_traversal(Web::HTML::CrossProcessId target_document_state_id);
-
     void server_did_paint(Badge<WebContentPage>, i32 bitmap_id, Gfx::IntSize size, Gfx::IntRect damage_rect);
 
     void set_window_position(Gfx::IntPoint);
     void set_window_size(Gfx::IntSize);
+    Web::HTML::VisibilityState system_visibility_state() const { return m_system_visibility_state; }
     void set_system_visibility_state(Web::HTML::VisibilityState);
     void set_has_system_focus(bool);
 
@@ -143,7 +144,7 @@ public:
     void reload();
     void stop_loading();
     bool is_loading() const { return m_is_loading; }
-    bool cancel_uncommitted_top_level_navigation_for_browser_traversal();
+    void cancel_uncommitted_top_level_navigation_for_browser_traversal();
 
     bool crash_overlay_active() const { return m_crash_state.has_value(); }
     static constexpr StringView crash_overlay_title() { return "Ladybird flew off-course!"sv; }
@@ -194,7 +195,7 @@ public:
     void set_preferred_contrast(Web::CSS::PreferredContrast);
     void set_preferred_motion(Web::CSS::PreferredMotion);
     // A page created to host documents of the tab in another process takes the preferences the view's page has.
-    void send_preferences_to_page(Badge<WebContentClient>, WebContentPage&);
+    void send_preferences_to_page(WebContentPage&);
 
     void notify_cookies_changed(HashTable<String> const& changed_domains, ReadonlySpan<HTTP::Cookie::Cookie> page_cookies, ReadonlySpan<HTTP::Cookie::Cookie> host_cookies);
     void listen_for_host_cookie_changes(DevTools::DevToolsDelegate::OnHostCookieChange);
@@ -257,7 +258,7 @@ public:
     void inspect_current_grid(Compositing::UniqueNodeID node_id);
     void inspect_current_flexbox(Compositing::UniqueNodeID node_id, bool only_look_at_parents);
     void retrieve_devtools_sources(DevTools::DevToolsDelegate::OnSourcesReceived);
-    void request_devtools_source(Web::HTML::ScriptRegistry::Identifier const&);
+    void request_devtools_source(Web::HTML::ScriptRegistryIdentifier const&);
     void attach_debugger(DevTools::DevToolsDelegate::OnDebuggerPaused, DevTools::DevToolsDelegate::OnDebuggerResumed);
     void configure_debugger(DebuggerConfiguration);
     void detach_debugger();
@@ -272,7 +273,7 @@ public:
     void retrieve_debugger_environments(u64 frame_id, DevTools::DevToolsDelegate::OnDebuggerEnvironmentsReceived);
     void evaluate_javascript_in_debugger_frame(u64 frame_id, String const&, DevTools::DevToolsDelegate::OnDebuggerEvaluationComplete);
     void retrieve_debugger_object_properties(u64 object_id, DevTools::DevToolsDelegate::OnDebuggerObjectPropertiesReceived);
-    void retrieve_debugger_source_positions(Web::HTML::ScriptRegistry::Identifier, DevTools::DevToolsDelegate::OnDebuggerSourcePositionsReceived);
+    void retrieve_debugger_source_positions(Web::HTML::ScriptRegistryIdentifier, DevTools::DevToolsDelegate::OnDebuggerSourcePositionsReceived);
     void resolve_dom_node_url(Optional<Compositing::UniqueNodeID> node_id, String const& url, DevTools::DevToolsDelegate::OnResolvedURLReceived);
     void clear_inspected_dom_node();
 
@@ -358,6 +359,7 @@ public:
     JsonValue webdriver_session_history() const;
     void wait_for_webdriver_navigation_completion(Optional<u64> page_load_timeout, Function<void(Web::WebDriver::Response)>);
     void run_webdriver_content_command(u64 command_id, Web::WebDriver::SessionBrowsingContext, String const& name, JsonValue payload, Vector<String> arguments);
+    void run_webdriver_commands_waiting_for_a_document(Badge<CanonicalTraversable>);
     void did_complete_webdriver_content_command(Badge<WebContentPage>, u64 command_id, Web::WebDriver::Response);
     void did_set_webdriver_current_browsing_context(Badge<WebContentPage>, u64 command_id, Web::HTML::CrossProcessId navigable_id);
     void enqueue_webdriver_mouse_event(Badge<WebContentPage>, Compositing::MouseEvent, Function<void()> on_handled);
@@ -373,6 +375,7 @@ public:
     Gfx::Color page_background_color() const { return m_page_background_color; }
 
     void did_allocate_backing_stores(Badge<WebContentPage>, Vector<i32> bitmap_ids, Vector<Gfx::SharedImage> backing_stores);
+    void install_backing_stores(Vector<i32> bitmap_ids, Vector<Gfx::SharedImage> backing_stores);
 
     enum class ScreenshotType {
         Visible,
@@ -445,14 +448,14 @@ public:
     Function<void(Vector<Web::CSS::StyleSheetIdentifier>)> on_received_style_sheet_list;
     Function<void(Web::CSS::StyleSheetIdentifier const&, URL::URL const&, Utf16String const&)> on_received_style_sheet_source;
     HashMap<u64, DevTools::DevToolsDelegate::OnSourcesReceived> on_received_devtools_sources;
-    HashMap<Web::HTML::ScriptRegistry::Identifier, Function<void(Optional<Web::HTML::ScriptRegistry::Content>)>> on_received_devtools_source;
+    HashMap<Web::HTML::ScriptRegistryIdentifier, Function<void(Optional<Web::HTML::ScriptRegistryContent>)>> on_received_devtools_source;
     HashMap<u64, DevTools::DevToolsDelegate::OnResolvedURLReceived> on_resolved_dom_node_url;
-    Function<void(Web::HTML::ScriptRegistry::Description)> on_devtools_source_available;
+    Function<void(Web::HTML::ScriptRegistryDescription)> on_devtools_source_available;
     DevTools::DevToolsDelegate::OnDebuggerPaused on_debugger_paused;
     DevTools::DevToolsDelegate::OnDebuggerResumed on_debugger_resumed;
     Function<void(JsonValue)> on_received_js_console_result;
     Function<void(ConsoleOutput)> on_console_message;
-    Function<void(u64 request_id, URL::URL const&, ByteString const&, Vector<HTTP::Header> const&, ByteBuffer, Optional<String>, String, bool, Web::Fetch::Infrastructure::Request::Priority)> on_network_request_started;
+    Function<void(u64 request_id, URL::URL const&, ByteString const&, Vector<HTTP::Header> const&, ByteBuffer, Optional<String>, String, bool, Web::Fetch::Infrastructure::RequestPriority)> on_network_request_started;
     Function<void(u64 request_id, u32 status_code, Optional<String> const&, Vector<HTTP::Header> const&, Requests::CameFromCache)> on_network_response_headers_received;
     Function<void(u64 request_id, ByteBuffer)> on_network_response_body_received;
     Function<void(u64 request_id, u64 body_size, Requests::RequestTimingInfo const&, Optional<Requests::NetworkError> const&)> on_network_request_finished;
@@ -502,7 +505,7 @@ public:
     void did_request_page_context_menu(Badge<WebContentPage>, Gfx::IntPoint content_position, Web::ContextMenuForInputEventsTarget for_input_events_target);
     void did_request_link_context_menu(Badge<WebContentPage>, Gfx::IntPoint content_position, URL::URL url);
     void did_request_image_context_menu(Badge<WebContentPage>, Gfx::IntPoint content_position, URL::URL url, Optional<Gfx::ShareableBitmap> bitmap);
-    void did_request_media_context_menu(Badge<WebContentPage>, WebContentPage& requesting_page, Gfx::IntPoint content_position, Web::Page::MediaContextMenu menu);
+    void did_request_media_context_menu(Badge<WebContentPage>, WebContentPage& requesting_page, Gfx::IntPoint content_position, Web::MediaContextMenu menu);
     void send_to_media_context_menu_page(Function<void(WebContentPage&)> const&);
 
     void did_request_color_picker(Badge<WebContentPage>, WebContentPage& requesting_page, Color current_color);
@@ -525,7 +528,6 @@ public:
 
 protected:
     void will_apply_history_traversal_step(Web::HTML::CrossProcessId operation_id);
-    void did_resume_history_traversal(Web::HTML::CrossProcessId operation_id);
     void did_apply_top_level_history_traversal_step(Web::HTML::CrossProcessId operation_id);
     void did_finish_history_traversal(Web::HTML::CrossProcessId operation_id, Web::HTML::HistoryStepResult);
 
@@ -566,13 +568,9 @@ protected:
         Always,
     };
     void dump_session_history(StringView reason, SessionHistoryDumpMode = SessionHistoryDumpMode::IfDebuggingEnabled) const;
-    void recover_current_session_history_entry_with_history_operation(RefPtr<WebContentPage> crashed_endpoint = {});
+    void recover_current_session_history_entry_with_history_operation();
     void reconstruct_current_session_history_entry_with_history_operation(StringView reason);
-    enum class ReconstructCanceledNavigation {
-        No,
-        Yes,
-    };
-    bool cancel_uncommitted_top_level_navigation(StringView reason, bool stop_loading, ReconstructCanceledNavigation = ReconstructCanceledNavigation::Yes);
+    bool cancel_uncommitted_top_level_navigation(StringView reason, bool stop_loading);
     NonnullRefPtr<Core::Promise<Empty>> reset_session_history_for_testing();
 
     virtual void update_zoom();
@@ -591,7 +589,8 @@ protected:
         No,
         Yes,
     };
-    virtual void initialize_client(CreateNewClient = CreateNewClient::Yes, Optional<Web::HTML::CrossProcessId> initial_document_state_id = {});
+    virtual void initialize_client(CreateNewClient = CreateNewClient::Yes);
+    void display_page_changed(RefPtr<WebContentPage> previous_page);
     void cancel_all_native_geolocation_requests();
     void send_geolocation_emulated_position(WebContentPage&);
     WebContentPage& focused_navigable_host() const;
@@ -637,7 +636,6 @@ protected:
     };
 
     struct ClientState {
-        RefPtr<WebContentPage> page;
         String client_handle;
         SharedBitmap front_bitmap;
         Vector<SharedBitmap> other_bitmaps;
@@ -791,6 +789,14 @@ protected:
     };
     HashMap<u64, PendingWebDriverCommand> m_pending_webdriver_commands;
     HashMap<u64, PendingWebDriverCommand> m_pending_webdriver_crash_commands;
+    struct WebDriverCommandWaitingForADocument {
+        Optional<Web::HTML::CrossProcessId> navigable_id;
+        String name;
+        JsonValue payload;
+        Vector<String> arguments;
+    };
+    HashMap<u64, WebDriverCommandWaitingForADocument> m_webdriver_commands_waiting_for_a_document;
+    void run_webdriver_content_command(u64 command_id, Optional<Web::HTML::CrossProcessId> navigable_id, String const& name, JsonValue payload, Vector<String> arguments);
     static bool webdriver_content_command_outlives_its_page(StringView name);
     bool complete_webdriver_content_command_after_navigation(u64 command_id, PendingWebDriverCommand const&);
     void complete_webdriver_content_commands_after_process_replacement(HashMap<u64, PendingWebDriverCommand> const&);
@@ -807,7 +813,8 @@ protected:
 
     Web::HTML::MuteState m_mute_state { Web::HTML::MuteState::Unmuted };
 
-    CanonicalTraversable m_top_level_traversable;
+    CanonicalTraversable* m_top_level_traversable { nullptr };
+    Web::HTML::VisibilityState m_system_visibility_state { Web::HTML::VisibilityState::Hidden };
     Optional<SessionTabId> m_session_tab_id;
     Optional<SessionHistorySnapshot> m_captured_session_history_snapshot_for_testing;
     RefPtr<Core::Promise<Empty>> m_pending_session_history_reset_for_testing;

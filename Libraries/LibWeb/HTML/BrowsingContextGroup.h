@@ -12,7 +12,7 @@
 #include <LibJS/Heap/Cell.h>
 #include <LibURL/Origin.h>
 #include <LibWeb/Forward.h>
-#include <LibWeb/HTML/Scripting/SerializedEnvironmentSettingsObject.h>
+#include <LibWebCommon/HTML/Scripting/SerializedEnvironmentSettingsObject.h>
 
 namespace Web::HTML {
 
@@ -26,7 +26,7 @@ public:
         GC::Ref<DOM::Document> document;
     };
 
-    static BrowsingContextGroupAndDocument create_a_new_browsing_context_group_and_document(GC::Ref<Page>);
+    static BrowsingContextGroupAndDocument create_a_new_browsing_context_group_and_document(GC::Ref<Page>, GC::Ptr<WindowProxy> existing_window_proxy = {});
 
     Page& page() { return m_page; }
     Page const& page() const { return m_page; }

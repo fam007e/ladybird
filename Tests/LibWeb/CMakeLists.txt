@@ -6,6 +6,7 @@ set(TEST_SOURCES
     TestControlMessageQueue.cpp
     TestCSSIDSpeed.cpp
     TestCSSInheritedProperty.cpp
+    TestCSSPropertyList.cpp
     TestCSSDecodeBytes.cpp
     TestDownloadReader.cpp
     TestDump.cpp
@@ -30,7 +31,6 @@ set(TEST_SOURCES
     TestStructuredSerializeHardening.cpp
     TestStructuredSerializeSharedArrayBuffer.cpp
     TestStyleEngineBridge.cpp
-    TestTrackBufferDemuxer.cpp
     TestWebGLSpanWithStorage.cpp
     TestWebIDLBuffers.cpp
     TestWindowProxyWorld.cpp
@@ -78,7 +78,7 @@ target_link_libraries(TestStructuredSerializeHardening PRIVATE LibGC LibJS LibCr
 target_link_libraries(TestStructuredSerializeSharedArrayBuffer PRIVATE LibGC LibJS LibIPC)
 target_link_libraries(TestSecureContexts PRIVATE LibURL)
 target_link_libraries(TestSessionHistoryEntry PRIVATE LibJS LibURL)
-target_link_libraries(TestSourceHighlighter PRIVATE LibURL LibWebView)
+target_link_libraries(TestSourceHighlighter PRIVATE LibURL)
 target_link_libraries(TestWrapperWorld PRIVATE LibGC LibJS LibURL)
 target_link_libraries(TestSharedCompiledStyleSheet PRIVATE LibGC LibJS LibURL)
 target_sources(TestWorldCallback PRIVATE

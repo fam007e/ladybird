@@ -27,6 +27,7 @@
 #include <LibDevTools/DevToolsServer.h>
 #include <LibDevTools/FirefoxClient.h>
 #include <LibFileSystem/FileSystem.h>
+#include <LibGfx/SystemTheme.h>
 #include <LibHTTP/Cache/CacheMode.h>
 #include <LibHTTP/Cookie/IncludeCredentials.h>
 #include <LibHTTP/HeaderList.h>
@@ -38,11 +39,12 @@
 #include <LibRequests/RequestControlClient.h>
 #include <LibURL/InternalURLs.h>
 #include <LibURL/Parser.h>
-#include <LibWeb/CSS/PropertyID.h>
-#include <LibWeb/Fetch/Infrastructure/HTTP/Statuses.h>
-#include <LibWeb/Loader/DownloadFilename.h>
-#include <LibWeb/Loader/UserAgent.h>
-#include <LibWeb/WebDriver/TimeoutsConfiguration.h>
+#include <LibWebCommon/CSS/PropertyList.h>
+#include <LibWebCommon/Fetch/Infrastructure/HTTP/Statuses.h>
+#include <LibWebCommon/Loader/DownloadFilename.h>
+#include <LibWebCommon/Loader/UserAgent.h>
+#include <LibWebCommon/WebDriver/TimeoutsConfiguration.h>
+#include <LibWebCommon/WebView/SiteIsolation.h>
 #include <LibWebView/Application.h>
 #include <LibWebView/AutocompleteService.h>
 #include <LibWebView/BlobURLStore.h>
@@ -59,7 +61,6 @@
 #include <LibWebView/ProcessType.h>
 #include <LibWebView/SessionStore.h>
 #include <LibWebView/SiteCompatibility.h>
-#include <LibWebView/SiteIsolation.h>
 #include <LibWebView/TabPerformanceMonitor.h>
 #include <LibWebView/URL.h>
 #include <LibWebView/UserAgent.h>
@@ -1021,7 +1022,7 @@ void Application::open_bookmark_in_new_window(String const& bookmark_id, IsPriva
         open_url_in_new_window(bookmark->bookmark().url, is_private);
 }
 
-ErrorOr<NonnullRefPtr<WebContentClient>> Application::create_web_content_client(Optional<ViewImplementation&> view, IsPrivate is_private, Compositing::PageId initial_page_id, Optional<Web::HTML::CrossProcessId> navigable_to_adopt, Optional<Web::HTML::CrossProcessId> initial_document_state_id, Vector<Web::HTML::RemoteNavigableDescriptor> remote_navigables, Optional<Web::HTML::SessionHistoryEntryDescriptor> canonical_initial_history_entry)
+ErrorOr<NonnullRefPtr<WebContentClient>> Application::create_web_content_client(Optional<ViewImplementation&> view, IsPrivate is_private, Compositing::PageId initial_page_id, Optional<Web::HTML::CrossProcessId> navigable_to_adopt, Optional<Web::HTML::CrossProcessId> initial_document_state_id, Vector<Web::HTML::RemoteNavigableDescriptor> remote_navigables, Optional<Web::HTML::SessionHistoryEntryDescriptor> canonical_initial_history_entry, Web::HTML::VisibilityState system_visibility_state)
 {
     // The client's WebContentClient picks up this same session when it is created.
     auto request_server_handle = TRY(connect_new_request_server_client(session_for_new_view(is_private)));
@@ -1037,18 +1038,14 @@ ErrorOr<NonnullRefPtr<WebContentClient>> Application::create_web_content_client(
 
     auto client = TRY(WebView::launch_web_content_process(is_private, initial_page_id, root_navigable_id));
     TRY(Application::the().connect_web_content_to_compositor(*client));
-    // NB: A replacement process's bootstrap about:blank is not the displayed document. Keep it hidden so it
-    //     cannot paint over the outgoing page; activation supplies the destination's actual visibility state.
-    auto system_visibility_state = view.has_value() && !navigable_to_adopt.has_value()
-        ? view->traversable().system_visibility_state()
-        : Web::HTML::VisibilityState::Hidden;
+    if (view.has_value())
+        system_visibility_state = view->system_visibility_state();
 
-    // A process replacing another adopts the view's traversable, so this entry only bootstraps its about:blank: the
-    // canonical entry it will host arrives with the traversal. A process hosting a child's document stands in for the
-    // canonical current entry, whose identity its state reports carry.
+    // A view's first process creates its traversable from this entry. A process hosting a navigable of an existing tab
+    // stands in for the canonical current entry.
     auto initial_history_entry = canonical_initial_history_entry.has_value()
         ? canonical_initial_history_entry.release_value()
-        : Web::HTML::create_initial_session_history_entry_descriptor(*initial_document_state_id, {}, {}, {});
+        : Web::HTML::create_initial_session_history_entry_descriptor(*initial_document_state_id, {}, {});
     client->async_initialize(initial_page_id, move(remote_navigables), root_navigable_id, cross_process_id_allocator, initial_history_entry, system_visibility_state);
 
     if (!navigable_to_adopt.has_value())
@@ -1431,13 +1428,10 @@ void Application::crash_compositor_process()
     m_compositor_client->async_crash();
 }
 
-ErrorOr<NonnullRefPtr<WebContentClient>> Application::launch_web_content_process(ViewImplementation& view, Optional<Web::HTML::CrossProcessId> navigable_to_adopt, Optional<Web::HTML::CrossProcessId> initial_document_state_id)
+ErrorOr<NonnullRefPtr<WebContentClient>> Application::launch_web_content_process(ViewImplementation& view)
 {
     if (view.is_private() == IsPrivate::Yes)
-        return create_web_content_client(view, IsPrivate::Yes, allocate_page_id(), navigable_to_adopt, initial_document_state_id);
-
-    if (navigable_to_adopt.has_value() || initial_document_state_id.has_value())
-        return create_web_content_client(view, IsPrivate::No, allocate_page_id(), navigable_to_adopt, initial_document_state_id);
+        return create_web_content_client(view, IsPrivate::Yes, allocate_page_id());
 
     if (m_spare_web_content_process) {
         auto web_content_client = m_spare_web_content_process.release_nonnull();
@@ -1451,11 +1445,11 @@ ErrorOr<NonnullRefPtr<WebContentClient>> Application::launch_web_content_process
     return create_web_content_client(view, IsPrivate::No, allocate_page_id());
 }
 
-ErrorOr<Application::ChildFrameWebContentProcess> Application::launch_child_frame_web_content_process(IsPrivate is_private, Vector<Web::HTML::RemoteNavigableDescriptor> remote_navigables, Web::HTML::CrossProcessId root_navigable_id, Web::HTML::SessionHistoryEntryDescriptor initial_history_entry)
+ErrorOr<Application::ChildFrameWebContentProcess> Application::launch_child_frame_web_content_process(IsPrivate is_private, Vector<Web::HTML::RemoteNavigableDescriptor> remote_navigables, Web::HTML::CrossProcessId root_navigable_id, Web::HTML::SessionHistoryEntryDescriptor initial_history_entry, Web::HTML::VisibilityState system_visibility_state)
 {
     auto page_id = allocate_page_id();
     auto initial_document_state_id = initial_history_entry.document_state.id;
-    auto client = TRY(create_web_content_client({}, is_private, page_id, root_navigable_id, initial_document_state_id, move(remote_navigables), move(initial_history_entry)));
+    auto client = TRY(create_web_content_client({}, is_private, page_id, root_navigable_id, initial_document_state_id, move(remote_navigables), move(initial_history_entry), system_visibility_state));
     return ChildFrameWebContentProcess {
         .client = move(client),
         .page_id = page_id,
@@ -2112,12 +2106,8 @@ Optional<Process&> Application::find_process(pid_t pid)
     return m_process_manager->find_process(pid);
 }
 
-void Application::process_did_exit(Process&& process, Optional<int> exit_status)
+void Application::process_did_exit(Process&& process, Optional<int>)
 {
-#if defined(AK_OS_WINDOWS)
-    (void)exit_status;
-#endif
-
     if (m_event_loop->was_exit_requested())
         return;
 
@@ -2138,6 +2128,12 @@ void Application::process_did_exit(Process&& process, Optional<int> exit_status)
             }
         }
         break;
+    case ProcessType::MediaServer:
+        if (auto client = process.client<MediaClient::Client>()) {
+            if (auto on_death = move(client->on_death))
+                on_death();
+        }
+        break;
     case ProcessType::RequestServer:
         if (auto client = process.client<Requests::RequestControlClient>()) {
             dbgln_if(WEBVIEW_PROCESS_DEBUG, "Restart request server");
@@ -2156,12 +2152,7 @@ void Application::process_did_exit(Process&& process, Optional<int> exit_status)
         break;
     case ProcessType::WebContent:
         if (auto client = process.client<WebContentClient>()) {
-            bool exited_on_request = false;
-#if !defined(AK_OS_WINDOWS)
-            exited_on_request = exit_status.has_value() && WIFEXITED(*exit_status) && WEXITSTATUS(*exit_status) == 0 && !client->has_views();
-#endif
-            if (!exited_on_request)
-                client->notify_all_views_of_crash();
+            client->did_lose_process();
             m_web_content_clients.remove(client.release_nonnull());
         }
         break;
@@ -2694,21 +2685,22 @@ void Application::initialize_actions()
     create_platform_actions();
 }
 
-void Application::apply_view_options(Badge<ViewImplementation>, ViewImplementation& view)
+// The options every page hosting the tab's document runs with.
+void Application::apply_view_options(Badge<ViewImplementation>, ViewImplementation& view, WebContentPage& page)
 {
     view.set_preferred_color_scheme(m_color_scheme);
     view.set_preferred_contrast(m_contrast);
     view.set_preferred_motion(m_motion);
 
-    view.debug_request("set-line-box-borders"sv, m_show_line_box_borders_action->checked() ? "on"sv : "off"sv);
-    view.debug_request("set-caret-hit-test-debug-overlay"sv, m_show_caret_hit_test_debug_overlay_action->checked() ? "on"sv : "off"sv);
-    view.debug_request("scripting"sv, m_enable_scripting_action->checked() ? "on"sv : "off"sv);
-    view.debug_request("content-blocking"sv, m_enable_content_blocking_action->checked() ? "on"sv : "off"sv);
+    page.async_debug_request("set-line-box-borders"sv, m_show_line_box_borders_action->checked() ? "on"sv : "off"sv);
+    page.async_debug_request("set-caret-hit-test-debug-overlay"sv, m_show_caret_hit_test_debug_overlay_action->checked() ? "on"sv : "off"sv);
+    page.async_debug_request("scripting"sv, m_enable_scripting_action->checked() ? "on"sv : "off"sv);
+    page.async_debug_request("content-blocking"sv, m_enable_content_blocking_action->checked() ? "on"sv : "off"sv);
     if (m_content_blocker_list_buffer.has_value())
-        view.client().async_set_content_blockers(*m_content_blocker_list_buffer);
-    view.debug_request("block-pop-ups"sv, m_block_pop_ups_action->checked() ? "on"sv : "off"sv);
-    view.debug_request("spoof-user-agent"sv, m_user_agent_string);
-    view.debug_request("navigator-compatibility-mode"sv, m_navigator_compatibility_mode);
+        page.client().async_set_content_blockers(*m_content_blocker_list_buffer);
+    page.async_debug_request("block-pop-ups"sv, m_block_pop_ups_action->checked() ? "on"sv : "off"sv);
+    page.async_debug_request("spoof-user-agent"sv, m_user_agent_string);
+    page.async_debug_request("navigator-compatibility-mode"sv, m_navigator_compatibility_mode);
 }
 
 void Application::update_vertical_tabs_action()
@@ -3008,12 +3000,10 @@ Vector<DevTools::CSSProperty> Application::css_property_list() const
 {
     Vector<DevTools::CSSProperty> property_list;
 
-    for (auto i = to_underlying(Web::CSS::first_property_id); i <= to_underlying(Web::CSS::last_property_id); ++i) {
-        auto property_id = static_cast<Web::CSS::PropertyID>(i);
-
+    for (auto const& entry : Web::CSS::property_list()) {
         DevTools::CSSProperty property;
-        property.name = Web::CSS::string_from_property_id(property_id).to_utf16_string().to_utf8_but_should_be_ported_to_utf16();
-        property.is_inherited = Web::CSS::is_inherited_property(property_id);
+        property.name = MUST(String::from_utf8(entry.name));
+        property.is_inherited = entry.is_inherited;
         property_list.append(move(property));
     }
 
@@ -3633,7 +3623,7 @@ void Application::retrieve_sources(DevTools::TabDescription const& description, 
     view->retrieve_devtools_sources(move(on_complete));
 }
 
-void Application::retrieve_source(DevTools::TabDescription const& description, Web::HTML::ScriptRegistry::Identifier source_id, OnSourceReceived on_complete) const
+void Application::retrieve_source(DevTools::TabDescription const& description, Web::HTML::ScriptRegistryIdentifier source_id, OnSourceReceived on_complete) const
 {
     auto view = ViewImplementation::find_view_by_id(description.id);
     if (!view.has_value()) {
@@ -3641,7 +3631,7 @@ void Application::retrieve_source(DevTools::TabDescription const& description, W
         return;
     }
 
-    view->on_received_devtools_source.set(source_id, [on_complete = move(on_complete)](Optional<Web::HTML::ScriptRegistry::Content> source) {
+    view->on_received_devtools_source.set(source_id, [on_complete = move(on_complete)](Optional<Web::HTML::ScriptRegistryContent> source) {
         if (!source.has_value()) {
             on_complete(Error::from_string_literal("Unable to locate source"));
             return;
@@ -3659,7 +3649,7 @@ void Application::listen_for_sources(DevTools::TabDescription const& description
     if (!view.has_value())
         return;
 
-    view->on_devtools_source_available = [on_source_available = move(on_source_available)](Web::HTML::ScriptRegistry::Description source) {
+    view->on_devtools_source_available = [on_source_available = move(on_source_available)](Web::HTML::ScriptRegistryDescription source) {
         on_source_available(move(source));
     };
 }
@@ -3771,7 +3761,7 @@ void Application::remove_debugger_breakpoint(DevTools::TabDescription const& des
     view->remove_debugger_breakpoint(move(location), move(on_complete));
 }
 
-void Application::retrieve_debugger_source_positions(DevTools::TabDescription const& description, Web::HTML::ScriptRegistry::Identifier source_id, OnDebuggerSourcePositionsReceived on_complete) const
+void Application::retrieve_debugger_source_positions(DevTools::TabDescription const& description, Web::HTML::ScriptRegistryIdentifier source_id, OnDebuggerSourcePositionsReceived on_complete) const
 {
     auto view = ViewImplementation::find_view_by_id(description.id);
     if (!view.has_value()) {
@@ -3832,7 +3822,7 @@ void Application::listen_for_network_events(DevTools::TabDescription const& desc
     if (!view.has_value())
         return;
 
-    view->on_network_request_started = [on_request_started = move(on_request_started)](u64 request_id, URL::URL const& url, ByteString const& method, Vector<HTTP::Header> const& headers, ByteBuffer request_body, Optional<String> initiator_type, String referrer_policy, bool is_navigation_request, Web::Fetch::Infrastructure::Request::Priority priority) {
+    view->on_network_request_started = [on_request_started = move(on_request_started)](u64 request_id, URL::URL const& url, ByteString const& method, Vector<HTTP::Header> const& headers, ByteBuffer request_body, Optional<String> initiator_type, String referrer_policy, bool is_navigation_request, Web::Fetch::Infrastructure::RequestPriority priority) {
         on_request_started({
             .request_id = request_id,
             .url = url.to_string(),

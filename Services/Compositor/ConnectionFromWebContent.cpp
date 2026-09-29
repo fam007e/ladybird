@@ -220,6 +220,39 @@ Messages::CompositorWebContentServer::GetCanvasPixelsResponse ConnectionFromWebC
     return m_canvas_host.read_back_pixels(canvas_id, rect);
 }
 
+Messages::CompositorWebContentServer::AllocatePlaceholderCanvasResponse ConnectionFromWebContent::allocate_placeholder_canvas()
+{
+    auto allocation = m_compositor_state->allocate_placeholder_canvas(*this);
+    return { allocation.canvas_id, allocation.secret };
+}
+
+void ConnectionFromWebContent::release_placeholder_canvas(Compositing::CanvasId canvas_id)
+{
+    m_compositor_state->release_placeholder_canvas(*this, canvas_id);
+}
+
+void ConnectionFromWebContent::commit_placeholder_canvas(Compositing::CanvasId canvas_id, u64 secret, Optional<Compositing::CanvasId> source_canvas_id, Gfx::IntSize size, bool origin_clean)
+{
+    RefPtr<Gfx::PaintingSurface> source_surface;
+    if (source_canvas_id.has_value()) {
+        source_surface = m_canvas_host.presented_surface(*source_canvas_id);
+        if (!source_surface)
+            return;
+    }
+    m_compositor_state->commit_placeholder_canvas(canvas_id, secret, move(source_surface), size, origin_clean);
+}
+
+Messages::CompositorWebContentServer::GetPlaceholderCanvasPixelsResponse ConnectionFromWebContent::get_placeholder_canvas_pixels(Compositing::CanvasId canvas_id, Gfx::IntRect rect)
+{
+    auto result = m_compositor_state->read_placeholder_canvas_pixels(*this, canvas_id, rect);
+    return { move(result.pixels), result.origin_clean };
+}
+
+void ConnectionFromWebContent::placeholder_canvas_committed(Compositing::CanvasId canvas_id, Gfx::IntSize size, bool origin_clean)
+{
+    async_placeholder_canvas_committed(canvas_id, size, origin_clean);
+}
+
 Messages::CompositorWebContentServer::CreateWebglContextResponse ConnectionFromWebContent::create_webgl_context(Compositing::WebGL::WebGLVersion webgl_version, Gfx::IntSize size, bool depth, bool stencil, bool antialias)
 {
     auto result = m_canvas_host.create_webgl_context(webgl_version, size, depth, stencil, antialias);
@@ -262,6 +295,11 @@ void ConnectionFromWebContent::webgl_commands(Compositing::CanvasId canvas_id, C
 void ConnectionFromWebContent::webgl_present_canvas(Compositing::CanvasId canvas_id, bool preserve_drawing_buffer)
 {
     m_canvas_host.present_webgl_canvas(canvas_id, preserve_drawing_buffer);
+}
+
+void ConnectionFromWebContent::webgl_clear_drawing_buffer(Compositing::CanvasId canvas_id)
+{
+    m_canvas_host.clear_webgl_drawing_buffer(canvas_id);
 }
 
 Messages::CompositorWebContentServer::WebglSyncCallResponse ConnectionFromWebContent::webgl_sync_call(Compositing::CanvasId canvas_id, ByteBuffer request)
@@ -313,11 +351,11 @@ Messages::CompositorWebContentServer::AsyncScrollByResponse ConnectionFromWebCon
     return result;
 }
 
-Messages::CompositorWebContentServer::SmoothScrollToResponse ConnectionFromWebContent::smooth_scroll_to(Compositing::CompositorContextId context_id, Compositing::AsyncScrollNodeStableID stable_node_id, Gfx::FloatPoint offset, Gfx::FloatPoint main_thread_offset, Gfx::IntRect viewport_rect, Compositing::ScrollAnimationKind animation_kind)
+Messages::CompositorWebContentServer::SmoothScrollToResponse ConnectionFromWebContent::smooth_scroll_to(Compositing::CompositorContextId context_id, Compositing::AsyncScrollNodeStableID stable_node_id, Gfx::FloatPoint offset, Gfx::FloatPoint main_thread_offset, Gfx::IntRect viewport_rect, Compositing::ScrollAnimationKind animation_kind, Compositing::SmoothScrollInitiator initiator)
 {
     if (!context_is_owned_by_this_connection(context_id))
         return Compositing::AsyncScrollEnqueueResult {};
-    auto result = m_compositor_state->smooth_scroll_to(context_id, stable_node_id, offset, main_thread_offset, viewport_rect, animation_kind);
+    auto result = m_compositor_state->smooth_scroll_to(context_id, stable_node_id, offset, main_thread_offset, viewport_rect, animation_kind, initiator);
     if (result.accepted)
         async_request_rendering_update();
     return result;

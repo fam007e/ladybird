@@ -17,6 +17,7 @@
 #include <LibMedia/PipelineStatus.h>
 #include <LibMedia/Processors/AudioProcessor.h>
 #include <LibMedia/Producers/AudioProducer.h>
+#include <LibMedia/SynchronizedWakeHandler.h>
 
 namespace Media {
 
@@ -42,6 +43,7 @@ private:
     void ensure_stretcher_while_locked() const;
     void prime_stretcher_for_input_seek_while_locked(i64 target_frame, i64 output_frame) const;
     void maybe_recover_from_stale_upstream_eos_while_locked() const;
+    bool input_is_suspended_while_locked() const;
     PipelineStatus produce_block_while_locked(AudioBlock&) const;
     void dispatch_wake();
 
@@ -58,9 +60,8 @@ private:
     mutable bool m_stretcher_reached_eos { false };
 
     mutable AudioBlock m_pending_block;
-    mutable bool m_downstream_needs_wake { true };
 
-    PipelineWakeHandler m_wake_handler;
+    SynchronizedWakeHandler m_wake_handler;
 };
 
 }

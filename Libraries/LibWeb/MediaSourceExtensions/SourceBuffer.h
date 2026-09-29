@@ -9,16 +9,13 @@
 
 #include <AK/NonnullRefPtr.h>
 #include <AK/Types.h>
+#include <LibMedia/Track.h>
+#include <LibMediaClient/Forward.h>
 #include <LibWeb/Bindings/SourceBuffer.h>
 #include <LibWeb/DOM/EventTarget.h>
 #include <LibWeb/WebIDL/Buffers.h>
 
 namespace Web::MediaSourceExtensions {
-
-using AppendMode = Bindings::AppendMode;
-
-class SourceBufferProcessor;
-struct InitializationSegmentData;
 
 // https://w3c.github.io/media-source/#dom-sourcebuffer
 class SourceBuffer : public DOM::EventTarget {
@@ -44,12 +41,20 @@ public:
     GC::Ptr<WebIDL::CallbackType> onabort();
 
     // https://w3c.github.io/media-source/#dom-sourcebuffer-mode
-    AppendMode mode() const;
-    WebIDL::ExceptionOr<void> set_mode(AppendMode);
+    Bindings::AppendMode mode() const;
+    WebIDL::ExceptionOr<void> set_mode(Bindings::AppendMode);
 
     // https://w3c.github.io/media-source/#dom-sourcebuffer-timestampoffset
     double timestamp_offset() const;
     WebIDL::ExceptionOr<void> set_timestamp_offset(double);
+
+    // https://w3c.github.io/media-source/#dom-sourcebuffer-appendwindowstart
+    double append_window_start() const { return m_append_window_start; }
+    WebIDL::ExceptionOr<void> set_append_window_start(double);
+
+    // https://w3c.github.io/media-source/#dom-sourcebuffer-appendwindowend
+    double append_window_end() const { return m_append_window_end; }
+    WebIDL::ExceptionOr<void> set_append_window_end(double);
 
     // https://w3c.github.io/media-source/#dom-sourcebuffer-updating
     bool updating() const;
@@ -88,20 +93,31 @@ protected:
 private:
     virtual GC::Ptr<Bindings::Wrappable> relevant_global_impl() const override;
 
-    WebIDL::ExceptionOr<void> prepare_append(size_t new_data_size);
+    WebIDL::ExceptionOr<void> prepare_append();
     void run_buffer_append_algorithm(u64 append_generation);
     void abort_buffer_append_algorithm();
     void run_range_removal(AK::Duration start, AK::Duration end);
     void run_append_error_algorithm();
-    void on_first_initialization_segment_processed(InitializationSegmentData const&);
-    void update_ready_state_and_duration_after_coded_frame_processing();
+    void on_first_initialization_segment_processed(Vector<Media::Track> const& audio_tracks, Vector<Media::Track> const& video_tracks, Vector<Media::Track> const& text_tracks);
+    void finish_range_removal();
+    void update_ready_state_and_duration_after_coded_frame_processing(AK::Duration group_end_timestamp);
     void finish_buffer_append();
 
     GC::Ref<MediaSource> m_media_source;
-    NonnullRefPtr<SourceBufferProcessor> m_processor;
+    NonnullRefPtr<MediaClient::RemoteSourceBuffer> m_remote_source_buffer;
 
-    // NB: The generation of the current buffer-append run — captured by the run when it starts. Bumped by
-    //     abort_buffer_append_algorithm(). A run whose captured generation no longer matches does nothing further.
+    // https://w3c.github.io/media-source/#dom-sourcebuffer-updating
+    bool m_updating { false };
+
+    // https://w3c.github.io/media-source/#dom-sourcebuffer-appendwindowstart
+    double m_append_window_start { 0 };
+    // https://w3c.github.io/media-source/#dom-sourcebuffer-appendwindowend
+    double m_append_window_end { AK::Infinity<double> };
+
+    void send_append_window();
+
+    // NB: The generation of the current buffer-append run, captured by the run's task when it is queued and bumped by
+    //     abort_buffer_append_algorithm(). A task whose captured generation no longer matches does nothing.
     u64 m_append_generation { 0 };
 
     // https://w3c.github.io/media-source/#sourcebuffer-range-removal

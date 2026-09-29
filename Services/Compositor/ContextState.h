@@ -138,7 +138,7 @@ public:
         u32 modifiers,
         Compositing::AsyncScrollOperationTracking,
         Optional<MonotonicTime> now_for_testing = {});
-    AsyncScrollResult smooth_scroll_to(Compositing::AsyncScrollNodeStableID, Gfx::FloatPoint offset, Gfx::FloatPoint main_thread_offset, Gfx::IntRect viewport_rect, Compositing::ScrollAnimationKind);
+    AsyncScrollResult smooth_scroll_to(Compositing::AsyncScrollNodeStableID, Gfx::FloatPoint offset, Gfx::FloatPoint main_thread_offset, Gfx::IntRect viewport_rect, Compositing::ScrollAnimationKind, Compositing::SmoothScrollInitiator);
     void cancel_smooth_scroll(Compositing::AsyncScrollNodeStableID);
     Optional<Gfx::IntRect> advance_smooth_scroll_animations(MonotonicTime now);
     bool has_active_smooth_scroll_animations() const { return !m_smooth_scroll_animations.is_empty(); }
@@ -187,7 +187,8 @@ public:
     Optional<PendingFrame> take_pending_present_frame_if_unblocked();
     bool needs_rasterization() const;
     Optional<Gfx::IntRect> frame_rect_to_repaint() const;
-    Optional<Gfx::IntRect> video_present_rect() const;
+    Optional<Gfx::IntRect> self_present_rect() const;
+    bool draws_canvas(Compositing::CanvasId) const;
     Optional<PreparedFrame> prepare_frame(Compositing::DisplayListPlayerSkia&, PendingFrame, CompositedContextResolver const*);
     void did_submit_prepared_frame(Gfx::IntRect);
     bool present_synchronously(Compositing::DisplayListPlayerSkia&, CompositedContextResolver const*);
