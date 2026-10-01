@@ -133,6 +133,8 @@
 #include <LibWeb/HTML/Window.h>
 #include <LibWeb/HTML/XMLSerializer.h>
 #include <LibWeb/IntersectionObserver/IntersectionObserver.h>
+#include <LibWeb/Layout/LayoutRustFFI.h>
+#include <LibWeb/Layout/NodeArena.h>
 #include <LibWeb/Layout/TreeBuilder.h>
 #include <LibWeb/Layout/Viewport.h>
 #include <LibWeb/Loader/ContentBlocker.h>
@@ -210,8 +212,6 @@ void Element::RareData::visit_edges(Cell::Visitor& visitor)
         for (auto& observer : *registered_intersection_observers)
             visitor.visit(observer);
     }
-    if (counters_set)
-        counters_set->visit_edges(visitor);
 }
 
 OwnPtr<Node::RareData> Element::create_rare_data() const
@@ -318,6 +318,19 @@ Element::AttributeList& Element::ensure_attribute_list()
     if (!m_attributes)
         m_attributes = make<AttributeList>();
     return *m_attributes;
+}
+
+void Element::append_to_attribute_list(QualifiedName name, Utf16String value)
+{
+    add_to_subtree_attribute_name_filter(attribute_name_filter_bit(name.local_name()));
+    ensure_attribute_list().empend(move(name), move(value));
+}
+
+void Element::add_to_subtree_attribute_name_filter(u64 bits)
+{
+    // An element's filter holds those of its children, so the walk up ends at the first that has the bits.
+    for (auto* element = this; element && (element->m_subtree_attribute_name_filter & bits) != bits; element = element->parent_element().ptr())
+        element->m_subtree_attribute_name_filter |= bits;
 }
 
 void Element::ensure_attribute_capacity(size_t capacity)
@@ -469,32 +482,34 @@ Utf16String Element::get_an_elements_target(Optional<Utf16String> target) const
     return {};
 }
 
+bool Element::link_types_include(Utf16View link_type) const
+{
+    auto link_types = get_attribute_ns({}, HTML::AttributeNames::rel).value_or({});
+    size_t start = 0;
+    for (size_t i = 0; i <= link_types.length_in_code_units(); ++i) {
+        if (i != link_types.length_in_code_units() && !Infra::is_ascii_whitespace(link_types.code_unit_at(i)))
+            continue;
+
+        if (i > start && link_types.substring_view(start, i - start).equals_ignoring_ascii_case(link_type))
+            return true;
+        start = i + 1;
+    }
+    return false;
+}
+
 // https://html.spec.whatwg.org/multipage/links.html#get-an-element's-noopener
 HTML::TokenizedFeature::NoOpener Element::get_an_elements_noopener(URL::URL const& url, Utf16View target)
 {
     // To get an element's noopener, given an a, area, or form element element, a URL record url, and a string target,
     // perform the following steps. They return a boolean.
-    auto link_types = get_attribute_ns({}, HTML::AttributeNames::rel).value_or({});
-    auto has_link_type = [&](Utf16View link_type) {
-        size_t start = 0;
-        for (size_t i = 0; i <= link_types.length_in_code_units(); ++i) {
-            if (i != link_types.length_in_code_units() && !Infra::is_ascii_whitespace(link_types.code_unit_at(i)))
-                continue;
-
-            if (i > start && link_types.substring_view(start, i - start).equals_ignoring_ascii_case(link_type))
-                return true;
-            start = i + 1;
-        }
-        return false;
-    };
 
     // 1. If element's link types include the noopener or noreferrer keyword, then return true.
-    if (has_link_type(u"noopener"sv) || has_link_type(u"noreferrer"sv))
+    if (link_types_include(u"noopener"sv) || link_types_include(u"noreferrer"sv))
         return HTML::TokenizedFeature::NoOpener::Yes;
 
     // 2. If element's link types do not include the opener keyword and
     //    target is an ASCII case-insensitive match for "_blank", then return true.
-    if (!has_link_type(u"opener"sv) && target.equals_ignoring_ascii_case(u"_blank"sv))
+    if (!link_types_include(u"opener"sv) && target.equals_ignoring_ascii_case(u"_blank"sv))
         return HTML::TokenizedFeature::NoOpener::Yes;
 
     // 3. If url's blob URL entry is not null:
@@ -592,18 +607,26 @@ void Element::follow_the_hyperlink(Optional<Utf16String> hyperlink_suffix, HTML:
         url_string_with_suffix = url_string_builder.to_string();
     }
 
-    // 11. Let referrerPolicy be the current state of subject's referrerpolicy content attribute.
-    auto referrer_policy_attribute = attribute(HTML::AttributeNames::referrerpolicy);
-    auto referrer_policy = ReferrerPolicy::from_string(referrer_policy_attribute.has_value() ? referrer_policy_attribute->utf16_view() : u""sv).value_or(ReferrerPolicy::ReferrerPolicy::EmptyString);
-
-    // FIXME: 12. If subject's link types includes the noreferrer keyword, then set referrerPolicy to "no-referrer".
-
-    // 13. Navigate targetNavigable to urlString using subject's node document, with referrerPolicy set to referrerPolicy and userInvolvement set to userInvolvement.
+    // 11. Navigate targetNavigable to urlString using subject's node document, with referrerPolicy set to subject's
+    //     hyperlink referrer policy, userInvolvement set to userInvolvement, and sourceElement set to subject.
+    // FIXME: Set sourceElement.
     auto url = url_string_with_suffix.has_value()
         ? URL::Parser::basic_parse(url_string_with_suffix->utf16_view())
         : URL::Parser::basic_parse(url_string);
     VERIFY(url.has_value());
-    MUST(target_navigable->navigate({ .url = url.release_value(), .source_document = document(), .referrer_policy = referrer_policy, .user_involvement = user_involvement }));
+    MUST(target_navigable->navigate({ .url = url.release_value(), .source_document = document(), .referrer_policy = hyperlink_referrer_policy(), .user_involvement = user_involvement }));
+}
+
+// https://html.spec.whatwg.org/multipage/links.html#hyperlink-referrer-policy
+ReferrerPolicy::ReferrerPolicy Element::hyperlink_referrer_policy() const
+{
+    // 1. If subject's link types includes the noreferrer keyword, then return "no-referrer".
+    if (link_types_include(u"noreferrer"sv))
+        return ReferrerPolicy::ReferrerPolicy::NoReferrer;
+
+    // 2. Return the current state of subject's referrerpolicy content attribute.
+    auto referrer_policy_attribute = attribute(HTML::AttributeNames::referrerpolicy);
+    return ReferrerPolicy::from_string(referrer_policy_attribute.has_value() ? referrer_policy_attribute->utf16_view() : u""sv).value_or(ReferrerPolicy::ReferrerPolicy::EmptyString);
 }
 
 // https://html.spec.whatwg.org/multipage/links.html#downloading-hyperlinks
@@ -966,9 +989,8 @@ void Element::append_attribute(Attr& attribute)
 void Element::append_attribute(QualifiedName name, Utf16String value)
 {
     auto old_value = Optional<Utf16String> {};
-    auto& attributes = ensure_attribute_list();
-    attributes.empend(move(name), move(value));
-    auto& attribute = attributes.last();
+    append_to_attribute_list(move(name), move(value));
+    auto& attribute = m_attributes->last();
     auto attribute_name = attribute.name;
     auto new_value = attribute.value;
     handle_attribute_changes(move(attribute_name), move(old_value), move(new_value));
@@ -1846,16 +1868,6 @@ static bool content_displays_a_counter(CSS::StyleValue const& content)
     });
 }
 
-// A marker whose text is the same for every counter value (disc, circle, square, ...) does not
-// reveal renumbering.
-static bool counter_style_representation_depends_on_value(CSS::CounterStyle const& counter_style)
-{
-    auto first = counter_style.generate_an_initial_representation_for_the_counter_value(1);
-    auto second = counter_style.generate_an_initial_representation_for_the_counter_value(2);
-    auto third = counter_style.generate_an_initial_representation_for_the_counter_value(3);
-    return first != second || second != third;
-}
-
 static bool pseudo_element_content_displays_a_counter(Element const& element, CSS::PseudoElement pseudo_element)
 {
     if (!element.has_style(pseudo_element))
@@ -1882,7 +1894,7 @@ static bool element_displays_a_list_item_counter_value(Element const& element)
             return false;
         },
         [](RefPtr<CSS::CounterStyle const> const& counter_style) {
-            return !counter_style || counter_style_representation_depends_on_value(*counter_style);
+            return !counter_style || CSS::counter_style_representation_depends_on_value(*counter_style);
         },
         [](Utf16String const&) {
             return false;
@@ -1891,7 +1903,7 @@ static bool element_displays_a_list_item_counter_value(Element const& element)
             return true;
         },
         [](CSS::ListStyleSymbols const& symbols) {
-            return counter_style_representation_depends_on_value(*symbols.counter_style);
+            return CSS::counter_style_representation_depends_on_value(*symbols.counter_style);
         });
 }
 
@@ -2117,8 +2129,19 @@ void Element::set_style_uses_if_css_function()
 {
     if (m_style_uses_if_css_function)
         return;
+    bool const publishes = !style_recomputes_on_environment_move();
     m_style_uses_if_css_function = true;
     document().add_element_with_viewport_dependent_style(*this);
+    if (publishes)
+        publish_style_recomputes_on_environment_move();
+}
+
+void Element::publish_style_recomputes_on_environment_move()
+{
+    auto style_node = style_node_id();
+    if (style_node == 0)
+        return;
+    document().style_computer().style_engine().set_element_recomputes_on_environment_move(style_node, style_recomputes_on_environment_move());
 }
 
 void Element::set_style_depends_on_viewport_metrics()
@@ -2152,8 +2175,13 @@ void Element::publish_custom_property_names()
         .uses_custom_function = m_style_uses_custom_function,
     };
     Vector<RefPtr<CSS::CustomPropertyData const>> published_pseudo_element_data;
+    // NB: The engine names the synthetic pseudo-elements that hold an environment in one answer.
+    auto const synthetic_pseudo_elements_with_data = style_node_id() == 0 ? 0 : document().style_computer().style_engine().pseudo_elements_with_custom_property_data(style_node_id());
     for (auto i = 0; i < to_underlying(CSS::PseudoElement::KnownPseudoElementCount); ++i) {
-        if (auto data = custom_property_data(static_cast<CSS::PseudoElement>(i)))
+        auto pseudo_element = static_cast<CSS::PseudoElement>(i);
+        if (is_synthetic_pseudo_element(pseudo_element) && !((synthetic_pseudo_elements_with_data >> i) & 1))
+            continue;
+        if (auto data = custom_property_data(pseudo_element))
             published_pseudo_element_data.append(move(data));
     }
     Vector<Utf16FlyString> published_references;
@@ -2383,6 +2411,7 @@ CSS::RequiredInvalidationAfterStyleChange Element::apply_style_engine_reaction(b
     RefPtr<CSS::ComputedValues const> materialized_style;
     // These flags include reads by the previous pseudo styles. Recomputing just the element
     // would otherwise lose those dependencies when the flags below are reset.
+    bool const had_environment_move_dependencies = style_recomputes_on_environment_move();
     bool const had_style_context_dependencies = m_style_uses_attr_css_function
         || m_style_uses_var_css_function || m_style_uses_if_css_function
         || m_style_uses_custom_function || m_style_uses_inherit_css_function
@@ -2397,6 +2426,8 @@ CSS::RequiredInvalidationAfterStyleChange Element::apply_style_engine_reaction(b
     m_style_depends_on_viewport_metrics = false;
     m_style_depends_on_size_container_query = false;
     m_style_depends_on_style_container_query = false;
+    if (had_environment_move_dependencies)
+        publish_style_recomputes_on_environment_move();
     if (auto* rare_data = element_rare_data(); rare_data && rare_data->custom_property_consumer_data)
         rare_data->custom_property_consumer_data->style_query_references.clear_with_capacity();
     reusable_style_engine_matches = &style_engine_matches;
@@ -2844,6 +2875,68 @@ GC::Ptr<ShadowRoot> Element::open_shadow_root() const
     return shadow;
 }
 
+static bool has_same_type(Element const& element, Element const& other)
+{
+    return element.local_name() == other.local_name() && element.namespace_uri() == other.namespace_uri();
+}
+
+u32 Element::child_index(ChildIndexAmong among) const
+{
+    auto const* parent = this->parent();
+    if (!parent)
+        return 1;
+    auto generation = parent->child_index_generation();
+    auto of_type = among == ChildIndexAmong::SiblingsOfType;
+    auto is_counted = [&](Element const& sibling) { return !of_type || has_same_type(sibling, *this); };
+    auto remembered_index = [&](Element const& sibling) -> u32& {
+        if (sibling.m_parent_child_index_generation != generation) {
+            sibling.m_parent_child_index_generation = generation;
+            sibling.m_child_index = 0;
+            sibling.m_child_index_of_type = 0;
+        }
+        return of_type ? sibling.m_child_index_of_type : sibling.m_child_index;
+    };
+
+    // Walk back to the nearest counted sibling that remembers its index...
+    u32 index = 0;
+    Element const* sibling = nullptr;
+    for (auto const* candidate = this; candidate; candidate = candidate->previous_element_sibling()) {
+        if (!is_counted(*candidate))
+            continue;
+        if (auto known = remembered_index(*candidate)) {
+            if (candidate == this)
+                return known;
+            index = known;
+            sibling = candidate->next_element_sibling();
+            break;
+        }
+    }
+
+    // ...and number the counted siblings from there through this element.
+    for (sibling = sibling ? sibling : parent->first_child_of_type<Element>();; sibling = sibling->next_element_sibling()) {
+        if (!is_counted(*sibling))
+            continue;
+        remembered_index(*sibling) = ++index;
+        if (sibling == this)
+            return index;
+    }
+}
+
+u32 Element::child_index_from_end(ChildIndexAmong among) const
+{
+    auto const* parent = this->parent();
+    if (!parent)
+        return 1;
+    auto const* last = parent->last_child_of_type<Element>();
+    // NB: The walk back to the last sibling of this type is not remembered, so it costs the number of siblings of
+    //     other types that follow it on every call.
+    if (among == ChildIndexAmong::SiblingsOfType) {
+        while (!has_same_type(*last, *this))
+            last = last->previous_element_sibling();
+    }
+    return last->child_index(among) - child_index(among) + 1;
+}
+
 // https://dom.spec.whatwg.org/#dom-element-matches
 WebIDL::ExceptionOr<bool> Element::matches(Utf16View selectors) const
 {
@@ -2954,8 +3047,10 @@ void Element::set_shadow_root(GC::Ptr<ShadowRoot> shadow_root)
     if (m_shadow_root) {
         if (auto count = m_shadow_root->associated_animation_count_in_subtree())
             change_associated_animation_count_in_subtree(-static_cast<i32>(count));
-        if (is_connected())
+        if (is_connected()) {
+            m_shadow_root->detach_remaining_layout_nodes_for_removal();
             CSS::record_subtree_disconnecting(*m_shadow_root);
+        }
         m_shadow_root->set_host(nullptr);
         m_shadow_root->set_is_connected(false);
         // NB: We don't need to run the removed steps if the children have already been disconnected (or were never
@@ -2975,6 +3070,9 @@ void Element::set_shadow_root(GC::Ptr<ShadowRoot> shadow_root)
 
         m_shadow_root->set_host(this);
         m_shadow_root->set_is_connected(is_connected());
+        // A root attached to a connected host takes its StyleNodeID now rather than when a child
+        // first needs it, so that a root that stays empty is named too.
+        CSS::record_shadow_root_connected(*m_shadow_root);
         if (auto count = m_shadow_root->associated_animation_count_in_subtree())
             change_associated_animation_count_in_subtree(count);
     }
@@ -3070,6 +3168,8 @@ void Element::did_update_inline_style()
     if (!m_style_attribute_is_dirty)
         document().mark_style_attribute_dirty(*this);
     m_style_attribute_is_dirty = true;
+    // The style attribute is appended when it is next synchronized, but a selector query may skip this subtree before.
+    add_to_subtree_attribute_name_filter(attribute_name_filter_bit(HTML::AttributeNames::style));
     queue_mutation_record(MutationType::attributes, HTML::AttributeNames::style, {}, old_value, {}, {}, nullptr, nullptr);
 
     if (!document().suppresses_attribute_style_invalidation())
@@ -3102,7 +3202,7 @@ void Element::synchronize_style_attribute() const
     if (style_attribute_index.has_value()) {
         element.m_attributes->at(*style_attribute_index).value = new_value;
     } else {
-        element.ensure_attribute_list().empend(QualifiedName { HTML::AttributeNames::style, {}, {} }, new_value);
+        element.append_to_attribute_list(QualifiedName { HTML::AttributeNames::style, {}, {} }, new_value);
     }
 
     CSS::record_element_attribute_changed(element, HTML::AttributeNames::style, {}, old_value, new_value);
@@ -3403,8 +3503,30 @@ void Element::set_synthetic_pseudo_element_node(Badge<Layout::LayoutTreeBuilderA
     ensure_synthetic_pseudo_element(pseudo_element).set_layout_node(move(pseudo_element_node));
 }
 
+void Element::set_style_node_id(CSS::StyleNodeID style_node_id)
+{
+    if (m_style_node_id == style_node_id)
+        return;
+    m_published_presentational_hint_properties.clear();
+    auto old_style_node_id = m_style_node_id;
+    m_style_node_id = style_node_id;
+    Layout::Node::dom_node_style_node_changed(*this, old_style_node_id);
+}
+
+// The top layer is one of the few element facts the tree build reads that moves during the element's lifetime, so the
+// style mirror is told here rather than where the element arrives.
+void Element::set_rendered_in_top_layer(bool rendered_in_top_layer)
+{
+    if (m_rendered_in_top_layer == rendered_in_top_layer)
+        return;
+    m_rendered_in_top_layer = rendered_in_top_layer;
+    CSS::record_element_adjustment_facts(*this);
+}
+
 Layout::NodeWithStyle* Element::pseudo_element_layout_node(CSS::PseudoElement pseudo_element) const
 {
+    if (CSS::is_synthetic_pseudo_element(pseudo_element))
+        return pseudo_element_unsafe_layout_node(pseudo_element);
     if (auto element_data = get_pseudo_element(pseudo_element); element_data.has_value())
         return element_data->layout_node();
     return nullptr;
@@ -3412,6 +3534,16 @@ Layout::NodeWithStyle* Element::pseudo_element_layout_node(CSS::PseudoElement ps
 
 Layout::NodeWithStyle* Element::pseudo_element_unsafe_layout_node(CSS::PseudoElement pseudo_element) const
 {
+    // A synthetic pseudo-element has no StyleNodeID of its own: its box is the row the arena binds to this element's
+    // StyleNodeID and the pseudo-element's type. The generated content inside the box carries the same pair, so only
+    // this binding tells the box from its content. An element-reference pseudo-element has no box of its own and
+    // still has to be asked for the element it stands in for.
+    if (CSS::is_synthetic_pseudo_element(pseudo_element)) {
+        auto* arena = const_cast<Document&>(document()).layout_node_arena_if_created();
+        if (!arena)
+            return nullptr;
+        return static_cast<Layout::NodeWithStyle*>(Layout::RustFFI::layout_arena_bound_pseudo_element_shell(arena->handle(), style_node_id().value(), Layout::Node::encode_generated_for(pseudo_element)));
+    }
     if (auto element_data = get_pseudo_element(pseudo_element); element_data.has_value())
         return element_data->unsafe_layout_node();
     return nullptr;
@@ -5227,6 +5359,14 @@ size_t Element::attribute_list_size() const
     return m_attributes ? m_attributes->size() : 0;
 }
 
+ReadonlySpan<Element::Attribute> Element::attribute_list() const
+{
+    synchronize_all_attributes();
+    if (!m_attributes)
+        return {};
+    return m_attributes->span();
+}
+
 CSS::ComputedStyleRecordView Element::computed_style(Optional<CSS::PseudoElement> pseudo_element_type) const
 {
     return document().style_computer().computed_style_record_view(style_record_identity(pseudo_element_type));
@@ -5398,9 +5538,9 @@ SyntheticPseudoElement& Element::ensure_synthetic_pseudo_element(CSS::PseudoElem
 
     if (!pseudo_element_data->get(type).has_value()) {
         if (is_pseudo_element_root(type))
-            pseudo_element_data->set(type, heap().allocate<SyntheticPseudoElementTreeNode>(const_cast<Element&>(*this)));
+            pseudo_element_data->set(type, heap().allocate<SyntheticPseudoElementTreeNode>(type, const_cast<Element&>(*this)));
         else
-            pseudo_element_data->set(type, heap().allocate<SyntheticPseudoElement>(const_cast<Element&>(*this)));
+            pseudo_element_data->set(type, heap().allocate<SyntheticPseudoElement>(type, const_cast<Element&>(*this)));
     }
 
     return as<SyntheticPseudoElement>(*pseudo_element_data->get(type).value());
@@ -5426,47 +5566,58 @@ void Element::replace_custom_property_data(Optional<CSS::PseudoElement> pseudo_e
     install_custom_property_data(pseudo_element, move(data));
 }
 
+// The style engine keeps the custom-property environments an element and its synthetic pseudo-elements hold; the
+// element keeps no copy of its own. This is the only place they move.
 void Element::install_custom_property_data(Optional<CSS::PseudoElement> pseudo_element, RefPtr<CSS::CustomPropertyData const> data)
 {
-    if (!pseudo_element.has_value()) {
-        m_custom_property_data = move(data);
+    if (pseudo_element.has_value() && !CSS::Selector::PseudoElementSelector::is_known_pseudo_element_type(pseudo_element.value()))
+        return;
+
+    if (!pseudo_element.has_value() || is_synthetic_pseudo_element(pseudo_element.value())) {
+        auto style_node = style_node_id();
+        VERIFY(style_node != 0 || !data);
+        if (style_node == 0)
+            return;
+        auto& style_engine = document().style_computer().style_engine();
+        if (!pseudo_element.has_value()) {
+            style_engine.set_element_custom_property_data(style_node, data.ptr());
+            return;
+        }
+        if (data)
+            (void)ensure_synthetic_pseudo_element(pseudo_element.value());
+        style_engine.set_pseudo_element_custom_property_data(style_node, pseudo_element.value(), data.ptr());
         return;
     }
 
-    if (!CSS::Selector::PseudoElementSelector::is_known_pseudo_element_type(pseudo_element.value()))
-        return;
-
-    if (data) {
-        if (is_synthetic_pseudo_element(pseudo_element.value())) {
-            ensure_synthetic_pseudo_element(pseudo_element.value()).set_custom_property_data(move(data));
-        } else {
-            if (auto existing_pseudo_element = get_pseudo_element(pseudo_element.value()); existing_pseudo_element.has_value())
-                existing_pseudo_element->set_custom_property_data(move(data));
-
-            // FIXME: In the case that an originating element doesn't support a given element-reference pseudo-element
-            //        we will end up here, we can't create an element-reference pseudo-element on demand to store the
-            //        custom property data so we just ignore it.
-            //
-            //        The issue with this is it means the relevant custom properties aren't included in
-            //        getComputedStyle, which would be fixed if we stored CustomPropertyData on the computed style
-            //        instead of on the Element/PseudoElement directly. Chrome displays this same (presumably broken)
-            //        behavior whereas Firefox includes the properties in getComputedStyle.
-        }
-
-    } else if (auto existing_pseudo_element = get_pseudo_element(pseudo_element.value()); existing_pseudo_element.has_value())
-        existing_pseudo_element->set_custom_property_data({});
+    // FIXME: In the case that an originating element doesn't support a given element-reference pseudo-element
+    //        we will end up here, we can't create an element-reference pseudo-element on demand to store the
+    //        custom property data so we just ignore it.
+    //
+    //        The issue with this is it means the relevant custom properties aren't included in
+    //        getComputedStyle, which would be fixed if we stored CustomPropertyData on the computed style
+    //        instead of on the Element/PseudoElement directly. Chrome displays this same (presumably broken)
+    //        behavior whereas Firefox includes the properties in getComputedStyle.
+    if (auto existing_pseudo_element = get_pseudo_element(pseudo_element.value()); existing_pseudo_element.has_value())
+        as<ElementReferencePseudoElement>(*existing_pseudo_element).referenced_element()->set_custom_property_data({}, move(data));
 }
 
 RefPtr<CSS::CustomPropertyData const> Element::custom_property_data(Optional<CSS::PseudoElement> pseudo_element) const
 {
-    if (!pseudo_element.has_value())
-        return m_custom_property_data;
-
-    if (!CSS::Selector::PseudoElementSelector::is_known_pseudo_element_type(pseudo_element.value()))
+    if (pseudo_element.has_value() && !CSS::Selector::PseudoElementSelector::is_known_pseudo_element_type(pseudo_element.value()))
         return nullptr;
 
+    if (!pseudo_element.has_value() || is_synthetic_pseudo_element(pseudo_element.value())) {
+        auto style_node = style_node_id();
+        if (style_node == 0)
+            return nullptr;
+        auto const& style_engine = document().style_computer().style_engine();
+        if (!pseudo_element.has_value())
+            return style_engine.element_custom_property_data(style_node);
+        return style_engine.pseudo_element_custom_property_data(style_node, pseudo_element.value());
+    }
+
     if (auto existing_pseudo_element = get_pseudo_element(pseudo_element.value()); existing_pseudo_element.has_value())
-        return existing_pseudo_element->custom_property_data();
+        return as<ElementReferencePseudoElement>(*existing_pseudo_element).referenced_element()->custom_property_data({});
 
     return nullptr;
 }
@@ -5479,19 +5630,20 @@ bool Element::refresh_inherited_custom_property_data()
             parent_data = data->inheritable(document());
     }
 
-    if (m_custom_property_data && m_custom_property_data->is_animation_overlay()) {
-        if (m_custom_property_data->parent() == parent_data)
+    auto current = custom_property_data({});
+    if (current && current->is_animation_overlay()) {
+        if (current->parent() == parent_data)
             return false;
         OrderedHashMap<Utf16FlyString, CSS::StyleProperty> animated_values;
-        for (auto const& [name, property] : m_custom_property_data->own_values())
+        for (auto const& [name, property] : current->own_values())
             animated_values.set(name, property);
-        m_custom_property_data = CSS::CustomPropertyData::create_animation_overlay(move(animated_values), move(parent_data));
+        install_custom_property_data({}, CSS::CustomPropertyData::create_animation_overlay(move(animated_values), move(parent_data)));
         return true;
     }
 
-    if (m_custom_property_data == parent_data)
+    if (current == parent_data)
         return false;
-    m_custom_property_data = move(parent_data);
+    install_custom_property_data({}, move(parent_data));
     return true;
 }
 
@@ -6315,7 +6467,7 @@ void Element::attribute_changed(Utf16FlyString const& local_name, Optional<Utf16
     } else if (local_name == HTML::AttributeNames::class_) {
         // Elements without a StyleEngine identity have no feature state to update. Avoid moving
         // their class list out just for record_element_class_list_changed() to reject the update.
-        Optional<Vector<Utf16FlyString>> old_style_engine_classes;
+        Optional<Vector<Utf16FlyString, 1>> old_style_engine_classes;
         if (style_node_id().value() != 0)
             old_style_engine_classes = move(m_classes);
 
@@ -6517,36 +6669,6 @@ WebIDL::ExceptionOr<void> Element::set_html_unsafe(StringView html)
     TRY(unsafely_set_html(move(target), markup.utf16_view()));
 
     return {};
-}
-
-Optional<CSS::CountersSet const&> Element::counters_set() const
-{
-    auto const* rare_data = element_rare_data();
-    if (!rare_data || !rare_data->counters_set)
-        return {};
-    return *rare_data->counters_set;
-}
-
-CSS::CountersSet& Element::ensure_counters_set()
-{
-    auto& counters_set = ensure_element_rare_data().counters_set;
-    if (!counters_set)
-        counters_set = make<CSS::CountersSet>();
-    return *counters_set;
-}
-
-void Element::set_counters_set(OwnPtr<CSS::CountersSet>&& counters_set)
-{
-    if (counters_set)
-        ensure_element_rare_data().counters_set = move(counters_set);
-    else if (auto* rare_data = element_rare_data())
-        rare_data->counters_set = nullptr;
-}
-
-bool Element::has_non_empty_counters_set() const
-{
-    auto const* rare_data = element_rare_data();
-    return rare_data && rare_data->counters_set;
 }
 
 // https://html.spec.whatwg.org/multipage/dom.html#the-lang-and-xml:lang-attributes

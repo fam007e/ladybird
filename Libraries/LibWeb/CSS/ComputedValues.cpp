@@ -1475,35 +1475,6 @@ Vector<BackgroundLayerData> ComputedValues::MaskValues::mask_layers_value() cons
     return layers;
 }
 
-template<typename T, typename Mapper>
-static Vector<T> animation_keyword_items(ComputedValuesFFI::ComputedStyleValueHandle const& handle, Mapper mapper)
-{
-    Vector<T> result;
-    for (auto const& item : animation_items(handle))
-        result.append(mapper(item->to_keyword()).release_value());
-    return result;
-}
-
-static Vector<Time> animation_time_items(ComputedValuesFFI::ComputedStyleValueHandle const& handle)
-{
-    Vector<Time> result;
-    for (auto const& item : animation_items(handle))
-        result.append(Time::from_style_value(item, {}));
-    return result;
-}
-
-static Vector<Optional<Utf16FlyString>> animation_optional_name_items(ComputedValuesFFI::ComputedStyleValueHandle const& handle)
-{
-    Vector<Optional<Utf16FlyString>> result;
-    for (auto const& item : animation_items(handle)) {
-        if (item->is_custom_ident())
-            result.append(item->as_custom_ident().custom_ident());
-        else
-            result.empend();
-    }
-    return result;
-}
-
 Vector<ComputedAnimationName> ComputedValues::AnimationValues::animation_names_value() const
 {
     auto const* value = static_cast<StyleValueFFI::StyleValueData const*>(animation_name.pointer);
@@ -1537,34 +1508,6 @@ Vector<ComputedAnimationName> ComputedValues::AnimationValues::animation_names_v
     return result;
 }
 
-Vector<Optional<Utf16FlyString>> ComputedValues::AnimationValues::transition_properties_value() const
-{
-    return animation_optional_name_items(transition_property);
-}
-
-Vector<Time> ComputedValues::AnimationValues::transition_durations_value() const
-{
-    return animation_time_items(transition_duration);
-}
-
-Vector<EasingFunction> ComputedValues::AnimationValues::transition_timing_functions_value() const
-{
-    Vector<EasingFunction> result;
-    for (auto const& item : animation_items(transition_timing_function))
-        result.append(EasingFunction::from_style_value(item));
-    return result;
-}
-
-Vector<Time> ComputedValues::AnimationValues::transition_delays_value() const
-{
-    return animation_time_items(transition_delay);
-}
-
-Vector<TransitionBehavior> ComputedValues::AnimationValues::transition_behaviors_value() const
-{
-    return animation_keyword_items<TransitionBehavior>(transition_behavior, keyword_to_transition_behavior);
-}
-
 NonnullRefPtr<ComputedValues const> ComputedValues::create(ComputedStyleWorkingSet const& computed_style, DOM::Document const& document, StyleScope const& style_scope, ColorResolutionContext color_resolution_context, ComputedValues const* inherit_parent)
 {
     return create_internal(computed_style, document, style_scope, move(color_resolution_context), inherit_parent, nullptr, all_style_groups);
@@ -1575,7 +1518,7 @@ NonnullRefPtr<ComputedValues const> ComputedValues::create_over_base(ComputedSty
     return create_internal(computed_style, document, style_scope, move(color_resolution_context), nullptr, &base, groups_to_apply);
 }
 
-NonnullRefPtr<ComputedValues const> ComputedValues::create_internal(ComputedStyleWorkingSet const& computed_style, DOM::Document const& document, StyleScope const&, ColorResolutionContext color_resolution_context, ComputedValues const* inherit_parent, ComputedValues const* base, u32 groups_to_apply)
+NonnullRefPtr<ComputedValues const> ComputedValues::create_internal(ComputedStyleWorkingSet const& computed_style, DOM::Document const& document, StyleScope const& style_scope, ColorResolutionContext color_resolution_context, ComputedValues const* inherit_parent, ComputedValues const* base, u32 groups_to_apply)
 {
     // A group outside `groups_to_apply` keeps the base's payload: its build is skipped and it counts
     // as adopted, so the guarded setters below leave it alone. The caller warrants that every
@@ -1607,7 +1550,9 @@ NonnullRefPtr<ComputedValues const> ComputedValues::create_internal(ComputedStyl
     auto ffi_color_input = make_rust_color_resolution_input(color_resolution_context, length_context_storage);
     Optional<ComputedValuesFFI::FfiFontGroupBuildInputs> font_group_inputs;
     if (applies(StyleGroupIndex::FontValues)) {
-        auto font_list = computed_style.computed_font_list(document.font_computer());
+        // FIXME: A tree-scoped name is resolved in the tree of the declaration that named it, and inherits with that
+        //        tree (css-scoping). This resolves feature value names in the element's own tree scope instead.
+        auto font_list = computed_style.computed_font_list(document.font_computer(), style_scope.style_engine_tree_scope());
         auto const& first_available_font = font_list->first_available_font();
         auto const metrics = first_available_font.pixel_metrics();
         auto math_shift = keyword_to_math_shift(computed_style.property(PropertyID::MathShift).to_keyword()).release_value();

@@ -17,6 +17,7 @@ use std::ffi::c_void;
 use std::ops::ControlFlow;
 use std::sync::Arc;
 
+use super::publication::{Drive, OrRefused, Unanswered};
 use super::*;
 use crate::css::cascaded_properties::{
     CallbackFreeParseOutcome, FfiCascadeResolutionContext, FfiCustomPropertyDriveInput, FfiResolvedStyleValue,
@@ -38,8 +39,8 @@ struct EngineFinalizer {
 }
 
 /// The tail of resolving one component of unregistered custom properties, as the C++ finalizer
-/// does it for a name without a registration: `initial` is the guaranteed-invalid value, `inherit`
-/// and `unset` are what the parent resolved the name to, and the rest stands as substituted.
+/// does it for a name without a registration: `initial` is the guaranteed-invalid value, and
+/// `inherit`, `unset`, `revert` and `revert-layer` are what the parent resolved the name to.
 #[allow(clippy::arc_with_non_send_sync)]
 unsafe extern "C" fn finalize_engine_custom_property_component(
     context: *mut c_void,
@@ -59,7 +60,7 @@ unsafe extern "C" fn finalize_engine_custom_property_component(
         };
         let replacement: *const StyleValueData = match *keyword {
             keyword::INITIAL => Arc::into_raw(Arc::new(StyleValueData::GuaranteedInvalid)),
-            keyword::INHERIT | keyword::UNSET => {
+            keyword::INHERIT | keyword::UNSET | keyword::REVERT | keyword::REVERT_LAYER => {
                 let name_raw = unsafe { *names.add(member as usize) };
                 match parent.and_then(|parent| parent.get(name_raw)) {
                     Some(entry) => unsafe { retain_style_value(entry.value.pointer()) },
@@ -207,7 +208,7 @@ impl RetainedState {
     /// keeps the parent's whatever its reaction computes.
     pub(super) fn node_environment_may_move(&self, node: StyleNodeID) -> bool {
         let own = self.computed_group_sets.custom_property_environment_identity(node);
-        let parent = self.tree.flat_tree_parent(node).map_or(Some(0), |parent| {
+        let parent = self.tree.inheritance_parent(node).map_or(Some(0), |parent| {
             self.computed_group_sets.custom_property_environment_identity(parent)
         });
         own != parent || self.node_declares_custom_properties(node)
@@ -424,7 +425,7 @@ impl RetainedState {
         {
             return;
         }
-        let parent_environment = match self.tree.flat_tree_parent(node) {
+        let parent_environment = match self.tree.inheritance_parent(node) {
             Some(parent) => match self.computed_group_sets.custom_property_environment_identity(parent) {
                 Some(parent_environment) => parent_environment,
                 None => return,
@@ -445,7 +446,7 @@ impl RetainedState {
 
     /// The environment of a node the engine computes a record for: the one it inherits when its
     /// cascade declares no custom property, else what its declarations resolve to over that one.
-    /// `None` when the environment is C++'s to compute: a registered name, a substitution the
+    /// Refused when the environment is C++'s to compute: a registered name, a substitution the
     /// engine does not resolve, or an inherited environment the engine holds no store for.
     pub(super) fn engine_custom_property_environment(
         &mut self,
@@ -453,23 +454,23 @@ impl RetainedState {
         parent_environment: u64,
         inputs: &bridge::FfiDocumentStyleComputationInputs,
         counters: &mut Counters,
-    ) -> Option<u64> {
+    ) -> Drive<u64> {
         if !self.any_custom_property_is_declared() {
-            return Some(parent_environment);
+            return Ok(parent_environment);
         }
-        let cascaded = self.cascaded_custom_declarations(node)?;
+        let cascaded = self.cascaded_custom_declarations(node).or_refused()?;
         if cascaded.is_empty() {
-            return Some(parent_environment);
+            return Ok(parent_environment);
         }
         let registry = inputs.custom_property_registry;
         if registry.is_none() {
             counters.bump(Counter::EngineCustomPropertyEnvironmentBails);
-            return None;
+            return Err(Unanswered::Refused);
         }
         let registry_ref = unsafe { &*registry.as_pointer().cast::<CustomPropertyRegistry>() };
         if registry_ref.has_registrations() {
             counters.bump(Counter::EngineCustomPropertyEnvironmentBails);
-            return None;
+            return Err(Unanswered::Refused);
         }
         let key = Self::environment_inputs(
             parent_environment,
@@ -478,14 +479,14 @@ impl RetainedState {
         );
         if let Some(identity) = self.custom_property_environments.memoized(&key) {
             counters.bump(Counter::EngineCustomPropertyEnvironmentMemoHits);
-            return Some(identity);
+            return Ok(identity);
         }
         let parent_store = match parent_environment {
             0 => std::ptr::null(),
             identity => {
                 let Some(store) = self.custom_property_environments.store(identity) else {
                     counters.bump(Counter::EngineCustomPropertyEnvironmentBails);
-                    return None;
+                    return Err(Unanswered::Refused);
                 };
                 store
             }
@@ -495,11 +496,11 @@ impl RetainedState {
         for (declared, value) in &cascaded {
             let Some(name) = self.custom_property_environments.name(declared.name) else {
                 counters.bump(Counter::EngineCustomPropertyEnvironmentBails);
-                return None;
+                return Err(Unanswered::Refused);
             };
             if name.raw.raw() == 0 || !custom_property_value_is_engine_resolvable(value.data()) {
                 counters.bump(Counter::EngineCustomPropertyEnvironmentBails);
-                return None;
+                return Err(Unanswered::Refused);
             }
             // A value the parent already holds, by identity, declares nothing new.
             if parent.is_some_and(|parent| parent.value_is_identical(name.raw.raw(), value.pointer().cast())) {
@@ -516,7 +517,7 @@ impl RetainedState {
             let written_values = cascaded.into_iter().map(|(_, written)| written).collect();
             self.custom_property_environments
                 .remember(key, parent_environment, written_values);
-            return Some(parent_environment);
+            return Ok(parent_environment);
         }
         // SAFETY: The parent store is live for as long as a record names its environment, and the
         // values are the program's interned values, live for the call.
@@ -559,12 +560,12 @@ impl RetainedState {
         let written_values = cascaded.into_iter().map(|(_, written)| written).collect();
         self.custom_property_environments
             .remember(key, identity, written_values);
-        Some(identity)
+        Ok(identity)
     }
 
     /// What a written value with `var()` references substitutes to for a property under an
     /// environment, parsed as the property's value: what the C++ cascade computes for the
-    /// declaration, memoized by the written value. `None` when the value holds a substitution
+    /// declaration, memoized by the written value. Refused when the value holds a substitution
     /// the engine does not resolve, or the environment is one the engine holds no store for.
     pub(super) fn substitute_written_value(
         environments: &mut custom_property_environments::CustomPropertyEnvironments,
@@ -573,30 +574,30 @@ impl RetainedState {
         property: u16,
         written: RetainedStyleValueData,
         counters: &mut Counters,
-    ) -> Option<RetainedStyleValueData> {
+    ) -> Drive<RetainedStyleValueData> {
         if !custom_property_value_is_engine_resolvable(written.data()) {
             counters.bump(Counter::EngineComputedRecordBailSubstitution);
-            return None;
+            return Err(Unanswered::Refused);
         }
         let Some(inputs) = inputs else {
             counters.bump(Counter::EngineComputedRecordBailSubstitution);
-            return None;
+            return Err(Unanswered::Refused);
         };
         let registry = inputs.custom_property_registry;
         if registry.is_none() {
             counters.bump(Counter::EngineComputedRecordBailSubstitution);
-            return None;
+            return Err(Unanswered::Refused);
         }
         if let Some(value) = environments.substitution(&written, property, environment) {
             counters.bump(Counter::EngineComputedRecordSubstitutionMemoHits);
-            return Some(value);
+            return Ok(value);
         }
         let store = match environment {
             0 => std::ptr::null(),
             identity => {
                 let Some(store) = environments.store(identity) else {
                     counters.bump(Counter::EngineComputedRecordBailSubstitution);
-                    return None;
+                    return Err(Unanswered::Refused);
                 };
                 store
             }
@@ -609,7 +610,7 @@ impl RetainedState {
             (unsafe { prepare_var_resolution_environment(std::ptr::null(), 0, std::ptr::null(), 0, 0) })
         else {
             counters.bump(Counter::EngineComputedRecordBailSubstitution);
-            return None;
+            return Err(Unanswered::Refused);
         };
         // SAFETY: The store is live while a record names its environment, and the written value
         // is retained by the declaration that carries it.
@@ -659,18 +660,18 @@ impl RetainedState {
                     ParseOutcome::Invalid => RetainedStyleValueData::from_owned(StyleValueData::GuaranteedInvalid),
                     ParseOutcome::NotHandled => {
                         counters.bump(Counter::EngineComputedRecordBailSubstitution);
-                        return None;
+                        return Err(Unanswered::Refused);
                     }
                 }
             }
             NativeVarResolution::Invalid => RetainedStyleValueData::from_owned(StyleValueData::GuaranteedInvalid),
             NativeVarResolution::NotHandled => {
                 counters.bump(Counter::EngineComputedRecordBailSubstitution);
-                return None;
+                return Err(Unanswered::Refused);
             }
         };
         counters.bump(Counter::EngineComputedRecordSubstitutions);
         environments.remember_substitution(written, property, environment, value.clone_retained());
-        Some(value)
+        Ok(value)
     }
 }

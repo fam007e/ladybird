@@ -9,10 +9,10 @@
 
 namespace WebView {
 
-static Compositing::DevicePixelRect const screen_rect { 0, 0, 1920, 1080 };
+static Web::DevicePixelRect const screen_rect { 0, 0, 1920, 1080 };
 static constexpr auto child_close_timeout_ms = 1000;
 
-NonnullOwnPtr<HeadlessWebView> HeadlessWebView::create(Core::AnonymousBuffer theme, Compositing::DevicePixelSize window_size, IsPrivate is_private)
+NonnullOwnPtr<HeadlessWebView> HeadlessWebView::create(Core::AnonymousBuffer theme, Web::DevicePixelSize window_size, IsPrivate is_private)
 {
     auto view = adopt_own(*new HeadlessWebView(move(theme), window_size, is_private));
     view->initialize_client(CreateNewClient::Yes);
@@ -20,7 +20,7 @@ NonnullOwnPtr<HeadlessWebView> HeadlessWebView::create(Core::AnonymousBuffer the
     return view;
 }
 
-NonnullOwnPtr<HeadlessWebView> HeadlessWebView::create_child(HeadlessWebView& parent, WebContentClient& page_process, Compositing::PageId page_index)
+NonnullOwnPtr<HeadlessWebView> HeadlessWebView::create_child(HeadlessWebView& parent, WebContentClient& page_process, Web::PageId page_index)
 {
     // The child shares the WebContent client hosting its page, and with it that client's browsing session.
     auto view = adopt_own(*new HeadlessWebView(parent.m_theme, parent.m_viewport_size, parent.is_private()));
@@ -31,43 +31,26 @@ NonnullOwnPtr<HeadlessWebView> HeadlessWebView::create_child(HeadlessWebView& pa
     return view;
 }
 
-HeadlessWebView::HeadlessWebView(Core::AnonymousBuffer theme, Compositing::DevicePixelSize viewport_size, IsPrivate is_private)
+HeadlessWebView::HeadlessWebView(Core::AnonymousBuffer theme, Web::DevicePixelSize viewport_size, IsPrivate is_private)
     : ViewImplementation(is_private)
     , m_theme(move(theme))
     , m_viewport_size(viewport_size)
 {
-    on_new_web_view = [this](auto, auto, WebContentClient& page_process, Optional<Compositing::PageId> page_index) {
+    on_new_web_view = [this](auto, auto, WebContentClient& page_process, Optional<Web::PageId> page_index) {
         auto web_view = page_index.has_value()
             ? HeadlessWebView::create_child(*this, page_process, *page_index)
             : HeadlessWebView::create(m_theme, m_viewport_size, this->is_private());
 
-        auto* child_web_view = web_view.ptr();
-        auto weak_this = make_weak_ptr<HeadlessWebView>();
-        web_view->m_parent_web_view = weak_this;
-        auto discard_child_web_view = [weak_this, child_web_view]() {
-            if (weak_this)
-                weak_this->discard_child_web_view(*child_web_view);
-        };
-
-        // Propagate crashes from child views to parent, so parent tests don't hang
-        // waiting for a child that crashed.
-        web_view->on_web_content_crashed = [child_web_view, discard_child_web_view](auto crash_reason) {
-            child_web_view->propagate_web_content_crash(crash_reason);
-            discard_child_web_view();
-        };
-        web_view->on_close = move(discard_child_web_view);
-
-        m_child_web_views.append(move(web_view));
-        return m_child_web_views.last()->handle();
+        return adopt_child_web_view(move(web_view)).handle();
     };
 
     on_reposition_window = [this](auto position) {
-        m_previous_dimensions.set_location(position.template to_type<Compositing::DevicePixels>());
-        client().async_set_window_position(page_id(), position.template to_type<Compositing::DevicePixels>());
+        m_previous_dimensions.set_location(position.template to_type<Web::DevicePixels>());
+        client().async_set_window_position(page_id(), position.template to_type<Web::DevicePixels>());
     };
 
     on_resize_window = [this](auto size) {
-        m_viewport_size = size.template to_type<Compositing::DevicePixels>();
+        m_viewport_size = size.template to_type<Web::DevicePixels>();
 
         client().async_set_window_size(page_id(), m_viewport_size);
         handle_resize();
@@ -180,6 +163,33 @@ void HeadlessWebView::propagate_web_content_crash(WebContentCrashReason crash_re
         on_web_content_crashed(crash_reason);
 }
 
+HeadlessWebView& HeadlessWebView::adopt_child_web_view(NonnullOwnPtr<HeadlessWebView> web_view)
+{
+    auto* child_web_view = web_view.ptr();
+    auto weak_this = make_weak_ptr<HeadlessWebView>();
+    web_view->m_parent_web_view = weak_this;
+    auto discard_child_web_view = [weak_this, child_web_view]() {
+        if (weak_this)
+            weak_this->discard_child_web_view(*child_web_view);
+    };
+
+    // Propagate crashes from child views to parent, so parent tests don't hang waiting for a child that crashed.
+    web_view->on_web_content_crashed = [child_web_view, discard_child_web_view](auto crash_reason) {
+        child_web_view->propagate_web_content_crash(crash_reason);
+        discard_child_web_view();
+    };
+    web_view->on_close = move(discard_child_web_view);
+
+    m_child_web_views.append(move(web_view));
+    return *m_child_web_views.last();
+}
+
+// A headless browser has no tabs or windows, so what the browser UI would open in a new one gets a view of its own.
+ViewImplementation* HeadlessWebView::create_view_for_new_tab_or_window(IsPrivate is_private)
+{
+    return &adopt_child_web_view(HeadlessWebView::create(m_theme, m_viewport_size, is_private));
+}
+
 void HeadlessWebView::discard_child_web_view(HeadlessWebView& child_web_view)
 {
     auto* child_web_view_pointer = &child_web_view;
@@ -215,7 +225,7 @@ void HeadlessWebView::prepare_page_for_tab(WebContentPage& page)
     page.async_update_screen_rects({ { screen_rect } }, 0);
 }
 
-void HeadlessWebView::reset_viewport_size(Compositing::DevicePixelSize size)
+void HeadlessWebView::reset_viewport_size(Web::DevicePixelSize size)
 {
     m_viewport_size = size;
 

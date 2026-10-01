@@ -11,6 +11,7 @@
 #include <LibGC/WeakInlines.h>
 #include <LibWeb/CSS/ComputedStyleWorkingSet.h>
 #include <LibWeb/CSS/FontComputer.h>
+#include <LibWeb/CSS/FontResolution.h>
 #include <LibWeb/CSS/StyleSheetState.h>
 #include <LibWeb/CSS/StyleValues/ColorSchemeStyleValue.h>
 #include <LibWeb/CSS/StyleValues/ColorStyleValue.h>
@@ -1000,10 +1001,22 @@ ScrollbarColorData ComputedStyleWorkingSet::scrollbar_color(ColorResolutionConte
     return {};
 }
 
-ValueComparingNonnullRefPtr<Gfx::FontCascadeList const> ComputedStyleWorkingSet::computed_font_list(FontComputer const& font_computer) const
+ValueComparingNonnullRefPtr<Gfx::FontCascadeList const> ComputedStyleWorkingSet::computed_font_list(FontComputer const& font_computer, TreeScopeID tree_scope) const
 {
-    if (!m_cached_computed_font_list) {
-        m_cached_computed_font_list = font_computer.compute_font_for_style_values(computed_font_families(), font_size(), font_slope(), font_weight(), font_width(), font_optical_sizing(), font_variation_settings(), font_feature_data());
+    if (!m_cached_computed_font_list || m_cached_computed_font_list_scope != tree_scope) {
+        m_cached_computed_font_list = resolve_font_for_style_values(font_computer,
+            {
+                .font_families = computed_font_families(),
+                .font_optical_sizing = font_optical_sizing(),
+                .font_size = font_size(),
+                .font_slope = font_slope(),
+                .font_weight = font_weight(),
+                .font_width = font_width(),
+                .font_variation_settings = font_variation_settings(),
+                .font_feature_data = font_feature_data(),
+                .font_feature_values_scope = tree_scope,
+            });
+        m_cached_computed_font_list_scope = tree_scope;
         VERIFY(!m_cached_computed_font_list->is_empty());
     }
 
@@ -1012,8 +1025,10 @@ ValueComparingNonnullRefPtr<Gfx::FontCascadeList const> ComputedStyleWorkingSet:
 
 ValueComparingNonnullRefPtr<Gfx::Font const> ComputedStyleWorkingSet::first_available_computed_font(FontComputer const& font_computer) const
 {
+    // NB: Feature values only change how a font shapes text, not which font is first available, so the list
+    //     resolved for any tree scope answers.
     if (!m_cached_first_available_computed_font)
-        m_cached_first_available_computed_font = computed_font_list(font_computer)->first_available_font();
+        m_cached_first_available_computed_font = computed_font_list(font_computer, m_cached_computed_font_list_scope)->first_available_font();
     return *m_cached_first_available_computed_font;
 }
 

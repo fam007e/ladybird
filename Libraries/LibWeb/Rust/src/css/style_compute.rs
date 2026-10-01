@@ -2656,26 +2656,7 @@ pub struct FfiLonghandPhaseContext {
 pub struct FfiLonghandDriveResult {
     pub driver_results: FfiLonghandDriverResults,
     pub custom_properties: FfiResolvedCustomProperties,
-    pub transitions: FfiComputedTransitionList,
     pub animations: FfiComputedAnimationList,
-}
-
-#[repr(C)]
-pub struct FfiComputedTransition {
-    pub properties: *const u16,
-    pub property_count: usize,
-    pub duration: f64,
-    pub timing_function: *const c_void,
-    pub delay: f64,
-    pub behavior: u8,
-}
-
-#[repr(C)]
-pub struct FfiComputedTransitionList {
-    pub transitions: *const FfiComputedTransition,
-    pub count: usize,
-    pub delay_and_duration_are_single_zero: bool,
-    pub storage: *mut c_void,
 }
 
 #[derive(Clone, Copy)]
@@ -2701,6 +2682,9 @@ pub struct FfiComputedAnimation {
     pub timeline_kind: FfiAnimationTimelineKind,
     pub scroll_scroller: u8,
     pub scroll_axis: u8,
+    /// The index, in the list of CSS animations the host already holds for this element or
+    /// pseudo-element, of the animation this definition claims, or -1 where it asks for a new one.
+    pub matched_existing_index: i32,
 }
 
 #[repr(C)]
@@ -2736,7 +2720,7 @@ pub struct FfiComputePropertiesInput {
         *mut FfiLonghandDriveInput,
     ),
     pub finish_longhand_drive: unsafe extern "C" fn(*mut c_void, *const FfiLonghandDriveResult),
-    pub process_animation_definitions: unsafe extern "C" fn(*mut c_void),
+    pub apply_animation_definitions: unsafe extern "C" fn(*mut c_void),
     pub prepare_animations: unsafe extern "C" fn(*mut c_void) -> bool,
     pub apply_animations:
         unsafe extern "C" fn(*mut c_void, bool, *mut FfiInputLineHeightMetrics) -> *mut AnimatedOverlay,
@@ -4757,12 +4741,6 @@ unsafe fn compute_longhands(
         FfiLonghandDriveResult {
             driver_results,
             custom_properties,
-            transitions: FfiComputedTransitionList {
-                transitions: std::ptr::null(),
-                count: 0,
-                delay_and_duration_are_single_zero: false,
-                storage: std::ptr::null_mut(),
-            },
             animations: FfiComputedAnimationList {
                 animations: std::ptr::null(),
                 count: 0,
@@ -4771,11 +4749,6 @@ unsafe fn compute_longhands(
         },
         remaining_context.input_line_height_metrics,
     )
-}
-
-struct ComputedTransitionListStorage {
-    _property_lists: Vec<Box<[u16]>>,
-    transitions: Box<[FfiComputedTransition]>,
 }
 
 fn computed_value_list(table: &ComputedLonghandTable, property_id: u16) -> &[RetainedStyleValueData] {
@@ -4904,7 +4877,9 @@ pub(crate) fn active_transition_longhands(table: &ComputedLonghandTable) -> Cow<
     }
 }
 
-fn build_computed_transition_list(table: &ComputedLonghandTable) -> FfiComputedTransitionList {
+/// The table's `transition-*` values, per physical longhand they name: shorthands expanded,
+/// logical aliases mapped, and a longhand named more than once taking its last entry.
+pub(crate) fn transition_entries(table: &ComputedLonghandTable) -> Vec<crate::css::transition::FfiTransitionEntry> {
     use crate::css::property_metadata::property_id as prop;
 
     let property_values = computed_value_list(table, prop::TRANSITION_PROPERTY);
@@ -4914,53 +4889,87 @@ fn build_computed_transition_list(table: &ComputedLonghandTable) -> FfiComputedT
     let behavior_values = computed_value_list(table, prop::TRANSITION_BEHAVIOR);
     let (writing_mode, direction) = computed_writing_mode_and_direction(table);
 
-    let mut property_lists = Vec::with_capacity(property_values.len());
-    let mut transitions = Vec::with_capacity(property_values.len());
+    let mut entries: Vec<crate::css::transition::FfiTransitionEntry> = Vec::new();
+    // Where each longhand's entry is in `entries`, so a longhand named again takes the later entry's place.
+    let mut entry_indices = [u16::MAX; crate::css::property_metadata::LAST_LONGHAND_PROPERTY_ID as usize + 1];
+    let mut properties = Vec::new();
     for (index, property_value) in property_values.iter().enumerate() {
         let transition_property = match property_value.data() {
             StyleValueData::Keyword { keyword } if *keyword == keyword::NONE => None,
             StyleValueData::CustomIdent { custom_ident } => property_id_from_custom_ident(custom_ident),
             _ => unreachable!("computed transition-property must be none or a custom identifier"),
         };
-        let mut properties = Vec::new();
-        if let Some(transition_property) = transition_property {
-            append_transition_longhands(&mut properties, transition_property, &mut || (writing_mode, direction));
+        let Some(transition_property) = transition_property else {
+            continue;
+        };
+        properties.clear();
+        append_transition_longhands(&mut properties, transition_property, &mut || (writing_mode, direction));
+        // A `transition: all` entry names every longhand, and each takes the same attributes.
+        let delay = time_value_to_milliseconds(delay_values[index % delay_values.len()].data());
+        let duration = time_value_to_milliseconds(duration_values[index % duration_values.len()].data());
+        let timing_function = timing_function_values[index % timing_function_values.len()].pointer();
+        let behavior = match behavior_values[index % behavior_values.len()].data() {
+            StyleValueData::Keyword { keyword } => keyword_to_transition_behavior(*keyword).unwrap(),
+            _ => unreachable!("computed transition-behavior must be a keyword"),
+        };
+        entries.reserve(properties.len());
+        for &property_id in &properties {
+            let entry = crate::css::transition::FfiTransitionEntry {
+                property_id,
+                delay,
+                duration,
+                timing_function,
+                behavior,
+            };
+            match entry_indices[usize::from(property_id)] {
+                u16::MAX => {
+                    entry_indices[usize::from(property_id)] = entries.len() as u16;
+                    entries.push(entry);
+                }
+                index => entries[usize::from(index)] = entry,
+            }
         }
-        let properties = properties.into_boxed_slice();
-        transitions.push(FfiComputedTransition {
-            properties: properties.as_ptr(),
-            property_count: properties.len(),
-            duration: time_value_to_milliseconds(duration_values[index % duration_values.len()].data()),
-            timing_function: timing_function_values[index % timing_function_values.len()]
-                .pointer()
-                .cast(),
-            delay: time_value_to_milliseconds(delay_values[index % delay_values.len()].data()),
-            behavior: match behavior_values[index % behavior_values.len()].data() {
-                StyleValueData::Keyword { keyword } => keyword_to_transition_behavior(*keyword).unwrap(),
-                _ => unreachable!("computed transition-behavior must be a keyword"),
-            },
-        });
-        property_lists.push(properties);
+    }
+    entries
+}
+
+/// Whether `transition_entries` answers any entry for the table, without expanding them.
+pub(crate) fn has_transition_entries(table: &ComputedLonghandTable) -> bool {
+    use crate::css::property_metadata::property_id as prop;
+
+    // Whether an entry for `property` names a longhand, as `append_transition_longhands` would.
+    fn names_a_longhand(property: u16) -> bool {
+        if property == prop::ALL {
+            return true;
+        }
+        if property_is_shorthand(property) {
+            return longhands_for_shorthand(property)
+                .iter()
+                .any(|&longhand| names_a_longhand(longhand));
+        }
+        property != prop::CUSTOM
     }
 
-    let delay_and_duration_are_single_zero = delay_values.len() == 1
+    computed_value_list(table, prop::TRANSITION_PROPERTY)
+        .iter()
+        .any(|value| match value.data() {
+            StyleValueData::CustomIdent { custom_ident } => {
+                property_id_from_custom_ident(custom_ident).is_some_and(names_a_longhand)
+            }
+            _ => false,
+        })
+}
+
+/// Whether the table's `transition-delay` and `transition-duration` are each the single value `0s`.
+pub(crate) fn transition_delay_and_duration_are_single_zero(table: &ComputedLonghandTable) -> bool {
+    use crate::css::property_metadata::property_id as prop;
+
+    let duration_values = computed_value_list(table, prop::TRANSITION_DURATION);
+    let delay_values = computed_value_list(table, prop::TRANSITION_DELAY);
+    delay_values.len() == 1
         && duration_values.len() == 1
         && time_value_to_milliseconds(delay_values[0].data()) == 0.0
-        && time_value_to_milliseconds(duration_values[0].data()) == 0.0;
-    let storage = Box::new(ComputedTransitionListStorage {
-        _property_lists: property_lists,
-        transitions: transitions.into_boxed_slice(),
-    });
-    let result = FfiComputedTransitionList {
-        transitions: storage.transitions.as_ptr(),
-        count: storage.transitions.len(),
-        delay_and_duration_are_single_zero,
-        storage: std::ptr::null_mut(),
-    };
-    FfiComputedTransitionList {
-        storage: Box::into_raw(storage).cast(),
-        ..result
-    }
+        && time_value_to_milliseconds(duration_values[0].data()) == 0.0
 }
 
 fn fly_string_is_ascii(string: &crate::css::css_string::CssString, expected: &[u8]) -> bool {
@@ -5003,9 +5012,21 @@ fn animation_timeline_descriptor(value: &StyleValueData) -> (FfiAnimationTimelin
     }
 }
 
+/// Which of an element's animation lists a computation belongs to, in the host's own numbering:
+/// zero for the element itself, and the pseudo-element's value plus one for each pseudo-element.
+fn animation_slot(pseudo_kind: u8) -> crate::css::style::animations::AnimationSlot {
+    match pseudo_kind == crate::css::cascaded_properties::NO_PSEUDO_ELEMENT {
+        true => 0,
+        false => pseudo_kind + 1,
+    }
+}
+
 // https://drafts.csswg.org/css-values-4/#linked-properties
 // https://drafts.csswg.org/css-animations-1/#animations
-fn build_computed_animation_list(table: &ComputedLonghandTable) -> FfiComputedAnimationList {
+fn build_computed_animation_list(
+    table: &ComputedLonghandTable,
+    existing_animation_names: &[crate::css::css_string::CssString],
+) -> FfiComputedAnimationList {
     use crate::css::property_metadata::property_id as prop;
 
     let name_values = computed_value_list(table, prop::ANIMATION_NAME);
@@ -5020,13 +5041,18 @@ fn build_computed_animation_list(table: &ComputedLonghandTable) -> FfiComputedAn
     let timeline_values = computed_value_list(table, prop::ANIMATION_TIMELINE);
 
     let mut animations = Vec::with_capacity(name_values.len());
+    // The name of each definition, for matching against the animations the host holds.
+    let mut definition_names = Vec::new();
     for (index, name_value) in name_values.iter().enumerate() {
         let name = match name_value.data() {
             StyleValueData::Keyword { keyword } if *keyword == keyword::NONE => continue,
-            StyleValueData::CustomIdent { custom_ident } => custom_ident.as_ptr(),
-            StyleValueData::String { string, .. } => string.as_ptr(),
+            StyleValueData::CustomIdent { custom_ident } => custom_ident,
+            StyleValueData::String { string, .. } => string,
             _ => unreachable!("computed animation-name must be none or a string"),
         };
+        if !existing_animation_names.is_empty() {
+            definition_names.push(name);
+        }
         let duration_value = duration_values[index % duration_values.len()].data();
         let (duration_is_auto, duration) = match duration_value {
             StyleValueData::Keyword { keyword } if *keyword == keyword::AUTO => (true, 0.0),
@@ -5055,12 +5081,25 @@ fn build_computed_animation_list(table: &ComputedLonghandTable) -> FfiComputedAn
             delay: time_value_to_milliseconds(delay_values[index % delay_values.len()].data()),
             fill_mode: keyword_to_animation_fill_mode(keyword_value(fill_mode_values)).unwrap(),
             composition: keyword_to_animation_composition(keyword_value(composition_values)).unwrap(),
-            name,
+            name: name.as_ptr(),
             timeline_kind,
             scroll_scroller,
             scroll_axis,
+            matched_existing_index: crate::css::style::animations::NO_MATCHED_ANIMATION,
         });
     }
+
+    // Which animation each definition claims is decided here, from the names the host published,
+    // rather than by the host searching the list it holds. An index past what the host's list can
+    // hold claims nothing.
+    crate::css::style::animations::match_existing_animations(
+        existing_animation_names,
+        &definition_names,
+        |definition, animation| {
+            animations[definition].matched_existing_index =
+                i32::try_from(animation).unwrap_or(crate::css::style::animations::NO_MATCHED_ANIMATION);
+        },
+    );
 
     let animations = animations.into_boxed_slice();
     let result = FfiComputedAnimationList {
@@ -5209,10 +5248,20 @@ pub unsafe extern "C" fn rust_compute_properties(input: *const FfiComputePropert
     });
     let (mut result, mut finalization_line_height_metrics) =
         unsafe { compute_longhands(&drive_input, parent_snapshot.as_ref(), highlight.as_ref()) };
+    // The host's flag is its own precondition for holding any CSS animation, so an element without
+    // it has an empty list in every one of its slots and nothing to match.
+    let existing_animation_names = match input.has_css_defined_animations {
+        true => crate::css::style::tree::StyleNodeID::from_raw(input.style_node).map_or(&[][..], |node| {
+            style_engine.element_css_defined_animations(node, animation_slot(input.pseudo_kind))
+        }),
+        false => &[],
+    };
     if !input.stop_after_longhand_drive {
-        result.transitions = build_computed_transition_list(unsafe { &*drive_input.longhand_table });
-        result.animations = build_computed_animation_list(unsafe { &*drive_input.longhand_table });
+        result.animations =
+            build_computed_animation_list(unsafe { &*drive_input.longhand_table }, existing_animation_names);
     }
+    // An element with no definitions and no animations to cancel has no plan to apply.
+    let has_animation_plan = result.animations.count != 0 || !existing_animation_names.is_empty();
     let mut animated_overlay = drive_input.animated_overlay;
     let mut animation_values_applied = unsafe { animated_overlay.as_ref() }.is_some_and(|overlay| !overlay.is_empty());
     unsafe { (input.finish_longhand_drive)(input.callback_context, &raw const result) };
@@ -5224,7 +5273,9 @@ pub unsafe extern "C" fn rust_compute_properties(input: *const FfiComputePropert
         return;
     }
 
-    unsafe { (input.process_animation_definitions)(input.callback_context) };
+    if has_animation_plan {
+        unsafe { (input.apply_animation_definitions)(input.callback_context) };
+    }
     let has_animations = unsafe { (input.prepare_animations)(input.callback_context) };
     if animation_values_applied || has_animations {
         let invalidated = unsafe { restore_post_compute_values(&mut *drive_input.longhand_table, false) };
@@ -5649,9 +5700,6 @@ pub(crate) unsafe fn take_animation_keyframe_longhand_values(storage: *mut c_voi
 }
 
 unsafe fn destroy_style_computation_result(result: &FfiLonghandDriveResult) {
-    if !result.transitions.storage.is_null() {
-        drop(unsafe { Box::from_raw(result.transitions.storage.cast::<ComputedTransitionListStorage>()) });
-    }
     if !result.animations.storage.is_null() {
         drop(unsafe { Box::from_raw(result.animations.storage.cast::<Box<[FfiComputedAnimation]>>()) });
     }
@@ -6869,6 +6917,22 @@ pub(crate) mod ffi_test_stubs {
 
     #[unsafe(no_mangle)]
     extern "C" fn ladybird_utf16_fly_string_unref(_raw: usize) {}
+    #[unsafe(no_mangle)]
+    extern "C" fn web_css_custom_property_data_reference(_data: *const c_void) {}
+    #[unsafe(no_mangle)]
+    extern "C" fn web_css_font_face_snapshot_unreference(_snapshot: *const c_void) {}
+    #[unsafe(no_mangle)]
+    extern "C" fn web_css_font_cascade_memo_unreference(_memo: *const c_void) {}
+    #[unsafe(no_mangle)]
+    extern "C" fn web_css_resolve_font(
+        _memo: *mut c_void,
+        _snapshot: *const c_void,
+        _request: crate::css::style::bridge::FfiFontResolutionRequest,
+    ) -> crate::css::style::bridge::FfiResolvedFont {
+        crate::css::style::bridge::FfiResolvedFont::default()
+    }
+    #[unsafe(no_mangle)]
+    extern "C" fn web_css_custom_property_data_unreference(_data: *const c_void) {}
     #[unsafe(no_mangle)]
     extern "C" fn ladybird_utf16_string_unref(_raw: usize) {}
     #[unsafe(no_mangle)]

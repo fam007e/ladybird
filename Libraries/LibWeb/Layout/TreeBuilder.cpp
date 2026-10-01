@@ -18,7 +18,6 @@
 #include <LibWeb/CSS/CounterStyle.h>
 #include <LibWeb/CSS/CountersSet.h>
 #include <LibWeb/CSS/Enums.h>
-#include <LibWeb/CSS/GeneratedContent.h>
 #include <LibWeb/CSS/PseudoElement.h>
 #include <LibWeb/CSS/StyleComputer.h>
 #include <LibWeb/CSS/StyleInvalidation.h>
@@ -32,7 +31,6 @@
 #include <LibWeb/DOM/Text.h>
 #include <LibWeb/Dump.h>
 #include <LibWeb/HTML/HTMLInputElement.h>
-#include <LibWeb/HTML/HTMLSlotElement.h>
 #include <LibWeb/Layout/Box.h>
 #include <LibWeb/Layout/Node.h>
 #include <LibWeb/Layout/NodeArena.h>
@@ -44,7 +42,6 @@
 #include <LibWeb/SVG/SVGClipPathElement.h>
 #include <LibWeb/SVG/SVGMaskElement.h>
 #include <LibWeb/SVG/SVGPatternElement.h>
-#include <LibWeb/SVG/SVGSwitchElement.h>
 
 namespace Web::Layout {
 
@@ -57,10 +54,8 @@ public:
     static void detach_top_layer_element_layout_subtree(DOM::Element&);
 
 private:
-    struct PrincipalNodeFrameStorage;
     struct PseudoElementFrameStorage;
-    static TraversalDecision clear_stale_layout_node(DOM::Node&, DOM::Node const* cleared_subtree_root = nullptr);
-    static TraversalDecision clear_stale_layout_node_in_subtree(DOM::Node&, DOM::Node const& subtree_root, DOM::Node const* cleared_subtree_root = nullptr);
+    static TraversalDecision clear_stale_layout_node(DOM::Node&, u32 cleared_subtree_root);
 
     RustFFI::FfiDomTreeBuilderCallbacks make_ffi_dom_tree_builder_callbacks();
     RustFFI::FfiPseudoTreeBuilderCallbacks make_ffi_pseudo_tree_builder_callbacks();
@@ -69,9 +64,14 @@ private:
     static Box& create_list_item_marker(Box& list_box, CSS::LayoutStyle marker_style);
     static RustFFI::FfiFirstLetterNodes create_first_letter_nodes(DOM::Element&, RustFFI::FfiFirstLetterTarget);
 
+    void pin_style_record_for_build(CSS::StyleRecordID);
+
     GC::Ptr<DOM::Document> m_document;
-    OwnPtr<PrincipalNodeFrameStorage> m_principal_frames;
     OwnPtr<PseudoElementFrameStorage> m_pseudo_element_frames;
+    // Every style record a principal box is built from, held for the whole build. Letting go of a record the build has
+    // stopped looking at buys nothing before the build ends, and holding them all in one place is what lets a visit
+    // carry no C++ frame of its own.
+    Vector<CSS::StyleRecordID> m_pinned_style_records;
 };
 
 void LayoutTreeBuilderAccess::clear_synthetic_pseudo_element_layout_nodes(DOM::Element& element)
@@ -81,12 +81,10 @@ void LayoutTreeBuilderAccess::clear_synthetic_pseudo_element_layout_nodes(DOM::E
 
 void LayoutTreeBuilderAccess::detach_layout_node(DOM::Node& node)
 {
-    node.detach_layout_node({});
-}
-
-void LayoutTreeBuilderAccess::register_svg_resource_reference(SVG::SVGElement& resource, DOM::Element& referencing_element)
-{
-    resource.register_resource_box_referencing_element({}, referencing_element);
+    if (auto* layout_node = node.unsafe_layout_node()) {
+        layout_node->prepare_for_detach_from_layout_tree();
+        RustFFI::layout_arena_unbind_row(layout_node->arena_handle(), Node::slot_id(layout_node));
+    }
 }
 
 void LayoutTreeBuilderAccess::set_synthetic_pseudo_element_node(DOM::Element& element, CSS::PseudoElement pseudo_element, Layout::NodeWithStyle* layout_node)
@@ -94,385 +92,8 @@ void LayoutTreeBuilderAccess::set_synthetic_pseudo_element_node(DOM::Element& el
     element.set_synthetic_pseudo_element_node({}, pseudo_element, layout_node);
 }
 
-static RustFFI::FfiPrincipalDisplayFacts ffi_principal_display_facts(CSS::Display);
 static void update_style_if_needed_for_layout_tree_bypass_path(DOM::Element&);
-struct PrincipalNodeFrame;
-static Compositing::RustFFI::NodeSlotId create_layout_node_for_text(PrincipalNodeFrame&, DOM::Text&);
-
-static bool may_update_pseudo_elements_in_place(DOM::Node const& node)
-{
-    if (!node.needs_pseudo_element_layout_tree_update())
-        return false;
-    auto const* element = as_if<DOM::Element>(node);
-    auto const* layout_node = as_if<NodeWithStyle>(node.unsafe_layout_node());
-    if (!element || !layout_node || layout_node->kind() != RustFFI::NodeKind::BlockContainer
-        || element->shadow_root() || element->rendered_in_top_layer()
-        || node.first_letter_owner_for_layout_subtree_from(node))
-        return false;
-    auto const* payloads = element->style_record_payloads();
-    if (!payloads)
-        return false;
-    auto const& inherited_box_values = *CSS::style_group_from_payloads<CSS::ComputedValues::InheritedBoxValues>(payloads);
-    auto const display = CSS::style_group_from_payloads<CSS::ComputedValues::BoxValues>(payloads)->display_value();
-    if (inherited_box_values.content_visibility_value() != CSS::ContentVisibility::Visible
-        || (!display.is_flow_inside() && !display.is_flow_root_inside()))
-        return false;
-    if (layout_node->has_children() && !layout_node->children_are_inline())
-        return false;
-    for (auto const* child = layout_node->first_child(); child; child = child->next_sibling()) {
-        if (child->is_anonymous() && !child->is_generated_for_pseudo_element())
-            return false;
-    }
-    for (auto pseudo_element : { CSS::PseudoElement::Before, CSS::PseudoElement::After }) {
-        if (auto const* old_box = element->pseudo_element_unsafe_layout_node(pseudo_element)) {
-            // NB: The old box already holds the new style, including display:none when it is disappearing.
-            if (old_box->parent() != layout_node
-                || (!old_box->display().is_inline_outside() && !old_box->display().is_none())
-                || old_box->is_out_of_flow())
-                return false;
-        }
-        auto const* pseudo_payloads = element->style_record_payloads(pseudo_element);
-        if (!pseudo_payloads)
-            continue;
-        auto const& pseudo_content_values = *CSS::style_group_from_payloads<CSS::ComputedValues::ContentValues>(pseudo_payloads);
-        if (!pseudo_content_values.counter_reset_is_none() || !pseudo_content_values.counter_increment_is_none() || !pseudo_content_values.counter_set_is_none())
-            return false;
-        auto content = pseudo_content_values.computed_content_value();
-        if (!content->is_keyword()
-            && (!content->is_content() || !all_of(content->as_content().content().values(), [](auto const& item) { return item->is_string(); })))
-            return false;
-        auto const& pseudo_box_values = *CSS::style_group_from_payloads<CSS::ComputedValues::BoxValues>(pseudo_payloads);
-        auto const pseudo_display = pseudo_box_values.display_value();
-        if (pseudo_display.is_none() || content->is_keyword())
-            continue;
-        auto const pseudo_position = pseudo_box_values.position_value();
-        if (!pseudo_display.is_inline_outside() || pseudo_display.is_list_item()
-            || pseudo_position == CSS::Positioning::Absolute || pseudo_position == CSS::Positioning::Fixed
-            || pseudo_box_values.float_value() != CSS::Float::None)
-            return false;
-    }
-    return true;
-}
-
-static bool may_reuse_layout_node_for_child_list_insertion(DOM::Node const& node)
-{
-    if (!node.may_reuse_layout_node_for_child_list_insertion())
-        return false;
-
-    auto const* element = as_if<DOM::Element>(node);
-    auto const* layout_node = as_if<NodeWithStyle>(node.unsafe_layout_node());
-    if (!element || !layout_node || element->shadow_root() || is<HTML::HTMLSlotElement>(*element))
-        return false;
-
-    auto const* element_content_values = element->style_group<CSS::ComputedValues::ContentValues>();
-    if (element_content_values && element_content_values->counter_reset_has_reversed_counter())
-        return false;
-
-    auto collapsing_whitespace_can_be_inserted = [&](DOM::Text const& text) {
-        enum class SiblingDirection {
-            Previous,
-            Next,
-        };
-
-        Node const* last_layout_child = nullptr;
-        for (auto* layout_child = layout_node->first_child(); layout_child; layout_child = layout_child->next_sibling())
-            last_layout_child = layout_child;
-        auto const* trailing_inline_wrapper = last_layout_child && last_layout_child->is_anonymous() && last_layout_child->children_are_inline()
-                && !last_layout_child->is_generated_for_pseudo_element()
-            ? last_layout_child
-            : nullptr;
-        bool will_join_trailing_inline_wrapper = false;
-
-        auto can_place_next_to_layout_node = [&](Node const* sibling_layout_node, SiblingDirection direction, Optional<CSS::PseudoElement> pseudo_element) {
-            if (!sibling_layout_node)
-                return true;
-            if (auto const* node_with_style = as_if<NodeWithStyle>(*sibling_layout_node); node_with_style && node_with_style->is_out_of_flow()) {
-                if (pseudo_element.has_value() || direction == SiblingDirection::Next)
-                    return false;
-            }
-
-            while (sibling_layout_node->parent() && sibling_layout_node->parent() != layout_node)
-                sibling_layout_node = sibling_layout_node->parent();
-            if (sibling_layout_node->parent() != layout_node)
-                return false;
-            if (pseudo_element.has_value()) {
-                // ::after cannot anchor a newly appended anonymous wrapper. In normal flow,
-                // inline ::before content also has to remain in its existing inline run, while
-                // blockified flex/grid pseudo-elements remain separate items.
-                if (direction == SiblingDirection::Next)
-                    return layout_node->children_are_inline();
-
-                auto const* pseudo_box_values = element->style_group<CSS::ComputedValues::BoxValues>(*pseudo_element);
-                auto parent_display = layout_node->display();
-                auto pseudo_belongs_to_inline_run = pseudo_box_values
-                    && (pseudo_box_values->display_value().is_inline_outside() || pseudo_box_values->display_value().is_contents())
-                    && !parent_display.is_flex_inside() && !parent_display.is_grid_inside();
-                return layout_node->children_are_inline() || !pseudo_belongs_to_inline_run;
-            }
-            if (sibling_layout_node->is_anonymous()) {
-                if (sibling_layout_node != trailing_inline_wrapper)
-                    return false;
-                will_join_trailing_inline_wrapper = true;
-            }
-            return true;
-        };
-
-        auto can_place_next_to_sibling = [&](DOM::Node const* sibling, SiblingDirection direction) {
-            for (; sibling; sibling = direction == SiblingDirection::Next ? sibling->next_sibling() : sibling->previous_sibling()) {
-                if (auto const* sibling_element = as_if<DOM::Element>(*sibling)) {
-                    auto const* box_values = sibling_element->style_group<CSS::ComputedValues::BoxValues>();
-                    if (box_values && box_values->display_value().is_contents())
-                        return false;
-                }
-
-                auto const* sibling_layout_node = sibling->unsafe_layout_node();
-                if (!sibling_layout_node)
-                    continue;
-                return can_place_next_to_layout_node(sibling_layout_node, direction, {});
-            }
-
-            auto pseudo_element = direction == SiblingDirection::Previous
-                ? CSS::PseudoElement::Before
-                : CSS::PseudoElement::After;
-            return can_place_next_to_layout_node(element->pseudo_element_unsafe_layout_node(pseudo_element), direction, pseudo_element);
-        };
-
-        if (!can_place_next_to_sibling(text.previous_sibling(), SiblingDirection::Previous)
-            || !can_place_next_to_sibling(text.next_sibling(), SiblingDirection::Next)) {
-            return false;
-        }
-
-        // Incremental inline insertion always reuses a trailing anonymous inline wrapper. If the
-        // whitespace belongs to a different run, only a full rebuild can place it correctly.
-        return !trailing_inline_wrapper || will_join_trailing_inline_wrapper;
-    };
-
-    auto const* first_letter_owner = node.first_letter_owner_for_layout_subtree_from(node);
-
-    bool has_pending_collapsing_whitespace_since_layout_node = false;
-    bool pending_children_can_preserve_parent = true;
-    for (auto const* child = node.first_child(); child; child = child->next_sibling()) {
-        if (child->unsafe_layout_node()) {
-            has_pending_collapsing_whitespace_since_layout_node = false;
-            if (child->needs_layout_tree_update() || child->child_needs_layout_tree_update()) {
-                pending_children_can_preserve_parent = false;
-            }
-            continue;
-        }
-        if (!child->needs_layout_tree_update())
-            continue;
-        if (auto const* text = as_if<DOM::Text>(*child); text && text->data().is_ascii_whitespace()
-            && layout_node->white_space_collapse() == CSS::WhiteSpaceCollapse::Collapse
-            && !first_letter_owner
-            && collapsing_whitespace_can_be_inserted(*text)) {
-            if (has_pending_collapsing_whitespace_since_layout_node) {
-                pending_children_can_preserve_parent = false;
-                break;
-            }
-            has_pending_collapsing_whitespace_since_layout_node = true;
-            continue;
-        }
-        auto const* child_element = as_if<DOM::Element>(*child);
-        if (!child_element) {
-            pending_children_can_preserve_parent = false;
-            break;
-        }
-        auto const* box_values = child_element->style_group<CSS::ComputedValues::BoxValues>();
-        if (!box_values || !box_values->display_value().is_none()) {
-            pending_children_can_preserve_parent = false;
-            break;
-        }
-    }
-    // An empty set means every insertion was canceled before layout. Moves are marked dirty at
-    // their destination, so they still enter one of the rejection paths above.
-    if (pending_children_can_preserve_parent)
-        return true;
-
-    auto parent_display = layout_node->display();
-    auto parent_has_children = layout_node->has_children();
-    auto parent_lays_out_flex_or_grid_children = parent_display.is_flex_inside() || parent_display.is_grid_inside();
-    // A table cell lays out its contents as a flow root does.
-    auto parent_lays_out_flow = parent_display.is_flow_inside() || parent_display.is_flow_root_inside() || parent_display.is_table_cell();
-    auto parent_lays_out_inline_children = parent_lays_out_flow
-        && (layout_node->children_are_inline() || !parent_has_children);
-    auto parent_lays_out_block_children = parent_lays_out_flow
-        && !layout_node->children_are_inline();
-    auto parent_lays_out_table_rows = parent_display.is_table_row_group()
-        || parent_display.is_table_header_group()
-        || parent_display.is_table_footer_group();
-    if (!parent_lays_out_flex_or_grid_children && !parent_lays_out_inline_children && !parent_lays_out_block_children && !parent_lays_out_table_rows) {
-        return false;
-    }
-    if (first_letter_owner)
-        return false;
-
-    if (parent_lays_out_table_rows) {
-        enum class SiblingDirection {
-            Previous,
-            Next,
-        };
-        auto has_table_row_sibling = [&](DOM::Node const* sibling, SiblingDirection direction) {
-            for (; sibling; sibling = direction == SiblingDirection::Next ? sibling->next_sibling() : sibling->previous_sibling()) {
-                if (auto const* sibling_layout_node = sibling->unsafe_layout_node()) {
-                    auto const* node_with_style = as_if<NodeWithStyle>(*sibling_layout_node);
-                    return sibling_layout_node->parent() == layout_node && node_with_style && node_with_style->display().is_table_row();
-                }
-
-                if (auto const* sibling_element = as_if<DOM::Element>(*sibling)) {
-                    auto const* box_values = sibling_element->style_group<CSS::ComputedValues::BoxValues>();
-                    if (!box_values)
-                        return false;
-                    auto const sibling_display = box_values->display_value();
-                    if (!sibling_display.is_none())
-                        return sibling->needs_layout_tree_update() && sibling_display.is_table_row();
-                } else if (auto const* sibling_text = as_if<DOM::Text>(*sibling); sibling_text && !sibling_text->data().is_ascii_whitespace()) {
-                    return false;
-                }
-            }
-            return false;
-        };
-
-        // NB: Table fixup discards whitespace at the edge of a row group. Inserting a row outside
-        //     that whitespace makes it interior, so only a rebuild can create its anonymous table-row box.
-        for (auto const* child = node.first_child(); child; child = child->next_sibling()) {
-            auto const* text = as_if<DOM::Text>(*child);
-            if (!text || child->unsafe_layout_node() || child->needs_layout_tree_update() || !text->data().is_ascii_whitespace())
-                continue;
-            if (has_table_row_sibling(child->previous_sibling(), SiblingDirection::Previous)
-                && has_table_row_sibling(child->next_sibling(), SiblingDirection::Next)) {
-                return false;
-            }
-        }
-    }
-
-    bool will_insert_inline_child = false;
-    bool will_insert_block_child = false;
-    bool all_inserted_block_children_are_in_flow = true;
-    bool has_indirect_existing_child = false;
-    bool has_indirect_existing_child_after_insertion = false;
-    bool has_inserted_child = false;
-    // A fieldset keeps its content in a structural anonymous content box that appended children must also enter.
-    bool all_indirect_existing_children_are_in_text_run_wrappers = layout_node->kind() != RustFFI::NodeKind::FieldSetBox;
-    has_pending_collapsing_whitespace_since_layout_node = false;
-    for (auto const* child = node.first_child(); child; child = child->next_sibling()) {
-        if (auto const* child_layout_node = child->unsafe_layout_node()) {
-            has_pending_collapsing_whitespace_since_layout_node = false;
-            if (child_layout_node->parent() != layout_node) {
-                auto const* wrapper = child_layout_node->parent();
-                if (!wrapper || wrapper->parent() != layout_node || !wrapper->is_anonymous()
-                    || !wrapper->children_are_inline() || wrapper->is_generated_for_pseudo_element()) {
-                    all_indirect_existing_children_are_in_text_run_wrappers = false;
-                }
-                has_indirect_existing_child = true;
-                if (has_inserted_child)
-                    has_indirect_existing_child_after_insertion = true;
-            }
-            continue;
-        }
-
-        auto const* child_element = as_if<DOM::Element>(*child);
-        if (!child_element) {
-            if (!child->needs_layout_tree_update())
-                continue;
-            auto const* text = as_if<DOM::Text>(*child);
-            bool collapsed_whitespace_can_be_inserted = text && text->data().is_ascii_whitespace()
-                && layout_node->white_space_collapse() == CSS::WhiteSpaceCollapse::Collapse
-                && !first_letter_owner
-                && collapsing_whitespace_can_be_inserted(*text);
-            if (!collapsed_whitespace_can_be_inserted)
-                return false;
-            if (has_pending_collapsing_whitespace_since_layout_node)
-                return false;
-            has_pending_collapsing_whitespace_since_layout_node = true;
-            continue;
-        }
-
-        auto const* box_values = child_element->style_group<CSS::ComputedValues::BoxValues>();
-        if (!box_values)
-            return false;
-        auto const child_display = box_values->display_value();
-        if (child_display.is_contents())
-            return false;
-        if (!child->needs_layout_tree_update() || child_display.is_none())
-            continue;
-        if (CSS::subtree_affects_generated_content_state(*child_element))
-            return false;
-        if (child_element->rendered_in_top_layer() || is<SVG::SVGElement>(*child_element))
-            return false;
-        if (parent_lays_out_flex_or_grid_children) {
-            if (has_pending_collapsing_whitespace_since_layout_node
-                && (box_values->position_value() != CSS::Positioning::Static || box_values->float_value() != CSS::Float::None))
-                return false;
-            has_pending_collapsing_whitespace_since_layout_node = false;
-            has_inserted_child = true;
-            continue;
-        }
-        if (parent_lays_out_table_rows && child_display.is_table_row())
-            continue;
-        if (parent_lays_out_block_children && child_display.is_block_outside()) {
-            auto const child_position = box_values->position_value();
-            if (has_pending_collapsing_whitespace_since_layout_node
-                && (child_position != CSS::Positioning::Static || box_values->float_value() != CSS::Float::None))
-                return false;
-            has_pending_collapsing_whitespace_since_layout_node = false;
-            has_inserted_child = true;
-            will_insert_block_child = true;
-            if (child_position == CSS::Positioning::Absolute
-                || child_position == CSS::Positioning::Fixed
-                || box_values->float_value() != CSS::Float::None) {
-                all_inserted_block_children_are_in_flow = false;
-            }
-            if (will_insert_inline_child)
-                return false;
-            continue;
-        }
-        if (parent_lays_out_inline_children && child_display.is_inline_outside()
-            && (child_display.is_flow_root_inside() || child_display.is_flex_inside() || child_display.is_grid_inside())) {
-            will_insert_inline_child = true;
-            has_inserted_child = true;
-            if (will_insert_block_child)
-                return false;
-            continue;
-        }
-        // An absolutely positioned box joins the inline formatting context as an item of its own,
-        // without wrapping its inline siblings, whatever its outer display type.
-        if (parent_lays_out_inline_children && !will_insert_block_child
-            && (box_values->position_value() == CSS::Positioning::Absolute || box_values->position_value() == CSS::Positioning::Fixed)) {
-            if (has_pending_collapsing_whitespace_since_layout_node)
-                return false;
-            will_insert_inline_child = true;
-            has_inserted_child = true;
-            continue;
-        }
-        return false;
-    }
-    // OPTIMIZATION: Appending an in-flow block after every existing child cannot disturb an
-    //               earlier anonymous inline wrapper, and needs no indirect sibling anchor. A flex or grid
-    //               container never places an appended item, in flow or out of flow, into an existing anonymous
-    //               text run wrapper, so appending any items after every existing child is safe there too.
-    bool appends_independent_children = (parent_lays_out_block_children && will_insert_block_child && all_inserted_block_children_are_in_flow)
-        || (parent_lays_out_flex_or_grid_children && has_inserted_child && all_indirect_existing_children_are_in_text_run_wrappers);
-    bool can_append_after_indirect_existing_children = appends_independent_children
-        && !has_indirect_existing_child_after_insertion;
-    return (!has_indirect_existing_child || can_append_after_indirect_existing_children)
-        && !has_pending_collapsing_whitespace_since_layout_node;
-}
-
-static size_t ffi_assigned_node_count(void* slot_element_pointer)
-{
-    VERIFY(slot_element_pointer);
-    return static_cast<HTML::HTMLSlotElement*>(slot_element_pointer)->assigned_nodes_internal().size();
-}
-
-static void* ffi_assigned_node_at(void* slot_element_pointer, size_t index)
-{
-    VERIFY(slot_element_pointer);
-    auto assigned_nodes = static_cast<HTML::HTMLSlotElement*>(slot_element_pointer)->assigned_nodes_internal();
-    VERIFY(index < assigned_nodes.size());
-    DOM::Node* node = nullptr;
-    assigned_nodes[index].visit([&](auto& assigned_node) { node = assigned_node.ptr(); });
-    return node;
-}
+static Compositing::RustFFI::NodeSlotId create_layout_node_for_text(DOM::Text&);
 
 class GeneratedContentImageProvider final
     : public ImageProvider {
@@ -654,7 +275,7 @@ static CSS::ContentData resolve_normal_marker_content(DOM::AbstractElement& elem
     if (CSS::marker_text_depends_on_list_item_counter_value(list_box.list_style_type()))
         element_reference.element().document().did_render_list_item_counter_value(element_reference.element());
 
-    auto counter_value = element_reference.ensure_counters_set().counter_value_for_use(CSS::list_item_counter_name(), element_reference);
+    auto counter_value = CSS::counter_value_for_use(element_reference, CSS::list_item_counter_name());
 
     auto generate_from_counter_style = [&](RefPtr<CSS::CounterStyle const> const& counter_style) -> Utf16String {
         auto counter_representation = CSS::generate_a_counter_representation(counter_style, element_reference.style_scope(), counter_value);
@@ -681,6 +302,15 @@ static CSS::ContentData resolve_normal_marker_content(DOM::AbstractElement& elem
         });
     content.data.append(move(marker_string));
     return content;
+}
+
+// A DOM node paired with the identity its layout rows carry, so Rust can find them itself.
+static RustFFI::FfiIdentifiedDomNode identified_dom_node(DOM::Node const* node)
+{
+    return {
+        .node = const_cast<DOM::Node*>(node),
+        .style_node = Node::style_node_of(node).value(),
+    };
 }
 
 static CSS::PseudoElement css_pseudo_element(RustFFI::FfiPseudoElement pseudo_element)
@@ -785,7 +415,7 @@ RustFFI::FfiPseudoTreeBuilderCallbacks LayoutTreeBuildBridge::make_ffi_pseudo_tr
                     .display_is_contents = false,
                     .display_is_list_item = false,
                     .has_content_replacement = false,
-                    .originating_layout_node_is_list_item = false,
+                    .originating_list_box = Node::slot_id(nullptr),
                     .normal_marker_has_content = false,
                     .marker_position_is_inside = false,
                 };
@@ -806,7 +436,7 @@ RustFFI::FfiPseudoTreeBuilderCallbacks LayoutTreeBuildBridge::make_ffi_pseudo_tr
                 .display_is_contents = frame.display.is_contents(),
                 .display_is_list_item = frame.display.is_list_item(),
                 .has_content_replacement = frame.replacement_image != nullptr,
-                .originating_layout_node_is_list_item = frame.originating_list_box != nullptr,
+                .originating_list_box = Node::slot_id(frame.originating_list_box),
                 .normal_marker_has_content = normal_marker_has_content,
                 .marker_position_is_inside = frame.originating_list_box
                     && frame.originating_list_box->list_style_position() == CSS::ListStylePosition::Inside,
@@ -840,11 +470,6 @@ RustFFI::FfiPseudoTreeBuilderCallbacks LayoutTreeBuildBridge::make_ffi_pseudo_tr
                 break;
             }
             return Node::slot_id(frame.layout_node); },
-        .attach_style_resources = [](void* frame_pointer) {
-            VERIFY(frame_pointer);
-            auto& frame = *static_cast<PseudoElementFrame*>(frame_pointer);
-            VERIFY(frame.layout_node);
-            frame.layout_node->attach_style_resources(); },
 
         .create_nested_list_marker = [](void* frame_pointer, void* element_pointer, RustFFI::FfiPseudoElement originating_pseudo) -> Compositing::RustFFI::NodeSlotId {
             VERIFY(frame_pointer);
@@ -958,22 +583,24 @@ RustFFI::FfiPseudoTreeBuilderCallbacks LayoutTreeBuildBridge::make_ffi_pseudo_tr
     };
 }
 
+// The node an identity names. The document is not in the style computer's node table, because a document holding a
+// reference back to itself there would keep itself alive; every other identity resolves through the table.
+static DOM::Node& dom_node_for_style_node(DOM::Document& document, u32 style_node)
+{
+    CSS::StyleNodeID identity { style_node };
+    if (identity == document.style_node_id())
+        return document;
+    auto node = document.style_computer().node_for_style_node(identity);
+    VERIFY(node);
+    return *node;
+}
+
 static bool is_svg_resource_box(Node const& layout_node)
 {
     return layout_node.is_svg_pattern_box() || layout_node.is_svg_mask_box() || layout_node.is_svg_clip_box();
 }
 
-TraversalDecision LayoutTreeBuildBridge::clear_stale_layout_node_in_subtree(DOM::Node& node, DOM::Node const& subtree_root, DOM::Node const* cleared_subtree_root)
-{
-    if (&node != &subtree_root) {
-        auto const* element = as_if<DOM::Element>(node);
-        if (element && element->rendered_in_top_layer())
-            return TraversalDecision::SkipChildrenAndContinue;
-    }
-    return clear_stale_layout_node(node, cleared_subtree_root);
-}
-
-TraversalDecision LayoutTreeBuildBridge::clear_stale_layout_node(DOM::Node& node, DOM::Node const* cleared_subtree_root)
+TraversalDecision LayoutTreeBuildBridge::clear_stale_layout_node(DOM::Node& node, u32 cleared_subtree_root)
 {
     node.set_needs_layout_tree_update(false, DOM::SetNeedsLayoutTreeUpdateReason::None);
     node.set_child_needs_layout_tree_update(false);
@@ -994,8 +621,11 @@ TraversalDecision LayoutTreeBuildBridge::clear_stale_layout_node(DOM::Node& node
                 VERIFY(root_pointer);
                 return static_cast<DOM::Node*>(node_pointer)->is_shadow_including_inclusive_descendant_of(*static_cast<DOM::Node*>(root_pointer)); },
         };
+        // The cleared root is only ever looked at here, so the walk carries it as an identity and it is resolved once
+        // an SVG resource box asks rather than once per cleared node.
+        auto* cleared_subtree_root_node = cleared_subtree_root ? &dom_node_for_style_node(node.document(), cleared_subtree_root) : nullptr;
         if (RustFFI::rust_should_preserve_svg_resource_layout_node(
-                &callbacks, layout_node->arena_handle(), Node::slot_id(layout_node), const_cast<DOM::Node*>(cleared_subtree_root)))
+                &callbacks, layout_node->arena_handle(), Node::slot_id(layout_node), cleared_subtree_root_node))
             return TraversalDecision::SkipChildrenAndContinue;
     }
 
@@ -1020,135 +650,48 @@ TraversalDecision LayoutTreeBuildBridge::clear_stale_layout_node(DOM::Node& node
 void LayoutTreeBuildBridge::detach_top_layer_element_layout_subtree(DOM::Element& element)
 {
     RustFFI::FfiTopLayerDetachCallbacks callbacks {
-        .element_layout_node = [](void* element_pointer) -> Compositing::RustFFI::NodeSlotId {
-            VERIFY(element_pointer);
-            // NB: Called at DOM mutation processing time, outside layout tree construction.
-            return Node::slot_id(static_cast<DOM::Element*>(element_pointer)->unsafe_layout_node()); },
+        .context = &element.document(),
         .prepare_subtree_for_detach = [](void* layout_node_pointer) {
             VERIFY(layout_node_pointer);
             static_cast<Layout::Node*>(layout_node_pointer)->prepare_subtree_for_detach_from_layout_tree(); },
-        .clear_stale_subtree = [](void* root_pointer) {
-            VERIFY(root_pointer);
-            auto& root = *static_cast<DOM::Node*>(root_pointer);
-            root.for_each_shadow_including_inclusive_descendant([&](auto& node) {
-                return clear_stale_layout_node_in_subtree(node, root, &root);
-            }); },
-        .slot_element = [](void* element_pointer) -> void* {
-            VERIFY(element_pointer);
-            return as_if<HTML::HTMLSlotElement>(*static_cast<DOM::Element*>(element_pointer)); },
-        .assigned_node_count = ffi_assigned_node_count,
-        .assigned_node_at = ffi_assigned_node_at,
+        .clear_stale_layout_node = [](void* document_pointer, u32 style_node, u32 cleared_subtree_root) -> bool {
+            VERIFY(document_pointer);
+            auto& document = *static_cast<DOM::Document*>(document_pointer);
+            auto decision = clear_stale_layout_node(dom_node_for_style_node(document, style_node), cleared_subtree_root);
+            return decision == TraversalDecision::SkipChildrenAndContinue; },
     };
     RustFFI::rust_detach_top_layer_element_layout_subtree(
-        &callbacks, element.document().layout_node_arena().handle(), &element);
+        &callbacks, element.document().layout_node_arena().handle(), element.style_node_id().value());
 }
-
-struct PrincipalNodeFrame {
-    AK_ALLOC_WITH_KMALLOC;
-
-    Layout::Node* layout_node { nullptr };
-    RefPtr<CSS::ComputedValues const> anonymous_computed_values;
-    CSS::StyleRecordID style_record_identity;
-    GC::Ptr<CSS::StyleComputer> style_record_owner;
-};
-
-struct LayoutTreeBuildBridge::PrincipalNodeFrameStorage {
-    AK_ALLOC_WITH_KMALLOC;
-
-    Vector<NonnullOwnPtr<PrincipalNodeFrame>> frames;
-    size_t active_frame_count { 0 };
-};
 
 LayoutTreeBuildBridge::~LayoutTreeBuildBridge()
 {
+    if (m_pinned_style_records.is_empty())
+        return;
+    auto& style_computer = m_document->style_computer();
+    for (auto style_record_identity : m_pinned_style_records)
+        style_computer.unpin_style_record(style_record_identity);
 }
 
-static RustFFI::FfiPrincipalDisplayFacts ffi_principal_display_facts(CSS::Display display)
+void LayoutTreeBuildBridge::pin_style_record_for_build(CSS::StyleRecordID style_record_identity)
 {
-    return {
-        .display_is_none = display.is_none(),
-        .display_is_contents = display.is_contents(),
-        .display_is_table_inside = display.is_table_inside(),
-        .display_is_block_outside = display.is_block_outside(),
-        .display_is_internal_table = display.is_internal_table(),
-        .display_is_table_caption = display.is_table_caption(),
-    };
+    m_document->style_computer().pin_style_record(style_record_identity);
+    m_pinned_style_records.append(style_record_identity);
 }
 
 RustFFI::FfiDomTreeBuilderCallbacks LayoutTreeBuildBridge::make_ffi_dom_tree_builder_callbacks()
 {
     return {
         .builder = this,
-        .first_child = [](void* parent_pointer) -> void* {
-            VERIFY(parent_pointer);
-            return static_cast<DOM::ParentNode*>(parent_pointer)->first_child();
-        },
-        .next_sibling = [](void* node_pointer) -> void* {
-            VERIFY(node_pointer);
-            return static_cast<DOM::Node*>(node_pointer)->next_sibling();
-        },
-        .clear_dom_update_flags = [](void* node_pointer) {
-            VERIFY(node_pointer);
-            auto& node = *static_cast<DOM::Node*>(node_pointer);
-            node.set_needs_layout_tree_update(false, DOM::SetNeedsLayoutTreeUpdateReason::None);
-            node.set_child_needs_layout_tree_update(false); },
-        .assigned_node_count = ffi_assigned_node_count,
-        .assigned_node_at = ffi_assigned_node_at,
-        .is_svg_element = [](void* node_pointer) {
-            VERIFY(node_pointer);
-            return is<SVG::SVGElement>(*static_cast<DOM::Node*>(node_pointer)); },
-        .clear_stale_layout_node = [](void* builder_pointer, void* node_pointer) {
+        .clear_stale_layout_node = [](void* builder_pointer, u32 style_node, u32 cleared_subtree_root) -> bool {
             VERIFY(builder_pointer);
-            VERIFY(node_pointer);
-            (void)static_cast<LayoutTreeBuildBridge*>(builder_pointer)->clear_stale_layout_node(*static_cast<DOM::Node*>(node_pointer)); },
-        .display_contents_facts = [](void*, void* element_pointer) -> RustFFI::FfiDisplayContentsFacts {
-            VERIFY(element_pointer);
-            auto& element = *static_cast<DOM::Element*>(element_pointer);
-            auto* slot_element = as_if<HTML::HTMLSlotElement>(element);
-            auto shadow_root = element.shadow_root();
-            return {
-                .rendered_in_top_layer = element.rendered_in_top_layer(),
-                .content_visibility_hidden = element.style_group<CSS::ComputedValues::InheritedBoxValues>()->content_visibility_value() == CSS::ContentVisibility::Hidden,
-                .should_layout_dom_children = slot_element ? slot_element->assigned_nodes_internal().is_empty() && element.has_children() : element.has_children(),
-                .child_needs_layout_tree_update = element.child_needs_layout_tree_update(),
-                .dom_children_parent = static_cast<DOM::ParentNode*>(&element),
-                .shadow_root = shadow_root ? static_cast<DOM::ParentNode*>(shadow_root.ptr()) : nullptr,
-                .slot_element = slot_element,
-            };
-        },
-        .clear_stale_subtree = [](void* builder_pointer, void* root_pointer, RustFFI::FfiStaleSubtreeClearScope scope) {
-            VERIFY(builder_pointer);
-            VERIFY(root_pointer);
             auto& builder = *static_cast<LayoutTreeBuildBridge*>(builder_pointer);
-            auto& root = *static_cast<DOM::Node*>(root_pointer);
-            auto const* cleared_subtree_root = scope == RustFFI::FfiStaleSubtreeClearScope::Inclusive ? nullptr : &root;
-            if (scope == RustFFI::FfiStaleSubtreeClearScope::DescendantsBoundedToRoot) {
-                root.for_each_shadow_including_descendant([&](auto& node) {
-                    return builder.clear_stale_layout_node_in_subtree(node, root, cleared_subtree_root);
-                });
-            } else {
-                root.for_each_shadow_including_inclusive_descendant([&](auto& node) {
-                    return builder.clear_stale_layout_node_in_subtree(node, root, cleared_subtree_root);
-                });
-            } },
-        .resolve_counters = [](void* element_pointer, RustFFI::FfiPseudoElement ffi_pseudo) {
-            VERIFY(element_pointer);
-            auto& element = *static_cast<DOM::Element*>(element_pointer);
-            if (ffi_pseudo == RustFFI::FfiPseudoElement::None) {
-                DOM::AbstractElement element_reference { element };
-                CSS::resolve_counters(element_reference);
-            } else {
-                DOM::AbstractElement element_reference { element, css_pseudo_element(ffi_pseudo) };
-                CSS::resolve_counters(element_reference);
-            } },
+            auto decision = clear_stale_layout_node(dom_node_for_style_node(*builder.m_document, style_node), cleared_subtree_root);
+            return decision == TraversalDecision::SkipChildrenAndContinue; },
         .principal_descendant_facts = [](void*, void* node_pointer, void* layout_node_pointer) -> RustFFI::FfiPrincipalDescendantFacts {
             VERIFY(node_pointer);
             VERIFY(layout_node_pointer);
             auto& node = *static_cast<DOM::Node*>(node_pointer);
-            auto* element = as_if<DOM::Element>(node);
-            auto* slot_element = as_if<HTML::HTMLSlotElement>(node);
-            auto* parent_node = as_if<DOM::ParentNode>(node);
-            auto shadow_root = element ? element->shadow_root() : nullptr;
             auto* graphics_element = as_if<SVG::SVGGraphicsElement>(node);
             GC::Ptr<SVG::SVGMaskElement const> mask;
             GC::Ptr<SVG::SVGClipPathElement const> clip_path;
@@ -1162,152 +705,36 @@ RustFFI::FfiDomTreeBuilderCallbacks LayoutTreeBuildBridge::make_ffi_dom_tree_bui
                 stroke_pattern = graphics_element->stroke_pattern(layout_node);
             }
             return {
-                .is_element = element != nullptr,
-                .content_visibility_hidden = element && element->style_group<CSS::ComputedValues::InheritedBoxValues>()->content_visibility_value() == CSS::ContentVisibility::Hidden,
-                .should_layout_dom_children = slot_element ? slot_element->assigned_nodes_internal().is_empty() && node.has_children() : node.has_children(),
-                .child_needs_layout_tree_update = node.child_needs_layout_tree_update(),
-                .is_svg_switch_element = is<SVG::SVGSwitchElement>(node),
-                .is_document = node.is_document(),
-                .dom_children_parent = parent_node,
-                .shadow_root = shadow_root ? static_cast<DOM::ParentNode*>(shadow_root.ptr()) : nullptr,
-                .slot_element = slot_element,
-                .svg_graphics_element = graphics_element,
-                .svg_mask = const_cast<SVG::SVGMaskElement*>(mask.ptr()),
-                .svg_clip_path = const_cast<SVG::SVGClipPathElement*>(clip_path.ptr()),
-                .svg_fill_pattern = const_cast<SVG::SVGPatternElement*>(fill_pattern.ptr()),
-                .svg_stroke_pattern = const_cast<SVG::SVGPatternElement*>(stroke_pattern.ptr()),
+                .svg_graphics_element = graphics_element ? Node::style_node_of(graphics_element).value() : 0,
+                .svg_mask = identified_dom_node(mask.ptr()),
+                .svg_clip_path = identified_dom_node(clip_path.ptr()),
+                .svg_fill_pattern = identified_dom_node(fill_pattern.ptr()),
+                .svg_stroke_pattern = identified_dom_node(stroke_pattern.ptr()),
             }; },
-        .layout_node_has_first_letter_style = [](void* layout_node_pointer) {
-            VERIFY(layout_node_pointer);
-            auto* element = as_if<DOM::Element>(static_cast<Node*>(layout_node_pointer)->dom_node());
-            return element && element->has_style(CSS::PseudoElement::FirstLetter); },
         .create_first_letter_nodes = [](void*, void* element_pointer, RustFFI::FfiFirstLetterTarget target) -> RustFFI::FfiFirstLetterNodes {
             VERIFY(element_pointer);
             return create_first_letter_nodes(*static_cast<DOM::Element*>(element_pointer), target); },
         .top_layer_element_count = [](void* document_pointer) {
             VERIFY(document_pointer);
             return static_cast<DOM::Document*>(document_pointer)->top_layer_elements().size(); },
-        .copy_top_layer_elements = [](void* document_pointer, void** output, size_t count) {
+        .copy_top_layer_elements = [](void* document_pointer, RustFFI::FfiIdentifiedDomNode* output, size_t count) {
             VERIFY(document_pointer);
             VERIFY(output || count == 0);
             auto const& elements = static_cast<DOM::Document*>(document_pointer)->top_layer_elements();
             VERIFY(count == elements.size());
             size_t index = 0;
             for (auto const& element : elements)
-                output[index++] = element.ptr(); },
-        .rendered_in_top_layer = [](void* element_pointer) {
-            VERIFY(element_pointer);
-            return static_cast<DOM::Element*>(element_pointer)->rendered_in_top_layer(); },
-        .flat_tree_parent = [](void* node_pointer) -> void* {
-            VERIFY(node_pointer);
-            return static_cast<DOM::Node*>(node_pointer)->flat_tree_parent(); },
-        .flat_tree_render_facts = [](void* node_pointer) -> RustFFI::FfiFlatTreeRenderFacts {
-            VERIFY(node_pointer);
-            auto* element = as_if<DOM::Element>(*static_cast<DOM::Node*>(node_pointer));
-            auto const* box_values = element ? element->style_group<CSS::ComputedValues::BoxValues>() : nullptr;
-            return {
-                .is_element = element != nullptr,
-                .has_computed_style = box_values != nullptr,
-                .display_is_none = box_values && box_values->display_value().is_none(),
-            }; },
-        .svg_pattern_content_element = [](void* pattern_pointer) -> void* {
+                output[index++] = identified_dom_node(element.ptr()); },
+        .svg_pattern_content_element = [](void* pattern_pointer) -> RustFFI::FfiIdentifiedDomNode {
             VERIFY(pattern_pointer);
-            return const_cast<SVG::SVGPatternElement*>(static_cast<SVG::SVGPatternElement*>(pattern_pointer)->pattern_content_element().ptr()); },
-        .register_svg_resource_reference = [](void* resource_pointer, void* graphics_element_pointer) {
-            VERIFY(resource_pointer);
-            VERIFY(graphics_element_pointer);
-            LayoutTreeBuilderAccess::register_svg_resource_reference(
-                *static_cast<SVG::SVGElement*>(resource_pointer),
-                *static_cast<SVG::SVGGraphicsElement*>(graphics_element_pointer)); },
-        .element_layout_node = [](void* element_pointer) -> Compositing::RustFFI::NodeSlotId {
-            VERIFY(element_pointer);
-            // NB: Called during layout tree construction.
-            return Node::slot_id(static_cast<DOM::Element*>(element_pointer)->unsafe_layout_node()); },
-        .dom_node_layout_node = [](void* node_pointer) -> Compositing::RustFFI::NodeSlotId {
-            VERIFY(node_pointer);
-            return Node::slot_id(static_cast<DOM::Node*>(node_pointer)->unsafe_layout_node()); },
-        .layout_node_dom_element = [](void* layout_node_pointer) -> void* {
-            VERIFY(layout_node_pointer);
-            auto* dom_node = static_cast<Layout::Node*>(layout_node_pointer)->dom_node();
-            return dom_node ? as_if<DOM::Element>(*dom_node) : nullptr; },
-        .element_pseudo_layout_node = [](void* element_pointer, RustFFI::FfiPseudoElement pseudo_element) -> Compositing::RustFFI::NodeSlotId {
-            VERIFY(element_pointer);
-            return Node::slot_id(static_cast<DOM::Element*>(element_pointer)->pseudo_element_unsafe_layout_node(css_pseudo_element(pseudo_element))); },
-        .principal_node_entry_facts = [](void*, void* node_pointer, bool must_create_subtree) -> RustFFI::FfiPrincipalNodeEntryFacts {
-            VERIFY(node_pointer);
-            auto& node = *static_cast<DOM::Node*>(node_pointer);
-            // NB: Called during layout tree construction.
-            auto* existing_layout_node = node.unsafe_layout_node();
-            auto* element = as_if<DOM::Element>(node);
-            bool can_update_pseudo_elements = may_update_pseudo_elements_in_place(node);
-            bool can_insert_children = may_reuse_layout_node_for_child_list_insertion(node);
-            bool can_reuse = (!node.needs_pseudo_element_layout_tree_update() || can_update_pseudo_elements)
-                && (!node.may_reuse_layout_node_for_child_list_insertion() || can_insert_children);
-            return {
-                .must_create_subtree = must_create_subtree,
-                .needs_layout_tree_update = node.needs_layout_tree_update(),
-                .may_reuse_layout_node_for_child_list_insertion = can_reuse && can_insert_children,
-                .may_update_pseudo_elements_in_place = can_reuse && can_update_pseudo_elements,
-                .is_document = node.is_document(),
-                .has_layout_node = existing_layout_node != nullptr,
-                .is_element = element != nullptr,
-                .is_text = is<DOM::Text>(node),
-                .rendered_in_top_layer = element && element->rendered_in_top_layer(),
-                .layout_node_is_attached = existing_layout_node && existing_layout_node->has_parent(),
-                .is_svg_container = node.is_svg_container(),
-                .requires_svg_container = node.requires_svg_container(),
-                .is_svg_foreign_object = node.is_svg_foreign_object_element(),
-            }; },
-        .request_top_layer_zone_rebuild = [](void* node_pointer) {
-            VERIFY(node_pointer);
-            static_cast<DOM::Node*>(node_pointer)->document().set_top_layer_needs_layout_zone_rebuild(); },
-        .request_layout_tree_rebuild = [](void* builder_pointer, void* element_pointer) {
+            return identified_dom_node(static_cast<SVG::SVGPatternElement*>(pattern_pointer)->pattern_content_element().ptr()); },
+        .principal_dom_node = [](void* builder_pointer, u32 style_node) -> void* {
             VERIFY(builder_pointer);
-            VERIFY(element_pointer);
-            static_cast<DOM::Element*>(element_pointer)->set_needs_layout_tree_update(true, DOM::SetNeedsLayoutTreeUpdateReason::PseudoElementBoxEscapedRebuildRoot); },
-        .push_principal_frame = [](void* builder_pointer, void* node_pointer) -> RustFFI::FfiPrincipalNodeFrame {
-            VERIFY(builder_pointer);
-            VERIFY(node_pointer);
             auto& builder = *static_cast<LayoutTreeBuildBridge*>(builder_pointer);
-            if (!builder.m_principal_frames)
-                builder.m_principal_frames = make<PrincipalNodeFrameStorage>();
-            auto& storage = *builder.m_principal_frames;
-            if (storage.active_frame_count == storage.frames.size())
-                storage.frames.append(make<PrincipalNodeFrame>());
-            auto& frame = *storage.frames[storage.active_frame_count++];
-            auto& node = *static_cast<DOM::Node*>(node_pointer);
-            frame.layout_node = nullptr;
-            frame.anonymous_computed_values = nullptr;
-            VERIFY(!frame.style_record_owner);
-            frame.style_record_identity = 0;
-            // NB: Called during layout tree construction.
-            return {
-                .frame = &frame,
-                .old_layout_node = Node::slot_id(node.unsafe_layout_node()),
-            }; },
-        .pop_principal_frame = [](void* builder_pointer, void* frame_pointer) {
+            return &dom_node_for_style_node(*builder.m_document, style_node); },
+        .prepare_principal_element = [](void* builder_pointer, void* element_pointer, bool should_create_layout_node) {
             VERIFY(builder_pointer);
-            VERIFY(frame_pointer);
-            auto& builder = *static_cast<LayoutTreeBuildBridge*>(builder_pointer);
-            VERIFY(builder.m_principal_frames);
-            auto& storage = *builder.m_principal_frames;
-            VERIFY(storage.active_frame_count > 0);
-            VERIFY(storage.frames[storage.active_frame_count - 1].ptr() == frame_pointer);
-            auto& frame = *storage.frames[storage.active_frame_count - 1];
-            if (!!frame.style_record_identity) {
-                VERIFY(frame.style_record_owner);
-                frame.style_record_owner->unpin_style_record(frame.style_record_identity);
-                frame.style_record_owner = nullptr;
-            }
-            frame.layout_node = nullptr;
-            frame.anonymous_computed_values = nullptr;
-            frame.style_record_identity = 0;
-            --storage.active_frame_count; },
-        .prepare_principal_element = [](void* builder_pointer, void* frame_pointer, void* element_pointer, bool should_create_layout_node) -> RustFFI::FfiPreparedPrincipalElementFacts {
-            VERIFY(builder_pointer);
-            VERIFY(frame_pointer);
             VERIFY(element_pointer);
-            auto& frame = *static_cast<PrincipalNodeFrame*>(frame_pointer);
             auto& element = *static_cast<DOM::Element*>(element_pointer);
             element.update_inside_blocking_wheel_event_handler_state();
             if (should_create_layout_node) {
@@ -1329,35 +756,17 @@ RustFFI::FfiDomTreeBuilderCallbacks LayoutTreeBuildBridge::make_ffi_dom_tree_bui
                 if (auto* layout_node = element.unsafe_layout_node(); !layout_node->has_children())
                     layout_node->set_children_are_inline(false);
             }
-            frame.style_record_identity = element.style_record_identity();
-            VERIFY(frame.style_record_identity);
-            frame.style_record_owner = &element.document().style_computer();
-            frame.style_record_owner->pin_style_record(frame.style_record_identity);
-            auto const* box_values = element.style_group<CSS::ComputedValues::BoxValues>();
-            VERIFY(box_values);
-            return {
-                .display = ffi_principal_display_facts(box_values->display_value()),
-            }; },
-        .principal_element_layout_facts = [](void* frame_pointer, void* element_pointer) -> RustFFI::FfiElementLayoutFacts {
-            VERIFY(frame_pointer);
-            VERIFY(element_pointer);
-            auto& element = *static_cast<DOM::Element*>(element_pointer);
-            auto const* content_values = element.style_group<CSS::ComputedValues::ContentValues>();
-            VERIFY(content_values);
-            return {
-                .has_content_replacement = content_replacement_image(content_values->computed_content_value()) != nullptr,
-                .is_svg_mask_element = is<SVG::SVGMaskElement>(element),
-                .is_svg_clip_path_element = is<SVG::SVGClipPathElement>(element),
-                .is_svg_pattern_element = is<SVG::SVGPatternElement>(element),
-            }; },
-        .create_principal_element_layout = [](void* builder_pointer, void* frame_pointer, void* element_pointer, RustFFI::FfiElementLayoutKind kind) -> Compositing::RustFFI::NodeSlotId {
+            auto style_record_identity = element.style_record_identity();
+            VERIFY(style_record_identity);
+            static_cast<LayoutTreeBuildBridge*>(builder_pointer)->pin_style_record_for_build(style_record_identity); },
+        .create_principal_element_layout = [](void* builder_pointer, void* element_pointer, RustFFI::FfiElementLayoutKind kind) -> Compositing::RustFFI::NodeSlotId {
             VERIFY(builder_pointer);
-            VERIFY(frame_pointer);
             VERIFY(element_pointer);
-            auto& frame = *static_cast<PrincipalNodeFrame*>(frame_pointer);
             auto& element = *static_cast<DOM::Element*>(element_pointer);
-            VERIFY(frame.style_record_identity);
-            CSS::LayoutStyle style { frame.style_record_identity };
+            auto style_record_identity = element.style_record_identity();
+            VERIFY(style_record_identity);
+            CSS::LayoutStyle style { style_record_identity };
+            Layout::Node* layout_node = nullptr;
             switch (kind) {
             case RustFFI::FfiElementLayoutKind::ContentReplacement: {
                 auto const* content_values = element.style_group<CSS::ComputedValues::ContentValues>();
@@ -1365,79 +774,36 @@ RustFFI::FfiDomTreeBuilderCallbacks LayoutTreeBuildBridge::make_ffi_dom_tree_bui
                 auto computed_content = content_values->computed_content_value();
                 auto replacement_image = content_replacement_image(computed_content);
                 VERIFY(replacement_image);
-                frame.layout_node = &create_content_image_box(element.document(), element, style, const_cast<CSS::AbstractImageStyleValue&>(*replacement_image));
+                layout_node = &create_content_image_box(element.document(), element, style, const_cast<CSS::AbstractImageStyleValue&>(*replacement_image));
                 break;
             }
             case RustFFI::FfiElementLayoutKind::SvgMask:
-                frame.layout_node = &allocate_layout_node<Layout::Box>(element.document(), element, style, RustFFI::NodeKind::SVGMaskBox);
+                layout_node = &allocate_layout_node<Layout::Box>(element.document(), element, style, RustFFI::NodeKind::SVGMaskBox);
                 break;
             case RustFFI::FfiElementLayoutKind::SvgClipPath:
-                frame.layout_node = &allocate_layout_node<Layout::Box>(element.document(), element, style, RustFFI::NodeKind::SVGClipBox);
+                layout_node = &allocate_layout_node<Layout::Box>(element.document(), element, style, RustFFI::NodeKind::SVGClipBox);
                 break;
             case RustFFI::FfiElementLayoutKind::SvgPattern:
-                frame.layout_node = &allocate_layout_node<Layout::Box>(element.document(), element, style, RustFFI::NodeKind::SVGPatternBox);
+                layout_node = &allocate_layout_node<Layout::Box>(element.document(), element, style, RustFFI::NodeKind::SVGPatternBox);
                 break;
             case RustFFI::FfiElementLayoutKind::Normal:
-                frame.layout_node = element.create_layout_node(style);
+                layout_node = element.create_layout_node(style);
                 break;
             }
-            return Node::slot_id(frame.layout_node); },
-        .create_principal_document_layout = [](void* frame_pointer, void* document_pointer) -> Compositing::RustFFI::NodeSlotId {
-            VERIFY(frame_pointer);
+            return Node::slot_id(layout_node); },
+        .create_principal_document_layout = [](void*, void* document_pointer) -> Compositing::RustFFI::NodeSlotId {
             VERIFY(document_pointer);
-            auto& frame = *static_cast<PrincipalNodeFrame*>(frame_pointer);
             auto& document = *static_cast<DOM::Document*>(document_pointer);
-            frame.anonymous_computed_values = document.style_computer().create_document_style();
-            frame.layout_node = &allocate_layout_node<Layout::Viewport>(document, frame.anonymous_computed_values.release_nonnull());
-            return Node::slot_id(frame.layout_node); },
-        .principal_text_layout_facts = [](void* text_pointer) -> RustFFI::FfiTextLayoutFacts {
+            return Node::slot_id(&allocate_layout_node<Layout::Viewport>(document, document.style_computer().create_document_style())); },
+        .create_principal_text_layout = [](void* text_pointer) -> Compositing::RustFFI::NodeSlotId {
             VERIFY(text_pointer);
-            auto& text = *static_cast<DOM::Text*>(text_pointer);
-            auto* style_parent = as_if<DOM::Element>(text.flat_tree_parent());
-            auto const* style_parent_payloads = style_parent ? style_parent->style_record_payloads() : nullptr;
-            auto const* style_parent_box_values = CSS::style_group_from_payloads<CSS::ComputedValues::BoxValues>(style_parent_payloads);
-            auto const* style_parent_text_values = CSS::style_group_from_payloads<CSS::ComputedValues::InheritedTextValues>(style_parent_payloads);
-            return {
-                .has_style_parent = style_parent_payloads != nullptr,
-                .parent_display_is_contents = style_parent_box_values && style_parent_box_values->display_value().is_contents(),
-                .text_is_ascii_whitespace = text.data().is_ascii_whitespace(),
-                .parent_collapses_whitespace = style_parent_text_values && first_is_one_of(style_parent_text_values->white_space_collapse_value(), CSS::WhiteSpaceCollapse::Collapse),
-                .style_parent_style_record = style_parent ? style_parent->style_record_identity().value() : 0,
-            }; },
-        .create_principal_text_layout = [](void* frame_pointer, void* text_pointer) -> Compositing::RustFFI::NodeSlotId {
-            VERIFY(frame_pointer);
-            VERIFY(text_pointer);
-            return create_layout_node_for_text(*static_cast<PrincipalNodeFrame*>(frame_pointer), *static_cast<DOM::Text*>(text_pointer)); },
-        .set_principal_layout_node = [](void* builder_pointer, void* frame_pointer, Compositing::RustFFI::NodeSlotId slot) {
+            return create_layout_node_for_text(*static_cast<DOM::Text*>(text_pointer)); },
+        .attach_style_resources = [](void* builder_pointer, Compositing::RustFFI::NodeSlotId slot) {
             VERIFY(builder_pointer);
-            VERIFY(frame_pointer);
             auto& builder = *static_cast<LayoutTreeBuildBridge*>(builder_pointer);
-            auto& frame = *static_cast<PrincipalNodeFrame*>(frame_pointer);
-            frame.layout_node = static_cast<Node*>(RustFFI::layout_arena_node_shell_if_live(builder.m_document->layout_node_arena().handle(), slot));
-            VERIFY(frame.layout_node); },
-        .reuse_principal_layout = [](void* frame_pointer, void* node_pointer) {
-            VERIFY(frame_pointer);
-            VERIFY(node_pointer);
-            // NB: Called during layout tree construction.
-            static_cast<PrincipalNodeFrame*>(frame_pointer)->layout_node = static_cast<DOM::Node*>(node_pointer)->unsafe_layout_node(); },
-        .principal_layout_node = [](void* frame_pointer) -> Compositing::RustFFI::NodeSlotId {
-            VERIFY(frame_pointer);
-            return Node::slot_id(static_cast<PrincipalNodeFrame*>(frame_pointer)->layout_node); },
-        .attach_principal_style_resources = [](void* frame_pointer) {
-            VERIFY(frame_pointer);
-            auto& frame = *static_cast<PrincipalNodeFrame*>(frame_pointer);
-            VERIFY(frame.layout_node);
-            as<NodeWithStyle>(*frame.layout_node).attach_style_resources(); },
-
-        .document_layout_node = [](void* document_pointer) -> Compositing::RustFFI::NodeSlotId {
-            VERIFY(document_pointer);
-            // NB: Called during layout tree construction.
-            return Node::slot_id(static_cast<DOM::Document*>(document_pointer)->unsafe_layout_node()); },
-        .document_element_layout_node = [](void* document_pointer) -> Compositing::RustFFI::NodeSlotId {
-            VERIFY(document_pointer);
-            // NB: Called during layout tree construction.
-            auto* document_element = static_cast<DOM::Document*>(document_pointer)->document_element();
-            return Node::slot_id(document_element ? document_element->unsafe_layout_node() : nullptr); },
+            auto* layout_node = static_cast<Node*>(RustFFI::layout_arena_node_shell_if_live(builder.m_document->layout_node_arena().handle(), slot));
+            VERIFY(layout_node);
+            as<NodeWithStyle>(*layout_node).attach_style_resources(); },
         .layout = make_ffi_tree_builder_callbacks(),
         .pseudo = make_ffi_pseudo_tree_builder_callbacks(),
     };
@@ -1453,18 +819,18 @@ static void update_style_if_needed_for_layout_tree_bypass_path(DOM::Element& ele
         element.document().update_style_for_element({ element });
 }
 
-static Compositing::RustFFI::NodeSlotId create_layout_node_for_text(PrincipalNodeFrame& frame, DOM::Text& text_node)
+static Compositing::RustFFI::NodeSlotId create_layout_node_for_text(DOM::Text& text_node)
 {
     text_node.update_inside_blocking_wheel_event_handler_state();
-    frame.layout_node = &allocate_layout_node<Layout::TextNode>(text_node.document(), text_node);
-    return Node::slot_id(frame.layout_node);
+    return Node::slot_id(&allocate_layout_node<Layout::TextNode>(text_node.document(), text_node));
 }
 
 RustFFI::FfiLayoutTreeBuildOutcome LayoutTreeBuildBridge::build(DOM::Node& dom_node)
 {
     m_document = &dom_node.document();
     auto callbacks = make_ffi_dom_tree_builder_callbacks();
-    return RustFFI::rust_build_layout_tree(&callbacks, dom_node.document().layout_node_arena().handle(), &dom_node);
+    auto& document = dom_node.document();
+    return RustFFI::rust_build_layout_tree(&callbacks, document.layout_node_arena().handle(), &dom_node, document.style_node_id().value());
 }
 
 RustFFI::FfiLayoutTreeBuildOutcome build_layout_tree(DOM::Node& dom_node)

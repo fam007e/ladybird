@@ -9,6 +9,8 @@
 
 #include <AK/Debug.h>
 #include <LibCore/AnonymousBuffer.h>
+#include <LibCore/ElapsedTimer.h>
+#include <LibCore/Environment.h>
 #include <LibCore/EventLoop.h>
 #include <LibGfx/Bitmap.h>
 #include <LibGfx/PaintingSurface.h>
@@ -20,6 +22,15 @@
 #include <LibWeb/Page/Page.h>
 
 namespace Web::Compositor {
+
+static bool display_list_timing_enabled()
+{
+    static bool enabled = [] {
+        auto value = Core::Environment::get("LADYBIRD_DISPLAY_LIST_TIMING"sv);
+        return value.has_value() && !value->is_empty() && *value != "0"sv;
+    }();
+    return enabled;
+}
 
 CompositorConnection::CompositorConnection(NonnullOwnPtr<IPC::Transport> transport)
     : IPC::ConnectionToServer<CompositorWebContentClientEndpoint, CompositorWebContentServerEndpoint>(*this, move(transport))
@@ -56,21 +67,21 @@ void CompositorConnection::ensure_video_presentation_channel()
     dbgln_if(VIDEO_PRESENTATION_CHANNEL_DEBUG, "WebContent: offered the media server's video presentation channel to Compositor");
 }
 
-void CompositorConnection::set_parent_context(Compositing::CompositorContextId context_id, Optional<Compositing::CompositorContextId> parent_context_id)
+void CompositorConnection::set_parent_context(Web::CompositorContextId context_id, Optional<Web::CompositorContextId> parent_context_id)
 {
     if (!can_send_message_to_compositor())
         return;
     async_set_parent_context(context_id, parent_context_id);
 }
 
-void CompositorConnection::stop_presenting_to_client(Compositing::CompositorContextId context_id)
+void CompositorConnection::stop_presenting_to_client(Web::CompositorContextId context_id)
 {
     if (!can_send_message_to_compositor())
         return;
     async_stop_presenting_to_client(context_id);
 }
 
-void CompositorConnection::destroy_context(Compositing::CompositorContextId context_id)
+void CompositorConnection::destroy_context(Web::CompositorContextId context_id)
 {
     m_pending_async_scroll_updates.remove(context_id);
     if (!can_send_message_to_compositor())
@@ -84,7 +95,7 @@ void CompositorConnection::destroy_context(Compositing::CompositorContextId cont
 static constexpr size_t max_resources_per_message = 100;
 static_assert(max_resources_per_message <= IPC::MAX_MESSAGE_FD_COUNT);
 
-bool CompositorConnection::post_resource_additions_in_batches(Compositing::CompositorContextId context_id, Compositing::DisplayListResourceTransaction& resource_transaction)
+bool CompositorConnection::post_resource_additions_in_batches(Web::CompositorContextId context_id, Compositing::DisplayListResourceTransaction& resource_transaction)
 {
     auto fonts = move(resource_transaction.fonts);
     auto image_frames = move(resource_transaction.image_frames);
@@ -115,7 +126,7 @@ bool CompositorConnection::post_resource_additions_in_batches(Compositing::Compo
     return true;
 }
 
-void CompositorConnection::update_display_list(Compositing::CompositorContextId context_id, NonnullRefPtr<Compositing::DisplayList> const& display_list, Compositing::AccumulatedVisualContextTree const& visual_context_tree, Compositing::DisplayListResourceTransaction resource_transaction, Compositing::ScrollStateSnapshot const& scroll_state_snapshot)
+void CompositorConnection::update_display_list(Web::CompositorContextId context_id, NonnullRefPtr<Compositing::DisplayList> const& display_list, Compositing::AccumulatedVisualContextTree const& visual_context_tree, Compositing::DisplayListResourceTransaction resource_transaction, Compositing::ScrollStateSnapshot const& scroll_state_snapshot)
 {
     if (!can_send_message_to_compositor())
         return;
@@ -123,12 +134,24 @@ void CompositorConnection::update_display_list(Compositing::CompositorContextId 
     if (!post_resource_additions_in_batches(context_id, resource_transaction))
         return;
 
-    auto encoded_message = MUST(Messages::CompositorWebContentServer::UpdateDisplayList::static_encode(context_id, display_list, visual_context_tree, resource_transaction, scroll_state_snapshot));
+    // The tape and run table go over in a fresh shared buffer that the Compositor takes ownership of;
+    // this process keeps no mapping once the message is posted.
+    auto timer = Core::ElapsedTimer::start_new(Core::TimerType::Precise);
+    auto shared_tape_buffer = display_list->copy_to_shared_buffer();
+    if (shared_tape_buffer.is_error()) {
+        dbgln("WebContent: Could not place a {} byte display list in shared memory: {}", display_list->command_bytes().size(), shared_tape_buffer.error());
+        return;
+    }
+    auto copy_time = timer.elapsed_time();
+
+    auto encoded_message = MUST(Messages::CompositorWebContentServer::UpdateDisplayList::static_encode(context_id, shared_tape_buffer.value(), display_list->command_bytes().size(), display_list->command_runs().size(), display_list->properties(), visual_context_tree, resource_transaction, scroll_state_snapshot));
     if (post_message(encoded_message).is_error())
         did_lose_compositor();
+    if (display_list_timing_enabled())
+        dbgln("DISPLAY_LIST_PUBLISH bytes={} copy={} µs encode+post={} µs", display_list->command_bytes().size(), copy_time.to_microseconds(), (timer.elapsed_time() - copy_time).to_microseconds());
 }
 
-void CompositorConnection::update_visual_context_tree(Compositing::CompositorContextId context_id, Compositing::AccumulatedVisualContextTree const& visual_context_tree, Compositing::DisplayListResourceTransaction resource_transaction)
+void CompositorConnection::update_visual_context_tree(Web::CompositorContextId context_id, Compositing::AccumulatedVisualContextTree const& visual_context_tree, Compositing::DisplayListResourceTransaction resource_transaction)
 {
     if (!can_send_message_to_compositor())
         return;
@@ -141,7 +164,7 @@ void CompositorConnection::update_visual_context_tree(Compositing::CompositorCon
         did_lose_compositor();
 }
 
-void CompositorConnection::update_scroll_state(Compositing::CompositorContextId context_id, Compositing::ScrollStateSnapshot const& scroll_state_snapshot, Compositing::KeyboardScrollState const& keyboard_scroll_state)
+void CompositorConnection::update_scroll_state(Web::CompositorContextId context_id, Compositing::ScrollStateSnapshot const& scroll_state_snapshot, Compositing::KeyboardScrollState const& keyboard_scroll_state)
 {
     if (!can_send_message_to_compositor())
         return;
@@ -243,7 +266,7 @@ Web::Compositor::PlaceholderCanvasPixels CompositorConnection::get_placeholder_c
     return { pixels.is_valid() ? pixels.bitmap() : nullptr, response->origin_clean() };
 }
 
-void CompositorConnection::invalidate_keyboard_scroll_state(Compositing::CompositorContextId context_id, u64 generation)
+void CompositorConnection::invalidate_keyboard_scroll_state(Web::CompositorContextId context_id, u64 generation)
 {
     if (!can_send_message_to_compositor())
         return;
@@ -253,14 +276,14 @@ void CompositorConnection::invalidate_keyboard_scroll_state(Compositing::Composi
         did_lose_compositor();
 }
 
-void CompositorConnection::invalidate_wheel_event_listener_state(Compositing::CompositorContextId context_id, u64 generation)
+void CompositorConnection::invalidate_wheel_event_listener_state(Web::CompositorContextId context_id, u64 generation)
 {
     if (!can_send_message_to_compositor())
         return;
     async_invalidate_wheel_event_listener_state(context_id, generation);
 }
 
-Compositing::AsyncScrollEnqueueResult CompositorConnection::async_scroll_by(Compositing::CompositorContextId context_id, Compositing::UniqueNodeID document_id, Gfx::FloatPoint position, Gfx::FloatPoint delta, Gfx::IntRect viewport_rect, Compositing::WheelDeltaPrecision wheel_delta_precision, Compositing::ScrollGesturePhase scroll_gesture_phase, u32 modifiers, Compositing::AsyncScrollOperationTracking operation_tracking)
+Compositing::AsyncScrollEnqueueResult CompositorConnection::async_scroll_by(Web::CompositorContextId context_id, Web::UniqueNodeID document_id, Gfx::FloatPoint position, Gfx::FloatPoint delta, Gfx::IntRect viewport_rect, Web::WheelDeltaPrecision wheel_delta_precision, Web::ScrollGesturePhase scroll_gesture_phase, u32 modifiers, Compositing::AsyncScrollOperationTracking operation_tracking)
 {
     if (!can_send_message_to_compositor())
         return {};
@@ -273,7 +296,7 @@ Compositing::AsyncScrollEnqueueResult CompositorConnection::async_scroll_by(Comp
     return response->take_result();
 }
 
-Compositing::AsyncScrollEnqueueResult CompositorConnection::smooth_scroll_to(Compositing::CompositorContextId context_id, Compositing::AsyncScrollNodeStableID stable_node_id, Gfx::FloatPoint offset, Gfx::FloatPoint main_thread_offset, Gfx::IntRect viewport_rect, Compositing::ScrollAnimationKind animation_kind, Compositing::SmoothScrollInitiator initiator)
+Compositing::AsyncScrollEnqueueResult CompositorConnection::smooth_scroll_to(Web::CompositorContextId context_id, Web::AsyncScrollNodeStableID stable_node_id, Gfx::FloatPoint offset, Gfx::FloatPoint main_thread_offset, Gfx::IntRect viewport_rect, Compositing::ScrollAnimationKind animation_kind, Compositing::SmoothScrollInitiator initiator)
 {
     if (!can_send_message_to_compositor())
         return {};
@@ -286,14 +309,14 @@ Compositing::AsyncScrollEnqueueResult CompositorConnection::smooth_scroll_to(Com
     return response->take_result();
 }
 
-void CompositorConnection::cancel_smooth_scroll(Compositing::CompositorContextId context_id, Compositing::AsyncScrollNodeStableID stable_node_id)
+void CompositorConnection::cancel_smooth_scroll(Web::CompositorContextId context_id, Web::AsyncScrollNodeStableID stable_node_id)
 {
     if (!can_send_message_to_compositor())
         return;
     async_cancel_smooth_scroll(context_id, stable_node_id);
 }
 
-Compositing::PendingAsyncScrollUpdates CompositorConnection::take_pending_async_scroll_updates(Compositing::CompositorContextId context_id, Compositing::AsyncScrollUpdateFreshness freshness)
+Compositing::PendingAsyncScrollUpdates CompositorConnection::take_pending_async_scroll_updates(Web::CompositorContextId context_id, Compositing::AsyncScrollUpdateFreshness freshness)
 {
     // The compositor process pushes its scroll updates as it makes them, in order with the input
     // events it forwards, so a rendering update finds the latest ones here. A reader that needs the
@@ -305,7 +328,7 @@ Compositing::PendingAsyncScrollUpdates CompositorConnection::take_pending_async_
         // same queue; they merge in the order the compositor published them, whatever order the
         // transport handed them over in, so a gesture state settles as the newest publication says.
         struct Arrival {
-            Compositing::CompositorContextId context_id;
+            Web::CompositorContextId context_id;
             Compositing::PendingAsyncScrollUpdates updates;
         };
         Vector<Arrival> arrivals;
@@ -344,12 +367,12 @@ Compositing::PendingAsyncScrollUpdates CompositorConnection::take_pending_async_
     return updates;
 }
 
-void CompositorConnection::async_scroll_updates(Compositing::CompositorContextId context_id, Compositing::PendingAsyncScrollUpdates updates)
+void CompositorConnection::async_scroll_updates(Web::CompositorContextId context_id, Compositing::PendingAsyncScrollUpdates updates)
 {
     merge_async_scroll_updates(context_id, move(updates));
 }
 
-void CompositorConnection::merge_async_scroll_updates(Compositing::CompositorContextId context_id, Compositing::PendingAsyncScrollUpdates updates)
+void CompositorConnection::merge_async_scroll_updates(Web::CompositorContextId context_id, Compositing::PendingAsyncScrollUpdates updates)
 {
     auto& pending = m_pending_async_scroll_updates.ensure(context_id);
     // Whether a gesture is in progress is a state, not an event: the newest publication decides it.
@@ -374,14 +397,14 @@ void CompositorConnection::merge_async_scroll_updates(Compositing::CompositorCon
     pending.user_scroll_gesture_ended |= updates.user_scroll_gesture_ended;
 }
 
-void CompositorConnection::viewport_size_updated(Compositing::CompositorContextId context_id, Gfx::IntSize viewport_size, Compositing::WindowResizingInProgress window_resize_in_progress)
+void CompositorConnection::viewport_size_updated(Web::CompositorContextId context_id, Gfx::IntSize viewport_size, Compositing::WindowResizingInProgress window_resize_in_progress)
 {
     if (!can_send_message_to_compositor())
         return;
     async_viewport_size_updated(context_id, viewport_size, window_resize_in_progress);
 }
 
-bool CompositorConnection::request_rendering_opportunity(Compositing::CompositorContextId context_id, double maximum_frames_per_second)
+bool CompositorConnection::request_rendering_opportunity(Web::CompositorContextId context_id, double maximum_frames_per_second)
 {
     if (!can_send_message_to_compositor())
         return false;
@@ -389,14 +412,14 @@ bool CompositorConnection::request_rendering_opportunity(Compositing::Compositor
     return true;
 }
 
-void CompositorConnection::hurry_rendering_opportunity(Compositing::CompositorContextId context_id)
+void CompositorConnection::hurry_rendering_opportunity(Web::CompositorContextId context_id)
 {
     if (!can_send_message_to_compositor())
         return;
     async_hurry_rendering_opportunity(context_id);
 }
 
-void CompositorConnection::present_frame(Compositing::CompositorContextId context_id, Gfx::IntRect viewport_rect)
+void CompositorConnection::present_frame(Web::CompositorContextId context_id, Gfx::IntRect viewport_rect)
 {
     if (!can_send_message_to_compositor())
         return;
@@ -508,7 +531,7 @@ bool CompositorConnection::read_webgl_buffer_sub_data(Compositing::CanvasId canv
     return response->success();
 }
 
-void CompositorConnection::request_screenshot(Compositing::CompositorContextId context_id, NonnullRefPtr<Gfx::PaintingSurface> target_surface, Function<void()>&& callback)
+void CompositorConnection::request_screenshot(Web::CompositorContextId context_id, NonnullRefPtr<Gfx::PaintingSurface> target_surface, Function<void()>&& callback)
 {
     if (!can_send_message_to_compositor()) {
         if (callback)
@@ -523,16 +546,16 @@ void CompositorConnection::request_screenshot(Compositing::CompositorContextId c
     async_request_screenshot(context_id, request_id, move(shareable_bitmap));
 }
 
-void CompositorConnection::key_event(u64 page_id, Compositing::KeyEvent event)
+void CompositorConnection::key_event(u64 page_id, Web::KeyEvent event)
 {
     if (on_key_event)
-        on_key_event(Compositing::PageId { page_id }, move(event));
+        on_key_event(Web::PageId { page_id }, move(event));
 }
 
-void CompositorConnection::mouse_event(u64 page_id, Compositing::MouseEvent event)
+void CompositorConnection::mouse_event(u64 page_id, Web::MouseEvent event)
 {
     if (on_mouse_event)
-        on_mouse_event(Compositing::PageId { page_id }, move(event));
+        on_mouse_event(Web::PageId { page_id }, move(event));
 }
 
 // NB: A page hosting an isolated iframe paints through the context of that local root, not of a traversable.
@@ -544,7 +567,7 @@ void CompositorConnection::request_rendering_update()
     }
 }
 
-void CompositorConnection::rendering_opportunity(Compositing::CompositorContextId context_id, i64 frame_time_nanoseconds, double frame_interval_milliseconds)
+void CompositorConnection::rendering_opportunity(Web::CompositorContextId context_id, i64 frame_time_nanoseconds, double frame_interval_milliseconds)
 {
     for (auto& navigable : Web::HTML::all_local_navigables()) {
         if (!navigable->is_local_root() || !navigable->has_compositor_context())

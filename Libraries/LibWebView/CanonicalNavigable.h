@@ -18,8 +18,6 @@
 #include <AK/Vector.h>
 #include <AK/WeakPtr.h>
 #include <AK/Weakable.h>
-#include <LibCompositing/PageId.h>
-#include <LibCompositing/PixelUnits.h>
 #include <LibRequests/Forward.h>
 #include <LibURL/URL.h>
 #include <LibWebCommon/Forward.h>
@@ -31,6 +29,8 @@
 #include <LibWebCommon/HTML/ReplicatedNavigableState.h>
 #include <LibWebCommon/HTML/SameDocumentNavigationEntry.h>
 #include <LibWebCommon/HTML/SessionHistoryEntryDescriptor.h>
+#include <LibWebCommon/Page/PageId.h>
+#include <LibWebCommon/PixelUnits.h>
 #include <LibWebView/BlobURLStore.h>
 #include <LibWebView/CanonicalBrowsingContext.h>
 #include <LibWebView/CanonicalDocument.h>
@@ -118,6 +118,7 @@ public:
 
     // https://html.spec.whatwg.org/multipage/browsing-the-web.html#navigate
     void navigate(URL::URL, Web::HTML::DocumentResource = {}, Web::Bindings::NavigationHistoryBehavior = Web::Bindings::NavigationHistoryBehavior::Auto);
+    Web::HTML::PreparedNavigationDescriptor prepare_navigation(URL::URL, Web::HTML::DocumentResource = {}, Web::Bindings::NavigationHistoryBehavior = Web::Bindings::NavigationHistoryBehavior::Auto);
     void begin_navigation(Web::HTML::PreparedNavigationDescriptor);
     bool has_navigation_waiting_for_traversal() const { return m_navigation_waiting_for_traversal.has_value(); }
     void begin_navigation_waiting_for_traversal();
@@ -165,10 +166,10 @@ public:
     void discard_pending_host();
     void discard_pending_host(WebContentPage const&);
 
-    Optional<Compositing::DevicePixelRect> const& viewport_rect() const { return m_viewport_rect; }
-    Compositing::DevicePixelRect const& viewport_intersection() const { return m_viewport_intersection; }
+    Optional<Web::DevicePixelRect> const& viewport_rect() const { return m_viewport_rect; }
+    Web::DevicePixelRect const& viewport_intersection() const { return m_viewport_intersection; }
     double device_pixel_ratio() const { return m_device_pixel_ratio; }
-    void set_viewport(Compositing::DevicePixelRect, Compositing::DevicePixelRect viewport_intersection, double device_pixel_ratio);
+    void set_viewport(Web::DevicePixelRect, Web::DevicePixelRect viewport_intersection, double device_pixel_ratio);
     void send_viewport_to_host() const;
     void send_viewport_to(WebContentPage&) const;
 
@@ -256,8 +257,8 @@ private:
     BlobURLHandle m_document_blob_url;
     Optional<Web::HTML::CrossProcessId> m_ongoing_navigation_traversal_operation_id;
     ActiveDocumentLoad m_active_document_load;
-    Optional<Compositing::DevicePixelRect> m_viewport_rect;
-    Compositing::DevicePixelRect m_viewport_intersection;
+    Optional<Web::DevicePixelRect> m_viewport_rect;
+    Web::DevicePixelRect m_viewport_intersection;
     double m_device_pixel_ratio { 1 };
 };
 

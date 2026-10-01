@@ -2881,19 +2881,18 @@ pub unsafe extern "C" fn layout_arena_publish_compositor_animations(
 /// `arena` must be a live handle from `layout_arena_create`, used on the document thread; the
 /// sink pointer must stay valid for this synchronous call.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn layout_arena_hit_test_visit_caret_roots_and_chrome_widgets(
+pub unsafe extern "C" fn layout_arena_hit_test_visit_chrome_widgets(
     arena: *mut c_void,
     sink: *mut c_void,
-    visit: unsafe extern "C" fn(*mut c_void, NodeSlotId, u8, *mut c_void),
+    visit: unsafe extern "C" fn(*mut c_void, NodeSlotId, u8),
 ) {
-    with_hit_test_list_items_only(arena, (), |list, arena| {
+    with_hit_test_list_items_only(arena, (), |list, _arena| {
         for item in list.items.iter() {
-            let caret_node_shell = arena.shell_if_live(item.caret_node);
-            if item.chrome_widget_kind == crate::painting::hit_test::CHROME_WIDGET_NONE && caret_node_shell.is_null() {
+            if item.chrome_widget_kind == crate::painting::hit_test::CHROME_WIDGET_NONE {
                 continue;
             }
             // SAFETY: The C++ host consumes the visit synchronously.
-            unsafe { visit(sink, item.paintable, item.chrome_widget_kind, caret_node_shell) };
+            unsafe { visit(sink, item.paintable, item.chrome_widget_kind) };
         }
     });
 }
@@ -3003,12 +3002,12 @@ pub unsafe extern "C" fn layout_arena_hit_test_resolve_caret(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn layout_arena_hit_test_caret_line_for_position(
     arena: *mut c_void,
-    callbacks: crate::painting::host::FfiCaretPositionQueryCallbacks,
+    query: crate::painting::host::FfiCaretPositionQuery,
     offset: usize,
     affinity_is_downstream: bool,
 ) -> crate::painting::host::FfiCaretLineForPosition {
     with_hit_test_list_and_caret_lines(arena, Default::default(), |list, arena| {
-        match list.caret_line_for_position(arena, &callbacks, offset, affinity_is_downstream) {
+        match list.caret_line_for_position(arena, &query, offset, affinity_is_downstream) {
             Some(line_index) => crate::painting::host::FfiCaretLineForPosition {
                 has_line: true,
                 line_index,

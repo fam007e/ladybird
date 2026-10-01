@@ -47,14 +47,6 @@ fn every_retained_member_is_shareable(state: &RetainedState) {
         sheets_excluded_from_routing,
         routing_needs_detachment_sweep,
         match_workspace,
-        query_match_workspace,
-        selector_query_generation,
-        query_settled_transaction_version,
-        query_sorted_candidates,
-        query_sorted_candidates_stamp,
-        query_preorder_ranks,
-        query_preorder_ranks_stamp,
-        query_workspace_generation,
         exact_covered_scratch,
         cascade_compaction_scratch,
         cascade_compaction_scratch_memory,
@@ -68,6 +60,11 @@ fn every_retained_member_is_shareable(state: &RetainedState) {
         computed_group_sets,
         custom_property_environments,
         nodes_with_substituted_records,
+        element_custom_property_data,
+        pseudo_element_custom_property_data,
+        environment_move_recompute_nodes,
+        css_defined_animations,
+        transition_baselines,
         custom_property_registrations_changed,
         pending_element_style_computation_selections,
         pending_pseudo_style_computation_selections,
@@ -138,14 +135,6 @@ fn every_retained_member_is_shareable(state: &RetainedState) {
     assert_member_is_sync(sheets_excluded_from_routing);
     assert_member_is_sync(routing_needs_detachment_sweep);
     assert_member_is_sync(match_workspace);
-    assert_member_is_sync(query_match_workspace);
-    assert_member_is_sync(selector_query_generation);
-    assert_member_is_sync(query_settled_transaction_version);
-    assert_member_is_sync(query_sorted_candidates);
-    assert_member_is_sync(query_sorted_candidates_stamp);
-    assert_member_is_sync(query_preorder_ranks);
-    assert_member_is_sync(query_preorder_ranks_stamp);
-    assert_member_is_sync(query_workspace_generation);
     assert_member_is_sync(exact_covered_scratch);
     assert_member_is_sync(cascade_compaction_scratch);
     assert_member_is_sync(cascade_compaction_scratch_memory);
@@ -156,6 +145,11 @@ fn every_retained_member_is_shareable(state: &RetainedState) {
     assert_member_is_sync(specified_values);
     assert_member_is_sync(winner_groups);
     assert_member_is_sync(nodes_with_substituted_records);
+    assert_member_is_sync(element_custom_property_data);
+    assert_member_is_sync(pseudo_element_custom_property_data);
+    assert_member_is_sync(environment_move_recompute_nodes);
+    assert_member_is_sync(css_defined_animations);
+    assert_member_is_sync(transition_baselines);
     assert_member_is_sync(custom_property_registrations_changed);
     assert_member_is_sync(pending_element_style_computation_selections);
     assert_member_is_sync(pending_pseudo_style_computation_selections);

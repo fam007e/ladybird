@@ -50,6 +50,7 @@ macro_rules! define_id {
     };
 }
 
+pub(crate) mod animations;
 mod atoms;
 pub mod batch_matcher;
 pub mod bridge;
@@ -93,6 +94,7 @@ pub mod record_replay;
 mod routing;
 mod sorted_merge;
 mod style_invalidation;
+mod transition_baselines;
 #[cfg(not(feature = "style-recording"))]
 pub mod record_replay {
     include!(concat!(env!("OUT_DIR"), "/style_engine_event_kind_stub_generated.rs"));
@@ -144,6 +146,7 @@ pub mod record_replay {
 }
 pub mod relative_selector;
 pub mod selector;
+pub mod selector_evaluation;
 mod shareable;
 mod shared_vector;
 mod sheet_occurrences;
@@ -153,7 +156,6 @@ mod transaction_view;
 pub mod tree;
 
 use atoms::DocumentAtoms;
-use atoms::PinnedAtoms;
 use atoms::ReclaimedStyleAtom;
 use catalog::*;
 use column::BitColumn;
@@ -189,6 +191,7 @@ use exact_matcher::ExactMatchContext;
 use exact_matcher::ExactMatcher;
 
 pub use counter_context::StyleEngine;
+pub use inputs::{PublishedBoxFacts, TextStyleParentFacts};
 
 use batch_matcher::AncestorRequirements;
 use batch_matcher::AncestorRequirementsCache;
@@ -464,7 +467,7 @@ mod verification {
         }
     }
 
-    /// Require a published style transaction to complete without another selector query.
+    /// Require a published style transaction to complete without another `match_element()` call.
     pub(super) fn published_style_transaction(engine: &RetainedState, check: impl FnOnce(&RetainedState)) {
         if enabled(
             &PUBLISHED_STYLE_TRANSACTION,
@@ -773,13 +776,6 @@ impl ProgramStaging {
     }
 }
 
-/// One document's style engine.
-struct QuerySortedCandidatesStamp {
-    generation: u64,
-    root: StyleNodeID,
-    keys: Vec<DispatchKey>,
-}
-
 /// Long-lived engine state: the document, its program, derived results and cross-flush
 /// caches. This is the whole read side of an evaluation step; it holds no
 /// host handle, no journal intake and no borrowed FFI result storage.
@@ -805,28 +801,6 @@ pub struct RetainedState {
     /// points for rules that can no longer decide.
     routing_needs_detachment_sweep: bool,
     match_workspace: MatchScratch,
-    /// Sibling positions and relation answers shared by the candidates of one DOM selector query.
-    /// A query can't mutate the tree it walks — so this is reset per-query, rather than per-candidate.
-    query_match_workspace: MatchScratch,
-    /// Advanced when a selector query settles over a changed document — so a run of queries over
-    /// an unchanged one shares a single workspace. A query that never asks a positional question
-    /// pays a comparison, rather than a workspace rebuild.
-    selector_query_generation: u64,
-    /// The transaction version the last selector query settled at; the change detector for the
-    /// generation above.
-    query_settled_transaction_version: StyleTransactionVersion,
-    /// Tree-ordered candidates of the last posting-driven selector query. querySelector in a loop
-    /// typically asks with the same subject keys every time — so collect-and-sort pays once per
-    /// document change, rather than once per query.
-    query_sorted_candidates: Vec<StyleNodeID>,
-    /// What `query_sorted_candidates` was computed from. Same stamp, same list.
-    query_sorted_candidates_stamp: Option<QuerySortedCandidatesStamp>,
-    /// node -> preorder rank under the stamped root; how candidates get their tree order without a
-    /// walk per query.
-    query_preorder_ranks: HashMap<StyleNodeID, u32>,
-    query_preorder_ranks_stamp: Option<(u64, StyleNodeID)>,
-    /// Which query `query_match_workspace` holds answers for.
-    query_workspace_generation: u64,
     /// Scratch for the fact rows one exact candidate evaluation covers, reused across candidates.
     exact_covered_scratch: Vec<StyleNodeID>,
     cascade_compaction_scratch: ordering::CascadeCompactionWorkspace,
@@ -855,6 +829,23 @@ pub struct RetainedState {
     /// The nodes whose engine-computed record substituted a custom property into a winner: what
     /// C++ notes as reading custom properties when it installs the record.
     nodes_with_substituted_records: HashSet<StyleNodeID>,
+    /// The custom-property environment each element holds, for the elements that hold one. This is
+    /// the only copy: the element reads its environment from here.
+    element_custom_property_data: HashMap<StyleNodeID, inputs::RetainedCustomPropertyData>,
+    /// The custom-property environments of each element's synthetic pseudo-elements, by
+    /// pseudo-element kind, for the elements with a pseudo-element that holds one.
+    pseudo_element_custom_property_data: HashMap<StyleNodeID, Vec<(u8, inputs::RetainedCustomPropertyData)>>,
+    /// The elements whose style reads their custom-property environment other than through `var()`,
+    /// which a moved environment computes again.
+    environment_move_recompute_nodes: HashSet<StyleNodeID>,
+    /// The names of the CSS animations the host holds for each element, which the computation of
+    /// its animation definitions matches them against.
+    css_defined_animations: animations::CssDefinedAnimations,
+    /// https://drafts.csswg.org/css-transitions-2/#defining-before-change-style
+    /// Per transition target, by element and then pseudo-element kind, the before-change style its
+    /// transitions are decided against for the rest of the style stabilization epoch, pinned until
+    /// the epoch commits.
+    transition_baselines: HashMap<StyleNodeID, SmallVec<[(u8, u64); 1]>>,
     /// Whether the registrations used by this transaction differ from the preceding one. A
     /// previously substituted record must then be recomputed by C++, which implements registered
     /// custom properties, even when its cascade winners did not move.
@@ -1053,7 +1044,7 @@ pub struct HostState {
     /// Whether transaction settlement performed an atom sweep, including a sweep that reclaimed
     /// no identities. Recording consumes this alongside the release batch.
     style_atoms_swept: bool,
-    /// Replay reconstructs semantic engine state but not transient C++ query handles. The recorded
+    /// Replay reconstructs semantic engine state but not the C++ references to atoms. The recorded
     /// release batch supplies their lifetime boundary while still requiring every released atom to
     /// be reclaimable from replay's complete semantic root set.
     replay_reclaimed_style_atoms: Option<Vec<StyleAtomID>>,

@@ -218,11 +218,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     });
                     unsafe { bridge::style_engine_destroy(engine) };
                 }
-                EventKind::AllocateStyleNodes => {
+                EventKind::AllocateStyleNodes | EventKind::AllocateTextStyleNodes => {
                     let engine = read_engine(&mut event.payload, &live_engines)?;
                     let expected = event.payload.read_u32_vec()?;
                     let mut actual = vec![0; expected.len()];
-                    unsafe { bridge::style_engine_allocate_style_nodes(engine, actual.as_mut_ptr(), actual.len()) };
+                    let allocate = if event.kind == EventKind::AllocateStyleNodes {
+                        bridge::style_engine_allocate_style_nodes
+                    } else {
+                        bridge::style_engine_allocate_text_style_nodes
+                    };
+                    unsafe { allocate(engine, actual.as_mut_ptr(), actual.len()) };
                     if actual != expected {
                         return Err(
                             format!("style-node allocation diverged: expected {expected:?}, got {actual:?}").into(),
@@ -325,10 +330,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     let expected = event.payload.read_u32()?;
                     let actual = unsafe { bridge::style_engine_intern_atom(engine, token) };
                     assert_identity("atom", expected, actual)?;
-                }
-                EventKind::SelectorQueryAtomMappings => {
-                    let engine = read_engine(&mut event.payload, &live_engines)?;
-                    replay_atom_mappings(engine, &mut event.payload)?;
                 }
                 EventKind::ReplaceStyleRuleSelectors => {
                     let (engine_index, engine) = read_engine_indexed(&mut event.payload, &live_engines)?;
@@ -2734,6 +2735,11 @@ extern "C" fn ladybird_utf16_fly_string_from_utf16(_data: *const u16, _length: u
 extern "C" fn ladybird_gfx_font_cascade_list_ref(_list: *const c_void) {}
 #[unsafe(no_mangle)]
 extern "C" fn ladybird_gfx_font_cascade_list_unref(_list: *const c_void) {}
+// Replay has no C++ CustomPropertyData to count references on.
+#[unsafe(no_mangle)]
+extern "C" fn web_css_custom_property_data_reference(_data: *const c_void) {}
+#[unsafe(no_mangle)]
+extern "C" fn web_css_custom_property_data_unreference(_data: *const c_void) {}
 
 #[unsafe(no_mangle)]
 unsafe extern "C" fn unicode_rust_idna_to_ascii(

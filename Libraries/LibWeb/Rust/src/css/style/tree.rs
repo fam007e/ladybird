@@ -36,22 +36,52 @@ use super::memory::MemoryCategory;
 use super::memory::MemoryController;
 use super::transaction::TreeRelations;
 
-/// Document-local identity of an element.
+/// Document-local identity of an element or a text node.
+///
+/// The top bit says which kind of node it names, and the rest is a dense index into that kind's own
+/// columns. Text nodes outnumber elements on most pages and have none of their facts or styles, so
+/// sharing one index space would make every element column span them too.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct StyleNodeID(NonZeroU32);
+
+const TEXT_STYLE_NODE_BIT: u32 = 1 << 31;
 
 impl StyleNodeID {
     /// `index` is a dense element index starting at 1.
     #[must_use]
     pub fn element(index: u32) -> Self {
         assert!(index != 0, "element index 0 is reserved");
+        assert!(index < TEXT_STYLE_NODE_BIT, "element index space exhausted");
         Self(NonZeroU32::new(index).unwrap())
     }
 
-    /// The dense element index.
+    /// `index` is a dense text index starting at 1. The all-ones identity stays out of reach, as the
+    /// boundary gives it a meaning of its own.
+    #[must_use]
+    pub fn text(index: u32) -> Self {
+        assert!(index != 0, "text index 0 is reserved");
+        assert!(index < TEXT_STYLE_NODE_BIT - 1, "text index space exhausted");
+        Self(NonZeroU32::new(index | TEXT_STYLE_NODE_BIT).unwrap())
+    }
+
+    /// The dense element index, or `None` for a text node.
     #[must_use]
     pub fn element_index(self) -> Option<u32> {
-        Some(self.0.get())
+        (self.0.get() & TEXT_STYLE_NODE_BIT == 0).then_some(self.0.get())
+    }
+
+    /// The slot the node has in columns keyed by element index. A text node's identity has the
+    /// top bit set, which puts its slot past the end of every element column: indexing one with it
+    /// fails the bounds check, and looking it up finds nothing, without testing the kind first.
+    #[must_use]
+    pub fn element_slot(self) -> usize {
+        self.0.get() as usize
+    }
+
+    /// The dense text index, or `None` for an element.
+    #[must_use]
+    pub fn text_index(self) -> Option<u32> {
+        (self.0.get() & TEXT_STYLE_NODE_BIT != 0).then_some(self.0.get() & !TEXT_STYLE_NODE_BIT)
     }
 
     #[must_use]
@@ -374,9 +404,12 @@ impl TreeRelationStaging {
 /// actually diverges from the DOM tree.
 #[derive(Default)]
 struct ShadowRelations {
-    /// A slotted node's slot.
+    /// A slotted element's slot.
     assigned_slot: SegmentedNodeColumn<StyleNodeID>,
-    /// A slot's assigned nodes, in assignment order.
+    /// A slotted text node's slot. Text identities have no relation columns of their own, and a
+    /// slotted text node is rare enough that a map costs less than a second column would.
+    text_assigned_slot: HashMap<StyleNodeID, StyleNodeID>,
+    /// A slot's assigned nodes, text nodes included, in the order the DOM assigned them.
     assigned_nodes: HashMap<StyleNodeID, Vec<StyleNodeID>>,
     /// A shadow host's shadow root.
     shadow_root: SegmentedNodeColumn<StyleNodeID>,
@@ -401,7 +434,11 @@ impl ShadowRelations {
         }
         if let Some(nodes) = self.assigned_nodes.remove(&node) {
             for assigned in nodes {
-                if self.assigned_slot.get(assigned) == Some(node) {
+                if assigned.text_index().is_some() {
+                    if self.text_assigned_slot.get(&assigned) == Some(&node) {
+                        self.text_assigned_slot.remove(&assigned);
+                    }
+                } else if self.assigned_slot.get(assigned) == Some(node) {
                     self.assigned_slot.remove(assigned);
                 }
             }
@@ -415,9 +452,17 @@ impl ShadowRelations {
         self.part_hosts.remove(&node);
     }
 
+    fn retire_text(&mut self, node: StyleNodeID) {
+        if let Some(slot) = self.text_assigned_slot.remove(&node)
+            && let Some(nodes) = self.assigned_nodes.get_mut(&slot)
+        {
+            nodes.retain(|&assigned| assigned != node);
+        }
+    }
+
     fn capacity_bytes(&self) -> u64 {
         capacity_bytes! {
-            shallow [self.assigned_nodes, self.part_hosts];
+            shallow [self.text_assigned_slot, self.assigned_nodes, self.part_hosts];
             cached [];
             nested [
                 self.assigned_slot.capacity_bytes(),
@@ -473,6 +518,10 @@ pub struct StyleNodeTree {
     tree_scope: Option<Vec<TreeScopeID>>,
 
     live: BitColumn,
+    /// Identities that stand in the tree without being styled: the document, whose children the
+    /// DOM child sequence hangs from. A selector never names one and nothing publishes features
+    /// for one, so a style pass that reaches one must pass it by rather than ask it to match.
+    relation_only: BitColumn,
     connected_element_count: u32,
     /// Identities retired in the current epoch. They cannot be reused until the epoch that could
     /// still observe them has retired.
@@ -481,6 +530,16 @@ pub struct StyleNodeTree {
 
     /// Allocated only once a shadow tree exists.
     shadow: Option<Box<ShadowRelations>>,
+
+    // The DOM child sequence, text nodes included. Elements keep these beside their element-only
+    // links, which every selector walk reads; text nodes have nothing else.
+    //
+    // Unlike the element-only links, these are spliced when the DOM changes rather than staged,
+    // because no transaction plans from them.
+    first_child: Vec<Option<StyleNodeID>>,
+    next_sibling: Vec<Option<StyleNodeID>>,
+    previous_sibling: Vec<Option<StyleNodeID>>,
+    text: TextRows,
 
     capacity_bytes: u64,
 
@@ -511,10 +570,15 @@ impl StyleNodeTree {
             depth: Vec::new(),
             tree_scope: None,
             live: BitColumn::default(),
+            relation_only: BitColumn::default(),
             connected_element_count: 0,
             pending_reuse: Vec::new(),
             free_element_indexes: Vec::new(),
             shadow: None,
+            first_child: Vec::new(),
+            next_sibling: Vec::new(),
+            previous_sibling: Vec::new(),
+            text: TextRows::default(),
             capacity_bytes: 0,
             #[cfg(test)]
             depth_recompute_visits: 0,
@@ -525,6 +589,12 @@ impl StyleNodeTree {
         tree.next_element_sibling.push(None);
         tree.previous_element_sibling.push(None);
         tree.depth.push(0);
+        tree.first_child.push(None);
+        tree.next_sibling.push(None);
+        tree.previous_sibling.push(None);
+        tree.text.parent.push(None);
+        tree.text.next_sibling.push(None);
+        tree.text.previous_sibling.push(None);
         tree.capacity_bytes = tree.recompute_capacity_bytes();
         memory.reserve_required(MemoryCategory::RelationColumns, tree.capacity_bytes);
         tree
@@ -536,12 +606,37 @@ impl StyleNodeTree {
         self.connected_element_count
     }
 
-    #[must_use]
-    pub fn is_live(&self, node: StyleNodeID) -> bool {
-        self.live.contains(node.element_index().unwrap() as usize)
+    /// Mark an identity as standing in the tree without being styled. See `relation_only`.
+    pub fn mark_relation_only(&mut self, node: StyleNodeID, memory: &mut MemoryController) {
+        let Some(index) = node.element_index() else {
+            return;
+        };
+        let before = self.identity_capacity_bytes();
+        let (changed, _) = self.relation_only.set(index as usize, true);
+        let current = self.identity_capacity_bytes();
+        self.record_capacity_change(memory, before, current);
+        // The count is the number of elements a style pass has to answer for, and this is not one.
+        if changed {
+            self.connected_element_count -= 1;
+        }
     }
 
-    /// Every live style-tree identity, including the synthetic roots of shadow trees.
+    /// Whether the identity stands in the tree without being styled. See `relation_only`.
+    #[must_use]
+    pub fn is_relation_only(&self, node: StyleNodeID) -> bool {
+        node.element_index()
+            .is_some_and(|index| self.relation_only.contains(index as usize))
+    }
+
+    #[must_use]
+    pub fn is_live(&self, node: StyleNodeID) -> bool {
+        match node.text_index() {
+            Some(index) => self.text.live.contains(index as usize),
+            None => self.live.contains(node.element_slot()),
+        }
+    }
+
+    /// Every live element-kind identity, including the synthetic roots of shadow trees.
     pub fn live_nodes(&self) -> impl Iterator<Item = StyleNodeID> + '_ {
         (1..self.parent.len()).filter_map(|index| {
             let index = u32::try_from(index).expect("style node index space exhausted");
@@ -561,6 +656,9 @@ impl StyleNodeTree {
                 self.next_element_sibling[index as usize] = None;
                 self.previous_element_sibling[index as usize] = None;
                 self.depth[index as usize] = 0;
+                self.first_child[index as usize] = None;
+                self.next_sibling[index as usize] = None;
+                self.previous_sibling[index as usize] = None;
                 if let Some(column) = self.tree_scope.as_mut() {
                     column[index as usize] = TreeScopeID::DOCUMENT;
                 }
@@ -574,6 +672,9 @@ impl StyleNodeTree {
                 self.next_element_sibling.push(None);
                 self.previous_element_sibling.push(None);
                 self.depth.push(0);
+                self.first_child.push(None);
+                self.next_sibling.push(None);
+                self.previous_sibling.push(None);
                 if let Some(column) = self.tree_scope.as_mut() {
                     column.push(TreeScopeID::DOCUMENT);
                 }
@@ -610,12 +711,17 @@ impl StyleNodeTree {
                 shadow.retire_node(node);
             }
             self.live.set(index as usize, false);
+            if !self.relation_only.set(index as usize, false).0 {
+                self.connected_element_count -= 1;
+            }
             self.parent[index as usize] = None;
             self.first_element_child[index as usize] = None;
             self.next_element_sibling[index as usize] = None;
             self.previous_element_sibling[index as usize] = None;
             self.depth[index as usize] = 0;
-            self.connected_element_count -= 1;
+            self.first_child[index as usize] = None;
+            self.next_sibling[index as usize] = None;
+            self.previous_sibling[index as usize] = None;
             self.pending_reuse.push(index);
         }
         let current = self.retirement_capacity_bytes();
@@ -624,9 +730,10 @@ impl StyleNodeTree {
 
     /// Called once the read epoch that could still name the retired identities has retired.
     pub fn release_retired_identities(&mut self, memory: &mut MemoryController) {
-        let before = self.reuse_capacity_bytes();
+        let before = self.reuse_capacity_bytes() + self.text.capacity_bytes();
         self.free_element_indexes.append(&mut self.pending_reuse);
-        let current = self.reuse_capacity_bytes();
+        self.text.free_indexes.append(&mut self.text.pending_reuse);
+        let current = self.reuse_capacity_bytes() + self.text.capacity_bytes();
         self.record_capacity_change(memory, before, current);
     }
 
@@ -634,6 +741,182 @@ impl StyleNodeTree {
     #[cfg(test)]
     pub fn retired_identities_pending_release(&self) -> usize {
         self.pending_reuse.len()
+    }
+
+    /// Allocate a text identity. Like an element's, it is reused only once the epoch that could
+    /// still observe its previous occupant has retired.
+    pub fn allocate_text(&mut self, memory: &mut MemoryController) -> StyleNodeID {
+        let before = self.text.capacity_bytes();
+        let index = self.text.free_indexes.pop().unwrap_or_else(|| {
+            let index = u32::try_from(self.text.parent.len()).expect("text index space exhausted");
+            self.text.parent.push(None);
+            self.text.next_sibling.push(None);
+            self.text.previous_sibling.push(None);
+            index
+        });
+        self.text.live.set(index as usize, true);
+        let current = self.text.capacity_bytes();
+        self.record_capacity_change(memory, before, current);
+        StyleNodeID::text(index)
+    }
+
+    /// Retire text identities as their nodes disconnect. Nothing selects or styles a text node, so
+    /// it has no relations to stage, and its slot waits for [`Self::release_retired_identities`]
+    /// like an element's.
+    pub fn retire_texts(&mut self, nodes: impl IntoIterator<Item = StyleNodeID>, memory: &mut MemoryController) {
+        let before = self.text.capacity_bytes() + self.shadow_capacity_bytes();
+        for node in nodes {
+            let index = node.text_index().expect("retire_texts requires a text identity");
+            let (was_live, _) = self.text.live.set(index as usize, false);
+            assert!(was_live, "retiring a text identity that is not live");
+            self.text.is_ascii_whitespace.set(index as usize, false);
+            self.text.parent[index as usize] = None;
+            self.text.next_sibling[index as usize] = None;
+            self.text.previous_sibling[index as usize] = None;
+            self.text.pending_reuse.push(index);
+            if let Some(shadow) = self.shadow.as_mut() {
+                shadow.retire_text(node);
+            }
+        }
+        let current = self.text.capacity_bytes() + self.shadow_capacity_bytes();
+        self.record_capacity_change(memory, before, current);
+    }
+
+    /// Whether the text node's data is nothing but ASCII whitespace. Only a text node has data, so
+    /// every other identity answers no.
+    #[must_use]
+    pub fn text_is_ascii_whitespace(&self, node: StyleNodeID) -> bool {
+        node.text_index()
+            .is_some_and(|index| self.text.is_ascii_whitespace.contains(index as usize))
+    }
+
+    /// Record what the text node's data now spells, as its whitespace-only state.
+    pub fn set_text_is_ascii_whitespace(&mut self, node: StyleNodeID, value: bool, memory: &mut MemoryController) {
+        let Some(index) = node.text_index() else {
+            return;
+        };
+        let before = self.text.capacity_bytes();
+        self.text.is_ascii_whitespace.set(index as usize, value);
+        let current = self.text.capacity_bytes();
+        self.record_capacity_change(memory, before, current);
+    }
+
+    // -- DOM child sequence ------------------------------------------------------------------
+
+    /// Splice `node` into `parent`'s child sequence right after `previous`, or first when there is
+    /// none. A node with no parent is left unlinked: the document's own children are not a
+    /// sequence anything reads.
+    pub fn link_in_dom_order(&mut self, node: StyleNodeID, parent: Option<StyleNodeID>, previous: Option<StyleNodeID>) {
+        if !self.is_live(node) {
+            return;
+        }
+        let previous = previous.filter(|&previous| self.is_live(previous));
+        let Some(parent_index) = parent
+            .filter(|&parent| self.is_live(parent))
+            .and_then(StyleNodeID::element_index)
+        else {
+            *self.next_sibling_mut(node) = None;
+            *self.previous_sibling_mut(node) = None;
+            if let Some(index) = node.text_index() {
+                self.text.parent[index as usize] = None;
+            }
+            return;
+        };
+        let parent_index = parent_index as usize;
+        let next = match previous {
+            Some(previous) => self.next_sibling_in_dom_order(previous),
+            None => self.first_child[parent_index],
+        };
+        *self.previous_sibling_mut(node) = previous;
+        *self.next_sibling_mut(node) = next;
+        match previous {
+            Some(previous) => *self.next_sibling_mut(previous) = Some(node),
+            None => self.first_child[parent_index] = Some(node),
+        }
+        if let Some(next) = next {
+            *self.previous_sibling_mut(next) = Some(node);
+        }
+        if let Some(index) = node.text_index() {
+            self.text.parent[index as usize] = parent;
+        }
+    }
+
+    /// Take `node` out of the child sequence of `parent`, the parent it was linked under.
+    pub fn unlink_from_dom_order(&mut self, node: StyleNodeID, parent: Option<StyleNodeID>) {
+        if !self.is_live(node) {
+            return;
+        }
+        let previous = self.previous_sibling_mut(node).take();
+        let next = self.next_sibling_mut(node).take();
+        match previous {
+            Some(previous) => {
+                if self.is_live(previous) {
+                    *self.next_sibling_mut(previous) = next;
+                }
+            }
+            None => {
+                if let Some(parent_index) = parent
+                    .filter(|&parent| self.is_live(parent))
+                    .and_then(StyleNodeID::element_index)
+                    && self.first_child[parent_index as usize] == Some(node)
+                {
+                    self.first_child[parent_index as usize] = next;
+                }
+            }
+        }
+        if let Some(next) = next
+            && self.is_live(next)
+        {
+            *self.previous_sibling_mut(next) = previous;
+        }
+        if let Some(index) = node.text_index() {
+            self.text.parent[index as usize] = None;
+        }
+    }
+
+    /// The children of `node` in DOM order, text nodes included.
+    #[must_use]
+    pub fn dom_children(&self, node: StyleNodeID) -> DomChildren<'_> {
+        DomChildren {
+            tree: self,
+            next: node.element_index().and_then(|index| self.first_child[index as usize]),
+        }
+    }
+
+    /// The parent a text node is linked under.
+    #[must_use]
+    pub fn text_parent(&self, node: StyleNodeID) -> Option<StyleNodeID> {
+        self.text.parent[node.text_index()? as usize]
+    }
+
+    #[must_use]
+    pub fn next_sibling_in_dom_order(&self, node: StyleNodeID) -> Option<StyleNodeID> {
+        match node.text_index() {
+            Some(index) => self.text.next_sibling[index as usize],
+            None => self.next_sibling[node.element_slot()],
+        }
+    }
+
+    #[must_use]
+    pub fn previous_sibling_in_dom_order(&self, node: StyleNodeID) -> Option<StyleNodeID> {
+        match node.text_index() {
+            Some(index) => self.text.previous_sibling[index as usize],
+            None => self.previous_sibling[node.element_slot()],
+        }
+    }
+
+    fn next_sibling_mut(&mut self, node: StyleNodeID) -> &mut Option<StyleNodeID> {
+        match node.text_index() {
+            Some(index) => &mut self.text.next_sibling[index as usize],
+            None => &mut self.next_sibling[node.element_slot()],
+        }
+    }
+
+    fn previous_sibling_mut(&mut self, node: StyleNodeID) -> &mut Option<StyleNodeID> {
+        match node.text_index() {
+            Some(index) => &mut self.text.previous_sibling[index as usize],
+            None => &mut self.previous_sibling[node.element_slot()],
+        }
     }
 
     // -- Relation maintenance ----------------------------------------------------------------
@@ -811,14 +1094,50 @@ impl StyleNodeTree {
         }
         let before = self.shadow_capacity_bytes();
         let shadow = self.shadow_mut();
-        if let Some(previous) = shadow.assigned_slot.remove(node)
-            && let Some(nodes) = shadow.assigned_nodes.get_mut(&previous)
-        {
-            nodes.retain(|assigned| *assigned != node);
-        }
+        shadow.assigned_slot.remove(node);
         if let Some(slot) = slot {
             shadow.assigned_slot.insert(node, slot);
-            shadow.assigned_nodes.entry(slot).or_default().push(node);
+        }
+        let current = self.shadow_capacity_bytes();
+        self.record_capacity_change(memory, before, current);
+    }
+
+    /// Replace the ordered list of nodes `slot` has assigned to it.
+    ///
+    /// The list is published whole rather than assembled from the per-element assignments above,
+    /// because neither of the two things it has to be can be recovered from them. A text node is a
+    /// slottable but holds no relation row, so its assignment cannot be staged beside an element's;
+    /// and the order is the DOM's, not the order assignments arrive in: a manual assignment orders
+    /// its nodes the way `assign()` named them, and a reorder among a slot's own assignees changes
+    /// no node's slot at all.
+    pub fn set_assigned_nodes(&mut self, slot: StyleNodeID, nodes: &[StyleNodeID], memory: &mut MemoryController) {
+        if nodes.is_empty()
+            && self
+                .shadow
+                .as_ref()
+                .is_none_or(|shadow| !shadow.assigned_nodes.contains_key(&slot))
+        {
+            return;
+        }
+        let before = self.shadow_capacity_bytes();
+        let shadow = self.shadow_mut();
+        let mut assigned = shadow.assigned_nodes.remove(&slot).unwrap_or_default();
+        // A tree-wide assignment can have moved one of the departing text nodes to another slot
+        // already, and this slot must not take that newer assignment away again.
+        for node in &assigned {
+            if shadow.text_assigned_slot.get(node) == Some(&slot) {
+                shadow.text_assigned_slot.remove(node);
+            }
+        }
+        assigned.clear();
+        assigned.extend_from_slice(nodes);
+        for &node in &assigned {
+            if node.text_index().is_some() {
+                shadow.text_assigned_slot.insert(node, slot);
+            }
+        }
+        if !assigned.is_empty() {
+            shadow.assigned_nodes.insert(slot, assigned);
         }
         let current = self.shadow_capacity_bytes();
         self.record_capacity_change(memory, before, current);
@@ -840,7 +1159,11 @@ impl StyleNodeTree {
 
     #[must_use]
     pub fn assigned_slot_of(&self, node: StyleNodeID) -> Option<StyleNodeID> {
-        self.shadow.as_ref()?.assigned_slot.get(node)
+        let shadow = self.shadow.as_ref()?;
+        if node.text_index().is_some() {
+            return shadow.text_assigned_slot.get(&node).copied();
+        }
+        shadow.assigned_slot.get(node)
     }
 
     #[must_use]
@@ -917,6 +1240,18 @@ impl StyleNodeTree {
             return None;
         }
         Some(parent)
+    }
+
+    /// The element whose computed values this element inherits. Unlike [`Self::flat_tree_parent`],
+    /// this keeps the DOM parent of an element excluded from the flat tree: such an element can
+    /// still have its style requested through CSSOM and inherits from that parent when it does.
+    #[must_use]
+    pub fn inheritance_parent(&self, node: StyleNodeID) -> Option<StyleNodeID> {
+        if let Some(slot) = self.assigned_slot_of(node) {
+            return Some(slot);
+        }
+        let parent = self.parent(node)?;
+        Some(self.host_of(parent).unwrap_or(parent))
     }
 
     /// Compare nodes in the order C++ must apply style reactions.
@@ -1132,6 +1467,9 @@ impl StyleNodeTree {
                 self.next_element_sibling,
                 self.previous_element_sibling,
                 self.depth,
+                self.first_child,
+                self.next_sibling,
+                self.previous_sibling,
             ];
             cached [];
             nested [
@@ -1139,6 +1477,7 @@ impl StyleNodeTree {
                     .as_ref()
                     .map_or(0, |column| column.capacity() * size_of::<TreeScopeID>()),
                 self.live.capacity_bytes(),
+                self.relation_only.capacity_bytes(),
             ];
             skip [];
         }
@@ -1157,7 +1496,10 @@ impl StyleNodeTree {
     }
 
     fn recompute_capacity_bytes(&self) -> u64 {
-        self.identity_capacity_bytes() + self.reuse_capacity_bytes() + self.shadow_capacity_bytes()
+        self.identity_capacity_bytes()
+            + self.reuse_capacity_bytes()
+            + self.shadow_capacity_bytes()
+            + self.text.capacity_bytes()
     }
 
     fn record_capacity_change(&mut self, memory: &mut MemoryController, previous: u64, current: u64) {
@@ -1175,8 +1517,11 @@ impl StyleNodeTree {
     }
 
     fn element_index(&self, node: StyleNodeID) -> usize {
-        node.element_index()
-            .expect("tree relations are keyed by element identity") as usize
+        debug_assert!(
+            node.element_index().is_some(),
+            "tree relations are keyed by element identity"
+        );
+        node.element_slot()
     }
 
     fn live_element_index(&self, node: StyleNodeID) -> usize {
@@ -1188,6 +1533,48 @@ impl StyleNodeTree {
             "mutating relations of a retired identity"
         );
         index as usize
+    }
+}
+
+/// The rows of text identities, indexed by text index with slot 0 unused. A text node owns no
+/// element relations, only its place in the DOM child sequence. A retired index waits in
+/// `pending_reuse` until its epoch retires, as an element's does.
+#[derive(Default)]
+struct TextRows {
+    parent: Vec<Option<StyleNodeID>>,
+    next_sibling: Vec<Option<StyleNodeID>>,
+    previous_sibling: Vec<Option<StyleNodeID>>,
+    live: BitColumn,
+    /// Whether the node's data is nothing but ASCII whitespace, which is what decides whether the
+    /// layout tree build can collapse it away rather than give it a box of its own.
+    is_ascii_whitespace: BitColumn,
+    pending_reuse: Vec<u32>,
+    free_indexes: Vec<u32>,
+}
+
+impl TextRows {
+    fn capacity_bytes(&self) -> u64 {
+        capacity_bytes! {
+            shallow [self.parent, self.next_sibling, self.previous_sibling, self.pending_reuse, self.free_indexes];
+            cached [];
+            nested [self.live.capacity_bytes(), self.is_ascii_whitespace.capacity_bytes()];
+            skip [];
+        }
+    }
+}
+
+pub struct DomChildren<'a> {
+    tree: &'a StyleNodeTree,
+    next: Option<StyleNodeID>,
+}
+
+impl Iterator for DomChildren<'_> {
+    type Item = StyleNodeID;
+
+    fn next(&mut self) -> Option<StyleNodeID> {
+        let current = self.next?;
+        self.next = self.tree.next_sibling_in_dom_order(current);
+        Some(current)
     }
 }
 
@@ -1254,9 +1641,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn element_and_text_identities_index_their_own_kinds() {
+        let element = StyleNodeID::element(7);
+        let text = StyleNodeID::text(7);
+        assert_ne!(element, text);
+        assert_eq!(element.element_index(), Some(7));
+        assert_eq!(element.text_index(), None);
+        assert_eq!(text.element_index(), None);
+        assert_eq!(text.text_index(), Some(7));
+        assert_eq!(StyleNodeID::from_raw(text.raw()), Some(text));
+    }
+
+    #[test]
     fn radix_sorts_style_node_identities() {
         let mut nodes = vec![
-            StyleNodeID::element(u32::MAX),
+            StyleNodeID::element(i32::MAX as u32),
             StyleNodeID::element(256),
             StyleNodeID::element(65_536),
             StyleNodeID::element(255),
@@ -1272,7 +1671,7 @@ mod tests {
                 StyleNodeID::element(255),
                 StyleNodeID::element(256),
                 StyleNodeID::element(65_536),
-                StyleNodeID::element(u32::MAX),
+                StyleNodeID::element(i32::MAX as u32),
             ]
         );
     }
@@ -1486,6 +1885,123 @@ mod tests {
     }
 
     #[test]
+    fn text_identities_are_reused_only_after_the_epoch_retires() {
+        let mut fixture = TreeFixture::new();
+        let element = fixture.element();
+        let first = fixture.tree.allocate_text(&mut fixture.memory);
+        let second = fixture.tree.allocate_text(&mut fixture.memory);
+        assert_eq!(first, StyleNodeID::text(1));
+        assert_eq!(second, StyleNodeID::text(2));
+        assert!(fixture.tree.is_live(first) && fixture.tree.is_live(element));
+        assert_eq!(fixture.tree.connected_element_count(), 1);
+
+        fixture.tree.retire_texts([first], &mut fixture.memory);
+        assert!(!fixture.tree.is_live(first));
+        assert!(fixture.tree.is_live(element));
+
+        let third = fixture.tree.allocate_text(&mut fixture.memory);
+        assert_eq!(third, StyleNodeID::text(3));
+
+        fixture.tree.release_retired_identities(&mut fixture.memory);
+        let reused = fixture.tree.allocate_text(&mut fixture.memory);
+        assert_eq!(reused, first);
+        assert!(fixture.tree.is_live(reused));
+        assert_eq!(fixture.tree.live_nodes().collect::<Vec<_>>(), vec![element]);
+    }
+
+    #[test]
+    fn text_nodes_take_places_in_the_dom_child_sequence_beside_elements() {
+        let mut fixture = TreeFixture::new();
+        let parent = fixture.element();
+        let first_text = fixture.tree.allocate_text(&mut fixture.memory);
+        let element = fixture.element();
+        let last_text = fixture.tree.allocate_text(&mut fixture.memory);
+        fixture.tree.link_in_dom_order(first_text, Some(parent), None);
+        fixture.tree.link_in_dom_order(element, Some(parent), Some(first_text));
+        fixture.tree.link_in_dom_order(last_text, Some(parent), Some(element));
+
+        assert_eq!(
+            fixture.tree.dom_children(parent).collect::<Vec<_>>(),
+            vec![first_text, element, last_text]
+        );
+        assert_eq!(fixture.tree.text_parent(last_text), Some(parent));
+        assert_eq!(fixture.tree.children(parent).count(), 0);
+        assert_eq!(fixture.tree.connected_element_count(), 2);
+
+        // A move is an unlink followed by a link at the new place.
+        fixture.tree.unlink_from_dom_order(last_text, Some(parent));
+        fixture.tree.link_in_dom_order(last_text, Some(parent), None);
+        assert_eq!(
+            fixture.tree.dom_children(parent).collect::<Vec<_>>(),
+            vec![last_text, first_text, element]
+        );
+
+        fixture.tree.unlink_from_dom_order(first_text, Some(parent));
+        fixture.tree.retire_texts([first_text], &mut fixture.memory);
+        assert!(!fixture.tree.is_live(first_text));
+        assert_eq!(
+            fixture.tree.dom_children(parent).collect::<Vec<_>>(),
+            vec![last_text, element]
+        );
+        assert_eq!(fixture.tree.previous_sibling_in_dom_order(element), Some(last_text));
+
+        // Like an element's, a retired text identity is reused only once its epoch retires.
+        let replacement = fixture.tree.allocate_text(&mut fixture.memory);
+        assert_ne!(replacement, first_text);
+        fixture.tree.release_retired_identities(&mut fixture.memory);
+        let reused = fixture.tree.allocate_text(&mut fixture.memory);
+        assert_eq!(reused, first_text);
+        assert_eq!(fixture.tree.text_parent(reused), None);
+        assert_eq!(fixture.tree.next_sibling_in_dom_order(reused), None);
+    }
+
+    #[test]
+    fn a_text_slottable_holds_a_place_in_its_slots_assigned_list() {
+        let mut fixture = TreeFixture::new();
+        let slot = fixture.element();
+        let element = fixture.element();
+        let text = fixture.tree.allocate_text(&mut fixture.memory);
+        fixture
+            .tree
+            .set_assigned_nodes(slot, &[text, element], &mut fixture.memory);
+        assert_eq!(fixture.tree.assigned_nodes_of(slot), &[text, element]);
+        assert_eq!(fixture.tree.assigned_slot_of(text), Some(slot));
+
+        fixture.tree.retire_texts([text], &mut fixture.memory);
+        assert_eq!(fixture.tree.assigned_nodes_of(slot), &[element]);
+        assert_eq!(
+            fixture.memory.bytes_in_category(MemoryCategory::RelationColumns),
+            fixture.tree.capacity_bytes()
+        );
+    }
+
+    #[test]
+    fn a_relation_only_identity_roots_the_dom_child_sequence_without_counting_as_an_element() {
+        let mut fixture = TreeFixture::new();
+        let document = fixture.element();
+        fixture.tree.mark_relation_only(document, &mut fixture.memory);
+        let document_element = fixture.element();
+        fixture.tree.link_in_dom_order(document_element, Some(document), None);
+
+        assert!(fixture.tree.is_relation_only(document));
+        assert!(!fixture.tree.is_relation_only(document_element));
+        assert_eq!(fixture.tree.connected_element_count(), 1);
+        assert_eq!(
+            fixture.tree.dom_children(document).collect::<Vec<_>>(),
+            vec![document_element]
+        );
+        assert_eq!(fixture.tree.parent(document_element), None);
+
+        fixture
+            .tree
+            .retire_elements(&[document, document_element], &mut fixture.memory);
+        assert_eq!(fixture.tree.connected_element_count(), 0);
+        fixture.tree.release_retired_identities(&mut fixture.memory);
+        let reused = fixture.element();
+        assert!(!fixture.tree.is_relation_only(reused));
+    }
+
+    #[test]
     fn a_reused_identity_starts_in_the_document_tree_scope() {
         let mut fixture = TreeFixture::new();
         let node = fixture.element();
@@ -1509,6 +2025,7 @@ mod tests {
         let part = StyleAtomID(1);
         fixture.tree.set_shadow_root(host, root, &mut fixture.memory);
         fixture.tree.set_assigned_slot(slotted, Some(slot), &mut fixture.memory);
+        fixture.tree.set_assigned_nodes(slot, &[slotted], &mut fixture.memory);
         fixture.tree.set_part_hosts(host, &[(part, host)], &mut fixture.memory);
 
         fixture.tree.retire_element(host, &mut fixture.memory);
@@ -1607,6 +2124,9 @@ mod tests {
 
         fixture.tree.set_assigned_slot(first, Some(slot), &mut fixture.memory);
         fixture.tree.set_assigned_slot(second, Some(slot), &mut fixture.memory);
+        fixture
+            .tree
+            .set_assigned_nodes(slot, &[first, second], &mut fixture.memory);
         assert_eq!(
             fixture.tree.flat_tree_children(slot).collect::<Vec<_>>(),
             vec![first, second],
@@ -1635,6 +2155,7 @@ mod tests {
         fixture
             .tree
             .set_assigned_slot(assigned, Some(slot), &mut fixture.memory);
+        fixture.tree.set_assigned_nodes(slot, &[assigned], &mut fixture.memory);
 
         let mut reactions = vec![light_child, assigned, fallback, slot, host];
         reactions.sort_unstable_by(|first, second| fixture.tree.compare_style_reaction_order(*first, *second));
@@ -1683,11 +2204,18 @@ mod tests {
         fixture
             .tree
             .set_assigned_slot(node, Some(first_slot), &mut fixture.memory);
+        fixture
+            .tree
+            .set_assigned_nodes(first_slot, &[node], &mut fixture.memory);
         assert_eq!(fixture.tree.assigned_nodes_of(first_slot), &[node]);
 
         fixture
             .tree
             .set_assigned_slot(node, Some(second_slot), &mut fixture.memory);
+        fixture.tree.set_assigned_nodes(first_slot, &[], &mut fixture.memory);
+        fixture
+            .tree
+            .set_assigned_nodes(second_slot, &[node], &mut fixture.memory);
         assert_eq!(
             fixture.tree.assigned_nodes_of(first_slot),
             &[],
@@ -1701,6 +2229,7 @@ mod tests {
         );
 
         fixture.tree.set_assigned_slot(node, None, &mut fixture.memory);
+        fixture.tree.set_assigned_nodes(second_slot, &[], &mut fixture.memory);
         assert_eq!(fixture.tree.assigned_nodes_of(second_slot), &[]);
         assert_eq!(fixture.tree.assigned_slot_of(node), None);
     }
@@ -1746,6 +2275,7 @@ mod tests {
         );
 
         fixture.tree.set_assigned_slot(slotted, Some(slot), &mut fixture.memory);
+        fixture.tree.set_assigned_nodes(slot, &[slotted], &mut fixture.memory);
         assert_eq!(
             fixture.memory.bytes_in_category(MemoryCategory::RelationColumns),
             fixture.tree.capacity_bytes()

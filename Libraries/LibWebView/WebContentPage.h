@@ -13,19 +13,49 @@
 #include <AK/RefPtr.h>
 #include <AK/String.h>
 #include <AK/WeakPtr.h>
-#include <LibCompositing/InputEvent.h>
-#include <LibCompositing/PageId.h>
 #include <LibCompositing/Types.h>
 #include <LibGfx/Point.h>
 #include <LibGfx/Rect.h>
 #include <LibGfx/SharedImage.h>
 #include <LibWebCommon/HTML/CrossProcessId.h>
+#include <LibWebCommon/Page/InputEvent.h>
+#include <LibWebCommon/Page/PageId.h>
 #include <LibWebCommon/StorageAPI/StorageEndpoint.h>
 #include <LibWebView/Export.h>
 #include <LibWebView/Forward.h>
 #include <WebContent/WebContentClientEndpoint.h>
 #include <WebContent/WebContentServerEndpoint.h>
 #include <WebContent/WebContentTestClientEndpoint.h>
+
+namespace WebView {
+
+// A reply a page owes its traversable for a message the traversable sent it.
+struct OwedReply {
+    enum class Kind : u8 {
+        BeforeunloadCheck,
+        ChangingJob,
+        UnloadPreparation,
+        ContinuationApplied,
+        NonchangingUpdate,
+        DescendantUnload,
+    };
+
+    Kind kind;
+    Web::HTML::CrossProcessId id;
+    Web::HTML::CrossProcessId navigable_id;
+
+    bool operator==(OwedReply const&) const = default;
+};
+
+}
+
+template<>
+struct AK::Traits<WebView::OwedReply> : public DefaultTraits<WebView::OwedReply> {
+    static unsigned hash(WebView::OwedReply const& reply)
+    {
+        return pair_int_hash(to_underlying(reply.kind), pair_int_hash(Traits<Web::HTML::CrossProcessId>::hash(reply.id), Traits<Web::HTML::CrossProcessId>::hash(reply.navigable_id)));
+    }
+};
 
 namespace WebView {
 
@@ -42,13 +72,13 @@ class WEBVIEW_API WebContentPage final
     friend class WebContentTestClient;
 
 public:
-    WebContentPage(WebContentClient&, Compositing::PageId, CanonicalTraversable&);
+    WebContentPage(WebContentClient&, Web::PageId, CanonicalTraversable&);
     virtual ~WebContentPage() override;
 
     WebContentClient& client() const;
-    Compositing::PageId id() const { return m_id; }
+    Web::PageId id() const { return m_id; }
     WebContentClient* routed_connection() const { return m_client.ptr(); }
-    Compositing::PageId routed_page_id() const { return m_id; }
+    Web::PageId routed_page_id() const { return m_id; }
 
     CanonicalTraversable& traversable() const;
     ViewImplementation& view() const;
@@ -69,6 +99,9 @@ public:
     bool is_open() const { return m_is_open; }
     void close();
 
+    void owe_reply(OwedReply);
+    bool take_owed_reply(OwedReply);
+
     bool needs_beforeunload_check() const { return m_needs_beforeunload_check; }
     bool detached_close_pending() const { return m_detached_close_pending; }
     void set_detached_close_pending(bool pending) { m_detached_close_pending = pending; }
@@ -81,16 +114,18 @@ public:
     void request_close();
     void discard();
 
-    Compositing::CompositorContextId compositor_context_id();
-    bool handle_key_event_in_compositor(Compositing::KeyEvent const&);
-    void dispatch_key_event_to_web_content(Compositing::KeyEvent const&);
-    void handle_pinch_event_in_compositor(Compositing::PinchEvent const&);
+    Web::CompositorContextId compositor_context_id();
+    bool handle_key_event_in_compositor(Web::KeyEvent const&);
+    void dispatch_key_event_to_web_content(Web::KeyEvent const&);
+    void handle_pinch_event_in_compositor(Web::PinchEvent const&);
     // Returns whether the event was posted; a page without a compositor sends it to WebContent itself.
-    bool handle_and_dispatch_mouse_event_in_compositor(Compositing::MouseEvent const&);
+    bool handle_and_dispatch_mouse_event_in_compositor(Web::MouseEvent const&);
     void did_consume_input_event_in_compositor(u64 event_id);
     void did_not_dispatch_input_event_through_compositor(u64 event_id);
     void did_present_bitmap(Gfx::IntRect content_rect, Gfx::IntRect damage_rect, i32 bitmap_id);
     void did_present_backing_stores(Vector<i32> bitmap_ids, Vector<Gfx::SharedImage> backing_stores);
+    void did_add_backing_stores(Vector<i32> bitmap_ids, Vector<Gfx::SharedImage> backing_stores);
+    void did_retire_backing_stores(ReadonlySpan<i32> bitmap_ids);
     // The backing stores the compositor presented while the page did not display the tab, for the view to install
     // once it does.
     struct PresentedBackingStores {
@@ -135,8 +170,8 @@ private:
     virtual void did_leave_tooltip_area() override;
     virtual void did_hover_link(URL::URL url) override;
     virtual void did_unhover_link() override;
-    virtual void did_click_link(URL::URL url, ByteString target, unsigned modifiers) override;
-    virtual void did_middle_click_link(URL::URL url, ByteString, unsigned) override;
+    virtual void did_click_link(Web::HTML::PreparedNavigationDescriptor navigation, ByteString target, unsigned modifiers) override;
+    virtual void did_middle_click_link(Web::HTML::PreparedNavigationDescriptor navigation, ByteString, unsigned) override;
     virtual void did_request_external_url(URL::URL url, URL::Origin initiator_origin, bool has_transient_activation) override;
     virtual void did_inspect_storage(u64 request_id, String storage_items) override;
     virtual void did_inspect_grid_layouts(String grid_layouts) override;
@@ -144,8 +179,8 @@ private:
     virtual void did_inspect_current_flexbox(String flexbox_layout) override;
     virtual void did_inspect_indexed_database(u64 request_id, String result) override;
     virtual void did_inspect_accessibility_tree(String accessibility_tree) override;
-    virtual void did_get_hovered_node_id(Compositing::UniqueNodeID node_id) override;
-    virtual void did_get_node_id_at_position(u64 request_id, Compositing::UniqueNodeID node_id) override;
+    virtual void did_get_hovered_node_id(Web::UniqueNodeID node_id) override;
+    virtual void did_get_node_id_at_position(u64 request_id, Web::UniqueNodeID node_id) override;
     virtual void did_list_style_sheets(Vector<Web::CSS::StyleSheetIdentifier> stylesheets) override;
     virtual void did_get_style_sheet_source(Web::CSS::StyleSheetIdentifier identifier, URL::URL base_url, Utf16String source) override;
     virtual void did_list_devtools_sources(u64 request_id, Vector<Web::HTML::ScriptRegistryDescription> sources) override;
@@ -198,7 +233,7 @@ private:
     virtual void did_stop_geolocation_position_watch(u64 request_id) override;
     virtual void did_request_file_picker(Web::HTML::FileFilter accepted_file_types, Web::HTML::AllowMultipleFiles allow_multiple_files) override;
     virtual void did_finish_handling_input_event(u64 event_id, Web::EventResult event_result) override;
-    virtual void did_update_input_method_state(Optional<Compositing::DevicePixelRect> caret_rect, bool is_enabled, i32 cursor_position, i32 anchor_position, Utf16String text_before_cursor, Utf16String text_after_cursor) override;
+    virtual void did_update_input_method_state(Optional<Web::DevicePixelRect> caret_rect, bool is_enabled, i32 cursor_position, i32 anchor_position, Utf16String text_before_cursor, Utf16String text_after_cursor) override;
     virtual void did_change_theme_color(Gfx::Color color) override;
     virtual void did_change_background_color(Gfx::Color color) override;
     virtual void did_insert_clipboard_item(Web::Clipboard::SystemClipboardItem item, String) override;
@@ -208,10 +243,9 @@ private:
     virtual void did_update_session_history_entry_document_state_navigable_target_name(Web::HTML::CrossProcessId navigable_id, Web::HTML::SessionHistoryEntryIdentity entry_identity, Utf16String navigable_target_name) override;
     virtual void did_set_session_history_entry_document_state_reload_pending(Web::HTML::CrossProcessId navigable_id, Utf16String navigation_api_key, bool reload_pending) override;
     virtual void did_change_focused_navigable(Web::HTML::CrossProcessId navigable_id) override;
-    virtual void did_request_key_event_for_testing(Compositing::KeyEvent event) override;
+    virtual void did_request_key_event_for_testing(Web::KeyEvent event) override;
     virtual void request_history_operation(Web::HTML::CrossProcessId operation_id, Web::HistoryOperationParameters parameters) override;
     virtual void history_operation_ready(Web::HTML::CrossProcessId operation_id, Web::HistoryOperationReadyResult result) override;
-    virtual void history_step_unload_cancelation_result(Web::HTML::CrossProcessId operation_id, Web::HTML::HistoryStepResult result, Web::HTML::UnloadPromptShown unload_prompt_shown) override;
     virtual void beforeunload_check_result(Web::HTML::CrossProcessId operation_id, Web::HTML::HistoryStepResult result, Web::HTML::UnloadPromptShown unload_prompt_shown) override;
     virtual void changing_navigable_history_job_ready(Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::ChangingNavigableHistoryStepJobDisposition disposition, Web::HTML::UnloadDisplayedDocument unload_displayed_document) override;
     virtual void changing_navigable_unload_preparation_complete(Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id) override;
@@ -229,7 +263,7 @@ private:
     virtual void did_request_close_of_traversable(Web::HTML::CrossProcessId navigable_id, Web::HTML::CrossProcessId source_navigable_id) override;
     virtual void did_inspect_dom_tree(String dom_tree) override;
     virtual void did_inspect_dom_node(DOMNodeProperties properties) override;
-    virtual void did_finish_editing_dom_node(Optional<Compositing::UniqueNodeID> node_id) override;
+    virtual void did_finish_editing_dom_node(Optional<Web::UniqueNodeID> node_id) override;
     virtual void did_mutate_dom(Mutation mutation) override;
     virtual void did_get_dom_node_html(String html) override;
     virtual void did_resolve_dom_node_url(u64 request_id, String resolved_url) override;
@@ -248,8 +282,8 @@ private:
     virtual void did_change_hosted_navigable_state(Web::HTML::CrossProcessId navigable_id, Web::HTML::HostedNavigableState state) override;
     virtual void did_set_opener_browsing_context(Web::HTML::CrossProcessId navigable_id, Optional<Web::HTML::CrossProcessId> opener_navigable_id) override;
     virtual void did_change_navigable_container_state(Web::HTML::CrossProcessId navigable_id, Web::HTML::ReplicatedContainerState state) override;
-    virtual void did_update_child_frame_viewport(Web::HTML::CrossProcessId frame_id, Compositing::DevicePixelRect viewport_rect, Compositing::DevicePixelRect viewport_intersection, double device_pixel_ratio) override;
-    virtual void did_forward_mouse_event_to_child_frame(Web::HTML::CrossProcessId frame_id, Compositing::MouseEvent) override;
+    virtual void did_update_child_frame_viewport(Web::HTML::CrossProcessId frame_id, Web::DevicePixelRect viewport_rect, Web::DevicePixelRect viewport_intersection, double device_pixel_ratio) override;
+    virtual void did_forward_mouse_event_to_child_frame(Web::HTML::CrossProcessId frame_id, Web::MouseEvent) override;
     virtual void did_destroy_child_frame(Web::HTML::CrossProcessId frame_id) override;
     Messages::WebContentClient::DidStartDownloadWithoutRequestResponse did_start_download_without_request(URL::URL url, ByteString suggested_filename, Optional<u64> total_size);
     Messages::WebContentClient::DidStartDownloadResponse did_start_download(Web::HTML::CrossProcessId navigable_id, Optional<Utf16String> navigation_id, URL::URL url, ByteString suggested_filename, Optional<u64> total_size, int request_server_client_id, u64 request_server_request_id, ByteBuffer initial_data);
@@ -259,9 +293,9 @@ private:
     virtual void did_finish_loading(Web::HTML::CrossProcessId navigable_id, Optional<Utf16String> navigation_id) override;
     virtual void did_change_title(Utf16String title) override;
     virtual void did_request_context_menu(Web::HTML::CrossProcessId local_root_id, Gfx::IntPoint content_position, Web::ContextMenuForInputEventsTarget for_input_events_target) override;
-    virtual void did_request_link_context_menu(Web::HTML::CrossProcessId local_root_id, Gfx::IntPoint content_position, URL::URL url, ByteString, unsigned) override;
-    virtual void did_request_image_context_menu(Web::HTML::CrossProcessId local_root_id, Gfx::IntPoint content_position, URL::URL url, ByteString, unsigned, Optional<Gfx::ShareableBitmap> bitmap) override;
-    virtual void did_request_media_context_menu(Web::HTML::CrossProcessId local_root_id, Gfx::IntPoint content_position, ByteString, unsigned, Web::MediaContextMenu menu) override;
+    virtual void did_request_link_context_menu(Web::HTML::CrossProcessId local_root_id, Gfx::IntPoint content_position, Web::HTML::PreparedNavigationDescriptor navigation, ByteString, unsigned) override;
+    virtual void did_request_image_context_menu(Web::HTML::CrossProcessId local_root_id, Gfx::IntPoint content_position, Web::HTML::PreparedNavigationDescriptor navigation, ByteString, unsigned, Optional<Gfx::ShareableBitmap> bitmap) override;
+    virtual void did_request_media_context_menu(Web::HTML::CrossProcessId local_root_id, Gfx::IntPoint content_position, ByteString, unsigned, Web::MediaContextMenu menu, Web::HTML::PreparedNavigationDescriptor navigation) override;
     virtual void did_get_highlighted_source(String html) override;
     virtual void did_get_debugger_environments(u64 request_id, Optional<String> error, Vector<DebuggerEnvironment> environments) override;
     virtual void did_evaluate_javascript_in_debugger_frame(u64 request_id, Optional<String> error, DebuggerEvaluationResult result) override;
@@ -278,7 +312,7 @@ private:
     virtual void did_request_primary_paste() override;
     virtual void did_update_primary_selection(String text) override;
     virtual void did_update_session_history_entry_scroll_restoration_mode(Web::HTML::CrossProcessId navigable_id, Web::HTML::SessionHistoryEntryIdentity entry_identity, Web::HTML::ScrollRestorationMode scroll_restoration_mode) override;
-    virtual void did_request_webdriver_mouse_event(u64 request_id, Web::HTML::CrossProcessId local_root_id, Compositing::MouseEvent event) override;
+    virtual void did_request_webdriver_mouse_event(u64 request_id, Web::HTML::CrossProcessId local_root_id, Web::MouseEvent event) override;
     virtual void request_unload_check(Web::HTML::CrossProcessId navigable_id, Web::HTML::CrossProcessId check_id) override;
     Messages::WebContentClient::StartWorkerAgentResponse start_worker_agent(Web::HTML::WorkerAgentStartRequest request);
     Messages::WebContentClient::DidRequestStorageUsageResponse did_request_storage_usage(Web::HTML::EnvironmentId environment_id);
@@ -296,6 +330,9 @@ private:
     Messages::WebContentTestClient::DidRequestUiProcessSessionHistoryForTestingResponse did_request_ui_process_session_history_for_testing();
     Messages::WebContentTestClient::DidRequestSiteIsolationProcessTreeForTestingResponse did_request_site_isolation_process_tree_for_testing();
     virtual void did_request_crash_of_remote_frame_processes_for_testing() override;
+    virtual void did_request_stop_loading_for_testing() override;
+    virtual void did_request_reload_for_testing() override;
+    virtual void did_request_traverse_history_by_delta_for_testing(i32 delta) override;
     virtual void did_reset_session_history_for_testing(Web::HTML::SessionHistoryEntryDescriptor) override;
     Messages::WebContentTestClient::DidRequestCaptureSessionHistorySnapshotForTestingResponse did_request_capture_session_history_snapshot_for_testing();
     Messages::WebContentTestClient::DidRequestRestoreSessionHistorySnapshotForTestingResponse did_request_restore_session_history_snapshot_for_testing();
@@ -303,7 +340,7 @@ private:
     Messages::WebContentTestClient::DidRequestSessionStoreTabStateForTestingResponse did_request_session_store_tab_state_for_testing();
 
     WeakPtr<WebContentClient> m_client;
-    Compositing::PageId m_id;
+    Web::PageId m_id;
     WeakPtr<CanonicalTraversable> m_traversable;
     bool m_is_open { true };
     Optional<PresentedBackingStores> m_presented_backing_stores;
@@ -311,6 +348,7 @@ private:
     bool m_detached_close_pending { false };
     Optional<String> m_history_recorded_url_for_current_load;
     HashTable<u64> m_renderer_owned_downloads;
+    HashTable<OwedReply> m_owed_replies;
 };
 
 }

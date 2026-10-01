@@ -188,7 +188,7 @@ static bool element_style_depends_on_more_than_the_inherited_groups(DOM::Element
     if (element.has_relevant_animations()
         || element.has_css_defined_animations()
         || !element.property_ids_with_existing_transitions({}).is_empty()
-        || !element.property_ids_with_matching_transition_property_entry({}).is_empty())
+        || element.has_matching_transition_property_entry({}))
         return true;
     // The swapped groups are the parent's base values; a child of an animating parent inherits
     // the animated ones, which the engine never sees.
@@ -379,8 +379,7 @@ private:
 
     bool needs_recompute(DOM::Element& element) const
     {
-        return element.style_uses_if_css_function() || element.style_uses_inherit_css_function() || element.style_uses_custom_function()
-            || element.style_depends_on_style_container_query() || var_reads_a_changed_name(element);
+        return m_style_engine.element_recomputes_on_environment_move(element.style_node_id()) || var_reads_a_changed_name(element);
     }
 
     void mark(DOM::Element& element)
@@ -559,11 +558,18 @@ static RequiredInvalidationAfterStyleChange apply_style_engine_reactions(DOM::Do
                 }
             }
 
+            // An element whose style was cleared on entry to display:none computes it here, before its descendants.
+            if (!element->has_style() && reaction.gap == StyleEngineFFI::FfiStyleDeltaGap::Computed && reaction.old_style_record != 0) {
+                reaction.gap = StyleEngineFFI::FfiStyleDeltaGap::Materialize;
+                reaction.new_style_record = 0;
+                reaction.damage = StyleEngineFFI::FfiStyleDeltaDamage::None;
+                reaction.reaction |= StyleEngine::RecomputeStyle;
+            }
             // An engine-computed first record installs on an element without style; other record
             // deltas assume the style they move.
             if (!element->has_style()
                 && reaction.gap != StyleEngineFFI::FfiStyleDeltaGap::Materialize
-                && !(reaction.gap == StyleEngineFFI::FfiStyleDeltaGap::Computed && reaction.old_style_record == 0))
+                && reaction.gap != StyleEngineFFI::FfiStyleDeltaGap::Computed)
                 continue;
             // An earlier display:none reaction in this batch can clear the style of a materialization gap after the
             // inheritance closure was built. The gap must then rematerialize rather than letting its descendants

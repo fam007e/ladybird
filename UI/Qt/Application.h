@@ -8,8 +8,8 @@
 
 #include <AK/Function.h>
 #include <AK/Platform.h>
-#include <LibCompositing/PageId.h>
 #include <LibURL/URL.h>
+#include <LibWebCommon/Page/PageId.h>
 #include <LibWebView/Application.h>
 #include <LibWebView/BrowsingSession.h>
 #include <UI/Qt/BrowserWindow.h>
@@ -26,10 +26,10 @@ namespace Ladybird {
 class ProcessManagerWindow;
 
 struct WindowConfiguration {
-    Optional<Compositing::DevicePixels> x {};
-    Optional<Compositing::DevicePixels> y {};
-    Optional<Compositing::DevicePixels> width {};
-    Optional<Compositing::DevicePixels> height {};
+    Optional<Web::DevicePixels> x {};
+    Optional<Web::DevicePixels> y {};
+    Optional<Web::DevicePixels> width {};
+    Optional<Web::DevicePixels> height {};
     Optional<bool> maximized {};
 };
 
@@ -46,7 +46,8 @@ public:
 
     Function<void(URL::URL)> on_open_file;
 
-    BrowserWindow& new_window(Vector<URL::URL> const& initial_urls, WindowConfiguration const& = {}, BrowserWindow::IsPopupWindow is_popup_window = BrowserWindow::IsPopupWindow::No, WebView::IsPrivate = WebView::IsPrivate::No, Tab* parent_tab = nullptr, RefPtr<WebView::WebContentClient> page_process = nullptr, Optional<Compositing::PageId> page_index = {}, ShowWindow = ShowWindow::Yes);
+    // A page's initial navigation, when there is one, starts in place of the first initial URL.
+    BrowserWindow& new_window(Vector<URL::URL> const& initial_urls, WindowConfiguration const& = {}, BrowserWindow::IsPopupWindow is_popup_window = BrowserWindow::IsPopupWindow::No, WebView::IsPrivate = WebView::IsPrivate::No, Tab* parent_tab = nullptr, RefPtr<WebView::WebContentClient> page_process = nullptr, Optional<Web::PageId> page_index = {}, ShowWindow = ShowWindow::Yes, Optional<Web::HTML::PreparedNavigationDescriptor> initial_navigation = {});
     WindowConfiguration configuration_for_new_window() const;
 
     void open_new_tab();
@@ -116,6 +117,8 @@ private:
     virtual void open_url_in_new_tab(URL::URL const&, Web::HTML::ActivateTab) const override;
     virtual void open_urls_in_new_tabs(ReadonlySpan<URL::URL>) const override;
     virtual void open_url_in_new_window(URL::URL const&, WebView::IsPrivate) override;
+    virtual void open_navigation_in_new_tab(Web::HTML::PreparedNavigationDescriptor, Web::HTML::ActivateTab) const override;
+    virtual void open_navigation_in_new_window(Web::HTML::PreparedNavigationDescriptor, WebView::IsPrivate) override;
 
     virtual void resolve_external_url_handler(URL::URL const&, WebView::ExternalURLHandlerCallback) const override;
 

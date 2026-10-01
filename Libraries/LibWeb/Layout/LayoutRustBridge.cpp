@@ -16,17 +16,16 @@
 #include <LibUnicode/CharacterTypes.h>
 #include <LibWeb/CSS/ComputedValues.h>
 #include <LibWeb/CSS/Display.h>
-#include <LibWeb/CSS/Invalidation/ContainerQueryInvalidator.h>
 #include <LibWeb/CSS/LengthBox.h>
 #include <LibWeb/CSS/StyleValues/AnchorStyleValue.h>
 #include <LibWeb/CSS/StyleValues/CalculatedStyleValue.h>
 #include <LibWeb/CSS/ValueType.h>
 #include <LibWeb/DOM/AbstractElement.h>
+#include <LibWeb/DOM/CommitMessages.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/Element.h>
 #include <LibWeb/DOM/Node.h>
 #include <LibWeb/DOM/Text.h>
-#include <LibWeb/Dump.h>
 #include <LibWeb/HTML/AttributeNames.h>
 #include <LibWeb/HTML/HTMLBodyElement.h>
 #include <LibWeb/HTML/HTMLElement.h>
@@ -52,6 +51,7 @@ namespace Web::Layout {
 
 static_assert(to_underlying(CSS::StyleGroupIndex::Count) == RustFFI::STYLE_GROUP_COUNT);
 static_assert(to_underlying(CSS::StyleGroupIndex::GridValues) == RustFFI::STYLE_GROUP_INDEX_GRID);
+static_assert(to_underlying(CSS::StyleGroupIndex::ContentValues) == RustFFI::STYLE_GROUP_INDEX_CONTENT);
 static_assert(to_underlying(CSS::StyleGroupIndex::AnchorValues) == RustFFI::STYLE_GROUP_INDEX_ANCHOR);
 static_assert(to_underlying(CSS::StyleGroupIndex::InheritedTableValues) == RustFFI::STYLE_GROUP_INDEX_INHERITED_TABLE);
 static_assert(to_underlying(CSS::StyleGroupIndex::InheritedTextValues) == RustFFI::STYLE_GROUP_INDEX_INHERITED_TEXT);
@@ -436,14 +436,6 @@ static RustFFI::FfiViewportPropagationFacts viewport_propagation_facts(DOM::Docu
     return facts;
 }
 
-static void invalidate_descendant_styles_for_container_query_size_change(GC::Ptr<DOM::Node> node)
-{
-    auto* element = as_if<DOM::Element>(node.ptr());
-    if (!element)
-        return;
-    CSS::Invalidation::invalidate_descendant_styles_depending_on_size_container_query(*element);
-}
-
 static Optional<DOM::AbstractElement> abstract_element_for_abspos_box(Box const& box)
 {
     if (box.is_generated_for_pseudo_element())
@@ -471,10 +463,6 @@ void register_layout_host(NodeArena& arena, DOM::Document& document)
     static_assert(to_underlying(SVG::SVGUnits::UserSpaceOnUse) == 1);
     RustFFI::FfiLayoutHostCallbacks callbacks {
         .context = &document,
-        .report_unexpected_fragmented_inline = [](void*, void* node) {
-            auto const& box = *static_cast<Box const*>(node);
-            dbgln("FIXME: InlineFormattingContext::dimension_box_on_line got unexpected box in inline context:");
-            dump_tree(box); },
         .build_svg_facts = [](void*, void* node) {
             auto const* node_with_style = as_if<NodeWithStyle>(*static_cast<Node const*>(node));
             VERIFY(node_with_style);
@@ -536,12 +524,12 @@ void register_layout_host(NodeArena& arena, DOM::Document& document)
             auto const* dom_node = static_cast<Box const*>(node)->dom_node();
             return dom_node ? dom_node->unique_id().value() : -1;
         },
-        .content_size_changed_for_container_queries = [](void*, void* layout_node_shell) {
-            auto& layout_node = *static_cast<Node*>(layout_node_shell);
-            invalidate_descendant_styles_for_container_query_size_change(layout_node.dom_node()); },
-        .finish_commit = [](void*, void* const* viewport_shells, size_t viewport_count) {
-            for (size_t index = 0; index < viewport_count; ++index)
-                as<Box>(*static_cast<Node*>(viewport_shells[index])).notify_content_navigable_of_committed_viewport(); },
+        .deliver_commit_messages = [](void* context, RustFFI::FfiCommitMessage const* messages, size_t count) {
+            auto& commit_messages = static_cast<DOM::Document*>(context)->commit_messages();
+            for (size_t index = 0; index < count; ++index)
+                commit_messages.append(messages[index]);
+            // The pass that produced them reads back what they change before it ends.
+            commit_messages.apply(); },
         .build_replaced_content_facts = [](void*, void* node_shell, RustFFI::FfiReplacedContentFacts* facts) {
             auto const& node = *static_cast<Node const*>(node_shell);
             if (auto const* box = as_if<Box>(node))
@@ -604,9 +592,4 @@ extern "C" WEB_API Web::Layout::RustFFI::FfiCodePointCategoryFacts ladybird_layo
 extern "C" WEB_API void ladybird_layout_node_shell_destroy(void* shell)
 {
     Web::Layout::Node::delete_arena_owned_shell(*static_cast<Web::Layout::Node*>(shell));
-}
-
-extern "C" WEB_API void ladybird_layout_node_rebind_dom_node(void* dom_node, void* shell)
-{
-    Web::Layout::Node::rebind_dom_node_to_surviving_shell(*static_cast<Web::DOM::Node*>(dom_node), *static_cast<Web::Layout::Node*>(shell));
 }

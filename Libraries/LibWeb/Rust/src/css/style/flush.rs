@@ -1395,12 +1395,12 @@ impl StyleEngineState {
             if !emit_node {
                 return;
             }
-            // A departure can remain in a conservative region while its routing facts survive,
-            // and a live shadow root is a synthetic relation node rather than a style output.
-            // Neither has a C++ element to consume a record; every live element whose style either
-            // can affect is another member of the region.
+            // A departure can remain in a conservative region while its routing facts survive, and
+            // a live shadow root or document is a synthetic relation node rather than a style
+            // output. None has a C++ element to consume a record; every live element whose style
+            // any of them can affect is another member of the region.
             let is_scope_root = self.retained.scope_by_root.get(node).is_some();
-            if !self.retained.tree.is_live(node) || is_scope_root {
+            if !self.retained.tree.is_live(node) || is_scope_root || self.retained.tree.is_relation_only(node) {
                 return;
             }
             if repair_match_identity {
@@ -1909,7 +1909,7 @@ impl StyleEngineState {
                         break chain;
                     }
                     crossed.push(ancestor);
-                    current = engine.tree.flat_tree_parent(ancestor);
+                    current = engine.tree.inheritance_parent(ancestor);
                 };
                 let mut chain_is_final = true;
                 for &ancestor in crossed.iter().rev() {
@@ -1937,6 +1937,7 @@ impl StyleEngineState {
             let mut next_published_index = 0;
             let mut pending_parent_inputs = None;
             while next_published_index < published_nodes.len() {
+                let mut suspended_on_font = false;
                 for (published_index, node) in published_nodes.iter().copied().enumerate().skip(next_published_index) {
                     let pseudo_inputs_may_have_changed = pseudo_inputs_may_have_changed
                         || !selector_truth_changes.refreshes_for(node).is_empty()
@@ -1988,7 +1989,7 @@ impl StyleEngineState {
                     // path reads without asking about the chain above it.
                     let direct_inherited_delta = (reaction == transaction::STYLE_REACTION_INHERITED_STYLE
                         && !resuming_font)
-                        .then(|| self.retained.tree.flat_tree_parent(node))
+                        .then(|| self.retained.tree.inheritance_parent(node))
                         .flatten()
                         .filter(|parent| {
                             !row_of(&engine_computed_record_scratch.derived_child_inputs, *parent)
@@ -2074,7 +2075,7 @@ impl StyleEngineState {
                     } else {
                         match self
                             .tree
-                            .flat_tree_parent(node)
+                            .inheritance_parent(node)
                             .map_or(publication::AncestorChain::ROOT, |parent| {
                                 ancestor_chain(
                                     self,
@@ -2087,9 +2088,8 @@ impl StyleEngineState {
                         {
                             None => {
                                 counters.bump(Counter::EngineComputedRecordGateAncestors);
-                                retry_after_ancestor = self.retained.tree.tree_scope(node) == TreeScopeID::DOCUMENT
-                                    && (answer.cascade_winners_are_complete
-                                        || self.cascade_winners_are_complete_but_for_custom_properties(node));
+                                retry_after_ancestor =
+                                    self.row_may_retry_after_ancestor(node, answer.cascade_winners_are_complete);
                                 false
                             }
                             Some(relied_on_settled_ancestor) => {
@@ -2098,50 +2098,59 @@ impl StyleEngineState {
                             }
                         }
                     };
-                    let engine_computed_delta = engine_computed_gate_passes
-                        .then(|| {
-                            // Unchanged winners stand for an unchanged record only when the reaction
-                            // is rules flipping for the node, every one of them known and declaring
-                            // nothing past its winners, or the node's answer is the one it had.
-                            let flipped_rules = selector_truth_changes.deltas_for(node);
-                            let answer_is_unchanged = answer.cascade_input.is_some()
-                                && answer.cascade_input == previous_cascade_inputs[published_index];
-                            let flipped: publication::FlippedRules = flipped_rules
-                                .iter()
-                                .map(|delta| {
-                                    self.retained
-                                        .programs
-                                        .entry(delta.entry)
-                                        .1
-                                        .pseudo_element
-                                        .map(|pseudo| pseudo.kind.0)
-                                })
-                                .collect();
-                            let winners_are_exact = !environment_changed
-                                && !rule_declarations_edited
-                                && selector_truth_changes.refreshes_for(node).is_empty()
-                                && (answer_is_unchanged
-                                    || (!flipped_rules.is_empty()
-                                        && flipped_rules.iter().all(|delta| {
-                                            self.retained.program.declarations_are_complete_for(delta.rule)
-                                        })));
-                            self.engine_computed_record_delta(
-                                node,
-                                answer.cascade_winners_are_complete,
-                                winners_are_exact.then_some(flipped),
-                                parent_inputs_moved,
-                                &mut engine_computed_record_scratch,
-                                counters,
-                            )
-                        })
-                        .flatten();
-                    if engine_computed_record_scratch.font_drive.request.is_some() {
+                    let engine_record_answer = engine_computed_gate_passes.then(|| {
+                        // Unchanged winners stand for an unchanged record only when the reaction
+                        // is rules flipping for the node, every one of them known and declaring
+                        // nothing past its winners, or the node's answer is the one it had.
+                        let flipped_rules = selector_truth_changes.deltas_for(node);
+                        let answer_is_unchanged = answer.cascade_input.is_some()
+                            && answer.cascade_input == previous_cascade_inputs[published_index];
+                        let flipped: publication::FlippedRules = flipped_rules
+                            .iter()
+                            .map(|delta| {
+                                self.retained
+                                    .programs
+                                    .entry(delta.entry)
+                                    .1
+                                    .pseudo_element
+                                    .map(|pseudo| pseudo.kind.0)
+                            })
+                            .collect();
+                        let winners_are_exact = !environment_changed
+                            && !rule_declarations_edited
+                            && selector_truth_changes.refreshes_for(node).is_empty()
+                            && (answer_is_unchanged
+                                || (!flipped_rules.is_empty()
+                                    && flipped_rules
+                                        .iter()
+                                        .all(|delta| self.retained.program.declarations_are_complete_for(delta.rule))));
+                        self.engine_computed_record_delta(
+                            node,
+                            answer.cascade_winners_are_complete,
+                            winners_are_exact.then_some(flipped),
+                            parent_inputs_moved,
+                            &mut engine_computed_record_scratch,
+                            counters,
+                        )
+                    });
+                    if let Some(Err(publication::Unanswered::Suspended(publication::Suspension::Font))) =
+                        engine_record_answer
+                    {
                         // NB: Retain this canonical suffix across refill. Descendants have not read
                         //     their pending parent's old record, and the journal may be empty.
                         next_published_index = published_index;
                         pending_parent_inputs = Some(parent_inputs_moved);
+                        suspended_on_font = true;
                         break;
                     }
+                    // A row whose inheritance parent the host styles in this update is asked for again
+                    // once the host has applied the rows before it, as a row behind an unsettled
+                    // ancestor is.
+                    if let Some(Err(publication::Unanswered::AwaitsParent)) = engine_record_answer {
+                        retry_after_ancestor =
+                            self.row_may_retry_after_ancestor(node, answer.cascade_winners_are_complete);
+                    }
+                    let engine_computed_delta = engine_record_answer.and_then(Result::ok);
                     next_published_index = published_index + 1;
                     // A first record C++ declines for the custom-property environment it inherits
                     // takes its descendants' first records down with it: a descendant's environment is
@@ -2259,7 +2268,8 @@ impl StyleEngineState {
                         );
                     }
                 }
-                if let Some(request) = engine_computed_record_scratch.font_drive.request.take() {
+                if suspended_on_font {
+                    let request = engine_computed_record_scratch.font_drive.take_suspended_request();
                     computation_scratch_memory.resize_required_to(
                         &mut self.retained.memory,
                         engine_computed_record_scratch.capacity_bytes(),
@@ -2401,6 +2411,13 @@ impl StyleEngineState {
 }
 
 impl StyleEngineState {
+    /// Whether the host can ask for a declined row again once it has applied the rows before it:
+    /// a document-scope row whose winners the engine holds.
+    fn row_may_retry_after_ancestor(&self, node: StyleNodeID, cascade_winners_are_complete: bool) -> bool {
+        self.retained.tree.tree_scope(node) == TreeScopeID::DOCUMENT
+            && (cascade_winners_are_complete || self.cascade_winners_are_complete_but_for_custom_properties(node))
+    }
+
     pub fn take_style_transaction(
         &mut self,
         root: StyleNodeID,

@@ -6,6 +6,8 @@
 
 #include <AK/StdLibExtras.h>
 #include <AK/Time.h>
+#include <LibWeb/CSS/FontComputer.h>
+#include <LibWeb/CSS/FontResolution.h>
 #include <LibWeb/CSS/RustDeclarationBlock.h>
 #include <LibWeb/CSS/StyleComputer.h>
 #include <LibWeb/CSS/StyleEngineBridge.h>
@@ -15,38 +17,6 @@
 #include <LibWeb/StyleValueRustFFI.h>
 
 namespace Web::CSS {
-
-static StyleEngineFFI::FfiResolvedFont resolve_font(void* context, StyleEngineFFI::FfiFontResolutionRequest request)
-{
-    auto& style_computer = *static_cast<StyleComputer*>(context);
-    auto& font_computer = style_computer.document().font_computer();
-    // The engine holds the family value as an opaque handle, never as a pointer it could
-    // follow; the bridge is where it becomes one again.
-    auto font_family = StyleValue::adopt_rust_style_value_data(StyleValueFFI::rust_style_value_retain(
-        reinterpret_cast<StyleValueFFI::StyleValueData const*>(request.font_family)));
-    auto font_list = font_computer.compute_font_for_style_values(
-        *font_family,
-        CSSPixels::from_raw(request.font_size_raw),
-        request.font_slope,
-        request.font_weight,
-        Percentage(request.font_width),
-        static_cast<FontOpticalSizing>(request.font_optical_sizing),
-        {},
-        {});
-    // The metric probe must not load a face: the first available font answers without one.
-    auto const& first_available_font = font_list->first_available_font();
-    auto const metrics = first_available_font.pixel_metrics();
-    // The engine's resolver cache adopts this reference and releases it on eviction.
-    return {
-        // Handles, not pointers: the engine names these host objects and hands them back here.
-        .first_available_font = reinterpret_cast<StyleEngineFFI::FfiHostHandle>(&first_available_font),
-        .font_cascade_list = reinterpret_cast<StyleEngineFFI::FfiHostHandle>(&font_list.leak_ref()),
-        .ascent = metrics.ascent,
-        .descent = metrics.descent,
-        .x_height = metrics.x_height,
-        .zero_advance = metrics.advance_of_ascii_zero,
-    };
-}
 
 static_assert(StyleEngineFFI::LAST_SYNTHETIC_PSEUDO_ELEMENT_KIND == to_underlying(last_synthetic_pseudo_element));
 static_assert(!IsMoveConstructible<StyleEngine>);
@@ -60,7 +30,6 @@ StyleEngine::StyleEngine(DeviceClass device_class, StyleComputer* style_computer
 {
     if (m_style_computer) {
         set_pseudo_element_style_deferred(to_underlying(PseudoElement::Selection), true);
-        StyleEngineFFI::style_engine_install_font_resolver(m_impl, m_style_computer.ptr(), resolve_font);
     }
 }
 
@@ -89,6 +58,13 @@ void StyleEngine::allocate_style_nodes(Span<StyleNodeID> nodes)
     if (nodes.is_empty())
         return;
     StyleEngineFFI::style_engine_allocate_style_nodes(m_impl, reinterpret_cast<u32*>(nodes.data()), nodes.size());
+}
+
+void StyleEngine::allocate_text_style_nodes(Span<StyleNodeID> nodes)
+{
+    if (nodes.is_empty())
+        return;
+    StyleEngineFFI::style_engine_allocate_text_style_nodes(m_impl, reinterpret_cast<u32*>(nodes.data()), nodes.size());
 }
 
 HashTable<StyleNodeID> StyleEngine::take_deferred_element_initial_features()
@@ -669,6 +645,8 @@ StyleEngine::PublishedStyleTransaction StyleEngine::take_style_transaction(Style
         }
     }
     auto bridge_started_at = MonotonicTime::now();
+    if (m_style_computer)
+        publish_font_faces(m_style_computer->document().font_computer());
     auto view = StyleEngineFFI::style_engine_take_style_transaction(m_impl, root.value(), computation_inputs);
     auto bridge_microseconds = (MonotonicTime::now() - bridge_started_at).to_truncated_microseconds();
     if (view.reclaimed_style_atom_count != 0) {
@@ -794,97 +772,6 @@ bool StyleEngine::consume_published_match_answer(StyleNodeID node, Vector<RuleMa
     return read_matches(node, matches, {});
 }
 
-void* StyleEngine::compile_selector_query(ReadonlySpan<void const*> selectors)
-{
-    return compile_selector_query(selectors, {});
-}
-
-void* StyleEngine::compile_selector_query(ReadonlySpan<void const*> selectors, Function<void()> const& backfill_attribute_value_texts)
-{
-    auto* query = StyleEngineFFI::style_engine_compile_selector_query(m_impl, selectors.data(), selectors.size());
-    if (refresh_attribute_value_text_requirements()) {
-        if (m_style_computer)
-            publish_required_attribute_value_texts(*this, *m_style_computer);
-        else if (backfill_attribute_value_texts)
-            backfill_attribute_value_texts();
-    }
-    return query;
-}
-
-void StyleEngine::destroy_selector_query(void* query)
-{
-    StyleEngineFFI::style_engine_destroy_selector_query(query);
-}
-
-void StyleEngine::prepare_selector_query()
-{
-    // Exact selector queries read current tree and fact columns. Make those inputs visible while
-    // retaining their old rows and the transaction journal for the normal style update to consume.
-    submit_recorded_input();
-    StyleEngineFFI::style_engine_prepare_selector_query(m_impl);
-}
-
-Optional<bool> StyleEngine::selector_query_matches(void const* query, StyleNodeID node, StyleNodeID scope_root, StyleNodeID shadow_root)
-{
-    auto result = StyleEngineFFI::style_engine_selector_query_matches(m_impl, query, node.value(), scope_root.value(), shadow_root.value());
-    if (result == NumericLimits<u8>::max())
-        return {};
-    return result != 0;
-}
-
-Optional<bool> StyleEngine::selector_query_matches_without_document_root(void const* query, StyleNodeID node, StyleNodeID scope_root, StyleNodeID shadow_root)
-{
-    auto result = StyleEngineFFI::style_engine_selector_query_matches_without_document_root(m_impl, query, node.value(), scope_root.value(), shadow_root.value());
-    if (result == NumericLimits<u8>::max())
-        return {};
-    return result != 0;
-}
-
-bool StyleEngine::selector_query_all(void* query, StyleNodeID root, bool include_root, StyleNodeID scope_root, StyleNodeID shadow_root, bool has_document_root, Vector<StyleNodeID>& matches)
-{
-    matches.resize(16);
-    auto read = [&] {
-        return StyleEngineFFI::style_engine_selector_query_all(
-            m_impl,
-            query,
-            root.value(),
-            include_root,
-            scope_root.value(),
-            shadow_root.value(),
-            has_document_root,
-            reinterpret_cast<u32*>(matches.data()),
-            matches.size());
-    };
-    auto count = read();
-    if (count == NumericLimits<size_t>::max())
-        return false;
-    if (count > matches.size()) {
-        matches.resize(count);
-        count = read();
-        if (count == NumericLimits<size_t>::max() || count > matches.size())
-            return false;
-    }
-    matches.shrink(count);
-    return true;
-}
-
-bool StyleEngine::selector_query_first(void* query, StyleNodeID root, bool include_root, StyleNodeID scope_root, StyleNodeID shadow_root, bool has_document_root, StyleNodeID& matched)
-{
-    u32 raw_matched = 0;
-    if (!StyleEngineFFI::style_engine_selector_query_first(
-            m_impl,
-            query,
-            root.value(),
-            include_root,
-            scope_root.value(),
-            shadow_root.value(),
-            has_document_root,
-            &raw_matched))
-        return false;
-    matched = StyleNodeID(raw_matched);
-    return true;
-}
-
 bool StyleEngine::counter(size_t index, StringView& out_name, u64& out_value) const
 {
     size_t name_length = 0;
@@ -893,6 +780,43 @@ bool StyleEngine::counter(size_t index, StringView& out_name, u64& out_value) co
         return false;
     out_name = StringView { name, name_length };
     return true;
+}
+
+void StyleEngine::set_element_custom_property_data(StyleNodeID node, CustomPropertyData const* data)
+{
+    StyleEngineFFI::style_engine_set_element_custom_property_data(m_impl, node.value(), data);
+}
+
+CustomPropertyData const* StyleEngine::element_custom_property_data(StyleNodeID node) const
+{
+    return static_cast<CustomPropertyData const*>(StyleEngineFFI::style_engine_element_custom_property_data(m_impl, node.value()));
+}
+
+static_assert(to_underlying(PseudoElement::KnownPseudoElementCount) <= 64);
+
+void StyleEngine::set_pseudo_element_custom_property_data(StyleNodeID node, PseudoElement pseudo_element, CustomPropertyData const* data)
+{
+    StyleEngineFFI::style_engine_set_pseudo_element_custom_property_data(m_impl, node.value(), to_underlying(pseudo_element), data);
+}
+
+CustomPropertyData const* StyleEngine::pseudo_element_custom_property_data(StyleNodeID node, PseudoElement pseudo_element) const
+{
+    return static_cast<CustomPropertyData const*>(StyleEngineFFI::style_engine_pseudo_element_custom_property_data(m_impl, node.value(), to_underlying(pseudo_element)));
+}
+
+u64 StyleEngine::pseudo_elements_with_custom_property_data(StyleNodeID node) const
+{
+    return StyleEngineFFI::style_engine_pseudo_elements_with_custom_property_data(m_impl, node.value());
+}
+
+// The engine resolves fonts against the @font-face table and cascade memo it was given, at the generation of the
+// computation inputs it was given with them.
+void StyleEngine::publish_font_faces(FontComputer const& font_computer)
+{
+    if (m_published_font_environment_generation == font_computer.environment_generation())
+        return;
+    m_published_font_environment_generation = font_computer.environment_generation();
+    StyleEngineFFI::style_engine_publish_font_faces(m_impl, &font_computer.font_face_snapshot().leak_ref(), &NonnullRefPtr { font_computer.font_cascade_memo() }.leak_ref());
 }
 
 }

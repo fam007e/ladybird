@@ -14,13 +14,11 @@
 #include <LibWeb/HTML/HTMLObjectElement.h>
 #include <LibWeb/HTML/HTMLTextAreaElement.h>
 #include <LibWeb/HTML/HTMLVideoElement.h>
-#include <LibWeb/HTML/LocalNavigable.h>
 #include <LibWeb/Layout/Box.h>
 #include <LibWeb/Layout/ImageProvider.h>
 #include <LibWeb/Layout/LayoutRustBridge.h>
 #include <LibWeb/Layout/NodeArena.h>
 #include <LibWeb/Page/Page.h>
-#include <LibWeb/Painting/BoxViews.h>
 #include <LibWeb/SVG/SVGSVGElement.h>
 
 namespace Web::Layout {
@@ -66,6 +64,16 @@ void Box::set_owned_image_provider(NonnullOwnPtr<ImageProvider> image_provider)
 {
     VERIFY(kind() == RustFFI::NodeKind::ImageBox);
     m_owned_image_provider = move(image_provider);
+}
+
+// An element's image provider outlives its box and keeps nothing about it, so only a provider the
+// box owns needs to hear about the detach. Detaching thus never needs the element, whose StyleNodeID
+// may already be retired.
+void Box::notify_owned_image_provider_of_detach()
+{
+    VERIFY(kind() == RustFFI::NodeKind::ImageBox);
+    if (m_owned_image_provider)
+        m_owned_image_provider->layout_node_was_detached();
 }
 
 bool Box::is_partial_relayout_boundary() const
@@ -244,14 +252,6 @@ RustFFI::FfiReplacedContentFacts Box::build_replaced_content_facts_for_arena() c
         }
     }
     return facts;
-}
-
-void Box::notify_content_navigable_of_committed_viewport()
-{
-    // A navigable another process hosts learns its viewport from the UI process, which the container tells of the
-    // viewport's rect when its document is painted.
-    if (auto* content_navigable = as_if<HTML::LocalNavigable>(as<HTML::NavigableContainer>(*dom_node()).content_navigable().ptr()))
-        content_navigable->set_viewport_size(Painting::content_size(*this));
 }
 
 }

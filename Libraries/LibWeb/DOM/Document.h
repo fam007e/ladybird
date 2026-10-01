@@ -451,6 +451,10 @@ public:
     bool style_engine_tracks_tree() const { return m_style_engine_tracks_tree; }
     void ensure_style_engine_tracks_tree();
 
+    // The document's identity in the style mirror, which only names it as the root of the DOM child sequence.
+    [[nodiscard]] CSS::StyleNodeID style_node_id() const { return m_style_node_id; }
+    void set_style_node_id(CSS::StyleNodeID);
+
     Page& page();
     Page const& page() const;
     GC::Ref<EventTarget> relevant_global_event_target() const { return m_relevant_global_event_target; }
@@ -529,6 +533,12 @@ public:
         m_effects_needing_animated_style_update_after_current_update.clear();
     }
     [[nodiscard]] bool is_running_update_layout() const;
+
+    // The marks the DOM side has made on this document's layout and paint state but not written there yet.
+    [[nodiscard]] InvalidationJournal& invalidation_journal() { return *m_invalidation_journal; }
+    void drain_invalidation_journal() const;
+    // What layout has told this document and the document has not acted on yet.
+    [[nodiscard]] CommitMessages& commit_messages() { return *m_commit_messages; }
 
     void invalidate_layout_tree(InvalidateLayoutTreeReason);
 
@@ -867,6 +877,8 @@ public:
     CSS::ScrollStateQueryContainers& scroll_state_query_containers() { return m_scroll_state_query_containers; }
 
     [[nodiscard]] Layout::NodeArena& layout_node_arena();
+    [[nodiscard]] Layout::NodeArena* layout_node_arena_if_created() { return m_layout_node_arena; }
+    [[nodiscard]] Layout::NodeArena const* layout_node_arena_if_created() const { return m_layout_node_arena; }
     Painting::ChromeWidgetRegistry& chrome_widget_registry() { return *m_chrome_widget_registry; }
     Painting::ChromeWidgetRegistry const& chrome_widget_registry() const { return *m_chrome_widget_registry; }
 
@@ -1199,8 +1211,8 @@ public:
     void schedule_accumulated_visual_context_update(Element&, AccumulatedVisualContextUpdateScope);
     void schedule_accumulated_visual_context_update(Layout::Node const&, AccumulatedVisualContextUpdateScope);
 
-    Compositing::SnappedAreas const& snapped_areas_of_scroll_container(Compositing::AsyncScrollNodeStableID const&) const;
-    void set_snapped_areas_of_scroll_container(Compositing::AsyncScrollNodeStableID const&, Compositing::SnappedAreas);
+    Compositing::SnappedAreas const& snapped_areas_of_scroll_container(Web::AsyncScrollNodeStableID const&) const;
+    void set_snapped_areas_of_scroll_container(Web::AsyncScrollNodeStableID const&, Compositing::SnappedAreas);
     void forget_snapped_areas_of_scroll_container(Layout::Node const&);
 
     void schedule_list_item_renumber(Element& list_owner);
@@ -1213,7 +1225,7 @@ public:
     [[nodiscard]] bool may_have_scroll_snap_areas() const { return m_may_have_scroll_snap_areas; }
 
     void register_scroll_snap_container(Layout::Node const&);
-    [[nodiscard]] Vector<WeakPtr<Layout::Node const>> collect_scroll_snap_containers();
+    [[nodiscard]] Vector<Compositing::RustFFI::NodeSlotId> collect_scroll_snap_containers();
 
     virtual Vector<Utf16FlyString> supported_property_names() const override;
     Vector<GC::Ref<DOM::Element>> const& potentially_named_elements() const { return m_potentially_named_elements; }
@@ -1307,6 +1319,10 @@ public:
     {
         set_needs_repaint(should_invalidate_display_list);
     }
+
+    // A repaint mark the journal holds applies its damage when the journal drains, but the frame that drains it has to
+    // be asked for when the mark is made.
+    void request_frame_for_pending_repaint(Badge<InvalidationJournal>) { request_frame_for_pending_repaint(); }
 
     RefPtr<Compositing::DisplayList> record_display_list(HTML::PaintConfig, Compositing::DisplayListResourceStorage&, Painting::PaintCommandCacheMode);
     Painting::HitTestDisplayList const* hit_test_display_list() const { return m_hit_test_display_list.ptr(); }
@@ -1476,7 +1492,6 @@ public:
 
     RefPtr<SelectorQuery const> selector_query_for(Utf16View) const;
     QuerySelectorResultCache& query_selector_result_cache();
-    IsolatedSelectorQueryEngineCache& isolated_selector_query_engine_cache();
 
     GC::Ptr<HTML::CustomElementRegistry> custom_element_registry() const;
     void set_custom_element_registry(GC::Ptr<HTML::CustomElementRegistry> custom_element_registry) { m_custom_element_registry = custom_element_registry; }
@@ -1512,6 +1527,7 @@ private:
     GC::Ref<WebIDL::ObservableArray> adopted_style_sheets() const;
 
     void set_needs_repaint(InvalidateDisplayList = InvalidateDisplayList::PaintCommandsAndHitTestList);
+    void request_frame_for_pending_repaint();
 
     // ^JS::Object
     virtual bool is_dom_document() const final { return true; }
@@ -1521,8 +1537,13 @@ private:
 
     virtual void finalize() override final;
 
-    void tear_down_layout_tree_for_inactive_document();
-    void set_layout_root(Compositing::RustFFI::NodeSlotId viewport_slot);
+    Layout::RustFFI::FfiLayoutTreeBuildOutcome build_layout_tree();
+
+    // The row the document's layout tree is rooted at. The tree build records it in the arena, so
+    // the document keeps no copy of its own.
+    [[nodiscard]] Compositing::RustFFI::NodeSlotId layout_root_slot() const;
+    [[nodiscard]] bool has_layout_root() const { return layout_root_slot().index != Compositing::RustFFI::INVALID_NODE_SLOT_INDEX; }
+    [[nodiscard]] Layout::Node* layout_root_if_live() const;
     void tear_down_layout_tree();
     void process_pending_top_layer_layout_changes();
 
@@ -1599,9 +1620,10 @@ private:
     GC::Ref<DOM::EventTarget> m_relevant_global_event_target;
 
     RefPtr<Layout::NodeArena> m_layout_node_arena;
+    NonnullOwnPtr<InvalidationJournal> m_invalidation_journal;
+    NonnullOwnPtr<CommitMessages> m_commit_messages;
     OwnPtr<Painting::DocumentPaintState> m_paint_state;
     NonnullRefPtr<Painting::ChromeWidgetRegistry> m_chrome_widget_registry;
-    Layout::Viewport* m_layout_root { nullptr };
     bool m_may_have_content_visibility_auto_style { false };
 
     GC::Ptr<Node> m_hovered_node;
@@ -1751,6 +1773,7 @@ private:
 
     bool m_has_completed_style_update { false };
     bool m_style_engine_tracks_tree { false };
+    CSS::StyleNodeID m_style_node_id;
     GC::WeakHashSet<Element> m_elements_with_dirty_style_attributes;
     GC::WeakHashSet<Element> m_elements_with_viewport_dependent_style;
     bool m_suppresses_attribute_style_invalidation { false };
@@ -1885,8 +1908,8 @@ private:
     Optional<MonotonicTime> m_compositor_animation_wakeup_deadline;
     RefPtr<Core::Timer> m_compositor_animation_observation_timer;
     bool m_force_visual_context_tree_rebuild_on_next_compositor_animation_update_for_testing { false };
-    Vector<WeakPtr<Layout::Node>> m_layout_nodes_with_forced_compositor_effects_layer;
-    Vector<WeakPtr<Layout::Node>> m_layout_nodes_with_forced_compositor_background_color_frame;
+    Vector<Compositing::RustFFI::NodeSlotId> m_layout_nodes_with_forced_compositor_effects_layer;
+    Vector<Compositing::RustFFI::NodeSlotId> m_layout_nodes_with_forced_compositor_background_color_frame;
 
     bool m_temporary_document_for_fragment_parsing { false };
 
@@ -1938,8 +1961,8 @@ private:
 
     bool m_needs_accumulated_visual_contexts_update { false };
 
-    HashMap<Compositing::AsyncScrollNodeStableID, Compositing::SnappedAreas> m_scroll_container_snapped_areas;
-    Vector<WeakPtr<Layout::Node const>> m_scroll_snap_containers;
+    HashMap<Web::AsyncScrollNodeStableID, Compositing::SnappedAreas> m_scroll_container_snapped_areas;
+    Vector<Compositing::RustFFI::NodeSlotId> m_scroll_snap_containers;
     bool m_needs_scroll_container_resnap { false };
     bool m_may_have_scroll_snap_areas { false };
 
@@ -2091,9 +2114,6 @@ private:
 
     // Cache of querySelectorAll results, validated lazily against the query root's dom_tree_version/character_data_version.
     OwnPtr<QuerySelectorResultCache> m_query_selector_result_cache;
-
-    // Style engines for selector queries against disconnected trees, one per tree root, validated the same way.
-    OwnPtr<IsolatedSelectorQueryEngineCache> m_isolated_selector_query_engine_cache;
 
     // https://fullscreen.spec.whatwg.org/#list-of-pending-fullscreen-events
     Vector<PendingFullscreenEvent> m_pending_fullscreen_events;

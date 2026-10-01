@@ -6,13 +6,16 @@
 
 mod drive;
 mod pseudo;
+mod retry;
 mod winner_store;
 
 use winner_store::{WinnerDeclaration, WinnerStore, WinnerValue, shorthand_longhand_data};
 
 use super::*;
 use crate::css::computed_longhand_table::ComputedLonghandTable;
-use drive::{FontDriveGoal, drive_font_metric};
+pub(super) use drive::{Drive, OrRefused, Suspension, Unanswered};
+use drive::{FontDriveGoal, FullDrive, PartialDrive, drive_font_metric};
+use retry::InstalledAncestors;
 
 /// Another element's published style that a first-time computation may build over: the element
 /// whose cascade state stands in for the previous one, and the record it must still hold.
@@ -36,6 +39,26 @@ pub(super) struct ExactCascadeContext {
 pub(super) struct RootFontInputs {
     metrics: [u64; 5],
     depends_on_viewport: bool,
+}
+
+/// An element's old and new style records.
+pub(super) type RecordDelta = (computed::FinalStyleRecordID, computed::FinalStyleRecordID);
+
+/// What the computation of an element's record answers: its record delta, or, for the root-input
+/// probe, the document element's font inputs where the probe proved them.
+pub(super) enum ElementAnswer {
+    Delta(RecordDelta),
+    RootInputs(Option<RootFontInputs>),
+}
+
+impl ElementAnswer {
+    /// The delta of a computation that was no root-input probe.
+    fn delta(self) -> RecordDelta {
+        match self {
+            Self::Delta(delta) => delta,
+            Self::RootInputs(_) => unreachable!("only the root-input probe answers with root inputs"),
+        }
+    }
 }
 
 impl RootFontInputs {
@@ -63,6 +86,41 @@ impl RootFontInputs {
 }
 
 impl RetainedState {
+    /// The inheritance parent a node's record is computed from. C++ styles an element whose
+    /// inheritance parent has no style, such as a slotted element whose slot is in a `display: none`
+    /// subtree, from the initial values, the way it styles the document element. A parent without
+    /// a record is no such parent while the host may still be styling it: the row waits for it.
+    /// Only a retry, which runs once the host applied every row before it, knows the parent has
+    /// no style.
+    pub(super) fn record_inheritance_parent(
+        &self,
+        node: StyleNodeID,
+        installed_ancestors: Option<&InstalledAncestors>,
+    ) -> Drive<Option<StyleNodeID>> {
+        let Some(parent) = self.tree.inheritance_parent(node) else {
+            return Ok(None);
+        };
+        if self.computed_group_sets.assigned_style_record(parent).is_some() {
+            return Ok(Some(parent));
+        }
+        match installed_ancestors {
+            Some(_) => Ok(None),
+            None => Err(Unanswered::AwaitsParent),
+        }
+    }
+
+    /// The custom-property environment of a node the drive reads as an inheritance parent, which
+    /// holds a record. Every record is assigned with its environment, so it holds one; should it
+    /// not, the row waits for the parent as for one without a record.
+    fn held_custom_property_environment(&self, node: StyleNodeID, counters: &mut Counters) -> Drive<u64> {
+        let environment = self.computed_group_sets.custom_property_environment_identity(node);
+        debug_assert!(environment.is_some(), "an inheritance parent without an environment");
+        environment.ok_or_else(|| {
+            counters.bump(Counter::EngineComputedRecordBailRecordParent);
+            Unanswered::AwaitsParent
+        })
+    }
+
     fn shared_style_record_key(
         &self,
         node: StyleNodeID,
@@ -243,7 +301,7 @@ impl RetainedState {
         parent_inputs_moved: ParentInputsMoved,
         scratch: &mut EngineComputedRecordScratch,
         counters: &mut Counters,
-    ) -> Option<(computed::FinalStyleRecordID, computed::FinalStyleRecordID)> {
+    ) -> Drive<RecordDelta> {
         let delta = self.decide_engine_computed_record_delta(
             node,
             cascade_winners_are_complete,
@@ -266,9 +324,9 @@ impl RetainedState {
         parent_inputs_moved: ParentInputsMoved,
         scratch: &mut EngineComputedRecordScratch,
         counters: &mut Counters,
-    ) -> Option<(computed::FinalStyleRecordID, computed::FinalStyleRecordID)> {
+    ) -> Drive<RecordDelta> {
         if scratch.root_computation_unsupported == Some(node) {
-            return None;
+            return Err(Unanswered::Refused);
         }
         // An element-backed pseudo-element is the element in the host's shadow tree that backs
         // it, which is no row of the host's: a host whose rules for one flipped is left to C++,
@@ -279,7 +337,7 @@ impl RetainedState {
             && self.computed_group_sets.assigned_style_record(node).is_some()
         {
             counters.bump(Counter::EngineComputedRecordBailPseudoFlip);
-            return None;
+            return Err(Unanswered::Refused);
         }
         let pending_element = scratch.pending_element.take();
         if pending_element.is_none() {
@@ -289,43 +347,45 @@ impl RetainedState {
             scratch.noted_substitution = None;
             scratch.flipped_pseudo_rules = exact_flipped_rules.map_or(0, |flipped| flipped.pseudos);
             if parent_inputs_moved.inherited_style && !self.engine_marker_font_supported(node, counters) {
-                return None;
+                return Err(Unanswered::Refused);
             }
             if !self.engine_pseudo_inputs_available(
                 node,
                 self.computed_group_sets.assigned_style_record(node),
                 counters,
             ) {
-                return None;
+                return Err(Unanswered::Refused);
             }
         }
         let delta = match pending_element {
             Some(delta) => delta,
-            None => self.engine_computed_element_record_delta(
-                node,
-                cascade_winners_are_complete,
-                exact_flipped_rules,
-                parent_inputs_moved,
-                scratch,
-                FontDriveGoal::Complete,
-                counters,
-            )?,
+            None => self
+                .engine_computed_element_record_delta(
+                    node,
+                    cascade_winners_are_complete,
+                    exact_flipped_rules,
+                    parent_inputs_moved,
+                    scratch,
+                    FontDriveGoal::Complete,
+                    counters,
+                )?
+                .delta(),
         };
         // The element's pseudo-elements are settled beside its record, as the C++ computation
         // refreshes them after the element's own; a pseudo-element the engine cannot settle
         // sends the whole element to C++.
         let old_style_record = (delta.0 != computed::FinalStyleRecordID::NONE).then_some(delta.0);
         let generation = self.winner_groups.generation();
-        if self
-            .engine_pseudo_records(node, old_style_record, delta.1, generation, scratch, counters)
-            .is_none()
+        if let Err(unanswered) =
+            self.engine_pseudo_records(node, old_style_record, delta.1, generation, scratch, counters)
         {
-            if scratch.font_drive.request.is_some() {
-                scratch.pending_element = Some(delta);
-            } else {
-                self.abandon_engine_computed_record(node, scratch, counters);
+            match unanswered {
+                Unanswered::Suspended(_) => scratch.pending_element = Some(delta),
+                Unanswered::Refused | Unanswered::AwaitsParent => {
+                    self.abandon_engine_computed_record(node, scratch, counters);
+                }
             }
-            return None;
+            return Err(unanswered);
         }
         // What this element's record was computed from decides the fact when the computation
         // noted it; a record that stands unchanged keeps the fact the node already carries.
@@ -341,7 +401,7 @@ impl RetainedState {
                 });
         scratch.element_uses_substitution = uses_substitution;
         scratch.substitution_effects.push((node, uses_substitution));
-        Some(delta)
+        Ok(delta)
     }
 
     /// `exact_flipped_rules` are the rules that flipped for the node when the reaction is exactly
@@ -357,7 +417,7 @@ impl RetainedState {
         scratch: &mut EngineComputedRecordScratch,
         goal: FontDriveGoal,
         counters: &mut Counters,
-    ) -> Option<(computed::FinalStyleRecordID, computed::FinalStyleRecordID)> {
+    ) -> Drive<ElementAnswer> {
         use crate::css::computed_value_types::{
             STYLE_GROUP_INDEX_ANCHOR, STYLE_GROUP_INDEX_FONT, STYLE_GROUP_INDEX_SURROUND,
         };
@@ -369,7 +429,7 @@ impl RetainedState {
         // computes the environment it decides itself.
         if !cascade_winners_are_complete && !self.cascade_winners_are_complete_but_for_custom_properties(node) {
             counters.bump(Counter::EngineComputedRecordBailIncompleteWinners);
-            return None;
+            return Err(Unanswered::Refused);
         }
         // The winners the record was computed from, against the winners the node holds now: the
         // same comparison a C++ publication makes to select what it recomputes.
@@ -384,11 +444,11 @@ impl RetainedState {
                     cascade::WinnerGroupGap::StaleProgram { .. } => Counter::EngineComputedRecordBailWinnerStaleProgram,
                     cascade::WinnerGroupGap::StalePriority(_) => Counter::EngineComputedRecordBailWinnerStalePriority,
                 });
-                return None;
+                return Err(Unanswered::Refused);
             }
             Lookup::KnownAbsent => {
                 counters.bump(Counter::EngineComputedRecordBailWinner);
-                return None;
+                return Err(Unanswered::Refused);
             }
         };
         // An element's animations compose into its style in the C++ computation, an element
@@ -405,12 +465,12 @@ impl RetainedState {
             != 0
         {
             counters.bump(Counter::EngineComputedRecordBailWinnerElement);
-            return None;
+            return Err(Unanswered::Refused);
         }
         // Both first records and updates need the inherited values composed by the parent's animations.
         if self.parent_composes_animations(node) {
             counters.bump(Counter::EngineComputedRecordBailRecordOverlay);
-            return None;
+            return Err(Unanswered::Refused);
         }
         let Some(old_style_record) = self.computed_group_sets.assigned_style_record(node) else {
             // Presentational hints are mapped from the attributes by the C++ computation, which
@@ -419,13 +479,13 @@ impl RetainedState {
             // later record's winners carry the hints.
             if facts & bridge::element_adjustment_fact::HAS_PRESENTATIONAL_HINTS != 0 {
                 counters.bump(Counter::EngineComputedRecordBailWinnerElement);
-                return None;
+                return Err(Unanswered::Refused);
             }
             return self.engine_cold_record(node, (generation, state), scratch, goal, counters);
         };
         if self.record_requires_cpp_animation(old_style_record) {
             counters.bump(Counter::EngineComputedRecordBailRecordOverlay);
-            return None;
+            return Err(Unanswered::Refused);
         }
         // A record C++ computed holds no cascade state; when the reaction moved none of the
         // node's own rules its winners are the ones the record was computed from, and a full
@@ -435,7 +495,7 @@ impl RetainedState {
             Some((previous_generation, previous_state)) => {
                 if previous_generation != generation {
                     counters.bump(Counter::EngineComputedRecordBailStaleCascadeState);
-                    return None;
+                    return Err(Unanswered::Refused);
                 }
                 self.winner_groups.semantic_delta(Some(previous_state), state)
             }
@@ -444,12 +504,12 @@ impl RetainedState {
             }
             None => {
                 counters.bump(Counter::EngineComputedRecordBailNoCascadeState);
-                return None;
+                return Err(Unanswered::Refused);
             }
         };
         let Some(mut inputs) = self.document_style_computation_inputs else {
             counters.bump(Counter::EngineComputedRecordBailNoEnvironment);
-            return None;
+            return Err(Unanswered::Refused);
         };
         if let Some((root, root_inputs)) = scratch.root_element_inputs
             && root == node
@@ -460,30 +520,24 @@ impl RetainedState {
         // declaring none keeps its record's, which is the parent's; a moved environment
         // republishes the record under the new one.
         let environment = {
-            let parent_environment = match self.tree.flat_tree_parent(node) {
-                Some(parent) => {
-                    let Some(parent_environment) =
-                        self.computed_group_sets.custom_property_environment_identity(parent)
-                    else {
-                        counters.bump(Counter::EngineComputedRecordBailRecordParent);
-                        return None;
-                    };
-                    parent_environment
-                }
+            let parent = self
+                .record_inheritance_parent(node, scratch.installed_ancestors.as_ref())
+                .inspect_err(|_| counters.bump(Counter::EngineComputedRecordBailRecordParent))?;
+            let parent_environment = match parent {
+                Some(parent) => self.held_custom_property_environment(parent, counters)?,
                 None => 0,
             };
-            let Some(environment) =
-                self.engine_custom_property_environment(node, parent_environment, &inputs, counters)
+            let Ok(environment) = self.engine_custom_property_environment(node, parent_environment, &inputs, counters)
             else {
                 counters.bump(Counter::EngineComputedRecordBailCustomProperties);
-                return None;
+                return Err(Unanswered::Refused);
             };
             let Some(old_environment) = self
                 .computed_group_sets
                 .style_record_custom_property_environment(old_style_record.raw())
             else {
                 counters.bump(Counter::EngineComputedRecordBailRecord);
-                return None;
+                return Err(Unanswered::Refused);
             };
             (environment != old_environment).then_some(environment)
         };
@@ -492,7 +546,7 @@ impl RetainedState {
                 .style_record_custom_property_environment(old_style_record.raw())
         }) else {
             counters.bump(Counter::EngineComputedRecordBailRecord);
-            return None;
+            return Err(Unanswered::Refused);
         };
         // A moved environment reaches every winner written with a substitution: such a record
         // is driven again in full under the new one.
@@ -513,9 +567,9 @@ impl RetainedState {
                 // font inputs moved: keep the host's root-metric route rather than declaring the
                 // root's computation unsupported, which takes every descendant with it.
                 if goal == FontDriveGoal::RootInputs {
-                    scratch.font_drive.root_inputs_unproven = true;
+                    return Ok(ElementAnswer::RootInputs(None));
                 }
-                return None;
+                return Err(Unanswered::Refused);
             }
             // The winners stand while the parent's inherited style or display moved under the
             // record: it is driven again in full against the parent as it is now. The record
@@ -529,8 +583,9 @@ impl RetainedState {
                     if goal == FontDriveGoal::RootInputs {
                         // NB: This proof covers the retained font, without publishing the root's
                         //     remaining properties or custom-property environment during preparation.
-                        scratch.font_drive.root_inputs = self.root_font_inputs_from_record(old_style_record);
-                        return None;
+                        return Ok(ElementAnswer::RootInputs(Some(
+                            self.root_font_inputs_from_record(old_style_record).or_refused()?,
+                        )));
                     }
                     // Only the environment moved: the record keeps its groups and takes the new one.
                     if let Some(environment) = environment {
@@ -539,11 +594,11 @@ impl RetainedState {
                             .republish_engine_record_with_environment(node, environment)
                         else {
                             counters.bump(Counter::EngineComputedRecordBailAssemble);
-                            return None;
+                            return Err(Unanswered::Refused);
                         };
                         counters.bump(Counter::EngineComputedRecordUnchangedWinners);
                         self.note_engine_computed_record(node, delta, (generation, state), 0, 0, counters);
-                        return Some(delta);
+                        return Ok(ElementAnswer::Delta(delta));
                     }
                     counters.bump(Counter::EngineComputedRecordUnchangedWinners);
                     counters.bump(Counter::CascadeWinnerDeltaStops);
@@ -555,7 +610,7 @@ impl RetainedState {
                         0,
                         counters,
                     );
-                    return Some((old_style_record, old_style_record));
+                    return Ok(ElementAnswer::Delta((old_style_record, old_style_record)));
                 }
                 let owned_groups = self
                     .winner_groups
@@ -564,7 +619,7 @@ impl RetainedState {
                     .fold(0_u32, |mask, group| mask | (1 << group));
                 if !self.record_inherits_from_current_parent(node, state, owned_groups) {
                     counters.bump(Counter::EngineComputedRecordBailUnchangedWinners);
-                    return None;
+                    return Err(Unanswered::Refused);
                 }
                 parent_inputs_moved.inherited_style = true;
             }
@@ -583,7 +638,7 @@ impl RetainedState {
         // Partial drives can share across parents whose inherited inputs agree. Keep the full
         // parent record in the key when a non-inherited property explicitly inherits, including
         // through substitution, or when a full drive may read more of the parent's style.
-        let parent = self.tree.flat_tree_parent(node);
+        let parent = self.tree.inheritance_parent(node);
         let parent_record = parent.and_then(|parent| self.computed_group_sets.assigned_style_record(parent));
         let mut cohort_parent = RecordDeltaParent::Exact(parent_record.map_or(0, |record| record.raw()));
         if !full_drive
@@ -605,15 +660,16 @@ impl RetainedState {
         );
         if let Some(&new_style_record) = scratch.cohorts.get(&cohort) {
             self.note_node_substitution(node, scratch, state, current_environment);
-            let delta =
-                self.computed_group_sets
-                    .assign_engine_computed_record(node, old_style_record, new_style_record)?;
+            let delta = self
+                .computed_group_sets
+                .assign_engine_computed_record(node, old_style_record, new_style_record)
+                .or_refused()?;
             if delta.0 == delta.1 {
                 counters.bump(Counter::ComputedWinnerPropagationStops);
             }
             self.note_engine_computed_record(node, delta, (generation, state), delta_property_count, 0, counters);
             counters.bump(Counter::EngineComputedRecordCohortHits);
-            return Some(delta);
+            return Ok(ElementAnswer::Delta(delta));
         }
 
         // The moved properties, the groups they feed, and the drive selection. A moved member of
@@ -628,7 +684,7 @@ impl RetainedState {
         let (writing_mode, direction) = {
             let Some(view) = self.computed_group_sets.style_record_view(old_style_record.raw()) else {
                 counters.bump(Counter::EngineComputedRecordBailRecord);
-                return None;
+                return Err(Unanswered::Refused);
             };
             let inherited_box = unsafe {
                 view.payloads[crate::css::computed_value_types::STYLE_GROUP_INDEX_INHERITED_BOX]
@@ -642,7 +698,7 @@ impl RetainedState {
             // environment behind `content` and `list-style-type` is resolved there.
             if property_starts_animation_or_counter_environment(property) {
                 counters.bump(Counter::EngineComputedRecordBailProperty);
-                return None;
+                return Err(Unanswered::Refused);
             }
             let groups = match computed_group_dependency_mask(property) {
                 Some(groups) => groups,
@@ -651,7 +707,7 @@ impl RetainedState {
                 None if full_drive && font_group_carries_longhand(property) => 0,
                 None => {
                     counters.bump(Counter::EngineComputedRecordBailProperty);
-                    return None;
+                    return Err(Unanswered::Refused);
                 }
             };
             groups_to_rebuild |= groups;
@@ -667,7 +723,7 @@ impl RetainedState {
             if counterpart != property {
                 let Some(groups) = computed_group_dependency_mask(counterpart) else {
                     counters.bump(Counter::EngineComputedRecordBailProperty);
-                    return None;
+                    return Err(Unanswered::Refused);
                 };
                 groups_to_rebuild |= groups;
                 select(counterpart);
@@ -683,7 +739,7 @@ impl RetainedState {
         {
             let Some(dependencies) = self.computed_group_sets.current_color_dependency_mask(target) else {
                 counters.bump(Counter::EngineComputedRecordBailRecord);
-                return None;
+                return Err(Unanswered::Refused);
             };
             groups_to_rebuild |= dependencies;
             // The dependents compute again from their specified values, so the table spells them
@@ -691,7 +747,7 @@ impl RetainedState {
             let Some(dependent_properties) = self.computed_group_sets.current_color_dependency_properties(target)
             else {
                 counters.bump(Counter::EngineComputedRecordBailRecord);
-                return None;
+                return Err(Unanswered::Refused);
             };
             for (word, &bits) in dependent_properties.iter().enumerate() {
                 let mut bits = bits;
@@ -717,18 +773,17 @@ impl RetainedState {
             groups_to_rebuild = (1 << crate::css::table_group_builder::group_index::COUNT) - 1;
         } else if groups_to_rebuild & (1 << STYLE_GROUP_INDEX_FONT) != 0 {
             counters.bump(Counter::EngineComputedRecordBailFontPhase);
-            return None;
+            return Err(Unanswered::Refused);
         }
 
         if goal == FontDriveGoal::RootInputs && !full_drive {
             // NB: No font property moved, but borrowing the retained font still needs the
             //     proof that only the named rule flips changed the computation's inputs.
-            if exact_flipped_rules.is_some() {
-                scratch.font_drive.root_inputs = self.root_font_inputs_from_record(old_style_record);
-            } else {
-                scratch.font_drive.root_inputs_unproven = true;
-            }
-            return None;
+            let proven = match exact_flipped_rules {
+                Some(_) => Some(self.root_font_inputs_from_record(old_style_record).or_refused()?),
+                None => None,
+            };
+            return Ok(ElementAnswer::RootInputs(proven));
         }
 
         let store = match scratch.stores.get(&(state, current_environment)) {
@@ -752,34 +807,30 @@ impl RetainedState {
             }
         };
         self.note_node_substitution(node, scratch, state, current_environment);
-        let mut driver_input_moved = false;
         let partial = if full_drive {
             None
         } else {
-            let partial = self.engine_driven_table(
+            Some(self.engine_driven_table(
                 node,
                 old_style_record,
                 &store,
                 &selected,
                 &inputs,
-                &mut driver_input_moved,
+                scratch.installed_ancestors.as_ref(),
                 counters,
-            );
-            if partial.is_none() && !driver_input_moved {
-                return None;
-            }
-            partial
+            )?)
         };
+        let driver_input_moved = matches!(partial, Some(PartialDrive::DriverInputMoved));
         let (table, length, longhand_evaluations, font) = match partial {
-            Some(partial) => partial,
+            Some(PartialDrive::Driven(partial)) => partial,
             // A partial drive whose driver inputs moved reaches values it did not select, so the
             // record is driven in full and every group is rebuilt.
-            None => {
+            Some(PartialDrive::DriverInputMoved) | None => {
                 if driver_input_moved {
                     groups_to_rebuild = (1 << crate::css::table_group_builder::group_index::COUNT) - 1;
                 }
-                let subject = self.element_drive_subject(node, counters)?;
-                self.engine_full_drive(
+                let subject = self.element_drive_subject(node, scratch.installed_ancestors.as_ref(), counters)?;
+                match self.engine_full_drive(
                     subject,
                     Some(old_style_record),
                     &store,
@@ -787,12 +838,15 @@ impl RetainedState {
                     &mut scratch.font_drive,
                     goal,
                     counters,
-                )?
+                )? {
+                    FullDrive::Driven(driven) => driven,
+                    FullDrive::RootInputs(root_inputs) => return Ok(ElementAnswer::RootInputs(Some(root_inputs))),
+                }
             }
         };
         let parent_in_display_none_subtree = self
             .tree
-            .flat_tree_parent(node)
+            .inheritance_parent(node)
             .and_then(|parent| self.computed_group_sets.assigned_style_record(parent))
             .and_then(|record| self.computed_group_sets.style_record_view(record.raw()))
             .is_some_and(|view| view.dependency_flags & (1 << 2) != 0);
@@ -808,7 +862,7 @@ impl RetainedState {
             environment,
         ) else {
             counters.bump(Counter::EngineComputedRecordBailAssemble);
-            return None;
+            return Err(Unanswered::Refused);
         };
         self.settle_computed_memory();
         counters.add(
@@ -832,7 +886,7 @@ impl RetainedState {
         if !driver_input_moved {
             scratch.cohorts.insert(cohort, delta.1);
         }
-        Some(delta)
+        Ok(ElementAnswer::Delta(delta))
     }
 
     /// Account for a record the engine derived and leave its commitment to C++'s acknowledgement.
@@ -972,12 +1026,12 @@ impl RetainedState {
         scratch: &mut EngineComputedRecordScratch,
         goal: FontDriveGoal,
         counters: &mut Counters,
-    ) -> Option<(computed::FinalStyleRecordID, computed::FinalStyleRecordID)> {
+    ) -> Drive<ElementAnswer> {
         let target = computed::ComputedStyleTarget::new(node, u8::MAX);
         let (_, state) = cascade_state;
         let Some(mut inputs) = self.document_style_computation_inputs else {
             counters.bump(Counter::EngineComputedRecordBailNoEnvironment);
-            return None;
+            return Err(Unanswered::Refused);
         };
         if let Some((root, root_inputs)) = scratch.root_element_inputs
             && root == node
@@ -985,34 +1039,21 @@ impl RetainedState {
             root_inputs.apply_to(&mut inputs);
         }
         let facts = self.computed_group_sets.adjustment_facts(node);
-        let parent = self.tree.flat_tree_parent(node);
-        // Only the document element is styled without a flat-tree parent: it inherits from the
-        // initial values.
-        if parent.is_none() && facts & bridge::element_adjustment_fact::IS_DOCUMENT_ELEMENT == 0 {
-            counters.bump(Counter::EngineComputedRecordBailRecordParent);
-            return None;
-        }
-        let parent_record = match parent {
-            Some(parent) => match self.computed_group_sets.assigned_style_record(parent) {
-                Some(parent_record) => Some(parent_record),
-                None => {
-                    counters.bump(Counter::EngineComputedRecordBailRecordParent);
-                    return None;
-                }
-            },
-            None => None,
-        };
+        // An element without a styled inheritance parent, the document element among them,
+        // inherits from the initial values.
+        let parent = self
+            .record_inheritance_parent(node, scratch.installed_ancestors.as_ref())
+            .inspect_err(|_| counters.bump(Counter::EngineComputedRecordBailRecordParent))?;
+        let parent_record = parent.and_then(|parent| self.computed_group_sets.assigned_style_record(parent));
         // The document element's environment is its own, which is nothing without declarations;
         // any other node's is its declarations resolved over the parent's.
-        let Some(parent_environment) = parent.map_or(Some(0), |parent| {
-            self.computed_group_sets.custom_property_environment_identity(parent)
-        }) else {
-            counters.bump(Counter::EngineComputedRecordBailRecordParent);
-            return None;
+        let parent_environment = match parent {
+            Some(parent) => self.held_custom_property_environment(parent, counters)?,
+            None => 0,
         };
         let Some(pseudo_styles) = self.pseudo_style_mask(node) else {
             counters.bump(Counter::EngineComputedRecordBailWinner);
-            return None;
+            return Err(Unanswered::Refused);
         };
         let cache_key = parent
             .zip(parent_record)
@@ -1022,7 +1063,7 @@ impl RetainedState {
                 previous_style_record: 0,
                 generation: cascade_state.0,
                 state,
-                facts,
+                facts: cold_record_facts(facts),
                 pseudo_styles,
                 environment: parent_environment,
                 font_environment_generation: inputs.font_environment_generation,
@@ -1043,7 +1084,7 @@ impl RetainedState {
                 counters,
             )
         {
-            return Some(delta);
+            return Ok(ElementAnswer::Delta(delta));
         }
         // A winner that starts an animation or reads the counter-style environment keeps the
         // record in C++. The font-phase longhands feed no group of their own: the full drive
@@ -1052,13 +1093,13 @@ impl RetainedState {
         for property in self.winner_groups.semantic_delta_properties(None, state) {
             if self.first_record_winner_needs_cpp(state, property) {
                 counters.bump(Counter::EngineComputedRecordBailProperty);
-                return None;
+                return Err(Unanswered::Refused);
             }
         }
-        let Some(environment) = self.engine_custom_property_environment(node, parent_environment, &inputs, counters)
+        let Ok(environment) = self.engine_custom_property_environment(node, parent_environment, &inputs, counters)
         else {
             counters.bump(Counter::EngineComputedRecordBailCustomProperties);
-            return None;
+            return Err(Unanswered::Refused);
         };
         // The state has to be one the engine can compute from before any record is shared under
         // it: a record C++ computed for a per-element value, such as a `random()` draw, is that
@@ -1077,7 +1118,7 @@ impl RetainedState {
                         environment,
                         inputs.custom_property_registration_generation,
                     ),
-                    store.is_some(),
+                    store.is_ok(),
                 );
                 let store = std::sync::Arc::new(store?);
                 scratch.store_capacity_bytes += store.capacity_bytes();
@@ -1097,7 +1138,7 @@ impl RetainedState {
                 previous_style_record: 0,
                 generation: cascade_state.0,
                 state,
-                facts,
+                facts: cold_record_facts(facts),
                 pseudo_styles,
                 environment,
                 font_environment_generation: inputs.font_environment_generation,
@@ -1115,7 +1156,7 @@ impl RetainedState {
             scratch,
             counters,
         ) {
-            return Some(delta);
+            return Ok(ElementAnswer::Delta(delta));
         }
         let donor = cache_key.and_then(|key| {
             let donor_key = ColdRecordDonorKey {
@@ -1151,13 +1192,13 @@ impl RetainedState {
             let donor_delta = self.winner_groups.semantic_delta(Some(donor.state), state);
             if let Some((groups_to_rebuild, selected)) =
                 self.cold_record_donor_selection(donor, donor_delta.properties())
-                && let Some((table, length, longhand_evaluations, _)) = self.engine_driven_table(
+                && let Ok(PartialDrive::Driven((table, length, longhand_evaluations, _))) = self.engine_driven_table(
                     node,
                     donor.record.record,
                     &store,
                     &selected,
                     &inputs,
-                    &mut false,
+                    scratch.installed_ancestors.as_ref(),
                     counters,
                 )
             {
@@ -1197,13 +1238,16 @@ impl RetainedState {
                         scratch.cold_cohorts.insert(cache_key, record);
                         self.remember_cold_record(cache_key, record);
                     }
-                    return Some(assembly.delta);
+                    return Ok(ElementAnswer::Delta(assembly.delta));
                 }
             }
         }
         let subject = DriveSubject { parent, facts };
         let (table, length, longhand_evaluations, font) =
-            self.engine_full_drive(subject, None, &store, &inputs, &mut scratch.font_drive, goal, counters)?;
+            match self.engine_full_drive(subject, None, &store, &inputs, &mut scratch.font_drive, goal, counters)? {
+                FullDrive::Driven(driven) => driven,
+                FullDrive::RootInputs(root_inputs) => return Ok(ElementAnswer::RootInputs(Some(root_inputs))),
+            };
         let font = font.expect("a full drive resolves the font");
         let (new_style_record, swap_eligible) = self.assemble_and_publish_engine_record(
             target,
@@ -1237,7 +1281,7 @@ impl RetainedState {
             longhand_evaluations,
             counters,
         );
-        Some(delta)
+        Ok(ElementAnswer::Delta(delta))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1479,110 +1523,6 @@ impl RetainedState {
         Some((groups_to_rebuild, selected))
     }
 
-    fn retry_engine_record_after_ancestor_step(
-        &mut self,
-        node: StyleNodeID,
-        scratch: &mut EngineComputedRecordScratch,
-        counters: &mut Counters,
-    ) -> u64 {
-        let facts = self.computed_group_sets.adjustment_facts(node);
-        if facts & bridge::element_adjustment_fact::DISALLOW_DISPLAY_CONTENTS != 0 {
-            return 0;
-        }
-        let Lookup::Known(cascade_state) = self
-            .current_winner_groups()
-            .token_for(WinnerGroupKey::current(node, self.program.version()))
-        else {
-            return 0;
-        };
-        if !scratch.font_drive.is_pending()
-            && !self.engine_pseudo_inputs_available(
-                node,
-                self.computed_group_sets.assigned_style_record(node),
-                counters,
-            )
-        {
-            return 0;
-        }
-        if !scratch.font_drive.is_pending()
-            && !self.node_declares_custom_properties(node)
-            && let Some(old_style_record) = self.computed_group_sets.assigned_style_record(node)
-            && let Some(inputs) = self.document_style_computation_inputs
-            && let Some(parent) = self.tree.flat_tree_parent(node)
-            && let Some(parent_record) = self.computed_group_sets.assigned_style_record(parent)
-            && let Some(environment) = self.computed_group_sets.custom_property_environment_identity(parent)
-            && let Some(pseudo_styles) = self.pseudo_style_mask(node)
-        {
-            let cache_key = self
-                .cold_record_parent(node, parent, parent_record, cascade_state.1)
-                .map(|parent| ColdRecordKey {
-                    parent,
-                    previous_style_record: old_style_record.raw(),
-                    generation: cascade_state.0,
-                    state: cascade_state.1,
-                    facts,
-                    pseudo_styles,
-                    environment,
-                    font_environment_generation: inputs.font_environment_generation,
-                    root_font_inputs: RootFontInputs::from_document(&inputs),
-                });
-            if let Some((old_record, record)) = self.assign_cached_cold_record(
-                node,
-                computed::ComputedStyleTarget::new(node, u8::MAX),
-                cascade_state,
-                cache_key,
-                Some(parent),
-                cascade_state.1,
-                old_style_record,
-                0,
-                scratch,
-                counters,
-            ) {
-                let pseudos_settled = self
-                    .engine_pseudo_records(node, Some(old_record), record, cascade_state.0, scratch, counters)
-                    .is_some();
-                if pseudos_settled && scratch.pseudo_uses_substitution {
-                    scratch.substitution_effects.push((node, true));
-                }
-                if !pseudos_settled {
-                    // A pseudo-element the engine cannot settle sends the element to C++.
-                    if scratch.font_drive.request.is_some() {
-                        scratch.pending_element = Some((old_record, record));
-                    } else {
-                        counters.bump(Counter::RetryAfterAncestorPseudoAbandons);
-                        self.abandon_engine_computed_record(node, scratch, counters);
-                    }
-                    self.apply_substitution_effects(scratch);
-                    return 0;
-                }
-                counters.bump(Counter::RetryAfterAncestorColdHits);
-                self.apply_substitution_effects(scratch);
-                return record.raw();
-            }
-        }
-        if !scratch.font_drive.is_pending() && self.computed_group_sets.node_answer_is_incomplete(node) {
-            return 0;
-        }
-        let cascade_winners_are_complete = self
-            .current_published_answer(node)
-            .is_some_and(|answer| answer.cascade_winners_are_complete);
-        let record = self.engine_computed_record_delta(
-            node,
-            cascade_winners_are_complete,
-            None,
-            ParentInputsMoved {
-                inherited_style: true,
-                display: true,
-            },
-            scratch,
-            counters,
-        );
-        let Some((_, record)) = record else {
-            return 0;
-        };
-        record.raw()
-    }
-
     /// Build a driven table's groups against the parent record's payloads and publish the record
     /// for `target` the way a C++ computation publishes one; the record's swap eligibility comes
     /// back beside its identity.
@@ -1599,7 +1539,7 @@ impl RetainedState {
         cascade_state: Option<(u64, CascadeStateID)>,
         scratch: &mut EngineComputabilityScratch,
         counters: &mut Counters,
-    ) -> Option<(computed::FinalStyleRecordID, bool)> {
+    ) -> Drive<(computed::FinalStyleRecordID, bool)> {
         use crate::css::computed_value_types::STYLE_GROUP_INDEX_FONT;
         use crate::css::table_group_builder::group_index;
 
@@ -1607,8 +1547,9 @@ impl RetainedState {
         let (parent_payloads, parent_in_display_none_subtree) = match parent_record {
             Some(parent_record) => {
                 let Some(parent_view) = self.computed_group_sets.style_record_view(parent_record.raw()) else {
+                    debug_assert!(false, "an assigned parent record has a view");
                     counters.bump(Counter::EngineComputedRecordBailRecordParent);
-                    return None;
+                    return Err(Unanswered::Refused);
                 };
                 (parent_view.payloads, parent_view.dependency_flags & (1 << 2) != 0)
             }
@@ -1616,7 +1557,7 @@ impl RetainedState {
         };
         let Ok(used_color_scheme) = u8::try_from(table.effective_color_scheme()) else {
             counters.bump(Counter::EngineComputedRecordBailDrive);
-            return None;
+            return Err(Unanswered::Refused);
         };
         let display_is_none = crate::css::style_compute::effective_display(&table, None).is_none();
         table.set_in_display_none_subtree(parent_in_display_none_subtree || display_is_none);
@@ -1633,7 +1574,7 @@ impl RetainedState {
         else {
             release_table(table);
             counters.bump(Counter::EngineComputedRecordBailAssemble);
-            return None;
+            return Err(Unanswered::Refused);
         };
         let mut payloads = Vec::with_capacity(group_index::COUNT);
         for (group, &parent_payload) in parent_payloads.iter().enumerate().take(group_index::COUNT) {
@@ -1663,7 +1604,7 @@ impl RetainedState {
                 }
                 release_table(table);
                 counters.bump(Counter::EngineComputedRecordBailAssemble);
-                return None;
+                return Err(Unanswered::Refused);
             };
             payloads.push(payload);
         }
@@ -1711,7 +1652,7 @@ impl RetainedState {
         if !transferred.table {
             release_table(table);
         }
-        Some((publication.style_record_identity, swap_eligible))
+        Ok((publication.style_record_identity, swap_eligible))
     }
 
     /// A derivation that could not be completed: everything derived for `node` this flush goes
@@ -1752,7 +1693,7 @@ impl RetainedState {
     /// `owned_groups` is the parent's own, no non-inherited property is inherited explicitly, and
     /// its custom-property environment is the parent's.
     fn record_inherits_from_current_parent(&self, node: StyleNodeID, state: CascadeStateID, owned_groups: u32) -> bool {
-        let Some(parent) = self.tree.flat_tree_parent(node) else {
+        let Some(parent) = self.tree.inheritance_parent(node) else {
             return false;
         };
         if self.state_explicitly_inherits_non_inherited_property(node, state) {
@@ -1833,26 +1774,30 @@ impl RetainedState {
         root_inputs.apply_to(inputs);
     }
 
-    fn element_drive_subject(&mut self, node: StyleNodeID, counters: &mut Counters) -> Option<DriveSubject> {
+    fn element_drive_subject(
+        &mut self,
+        node: StyleNodeID,
+        installed_ancestors: Option<&InstalledAncestors>,
+        counters: &mut Counters,
+    ) -> Drive<DriveSubject> {
         let facts = self.computed_group_sets.adjustment_facts(node);
-        let parent = self.tree.flat_tree_parent(node);
-        // Only the document element is styled without a flat-tree parent.
-        if parent.is_none() && facts & bridge::element_adjustment_fact::IS_DOCUMENT_ELEMENT == 0 {
-            counters.bump(Counter::EngineComputedRecordBailRecordParent);
-            return None;
-        }
+        // An element without a styled inheritance parent, the document element among them,
+        // inherits from the initial values.
+        let parent = self
+            .record_inheritance_parent(node, installed_ancestors)
+            .inspect_err(|_| counters.bump(Counter::EngineComputedRecordBailRecordParent))?;
         if self.parent_composes_animations(node) {
             counters.bump(Counter::EngineComputedRecordBailRecordOverlay);
-            return None;
+            return Err(Unanswered::Refused);
         }
-        Some(DriveSubject { parent, facts })
+        Ok(DriveSubject { parent, facts })
     }
 
     /// Whether a node inherits values its parent's animations sample, which C++ composes over the
     /// parent's record. An animation that settles a custom property installs an environment of its
     /// own on the parent, and sampling moves it without a publication the engine sees.
     fn parent_composes_animations(&self, node: StyleNodeID) -> bool {
-        self.tree.flat_tree_parent(node).is_some_and(|parent| {
+        self.tree.inheritance_parent(node).is_some_and(|parent| {
             self.computed_group_sets.node_has_animation_overlay(parent)
                 || self.computed_group_sets.adjustment_facts(parent) & bridge::element_adjustment_fact::HAS_ANIMATIONS
                     != 0
@@ -1923,7 +1868,7 @@ impl RetainedState {
         let mut substituted = false;
         let admitted = self
             .cascaded_store_for_state(node, cascade_state.1, None, environment, &mut substituted, counters)
-            .is_some();
+            .is_ok();
         scratch.remember(key, admitted);
         admitted
     }
@@ -2008,7 +1953,7 @@ impl RetainedState {
                         | u32::from(display.box_value) << 4,
                 );
             }
-            ancestor = self.tree.flat_tree_parent(current);
+            ancestor = self.tree.inheritance_parent(current);
         }
         None
     }
@@ -2102,7 +2047,7 @@ impl RetainedState {
         if cascade_state.0 != self.winner_groups.generation() {
             return;
         }
-        let Some(parent) = self.tree.flat_tree_parent(node) else {
+        let Some(parent) = self.tree.inheritance_parent(node) else {
             return;
         };
         let Some(parent_record) = self.computed_group_sets.assigned_style_record(parent) else {
@@ -2125,7 +2070,7 @@ impl RetainedState {
             previous_style_record: previous_style_record.map_or(0, computed::FinalStyleRecordID::raw),
             generation: cascade_state.0,
             state: cascade_state.1,
-            facts,
+            facts: cold_record_facts(facts),
             pseudo_styles,
             environment: custom_property_environment,
             font_environment_generation: inputs.font_environment_generation,
@@ -2144,6 +2089,48 @@ impl RetainedState {
     /// or no bits when the engine holds no answer for the node.
     pub(crate) fn published_pseudo_style_mask(&self, node: StyleNodeID) -> u64 {
         self.pseudo_style_mask(node).unwrap_or(0)
+    }
+
+    /// Whether the style record answers for a counter or a quote: the two things whose state runs
+    /// along the whole tree rather than staying inside one box.
+    fn style_record_affects_generated_content_state(&self, style_record: Option<computed::FinalStyleRecordID>) -> bool {
+        self.published_style_record_view(style_record)
+            .is_some_and(crate::css::computed_value_views::ComputedValuesView::affects_generated_content_state)
+    }
+
+    /// Whether the node or any of its DOM descendants styles a counter or a quote, itself or
+    /// through a `::before`, `::after` or `::marker`. Inserting such a subtree renumbers what
+    /// follows it, so the layout tree build has to rebuild rather than splice it in.
+    #[must_use]
+    pub fn subtree_affects_generated_content_state(&self, node: StyleNodeID) -> bool {
+        let mut pending = vec![node];
+        while let Some(node) = pending.pop() {
+            if node.element_index().is_some()
+                && (self
+                    .style_record_affects_generated_content_state(self.computed_group_sets.assigned_style_record(node))
+                    || [pseudo_kind::BEFORE, pseudo_kind::AFTER, pseudo_kind::MARKER]
+                        .into_iter()
+                        .any(|kind| {
+                            self.style_record_affects_generated_content_state(
+                                self.computed_group_sets.pseudo_style_record(node, kind),
+                            )
+                        }))
+            {
+                return true;
+            }
+            pending.extend(self.tree.dom_children(node));
+        }
+        false
+    }
+
+    /// Whether the node's published style holds a `::first-letter` record. The tree build asks a
+    /// block this before it goes looking for the letter to style, and again of each block it
+    /// descends into, which stops the search where a nested block styles its own first letter.
+    #[must_use]
+    pub(crate) fn has_published_first_letter_style(&self, node: StyleNodeID) -> bool {
+        self.computed_group_sets
+            .pseudo_style_record(node, pseudo_kind::FIRST_LETTER)
+            .is_some()
     }
 
     /// The value a winner's declaration was written with, and the declaration's index in its
@@ -2322,7 +2309,7 @@ impl RetainedState {
         environment: u64,
         substituted: &mut bool,
         counters: &mut Counters,
-    ) -> Option<WinnerStore> {
+    ) -> Drive<WinnerStore> {
         use crate::css::property_metadata::property_id as prop;
         crate::css::ffi_stats::bump(crate::css::ffi_stats::FfiOp::WinnerStoreBuilds);
         // Seeded in cascade order, and within one rule in declaration order, since a logical
@@ -2335,7 +2322,7 @@ impl RetainedState {
             };
             if winner.key.animation_relevance != 0 {
                 counters.bump(Counter::EngineComputedRecordBailWinnerAnimated);
-                return None;
+                return Err(Unanswered::Refused);
             }
             // A pseudo-element's cascade keeps the properties its kind supports; its `content`
             // computes in the drive when the value needs no element or counter environment.
@@ -2345,7 +2332,7 @@ impl RetainedState {
                 }
                 if winner.property != prop::CONTENT && self.pseudo_winner_needs_cpp(&winner) {
                     counters.bump(Counter::EngineComputedRecordBailProperty);
-                    return None;
+                    return Err(Unanswered::Refused);
                 }
             }
             // A shorthand written with a substitution is declared beside the longhands it
@@ -2362,7 +2349,7 @@ impl RetainedState {
             };
             let Some((index, value, checks)) = written else {
                 counters.bump(Counter::EngineComputedRecordBailWinnerSpelling);
-                return None;
+                return Err(Unanswered::Refused);
             };
             // A longhand declared through a shorthand keeps the whole shorthand as its written
             // value; the store takes the longhand's own part of it.
@@ -2375,7 +2362,7 @@ impl RetainedState {
                 crate::css::style_value::StyleValueData::Shorthand { .. } => {
                     let Some(value) = shorthand_longhand_data(winner.property, value.data()) else {
                         counters.bump(Counter::EngineComputedRecordBailWinnerSpelling);
-                        return None;
+                        return Err(Unanswered::Refused);
                     };
                     (location, Some(value))
                 }
@@ -2404,7 +2391,7 @@ impl RetainedState {
                         self.shorthand_declaration_written_as(node, winner.source, original_shorthand_value.pointer())
                     else {
                         counters.bump(Counter::EngineComputedRecordBailWinnerSpelling);
-                        return None;
+                        return Err(Unanswered::Refused);
                     };
                     let resolved = Self::substitute_written_value(
                         &mut self.custom_property_environments,
@@ -2416,8 +2403,7 @@ impl RetainedState {
                     )?;
                     let value = match resolved.data() {
                         crate::css::style_value::StyleValueData::GuaranteedInvalid => unset_value(),
-                        _ => expanded_longhand_value(shorthand, winner.property, &resolved)
-                            .map_or_else(unset_value, invalid_as_unset),
+                        _ => expanded_longhand_value(shorthand, winner.property, &resolved).unwrap_or_else(unset_value),
                     };
                     (WinnerValue::Substituted(value), None)
                 }
@@ -2427,6 +2413,15 @@ impl RetainedState {
                 WinnerValue::Substituted(value) => value.data(),
                 WinnerValue::Written { .. } => borrowed.expect("written declaration is borrowed"),
             };
+            if matches!(value, WinnerValue::Substituted(_))
+                && matches!(
+                    super::program_updates::declaration_operator(data),
+                    CascadeOperator::Revert | CascadeOperator::RevertLayer
+                )
+            {
+                counters.bump(Counter::EngineComputedRecordBailSubstitution);
+                return Err(Unanswered::Refused);
+            }
             if !checks
                 .longhand_context_free
                 .unwrap_or_else(|| value_computes_without_document_context(data))
@@ -2435,7 +2430,7 @@ impl RetainedState {
                     && !content_value_is_engine_computable(data))
             {
                 counters.bump(Counter::EngineComputedRecordBailValue);
-                return None;
+                return Err(Unanswered::Refused);
             }
             if matches!(value, WinnerValue::Substituted(_)) {
                 crate::css::ffi_stats::bump(crate::css::ffi_stats::FfiOp::WinnerStoreValueRetains);
@@ -2447,7 +2442,7 @@ impl RetainedState {
             ));
         }
         declarations.sort_by_key(|(priority, index, ..)| (*priority, *index));
-        Some(WinnerStore::new(
+        Ok(WinnerStore::new(
             declarations
                 .into_iter()
                 .map(|(_, _, declaration)| declaration)
@@ -2494,8 +2489,10 @@ impl RetainedState {
     /// Whether any of the node's children, as its descendants inherit through them, explicitly
     /// inherits a non-inherited property.
     fn children_explicitly_inherit_non_inherited_properties(&self, node: StyleNodeID) -> bool {
+        // A text slottable holds a place among a slot's assigned nodes, but inherits nothing on.
         self.tree
             .flat_tree_children(node)
+            .filter(|child| child.element_index().is_some())
             .any(|child| self.node_explicitly_inherits_non_inherited_property(child))
     }
 
@@ -3728,6 +3725,12 @@ impl StyleEngineState {
     }
 }
 
+/// The element facts a cold record is keyed by: every fact but the ones only the layout tree build
+/// reads, which no style depends on.
+fn cold_record_facts(facts: u32) -> u32 {
+    facts & !bridge::element_adjustment_fact::LAYOUT_TREE_FACTS
+}
+
 /// What a first record was derived from: the parent's side of the computation, the winner state
 /// (with the generation its identity belongs to), the element facts, the pseudo-elements the
 /// element has rules for, and the font environment.
@@ -3914,6 +3917,8 @@ pub(super) struct EngineComputedRecordScratch {
     pub(super) pseudo_deltas: Vec<PseudoRecordDelta>,
     /// The pseudo-element rules that flipped for the element being derived.
     pub(super) flipped_pseudo_rules: u64,
+    /// Held while a retry runs after the host applied the rows before the one asked for.
+    installed_ancestors: Option<InstalledAncestors>,
 }
 
 /// What one node tells its flat-tree children, decided where the node settles and read by the
@@ -4147,20 +4152,11 @@ fn unset_value() -> crate::css::style_value::RetainedStyleValueData {
     })
 }
 
-/// A substituted value as the cascade takes it: one invalid at computed-value time is unset, and
-/// so is a `revert` or `revert-layer` the substitution produced, which the cascade does not roll
-/// back once substitution has run.
 fn invalid_as_unset(
     value: crate::css::style_value::RetainedStyleValueData,
 ) -> crate::css::style_value::RetainedStyleValueData {
-    use crate::css::style_compute::keyword;
     match value.data() {
         crate::css::style_value::StyleValueData::GuaranteedInvalid => unset_value(),
-        crate::css::style_value::StyleValueData::Keyword { keyword }
-            if *keyword == keyword::REVERT || *keyword == keyword::REVERT_LAYER =>
-        {
-            unset_value()
-        }
         _ => value,
     }
 }
@@ -4655,20 +4651,8 @@ impl StyleEngineState {
             return;
         }
         scratch.root_element_inputs = Some((node, RootFontInputs::from_document(&inputs)));
-        self.engine_computed_element_record_delta(
-            node,
-            cascade_winners_are_complete,
-            exact_flipped_rules,
-            parent_inputs_moved,
-            scratch,
-            FontDriveGoal::RootInputs,
-            counters,
-        );
-        if let Some(request) = scratch.font_drive.request.take() {
-            // NB: A root font miss completes at this preparation boundary. Consumers need
-            //     current metrics even when their first records install in this same pass.
-            self.refill_font_request(node, request, counters);
-            self.engine_computed_element_record_delta(
+        let probe = |state: &mut Self, scratch: &mut EngineComputedRecordScratch, counters: &mut Counters| {
+            state.engine_computed_element_record_delta(
                 node,
                 cascade_winners_are_complete,
                 exact_flipped_rules,
@@ -4676,9 +4660,22 @@ impl StyleEngineState {
                 scratch,
                 FontDriveGoal::RootInputs,
                 counters,
-            );
+            )
+        };
+        let mut answer = probe(self, scratch, counters);
+        if let Err(Unanswered::Suspended(Suspension::Font)) = answer {
+            // NB: A root font miss completes at this preparation boundary. Consumers need
+            //     current metrics even when their first records install in this same pass.
+            let request = scratch.font_drive.take_suspended_request();
+            self.refill_font_request(node, request, counters);
+            answer = probe(self, scratch, counters);
         }
-        let prepared = scratch.font_drive.root_inputs.take();
+        // An unproven probe keeps the host's root-metric route; a refused one leaves the root's
+        // computation to C++.
+        let (prepared, unproven) = match answer {
+            Ok(ElementAnswer::RootInputs(prepared)) => (prepared, prepared.is_none()),
+            Ok(ElementAnswer::Delta(_)) | Err(_) => (None, false),
+        };
         if let Some(root_inputs) = prepared {
             scratch.root_font_inputs_changed = RootFontInputs::from_document(&inputs) != root_inputs;
             root_inputs.apply_to(self.document_style_computation_inputs.as_mut().unwrap());
@@ -4688,72 +4685,13 @@ impl StyleEngineState {
             //     turn every descendant into a host-boundary retry.
             counters.bump(Counter::RootFontInputsUnprovenFallbacks);
         }
-        if prepared.is_none() && !scratch.font_drive.is_pending() && !scratch.font_drive.root_inputs_unproven {
+        if prepared.is_none() && !scratch.font_drive.is_pending() && !unproven {
             scratch.root_computation_unsupported = Some(node);
         }
         if scratch.font_drive.is_pending() {
             scratch.prepared_root_font = Some((node, parent_inputs_moved, std::mem::take(&mut scratch.font_drive)));
         }
         self.apply_substitution_effects(scratch);
-    }
-
-    /// Retry a record after C++ has installed earlier records in the same preorder batch. A record
-    /// rejected while the batch was planned may become computable once its inheritance parent is
-    /// authoritative.
-    pub(crate) fn retry_engine_record_after_ancestor(
-        &mut self,
-        node: StyleNodeID,
-        counters: &mut Counters,
-    ) -> RetriedEngineRecord {
-        if let Some(inputs) = self.retained.document_style_computation_inputs
-            && let Some(resolver) = &mut self.retained.font_resolution
-        {
-            resolver.prepare(inputs.font_environment_generation);
-        }
-        counters.bump(Counter::RetryAfterAncestorCalls);
-        let started_at = std::time::Instant::now();
-        let mut scratch = EngineComputedRecordScratch::default();
-        let mut suspended_memory = MemoryLease::new(MemoryCategory::BatchScratch);
-        let style_record =
-            self.retry_engine_record_after_ancestor_loop(node, &mut scratch, &mut suspended_memory, counters);
-        counters.add(
-            Counter::RetryAfterAncestorMicroseconds,
-            u64::try_from(started_at.elapsed().as_micros()).unwrap_or(u64::MAX),
-        );
-        let mut retried = RetriedEngineRecord {
-            style_record,
-            ..RetriedEngineRecord::default()
-        };
-        if style_record != 0 {
-            for delta in &scratch.pseudo_deltas {
-                let kind = usize::from(delta.kind);
-                if kind < bridge::RETRY_PSEUDO_RECORD_SLOTS {
-                    retried.pseudo_records_present |= 1 << kind;
-                    retried.pseudo_records[kind] = delta.new_style_record.raw();
-                }
-            }
-        }
-        retried
-    }
-
-    fn retry_engine_record_after_ancestor_loop(
-        &mut self,
-        node: StyleNodeID,
-        scratch: &mut EngineComputedRecordScratch,
-        suspended_memory: &mut MemoryLease,
-        counters: &mut Counters,
-    ) -> u64 {
-        loop {
-            let record = self.retry_engine_record_after_ancestor_step(node, scratch, counters);
-            let Some(request) = scratch.font_drive.request.take() else {
-                if record != 0 {
-                    counters.bump(Counter::RetryAfterAncestorSettled);
-                }
-                return record;
-            };
-            suspended_memory.resize_required_to(&mut self.memory, scratch.font_drive.capacity_bytes());
-            self.refill_font_request(node, request, counters);
-        }
     }
 }
 

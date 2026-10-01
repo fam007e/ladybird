@@ -33,8 +33,11 @@ struct FfiTransitionInput;
 
 namespace Web::CSS {
 
+enum class PseudoElement : u8;
 enum class StyleRecordDependencyFlag : u8;
 
+class CustomPropertyData;
+class FontComputer;
 class StyleComputer;
 class RustDeclarationBlock;
 struct StyleProperty;
@@ -62,6 +65,7 @@ public:
     // Identity 0 is never returned; it means "no node".
     StyleNodeID allocate_style_node();
     void allocate_style_nodes(Span<StyleNodeID> nodes);
+    void allocate_text_style_nodes(Span<StyleNodeID> nodes);
     void defer_element_initial_features(StyleNodeID style_node)
     {
         m_nodes_with_pending_initial_features.set(style_node);
@@ -262,16 +266,17 @@ public:
     // Reads the complete match answer published by the style transaction which opened the active
     // traversal. False means that transaction did not publish an answer for this node.
     bool consume_published_match_answer(StyleNodeID node, Vector<RuleMatch>&);
-    void* compile_selector_query(ReadonlySpan<void const*> selectors);
-    // For an engine with no StyleComputer to reach its elements through: when the new query demands attribute value
-    // text that earlier facts were published without, the callback republishes every attribute value the engine holds.
-    void* compile_selector_query(ReadonlySpan<void const*> selectors, Function<void()> const& backfill_attribute_value_texts);
-    static void destroy_selector_query(void*);
-    void prepare_selector_query();
-    Optional<bool> selector_query_matches(void const* query, StyleNodeID node, StyleNodeID scope_root, StyleNodeID shadow_root);
-    Optional<bool> selector_query_matches_without_document_root(void const* query, StyleNodeID node, StyleNodeID scope_root, StyleNodeID shadow_root);
-    bool selector_query_all(void* query, StyleNodeID root, bool include_root, StyleNodeID scope_root, StyleNodeID shadow_root, bool has_document_root, Vector<StyleNodeID>& matches);
-    bool selector_query_first(void* query, StyleNodeID root, bool include_root, StyleNodeID scope_root, StyleNodeID shadow_root, bool has_document_root, StyleNodeID& matched);
+
+    // Give the engine the document's @font-face table and cascade memo, when they moved since it was last given them.
+    void publish_font_faces(FontComputer const&);
+
+    // The custom-property environment each element holds is kept here; the element keeps none of its own.
+    void set_element_custom_property_data(StyleNodeID, CustomPropertyData const*);
+    [[nodiscard]] CustomPropertyData const* element_custom_property_data(StyleNodeID) const;
+    void set_pseudo_element_custom_property_data(StyleNodeID, PseudoElement, CustomPropertyData const*);
+    [[nodiscard]] CustomPropertyData const* pseudo_element_custom_property_data(StyleNodeID, PseudoElement) const;
+    // One bit per kind of the element's synthetic pseudo-elements that hold an environment.
+    [[nodiscard]] u64 pseudo_elements_with_custom_property_data(StyleNodeID) const;
 
     // Enumerates the engine's counters. Returns false once index is past the last counter.
     bool counter(size_t index, StringView& out_name, u64& out_value) const;
@@ -290,6 +295,7 @@ private:
     void publish_attribute_value_text(StyleAtomID, Utf16View);
 
     void* m_impl { nullptr };
+    u64 m_published_font_environment_generation { 0 };
     GC::Ptr<StyleComputer> m_style_computer;
 
     HashMap<FlatPtr, StyleAtomID> m_atoms;

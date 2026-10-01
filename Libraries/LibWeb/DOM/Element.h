@@ -41,6 +41,7 @@
 #include <LibWeb/WebIDL/ExceptionOr.h>
 #include <LibWeb/WebIDL/Promise.h>
 #include <LibWebCommon/Fullscreen/FullscreenRequestType.h>
+#include <LibWebCommon/ReferrerPolicy/ReferrerPolicy.h>
 #include <LibWebCommon/WebIDL/Types.h>
 
 namespace Web::Animations {
@@ -212,12 +213,14 @@ public:
 
     Utf16String get_an_elements_target(Optional<Utf16String> target = {}) const;
     HTML::TokenizedFeature::NoOpener get_an_elements_noopener(URL::URL const& url, Utf16View target);
+    bool link_types_include(Utf16View) const;
 
     bool cannot_navigate() const;
 
     HTML::HTMLHyperlinkElementUtils const* created_hyperlink() const;
     bool creates_a_hyperlink() const;
     void follow_the_hyperlink(Optional<Utf16String> hyperlink_suffix, HTML::UserNavigationInvolvement = HTML::UserNavigationInvolvement::None);
+    ReferrerPolicy::ReferrerPolicy hyperlink_referrer_policy() const;
     void download_the_hyperlink(Optional<Utf16String> hyperlink_suffix, HTML::UserNavigationInvolvement = HTML::UserNavigationInvolvement::None);
     void activate_the_hyperlink(Event const&);
 
@@ -242,6 +245,20 @@ public:
 
     WebIDL::ExceptionOr<bool> toggle_attribute(Utf16FlyString const& name, Optional<bool> force);
     size_t attribute_list_size() const;
+
+    struct Attribute {
+        QualifiedName name;
+        Utf16String value;
+    };
+
+    // The element's attributes in order, borrowed until they next change.
+    ReadonlySpan<Attribute> attribute_list() const;
+
+    // A filter over the local names of the attributes of this element and its descendants: a name whose bit is clear
+    // is on none of them. Bits are only ever added, so a name may keep its bit after its last attribute is gone.
+    static u64 attribute_name_filter_bit(Utf16FlyString const& local_name) { return 1ull << (local_name.hash() % 64); }
+    u64 subtree_attribute_name_filter() const { return m_subtree_attribute_name_filter; }
+    void add_to_subtree_attribute_name_filter(u64 bits);
 
     GC::Ptr<NamedNodeMap const> attributes() const;
     GC::Ptr<NamedNodeMap> attributes();
@@ -311,17 +328,24 @@ public:
 
     bool has_class(Utf16View, CaseSensitivity = CaseSensitivity::CaseSensitive) const;
     bool has_class(Utf16FlyString const&, CaseSensitivity = CaseSensitivity::CaseSensitive) const;
-    Vector<Utf16FlyString> const& class_names() const { return m_classes; }
+    ReadonlySpan<Utf16FlyString> class_names() const { return m_classes; }
+
+    // https://drafts.csswg.org/selectors/#child-index
+    // The element's 1-based index among its inclusive element siblings, or among those with its type, counted from
+    // the first or from the last. An element remembers its indices until its parent's element children next move, so
+    // asking every child of a parent for its index walks them about once.
+    enum class ChildIndexAmong : u8 {
+        Siblings,
+        SiblingsOfType,
+    };
+    u32 child_index(ChildIndexAmong) const;
+    u32 child_index_from_end(ChildIndexAmong) const;
+    void forget_child_indices() { m_parent_child_index_generation = 0; }
 
     // The element's StyleEngine identity, or 0 while it has none. Disconnected and never-styled
     // elements keep 0, which is what makes them free.
     [[nodiscard]] CSS::StyleNodeID style_node_id() const { return m_style_node_id; }
-    void set_style_node_id(CSS::StyleNodeID style_node_id)
-    {
-        if (m_style_node_id != style_node_id)
-            m_published_presentational_hint_properties.clear();
-        m_style_node_id = style_node_id;
-    }
+    void set_style_node_id(CSS::StyleNodeID);
 
     // https://html.spec.whatwg.org/multipage/embedded-content-other.html#dimension-attributes
     virtual bool supports_dimension_attributes() const { return false; }
@@ -561,7 +585,15 @@ public:
     bool style_uses_tree_counting_function() const { return m_style_uses_tree_counting_function; }
     // Whether this element's style resolution called a custom function. Which one is not reported by
     // the substitution machinery, so an `@function` change reaches the elements that called any.
-    void set_style_uses_custom_function() { m_style_uses_custom_function = true; }
+    void set_style_uses_custom_function()
+    {
+        if (m_style_uses_custom_function)
+            return;
+        bool const publishes = !style_recomputes_on_environment_move();
+        m_style_uses_custom_function = true;
+        if (publishes)
+            publish_style_recomputes_on_environment_move();
+    }
     bool style_uses_custom_function() const { return m_style_uses_custom_function; }
 
     bool style_uses_if_css_function() const { return m_style_uses_if_css_function; }
@@ -569,11 +601,35 @@ public:
     bool style_depends_on_viewport_metrics() const { return m_style_depends_on_viewport_metrics; }
     void set_style_depends_on_viewport_metrics();
     bool style_uses_inherit_css_function() const { return m_style_uses_inherit_css_function; }
-    void set_style_uses_inherit_css_function() { m_style_uses_inherit_css_function = true; }
+    void set_style_uses_inherit_css_function()
+    {
+        if (m_style_uses_inherit_css_function)
+            return;
+        bool const publishes = !style_recomputes_on_environment_move();
+        m_style_uses_inherit_css_function = true;
+        if (publishes)
+            publish_style_recomputes_on_environment_move();
+    }
     bool style_depends_on_size_container_query() const { return m_style_depends_on_size_container_query; }
     void set_style_depends_on_size_container_query() { m_style_depends_on_size_container_query = true; }
     bool style_depends_on_style_container_query() const { return m_style_depends_on_style_container_query; }
-    void set_style_depends_on_style_container_query() { m_style_depends_on_style_container_query = true; }
+    void set_style_depends_on_style_container_query()
+    {
+        if (m_style_depends_on_style_container_query)
+            return;
+        bool const publishes = !style_recomputes_on_environment_move();
+        m_style_depends_on_style_container_query = true;
+        if (publishes)
+            publish_style_recomputes_on_environment_move();
+    }
+    // Whether a moved custom-property environment computes this element again: whether its style reads the
+    // environment other than through var(), through if(), inherit(), a custom function or a style container query.
+    bool style_recomputes_on_environment_move() const
+    {
+        return m_style_uses_if_css_function || m_style_uses_inherit_css_function || m_style_uses_custom_function || m_style_depends_on_style_container_query;
+    }
+    // Tell the style engine.
+    void publish_style_recomputes_on_environment_move();
     // Set on the element a container query selected as its query container, so a change on it knows
     // whether anything under it was ever asking. Neither is ever cleared: a dependent that stops
     // asking republishes nothing, and answering "maybe" costs the scan the element used to pay
@@ -757,13 +813,8 @@ public:
 
     // An element el is rendered in the top layer if el is contained in its node document’s top layer,
     // FIXME: and el has overlay: auto.
-    void set_rendered_in_top_layer(bool rendered_in_top_layer) { m_rendered_in_top_layer = rendered_in_top_layer; }
+    void set_rendered_in_top_layer(bool rendered_in_top_layer);
     bool rendered_in_top_layer() const { return m_rendered_in_top_layer; }
-
-    bool has_non_empty_counters_set() const;
-    Optional<CSS::CountersSet const&> counters_set() const;
-    CSS::CountersSet& ensure_counters_set();
-    void set_counters_set(OwnPtr<CSS::CountersSet>&&);
 
     ProximityToTheViewport proximity_to_the_viewport() const;
     void determine_proximity_to_the_viewport();
@@ -869,13 +920,10 @@ protected:
     struct RareData;
 
 private:
-    struct Attribute {
-        QualifiedName name;
-        Utf16String value;
-    };
     using AttributeList = Vector<Attribute, 1>;
 
     AttributeList& ensure_attribute_list();
+    void append_to_attribute_list(QualifiedName, Utf16String value);
 
     void install_custom_property_data(Optional<CSS::PseudoElement>, RefPtr<CSS::CustomPropertyData const>);
     void synchronize_attribute(Utf16FlyString const& qualified_name) const;
@@ -921,9 +969,14 @@ private:
     Optional<Directionality> contained_text_auto_directionality(bool can_exclude_root) const;
     Directionality parent_directionality() const;
 
+    // Selector matching reads the name, the ID and the classes of one element after another, so they sit together,
+    // and the class of an element with one is stored in place.
     QualifiedName m_qualified_name;
+    Optional<Utf16FlyString> m_id;
+    Vector<Utf16FlyString, 1> m_classes;
 
     OwnPtr<AttributeList> m_attributes;
+    u64 m_subtree_attribute_name_filter { 0 };
     GC::Ptr<CSS::CSSStyleProperties> m_inline_style;
     GC::Ptr<ShadowRoot> m_shadow_root;
 
@@ -933,7 +986,6 @@ private:
     CSS::StyleRecordID m_style_record_identity;
     u64 m_animation_style_generation { 0 };
     u64 m_animation_subtree_style_generation { 0 };
-    RefPtr<CSS::CustomPropertyData const> m_custom_property_data;
     OwnPtr<CSS::StyleInputRecord> m_style_input_record;
     PublishedCustomPropertyNames m_published_custom_property_names;
     Vector<CSS::StyleProperty> m_published_presentational_hint_properties;
@@ -942,10 +994,7 @@ private:
     SyntheticPseudoElement& ensure_synthetic_pseudo_element(CSS::PseudoElement) const;
     void clear_synthetic_pseudo_element_layout_nodes();
 
-    Vector<Utf16FlyString> m_classes;
     CSS::StyleNodeID m_style_node_id;
-
-    Optional<Utf16FlyString> m_id;
 
     friend class Attr;
     friend class NamedNodeMap;
@@ -970,6 +1019,12 @@ private:
     bool m_uses_document_global_custom_element_registry : 1 { false };
     bool m_has_name : 1 { false };
     mutable bool m_style_attribute_is_dirty : 1 { false };
+
+    // The child indices the element remembers, or zero for those not counted yet, and the generation of its parent's
+    // child list they were counted in; zero for none.
+    mutable u32 m_parent_child_index_generation { 0 };
+    mutable u32 m_child_index { 0 };
+    mutable u32 m_child_index_of_type { 0 };
 
     mutable Optional<Utf16String> m_lang_value;
 
