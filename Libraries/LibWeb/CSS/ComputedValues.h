@@ -778,11 +778,6 @@ public:
     // group payloads build from, plus explicit bindings for the bespoke-built groups. A longhand
     // without a binding has no single known group and must be treated conservatively.
     static Optional<StyleGroupIndex> style_group_of_property(PropertyID);
-    static u32 style_group_bit_of_property(PropertyID property_id)
-    {
-        auto group = style_group_of_property(property_id);
-        return group.has_value() ? 1u << to_underlying(*group) : all_style_groups;
-    }
 
     RefPtr<StyleValue const> computed_style_value(PropertyID, WithAnimationsApplied = WithAnimationsApplied::Yes) const;
 
@@ -1870,18 +1865,6 @@ public:
         m_values.m_inherited.text.access().letter_spacing = value;
     }
     void set_width(Size value) { set_size(&ComputedValuesFFI::SizingValues::width, move(value)); }
-    void set_overflow_x(Overflow value)
-    {
-        if (m_values.m_noninherited.box->overflow_x == to_underlying(value))
-            return;
-        m_values.m_noninherited.box.access().overflow_x = to_underlying(value);
-    }
-    void set_overflow_y(Overflow value)
-    {
-        if (m_values.m_noninherited.box->overflow_y == to_underlying(value))
-            return;
-        m_values.m_noninherited.box.access().overflow_y = to_underlying(value);
-    }
     void set_display(Display value)
     {
         if (m_values.display() == value)

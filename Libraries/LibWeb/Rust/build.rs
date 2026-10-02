@@ -543,6 +543,12 @@ fn boundary_type_names(kind: &str) -> Result<(&'static str, &'static str, &'stat
         "u16_slice" => Ok(("*const u16", "ReadonlySpan<u16>", "write_u16_slice", "read_u16_vec")),
         "u32_slice" => Ok(("*const u32", "ReadonlySpan<u32>", "write_u32_slice", "read_u32_vec")),
         "u64_slice" => Ok(("*const u64", "ReadonlySpan<u64>", "write_u64_slice", "read_u64_vec")),
+        "applied_animation_definition_slice" => Ok((
+            "*const FfiAppliedAnimationDefinition",
+            "ReadonlySpan<StyleEngineFFI::FfiAppliedAnimationDefinition>",
+            "write_applied_animation_definitions",
+            "read_raw_slice::<bridge::FfiAppliedAnimationDefinition>",
+        )),
         "style_atom_slice" => Ok((
             "*const u32",
             "ReadonlySpan<StyleAtomID>",
@@ -3021,6 +3027,13 @@ fn main() -> Result<(), Box<dyn Error>> {
         "FfiResolvedFont".to_string(),
         "FontResolutionFeatureInput".to_string(),
     ];
+    // A published keyframe's composite operation is the one the animation sampler composes with.
+    style_engine_config.export.rename.insert(
+        "FfiCompositeOperation".to_string(),
+        "Web::CSS::StyleValueFFI::FfiCompositeOperation".to_string(),
+    );
+    style_engine_config.after_includes =
+        Some("namespace Web::CSS::StyleValueFFI { enum class FfiCompositeOperation : uint8_t; }".to_string());
 
     generate_ffi_header(
         style_engine_config,

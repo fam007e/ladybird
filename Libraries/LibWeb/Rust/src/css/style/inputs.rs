@@ -538,6 +538,28 @@ impl RetainedState {
             .is_some_and(crate::css::computed_value_views::ComputedValuesView::counter_reset_has_reversed_counter)
     }
 
+    /// Whether `node` or one of its inclusive ancestors computed `display: none` in its record, as
+    /// the record stood before any animation was layered on it: the host's
+    /// `has_inclusive_ancestor_with_display_none_ignoring_animations()`. A node that holds no
+    /// record, a shadow root or one style has not reached yet, is passed over, as the host passes
+    /// over a node that is not an element.
+    #[must_use]
+    pub(crate) fn has_inclusive_ancestor_with_display_none_ignoring_animations(&self, node: StyleNodeID) -> bool {
+        std::iter::successors(Some(node), |&current| self.tree.parent_or_shadow_host(current)).any(|ancestor| {
+            self.computed_group_sets
+                .assigned_style_record(ancestor)
+                .and_then(|record| self.computed_group_sets.style_record_view(record.raw()))
+                .is_some_and(|view| {
+                    !view.base_payloads.is_empty()
+                        && crate::css::computed_value_views::ComputedValuesView::new(SharedPayload::as_pointer_slice(
+                            view.base_payloads,
+                        ))
+                        .display()
+                        .is_none()
+                })
+        })
+    }
+
     /// Whether the element is a `<slot>`, whose children the flat tree takes elsewhere.
     #[must_use]
     pub fn element_is_slot(&self, node: StyleNodeID) -> bool {
@@ -960,6 +982,12 @@ impl RetainedState {
             }
         }
         self.set_element_container_query_inputs(node, style_record);
+        // A `rem` the host resolves reads the font of the record it holds for the document element,
+        // which it can install in the middle of a style update.
+        if self.computed_group_sets.adjustment_facts(node) & bridge::element_adjustment_fact::IS_DOCUMENT_ELEMENT != 0 {
+            self.held_root_font_inputs = computed::FinalStyleRecordID::from_raw(style_record)
+                .and_then(|record| self.root_font_inputs_from_record(record));
+        }
     }
 
     /// Record that a child of an element or shadow root explicitly inherits a non-inherited
@@ -1043,36 +1071,79 @@ impl RetainedState {
         self.host_var_reads.insert(node, reads);
     }
 
-    /// Record the names of the CSS animations the host holds for one of an element's animation
-    /// lists, in the order it holds them. The names arrive packed into one buffer because a list is
-    /// almost always a single name, and a length per name is cheaper than a handle per name.
+    /// Record the CSS animations the host holds for one of an element's animation lists, in the
+    /// order it holds them: each one's name, and the definition the last plan applied to it. The
+    /// names arrive packed into one buffer because a list is almost always a single name, and a
+    /// length per name is cheaper than a handle per name.
     pub fn set_element_css_defined_animations(
         &mut self,
         node: StyleNodeID,
         slot: animations::AnimationSlot,
         name_lengths: &[u32],
         name_units: &[u16],
+        definitions: &[super::bridge::FfiAppliedAnimationDefinition],
     ) {
-        let mut offset = 0;
-        let names = name_lengths
-            .iter()
-            .map(|&length| {
-                let units = &name_units[offset..offset + length as usize];
-                offset += length as usize;
-                crate::css::css_string::CssString::from_utf16(units)
-            })
-            .collect();
-        self.css_defined_animations.set(node, slot, names);
+        self.css_defined_animations
+            .set(node, slot, name_lengths, name_units, definitions);
     }
 
-    /// The names of the CSS animations the host holds for one of an element's animation lists.
+    /// The CSS animations the host holds for one of an element's animation lists.
     #[must_use]
     pub(crate) fn element_css_defined_animations(
         &self,
         node: StyleNodeID,
         slot: animations::AnimationSlot,
-    ) -> &[crate::css::css_string::CssString] {
-        self.css_defined_animations.names(node, slot)
+    ) -> &[animations::CssDefinedAnimation] {
+        self.css_defined_animations.list(node, slot)
+    }
+
+    /// Replaces the `@keyframes` row of one style scope, as its rule cache resolved them: each name
+    /// with the host's keyframe set for it. An empty row gives the scope's row up.
+    pub fn set_tree_scope_animation_keyframes(
+        &mut self,
+        tree_scope: TreeScopeID,
+        shadow_root_identity: usize,
+        name_lengths: &[u32],
+        name_units: &[u16],
+        keyframe_sets: &[usize],
+    ) {
+        self.animation_keyframes.set(
+            tree_scope,
+            shadow_root_identity,
+            name_lengths,
+            name_units,
+            keyframe_sets,
+        );
+    }
+
+    /// The `@keyframes` the document's style scopes define.
+    #[must_use]
+    pub(crate) fn animation_keyframes(&self) -> &animations::AnimationKeyframes {
+        &self.animation_keyframes
+    }
+
+    /// Where an element stands among its siblings, as a tree-counting function reads it: how many
+    /// there are and its one-based index among them.
+    #[must_use]
+    pub(crate) fn element_sibling_position(&self, node: StyleNodeID) -> Option<(u32, u32)> {
+        self.sibling_position(node)
+            .map(|position| (position.count, position.index))
+    }
+
+    /// The registry of the custom properties the document registers.
+    #[must_use]
+    pub(crate) fn custom_property_registry(&self) -> &crate::css::custom_properties::CustomPropertyRegistry {
+        self.document_style_computation_inputs.custom_property_registry()
+    }
+
+    /// The effects one of an element's animation lists holds, as the host described them.
+    #[must_use]
+    pub(crate) fn element_animation_effects(
+        &self,
+        node: StyleNodeID,
+        slot: animations::AnimationSlot,
+    ) -> &[super::effect_descriptions::PublishedEffect] {
+        self.animation_effect_descriptions.effects(node, slot)
     }
 
     /// Record the custom properties an element declares or references. Also an index rather than an
@@ -1495,6 +1566,9 @@ impl StyleEngineState {
                 children_explicitly_inherit_marks: HashSet::default(),
                 host_var_reads: HashMap::default(),
                 css_defined_animations: Default::default(),
+                animation_keyframes: Default::default(),
+                animation_effect_descriptions: Default::default(),
+                held_root_font_inputs: None,
                 random_base_values: Default::default(),
                 transition_baselines: HashMap::default(),
                 custom_property_registrations_changed: false,
@@ -1564,8 +1638,6 @@ impl StyleEngineState {
                 font_resolver: None,
                 #[cfg(feature = "style-recording")]
                 recording_id: None,
-                computed_record_verification_counters: None,
-                computed_record_verification_pins: Vec::new(),
                 journal: NormalizationJournal::new(),
                 deferred_geometry_journal: NormalizationJournal::new(),
                 flushing_deferred_geometry_journal: false,
@@ -3004,6 +3076,11 @@ impl RetainedState {
             children_explicitly_inherit_marks,
             host_var_reads,
             css_defined_animations,
+            animation_keyframes: _,
+            animation_effect_descriptions,
+            // Like the host, a `rem` keeps reading the last document element's font until another
+            // takes its place.
+            held_root_font_inputs: _,
             random_base_values,
             transition_baselines,
             custom_property_registrations_changed: _,
@@ -3111,6 +3188,7 @@ impl RetainedState {
         children_explicitly_inherit_marks.remove(&node);
         host_var_reads.remove(&node);
         css_defined_animations.retire(node);
+        animation_effect_descriptions.retire(node);
         random_base_values.retire(node);
         pending_element_style_computation_selections.remove(&node);
         pending_pseudo_style_computation_selections.remove(&node);

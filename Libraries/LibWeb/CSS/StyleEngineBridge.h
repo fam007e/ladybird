@@ -135,9 +135,6 @@ public:
     [[nodiscard]] void const* style_record_payloads(StyleRecordID style_record) const;
     [[nodiscard]] StyleRecordDependencyFlag style_record_dependency_flags(StyleRecordID style_record) const;
     [[nodiscard]] u64 style_record_custom_property_environment(StyleRecordID style_record) const;
-    void begin_computed_record_verification();
-    void end_computed_record_verification();
-    [[nodiscard]] bool style_records_match_for_verification(StyleNodeID, u8 pseudo_kind, StyleRecordID, StyleRecordID) const;
     // What moving between two records changes, for no element in particular.
     [[nodiscard]] u32 compare_style_records(StyleRecordID old_style_record, StyleRecordID new_style_record) const;
     // What moving the element from one record to another damages, which the engine reads from the
@@ -342,7 +339,7 @@ public:
     void publish_font_faces(FontComputer const&);
 
     // The custom-property environment each element holds is kept here; the element keeps none of its own.
-    void set_element_custom_property_data(StyleNodeID, CustomPropertyData const*);
+    void set_element_custom_property_data(DOM::Element const&, CustomPropertyData const*);
     [[nodiscard]] CustomPropertyData const* element_custom_property_data(StyleNodeID) const;
     void set_pseudo_element_custom_property_data(StyleNodeID, PseudoElement, CustomPropertyData const*);
     [[nodiscard]] CustomPropertyData const* pseudo_element_custom_property_data(StyleNodeID, PseudoElement) const;

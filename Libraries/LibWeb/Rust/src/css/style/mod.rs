@@ -67,6 +67,8 @@ mod custom_property_cascade;
 mod custom_property_environments;
 #[cfg(test)]
 mod differential_tests;
+pub(crate) mod effect_descriptions;
+mod engine_sample;
 mod environment_move;
 pub mod exact_matcher;
 pub use crate::fast_hash;
@@ -132,6 +134,11 @@ pub mod record_replay {
         pub fn write_native_u16(&mut self, _value: u16) {}
         pub fn write_native_u32(&mut self, _value: u32) {}
         pub fn write_raw_slice<T: RawRecord>(&mut self, _values: &[T]) {}
+        pub fn write_applied_animation_definitions(
+            &mut self,
+            _definitions: &[super::bridge::FfiAppliedAnimationDefinition],
+        ) {
+        }
         pub fn write_raw_rows(
             &mut self,
             _count: usize,
@@ -924,6 +931,14 @@ pub struct RetainedState {
     /// The names of the CSS animations the host holds for each element, which the computation of
     /// its animation definitions matches them against.
     css_defined_animations: animations::CssDefinedAnimations,
+    /// The `@keyframes` each of the document's style scopes defines, as the host's rule caches
+    /// resolved them, which an animation definition's keyframes are resolved from.
+    animation_keyframes: animations::AnimationKeyframes,
+    /// The animation effects the host holds for each element, described for sampling.
+    animation_effect_descriptions: effect_descriptions::AnimationEffectDescriptions,
+    /// The font metrics of the record the host holds for the document element, which a `rem` the
+    /// host resolves reads, once it holds one.
+    held_root_font_inputs: Option<publication::RootFontInputs>,
     /// The random base value each random caching key has been given, for the random functions the
     /// document's styles hold.
     random_base_values: random_bases::RandomBaseValues,
@@ -1091,9 +1106,6 @@ pub struct HostState {
     /// The capture-local document identity, absent when record-replay is disabled.
     #[cfg(feature = "style-recording")]
     recording_id: Option<u64>,
-    /// The instrumentation state to restore after C++ materializes a record for verification.
-    computed_record_verification_counters: Option<Box<Counters>>,
-    computed_record_verification_pins: Vec<u64>,
     journal: NormalizationJournal,
     /// Local selector facts through the latest geometry read which reused committed layout. A
     /// normal style observation merges this into `journal`; a newly introduced transition can
