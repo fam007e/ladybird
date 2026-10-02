@@ -31,7 +31,7 @@
 #include <LibHTTP/Header.h>
 #include <LibIPC/Forward.h>
 #include <LibIPC/TransportHandle.h>
-#include <LibRequests/CameFromCache.h>
+#include <LibRequests/CacheState.h>
 #include <LibRequests/NetworkError.h>
 #include <LibRequests/RequestTimingInfo.h>
 #include <LibURL/Origin.h>
@@ -745,6 +745,7 @@ public:
     virtual void page_did_request_webdriver_mouse_event([[maybe_unused]] HTML::CrossProcessId local_root_id, [[maybe_unused]] Web::MouseEvent event, GC::Ref<GC::Function<void()>> on_handled) { on_handled->function()(); }
     virtual void page_did_request_set_system_visibility_state([[maybe_unused]] HTML::VisibilityState visibility_state) { }
     virtual String page_did_request_ui_process_session_history_for_testing() { return "{}"_string; }
+    virtual bool page_did_request_has_populated_document_for_testing([[maybe_unused]] HTML::CrossProcessId navigable_id) { return false; }
     virtual bool page_did_request_capture_session_history_snapshot_for_testing() { return false; }
     virtual bool page_did_request_restore_session_history_snapshot_for_testing() { return false; }
     virtual bool page_did_request_register_session_store_tab_for_testing() { return false; }
@@ -792,7 +793,7 @@ public:
     virtual void page_did_change_screen_wake_lock_state(ScreenWakeLockState) { }
 
     virtual void page_did_start_network_request([[maybe_unused]] u64 request_id, [[maybe_unused]] URL::URL const& url, [[maybe_unused]] ByteString const& method, [[maybe_unused]] Vector<HTTP::Header> const& request_headers, [[maybe_unused]] ReadonlyBytes request_body, [[maybe_unused]] Optional<String> initiator_type, [[maybe_unused]] String const& referrer_policy, [[maybe_unused]] bool is_navigation_request, [[maybe_unused]] Fetch::Infrastructure::Request::Priority priority) { }
-    virtual void page_did_receive_network_response_headers([[maybe_unused]] u64 request_id, [[maybe_unused]] u32 status_code, [[maybe_unused]] Optional<String> reason_phrase, [[maybe_unused]] Vector<HTTP::Header> const& response_headers, [[maybe_unused]] Requests::CameFromCache came_from_cache) { }
+    virtual void page_did_receive_network_response_headers([[maybe_unused]] u64 request_id, [[maybe_unused]] u32 status_code, [[maybe_unused]] Optional<String> reason_phrase, [[maybe_unused]] Vector<HTTP::Header> const& response_headers, [[maybe_unused]] Requests::CacheState cache_state) { }
     virtual void page_did_receive_network_response_body([[maybe_unused]] u64 request_id, [[maybe_unused]] ReadonlyBytes data) { }
     virtual void page_did_finish_network_request([[maybe_unused]] u64 request_id, [[maybe_unused]] u64 body_size, [[maybe_unused]] Requests::RequestTimingInfo const& timing_info, [[maybe_unused]] Optional<Requests::NetworkError> const& network_error) { }
     virtual void page_did_report_worker_exception([[maybe_unused]] Utf16String const& message, [[maybe_unused]] Utf16String const& filename, [[maybe_unused]] u32 lineno, [[maybe_unused]] u32 colno) { }

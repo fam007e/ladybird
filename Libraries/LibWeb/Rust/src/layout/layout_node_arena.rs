@@ -532,6 +532,9 @@ pub(crate) struct StaleWalkFacts {
     pub(crate) next_dom_sibling: Option<StyleNodeID>,
 }
 
+/// How many interned names one SVG element's attribute publication can name.
+const PUBLISHED_REFERENCE_ATOM_COUNT: usize = 5;
+
 pub(crate) struct LayoutNodeArena {
     chunks: Vec<Box<Chunk>>,
     chunks_by_address: Vec<ChunkAddress>,
@@ -558,6 +561,8 @@ pub(crate) struct LayoutNodeArena {
     shell_factory: Cell<Option<ShellFactory>>,
     box_presence_host: Cell<Option<BoxPresenceHost>>,
     layout_host: Cell<Option<FfiLayoutHostCallbacks>>,
+    /// Whether the document is an SVG file decoded as an image, which is fixed for its lifetime.
+    document_is_decoded_svg: Cell<bool>,
     /// Depth of synchronous layout passes, including their commits, on the stack.
     active_layout_pass_depth: Cell<u32>,
     /// Whether any fragment-cache epoch changed during the outermost active layout pass. Geometry that the pass laid
@@ -644,6 +649,8 @@ pub(crate) struct LayoutNodeArena {
     nodes_enrolled_for_replaced_content_facts_sync: RefCell<Vec<NodeSlotId>>,
     /// What the running pass has to tell the document, waiting for the commit that delivers it.
     messages_reported_during_pass: RefCell<Vec<super::commit::FfiCommitMessage>>,
+    /// The rows the layout commit in progress gathers for the style engine's container queries.
+    pub(crate) layout_style_snapshot_commit: RefCell<Vec<super::style_snapshot::CommittedGeometry>>,
     /// What the DOM has asked the next layout tree build to rebuild, by style node identity.
     layout_tree_update_marks: RefCell<super::tree_update_marks::LayoutTreeUpdateMarks>,
     /// The counter styles each tree scope registers. The rule cache that settles them is C++'s,
@@ -652,6 +659,18 @@ pub(crate) struct LayoutNodeArena {
     counter_styles: RefCell<crate::css::counter_representation::CounterStyleRegistry>,
     /// The CSS counters set of every element and pseudo-element the tree build resolved one for.
     counters_sets: RefCell<super::counters::CountersSets>,
+    /// What the tree build recorded about the generated content of each pseudo-element it built.
+    generated_content: RefCell<super::generated_content::GeneratedContent>,
+    /// The parsed SVG attributes each SVG element published, keyed by its style node: an
+    /// element that draws nothing itself has no row, and a mask, clip or pattern has one row per
+    /// element that references it.
+    ///
+    /// The maps are borrowed for writing only by the publication entry points, which can run while a
+    /// tree build is under way: an element styled on the build's behalf replaces its style record,
+    /// which republishes the resources its style names. No reader holds a borrow across a host call.
+    svg_attribute_facts: RefCell<HashMap<StyleNodeID, super::svg_formatting_context::FfiSvgAttributeFacts>>,
+    /// The `points` list each <polyline> and <polygon> published beside its facts.
+    svg_points: RefCell<HashMap<StyleNodeID, std::rc::Rc<[super::svg_formatting_context::FfiFloatPoint]>>>,
     owner_thread: thread::ThreadId,
 }
 
@@ -673,6 +692,7 @@ impl LayoutNodeArena {
             shell_factory: Cell::new(None),
             box_presence_host: Cell::new(None),
             layout_host: Cell::new(None),
+            document_is_decoded_svg: Cell::new(false),
             active_layout_pass_depth: Cell::new(0),
             fragment_cache_epoch_changed_during_layout_pass: Cell::new(false),
             layout_root: Cell::new(NodeSlotId::INVALID),
@@ -735,9 +755,13 @@ impl LayoutNodeArena {
             text_nodes_enrolled_for_content_sync: RefCell::new(HashSet::default()),
             nodes_enrolled_for_replaced_content_facts_sync: RefCell::new(Vec::new()),
             messages_reported_during_pass: RefCell::new(Vec::new()),
+            layout_style_snapshot_commit: RefCell::new(Vec::new()),
             layout_tree_update_marks: RefCell::default(),
             counter_styles: RefCell::default(),
             counters_sets: RefCell::default(),
+            generated_content: RefCell::default(),
+            svg_attribute_facts: RefCell::default(),
+            svg_points: RefCell::default(),
             owner_thread: thread::current().id(),
         }
     }
@@ -1090,17 +1114,23 @@ impl LayoutNodeArena {
         self.style_nodes[id.slot_index() as usize].get()
     }
 
-    /// Names the DOM node a row stands for the way a commit message does: by its style node, or by
-    /// 0 for the document, which the viewport row stands for. An anonymous row, which includes a
-    /// pseudo-element's, stands for no DOM node, and there is nothing to tell the document about it.
-    pub(crate) fn commit_message_style_node(&self, id: NodeSlotId) -> Option<u32> {
+    /// The style node of the DOM node a row stands for. An anonymous row, which includes a
+    /// pseudo-element's, stands for no DOM node, even though it carries its generator's style node.
+    pub(crate) fn dom_node_style_node(&self, id: NodeSlotId) -> Option<StyleNodeID> {
         if !self.slot_is_live(id) || super::node_facts::has_flag(self.data(id), NodeFlag::Anonymous) {
             return None;
         }
-        if self.data(id).kind.get() == NodeKind::Viewport {
+        self.node_style_node(id)
+    }
+
+    /// Names the DOM node a row stands for the way a commit message does: by its style node, or by
+    /// 0 for the document, which the viewport row stands for. An anonymous row stands for no DOM
+    /// node, and there is nothing to tell the document about it.
+    pub(crate) fn commit_message_style_node(&self, id: NodeSlotId) -> Option<u32> {
+        if self.slot_is_live(id) && self.data(id).kind.get() == NodeKind::Viewport {
             return Some(0);
         }
-        self.node_style_node(id).map(StyleNodeID::raw)
+        self.dom_node_style_node(id).map(StyleNodeID::raw)
     }
 
     pub(crate) fn layout_tree_update_marks(&self) -> &RefCell<super::tree_update_marks::LayoutTreeUpdateMarks> {
@@ -1331,6 +1361,7 @@ impl LayoutNodeArena {
     pub(crate) fn forget_style_node(&self, style_node: StyleNodeID) {
         self.assert_owner_thread();
         self.counters_sets.borrow_mut().forget(style_node);
+        self.generated_content.borrow_mut().forget(style_node);
         loop {
             let row = self.first_rows_by_style_node.borrow().head(style_node);
             if row.is_invalid() {
@@ -1410,6 +1441,14 @@ impl LayoutNodeArena {
 
     pub(crate) fn layout_host(&self) -> FfiLayoutHostCallbacks {
         self.layout_host.get().expect("layout node arena has no layout host")
+    }
+
+    pub(crate) fn set_document_is_decoded_svg(&self, is_decoded_svg: bool) {
+        self.document_is_decoded_svg.set(is_decoded_svg);
+    }
+
+    pub(crate) fn document_is_decoded_svg(&self) -> bool {
+        self.document_is_decoded_svg.get()
     }
 
     /// True while a synchronous layout pass, including its commit, is on the stack. Computed
@@ -1564,6 +1603,199 @@ impl LayoutNodeArena {
         &self.counters_sets
     }
 
+    pub(crate) fn generated_content(&self) -> &RefCell<super::generated_content::GeneratedContent> {
+        &self.generated_content
+    }
+
+    pub(crate) fn svg_attribute_facts(&self, id: NodeSlotId) -> super::svg_formatting_context::FfiSvgAttributeFacts {
+        match self.node_style_node(id) {
+            Some(style_node) => self.style_node_svg_attribute_facts(style_node),
+            None => Default::default(),
+        }
+    }
+
+    /// The parsed SVG attributes an element published, named by its style node. An element
+    /// the document never published for, anything that is not an SVG element, answers with the
+    /// default facts.
+    pub(crate) fn style_node_svg_attribute_facts(
+        &self,
+        style_node: StyleNodeID,
+    ) -> super::svg_formatting_context::FfiSvgAttributeFacts {
+        self.svg_attribute_facts
+            .borrow()
+            .get(&style_node)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// The `points` list a <polyline> or <polygon> parsed, shared rather than borrowed: a
+    /// publication can replace it while a reader still uses it.
+    pub(crate) fn svg_points(
+        &self,
+        id: NodeSlotId,
+    ) -> Option<std::rc::Rc<[super::svg_formatting_context::FfiFloatPoint]>> {
+        self.style_node_svg_points(self.node_style_node(id)?)
+    }
+
+    pub(crate) fn style_node_svg_points(
+        &self,
+        style_node: StyleNodeID,
+    ) -> Option<std::rc::Rc<[super::svg_formatting_context::FfiFloatPoint]>> {
+        self.svg_points.borrow().get(&style_node).cloned()
+    }
+
+    /// The element an SVG reference resolves to, named by the atom its URL fragment interned to.
+    /// `SVGGraphicsElement::resolve_fragment_identifier_to_element` asks the document first and the
+    /// shadow tree the referring element sits in second, so the lookup is made in that order.
+    pub(crate) fn element_by_svg_reference(&self, referrer: StyleNodeID, name: u32) -> Option<StyleNodeID> {
+        let name = crate::css::style::index::StyleAtomID(name);
+        if name.is_none() {
+            return None;
+        }
+        self.with_style_store(|engine| {
+            let scope = engine.tree().tree_scope(referrer);
+            engine
+                .element_by_id(crate::css::style::tree::TreeScopeID::DOCUMENT, name)
+                .or_else(|| {
+                    (scope != crate::css::style::tree::TreeScopeID::DOCUMENT)
+                        .then(|| engine.element_by_id(scope, name))
+                        .flatten()
+                })
+        })
+    }
+
+    /// The published computed style of an element the style tree names, which a box's own style
+    /// pointer cannot reach: a `<defs>` builds no box, so nothing under it has a row.
+    ///
+    /// The group pointers are copied out rather than borrowed, since the style store's borrow ends
+    /// with the query while the record they address is retained for the pass.
+    pub(crate) fn style_node_style_payloads(&self, style_node: StyleNodeID) -> Option<FfiStylePayloads> {
+        self.with_style_store(|engine| {
+            let groups = engine.element_published_style_payloads(style_node)?;
+            let mut payloads = FfiStylePayloads::default();
+            payloads.groups.copy_from_slice(groups);
+            Some(payloads)
+        })
+    }
+
+    pub(crate) fn set_style_node_svg_attribute_facts(
+        &self,
+        style_node: StyleNodeID,
+        facts: super::svg_formatting_context::FfiSvgAttributeFacts,
+        points: &[super::svg_formatting_context::FfiFloatPoint],
+    ) {
+        self.assert_owner_thread();
+        let retained = Self::published_reference_atoms(&facts);
+        let replaced = self
+            .svg_attribute_facts
+            .borrow_mut()
+            .insert(style_node, facts)
+            .map_or([0; PUBLISHED_REFERENCE_ATOM_COUNT], |published| {
+                Self::published_reference_atoms(&published)
+            });
+        self.retain_published_reference_atoms(retained, replaced);
+        let mut published_points = self.svg_points.borrow_mut();
+        if points.is_empty() {
+            published_points.remove(&style_node);
+        } else {
+            published_points.insert(style_node, points.into());
+        }
+    }
+
+    pub(crate) fn clear_style_node_svg_attribute_facts(&self, style_node: StyleNodeID) {
+        self.assert_owner_thread();
+        let removed = self.svg_attribute_facts.borrow_mut().remove(&style_node);
+        if let Some(removed) = removed {
+            self.retain_published_reference_atoms(
+                [0; PUBLISHED_REFERENCE_ATOM_COUNT],
+                Self::published_reference_atoms(&removed),
+            );
+        }
+        self.svg_points.borrow_mut().remove(&style_node);
+    }
+
+    /// Replace only the four names a graphics element's style carries. An element that has not
+    /// published its attributes yet has no place to put them, and will carry them itself when it
+    /// does: the publication is made when the style tree names the element.
+    pub(crate) fn set_style_node_svg_style_references(&self, style_node: StyleNodeID, references: [u32; 4]) {
+        self.assert_owner_thread();
+        let mut published = self.svg_attribute_facts.borrow_mut();
+        let Some(facts) = published.get_mut(&style_node) else {
+            return;
+        };
+        let replaced = Self::published_reference_atoms(facts);
+        [
+            facts.mask_reference_atom,
+            facts.clip_path_reference_atom,
+            facts.fill_reference_atom,
+            facts.stroke_reference_atom,
+        ] = references;
+        let retained = Self::published_reference_atoms(facts);
+        drop(published);
+        self.retain_published_reference_atoms(retained, replaced);
+    }
+
+    /// The element the document's id index holds for the atom `name`, which is what
+    /// `Document::get_element_by_id` answers with. A reference that resolves in the document scope
+    /// alone, an SVG `href` chain, asks for this rather than for `element_by_svg_reference`.
+    pub(crate) fn element_by_document_id(&self, name: u32) -> Option<StyleNodeID> {
+        let name = crate::css::style::index::StyleAtomID(name);
+        if name.is_none() {
+            return None;
+        }
+        self.with_style_store(|engine| engine.element_by_id(crate::css::style::tree::TreeScopeID::DOCUMENT, name))
+    }
+
+    /// Whether the element has an element child, which is what `childElementCount` counts.
+    pub(crate) fn has_dom_element_children(&self, style_node: StyleNodeID) -> bool {
+        style_node.element_index().is_some()
+            && self.with_style_store(|engine| engine.tree().first_element_child(style_node).is_some())
+    }
+
+    /// The names a publication holds a sweep retention on: the one an `href` names, and the four
+    /// a graphics element's style names.
+    fn published_reference_atoms(
+        facts: &super::svg_formatting_context::FfiSvgAttributeFacts,
+    ) -> [u32; PUBLISHED_REFERENCE_ATOM_COUNT] {
+        [
+            facts.reference_fragment_atom,
+            facts.mask_reference_atom,
+            facts.clip_path_reference_atom,
+            facts.fill_reference_atom,
+            facts.stroke_reference_atom,
+        ]
+    }
+
+    /// Hand the retention a publication's SVG references hold from the names they used to carry to
+    /// the names they carry now, so the style engine's atom sweep cannot reissue either number
+    /// while a publication still reads it. The atom an id names is otherwise rooted only by the
+    /// element answering to it, and a reference to an id that is in no document has no such
+    /// element.
+    fn retain_published_reference_atoms(
+        &self,
+        retained: [u32; PUBLISHED_REFERENCE_ATOM_COUNT],
+        released: [u32; PUBLISHED_REFERENCE_ATOM_COUNT],
+    ) {
+        if retained == released {
+            return;
+        }
+        // A document being torn down drops its style record host before the last publication is
+        // cleared. The engine it named is going with it, so there is nothing left to retain for.
+        let Some(host) = self.style_record_host.get() else {
+            return;
+        };
+        assert!(!host.style_engine.is_null());
+        // SAFETY: As with `with_style_store`, the engine outlives the arena's live nodes, and no
+        // reader keeps a borrow of the engine across the host call this publication arrives in.
+        let engine = unsafe { &mut *host.style_engine.cast::<StyleEngine>() };
+        for atom in retained {
+            engine.retain_published_atom(crate::css::style::index::StyleAtomID(atom));
+        }
+        for atom in released {
+            engine.release_published_atom(crate::css::style::index::StyleAtomID(atom));
+        }
+    }
+
     pub(crate) fn with_counter_style_registry<T>(
         &self,
         callback: impl FnOnce(&crate::css::counter_representation::CounterStyleRegistry) -> T,
@@ -1686,9 +1918,14 @@ impl LayoutNodeArena {
         self.with_style_store(|engine| engine.tree().assigned_nodes_of(style_node)[index])
     }
 
+    /// Whether a style engine hosts this arena's records; a layout test's arena has none.
+    pub(crate) fn has_style_engine(&self) -> bool {
+        self.style_record_host.get().is_some()
+    }
+
     // The engine outlives the arena's live nodes. No host callback runs while this
     // native style-store borrow is active; shell notifications follow publication.
-    fn with_style_engine<T>(&self, callback: impl FnOnce(&mut StyleEngine) -> T) -> T {
+    pub(crate) fn with_style_engine<T>(&self, callback: impl FnOnce(&mut StyleEngine) -> T) -> T {
         let host = self.style_record_host();
         assert!(!host.style_engine.is_null());
         unsafe { callback(&mut *host.style_engine.cast::<StyleEngine>()) }
@@ -2108,6 +2345,9 @@ impl LayoutNodeArena {
     /// Tells the host what boxes `node` has now. No row list may be borrowed here. A
     /// pseudo-element's boxes stay unmirrored, since nothing on the DOM side reads them as a bit.
     fn notify_box_presence(&self, node: BoundNode) {
+        if let BoundNode::Identity(style_node) = node {
+            self.gather_layout_style_snapshot_box_loss(style_node);
+        }
         let Some((context, callback)) = self.box_presence_host.get() else {
             return;
         };
@@ -3936,74 +4176,55 @@ pub unsafe extern "C" fn layout_arena_detach_and_free_subtree(arena: *mut c_void
     was_attached
 }
 
+/// Whether the counter styles the generated content of the element `style_node` names, or of its
+/// pseudo-element `generated_for`, names now differ from the ones its box was built with.
+///
+/// # Safety
+///
+/// The arena must remain valid for the duration of the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn layout_arena_content_counter_styles_changed(
+    arena: *mut c_void,
+    style_node: u32,
+    generated_for: u8,
+) -> bool {
+    assert!(!arena.is_null(), "layout node arena handle is null");
+    let Some(owner) = counter_owner(style_node, generated_for) else {
+        return false;
+    };
+    // SAFETY: The C++ wrapper keeps the arena alive for this call and serializes all access on the
+    // document thread.
+    let arena = unsafe { &*arena.cast::<LayoutNodeArena>() };
+    super::generated_content::content_counter_styles_changed(arena, owner)
+}
+
 fn counter_owner(style_node: u32, generated_for: u8) -> Option<super::counters::CounterOwner> {
     StyleNodeID::from_raw(style_node).map(|element| super::counters::CounterOwner { element, generated_for })
 }
 
-/// The value of the innermost counter named `name` in the counters set of the element `style_node`
-/// names, or of its pseudo-element `generated_for`, instantiating the counter first when there is
-/// none. An element without an identity has an empty set.
+/// The text the content of the pseudo-element `generated_for` of the element `style_node` names last
+/// resolved to, the way accessibility reads it: the alt text when there is one, otherwise every
+/// string in order. The result is an `AK::Utf16String` raw representation the caller adopts.
 ///
 /// # Safety
 ///
-/// The arena must remain valid for the duration of the call, and `name` must be the raw word of a
-/// live `AK::Utf16FlyString`.
+/// The arena must remain valid for the duration of the call.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn layout_arena_counter_value_for_use(
+pub unsafe extern "C" fn layout_arena_generated_content_accessible_text(
     arena: *mut c_void,
     style_node: u32,
     generated_for: u8,
-    name: usize,
-) -> i32 {
+) -> usize {
     assert!(!arena.is_null(), "layout node arena handle is null");
     let Some(owner) = counter_owner(style_node, generated_for) else {
-        return 0;
+        return ak::Utf16String::from_utf16(&[]).into_raw();
     };
-    // SAFETY: The caller passes the raw word of a string that outlives the call.
-    let name = unsafe { ak::utf16_string_units(&name) };
     // SAFETY: The C++ wrapper keeps the arena alive for this call and serializes all access on the
     // document thread.
-    unsafe { &*arena.cast::<LayoutNodeArena>() }
-        .counters_sets()
-        .borrow_mut()
-        .counter_value_for_use(owner, &name)
-}
-
-/// Every value named `name` in the counters set of the element `style_node` names, or of its
-/// pseudo-element `generated_for`, outermost first, instantiating the counter first when there is
-/// none. An element without an identity has an empty set.
-///
-/// # Safety
-///
-/// The arena must remain valid for the duration of the call, and `name` must be the raw word of a
-/// live `AK::Utf16FlyString`.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn layout_arena_counter_values_for_use(
-    arena: *mut c_void,
-    style_node: u32,
-    generated_for: u8,
-    name: usize,
-    context: *mut c_void,
-    callback: unsafe extern "C" fn(*mut c_void, i32),
-) {
-    assert!(!arena.is_null(), "layout node arena handle is null");
-    let values = match counter_owner(style_node, generated_for) {
-        Some(owner) => {
-            // SAFETY: The caller passes the raw word of a string that outlives the call.
-            let name = unsafe { ak::utf16_string_units(&name) };
-            // SAFETY: The C++ wrapper keeps the arena alive for this call and serializes all access
-            // on the document thread.
-            unsafe { &*arena.cast::<LayoutNodeArena>() }
-                .counters_sets()
-                .borrow_mut()
-                .counter_values_for_use(owner, &name)
-        }
-        None => vec![0],
-    };
-    for value in values {
-        // SAFETY: The caller keeps `context` valid for the callback.
-        unsafe { callback(context, value) };
-    }
+    let generated_content = unsafe { &*arena.cast::<LayoutNodeArena>() }
+        .generated_content()
+        .borrow();
+    ak::Utf16String::from_utf16(generated_content.accessible_text(owner)).into_raw()
 }
 
 /// Whether the innermost `list-item` counter in the counters set of the element `style_node` names
@@ -4368,6 +4589,7 @@ pub unsafe extern "C" fn layout_arena_set_node_style(
     if arena.set_node_style(id, style_record, payloads) {
         arena.refresh_style_flags(id);
     }
+    arena.publish_new_size_container_geometry(id);
     arena.enroll_node_for_svg_paint_resources_sync(id);
 }
 
@@ -4741,6 +4963,8 @@ mod tests {
         assert_eq!(arena.commit_message_style_node(viewport), Some(0));
         assert_eq!(arena.commit_message_style_node(anonymous), None);
         assert_eq!(arena.commit_message_style_node(pseudo_element), None);
+        assert_eq!(arena.dom_node_style_node(pseudo_element), None);
+        assert_eq!(arena.dom_node_style_node(principal), Some(element));
 
         arena.free_subtree(principal).destroy_shells_and_invoke_callbacks();
         assert_eq!(arena.commit_message_style_node(principal), None);
@@ -5067,7 +5291,7 @@ mod tests {
 
     fn test_fragment_link(node: NodeSlotId) -> fragment_tree::FragmentLink {
         fragment_tree::FragmentLink {
-            fragment: std::rc::Rc::new(fragment_tree::Fragment {
+            fragment: std::sync::Arc::new(fragment_tree::Fragment {
                 identity: 1,
                 node,
                 content_inline_size: CssPixels::default(),
@@ -5442,7 +5666,7 @@ mod tests {
         let moved = arena
             .take_committed_fragment_link(arena.data(old.slot))
             .expect("old slot must retain its committed fragment");
-        assert!(std::rc::Rc::ptr_eq(&moved.fragment, &retained_fragment));
+        assert!(std::sync::Arc::ptr_eq(&moved.fragment, &retained_fragment));
         arena.set_committed_fragment_link(arena.data(new.slot), moved, None);
 
         assert!(arena.committed_fragment_link(arena.data(old.slot)).is_none());
@@ -5451,7 +5675,7 @@ mod tests {
         let moved = arena
             .committed_fragment_link(arena.data(new.slot))
             .expect("new slot must receive the committed fragment");
-        assert!(std::rc::Rc::ptr_eq(&moved.fragment, &retained_fragment));
+        assert!(std::sync::Arc::ptr_eq(&moved.fragment, &retained_fragment));
         arena.set_committed_fragment_link(arena.data(new.slot), test_fragment_link(new.slot), None);
         assert_eq!(arena.saved_abspos_layout_inputs(arena.data(new.slot)), None);
         arena.free_subtree(old.slot).destroy_shells_and_invoke_callbacks();

@@ -255,6 +255,13 @@ pub(crate) fn length_unit_is_font_or_container_relative(unit: u8) -> bool {
     )
 }
 
+pub(crate) fn length_unit_is_container_relative(unit: u8) -> bool {
+    matches!(
+        length_unit_kinds().get(unit as usize),
+        Some(LengthUnitKind::ContainerRelative { .. })
+    )
+}
+
 fn select_font_metric(metrics: &FfiFontMetrics, metric: FontMetricSelector) -> f64 {
     match metric {
         FontMetricSelector::FontSize => metrics.font_size,
@@ -746,22 +753,49 @@ pub struct FfiFontSizeRecascadeBatch {
     pub skipped_calculated_value: bool,
 }
 
+/// The document's side of the lengths a monospace font-size recascade resolves on its own. Each
+/// caller passes the inputs it computes with: C++ its own root metrics and viewport, which move
+/// when it recomputes the root, and the style engine the inputs it prepared for the batch.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct FfiFontSizeRecascadeDocumentInputs {
+    pub root_font_size: f64,
+    pub root_font_metrics_depend_on_viewport_metrics: bool,
+    pub viewport_width: f64,
+    pub viewport_height: f64,
+}
+
+impl FfiFontSizeRecascadeDocumentInputs {
+    pub(crate) fn from_document(inputs: &crate::css::style::bridge::FfiDocumentStyleComputationInputs) -> Self {
+        Self {
+            root_font_size: inputs.root_font_size,
+            root_font_metrics_depend_on_viewport_metrics: inputs.root_font_metrics_depend_on_viewport_metrics,
+            viewport_width: inputs.viewport_width,
+            viewport_height: inputs.viewport_height,
+        }
+    }
+}
+
 /// Drives the time-traveling font-size inheritance applied when the cascade
 /// ends up with `font-family: monospace` through as many ancestors as Rust can
-/// resolve without another DOM-dependent length context.
+/// resolve without another DOM-dependent length context. Absolute, `em`, `rem`
+/// and viewport-relative lengths resolve from the size reached so far and the
+/// document's inputs.
 ///
 /// A non-null `length_resolution_context` applies only to the value at
 /// `start_index`.
 /// Building it involves font work, so the caller does so lazily after a batch
 /// reports `NeedsLengthResolution` and resumes at the reported index.
 ///
-fn recascade_font_size_batch(
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn recascade_font_size_batch(
     value_count: usize,
     mut value_at: impl FnMut(usize) -> *const c_void,
     start_index: usize,
     current_size_raw: i32,
     current_depends_on_viewport_metrics: bool,
     default_size_raw: i32,
+    document_inputs: FfiFontSizeRecascadeDocumentInputs,
     length_resolution_context: *const FfiLengthResolutionContext,
 ) -> FfiFontSizeRecascadeBatch {
     assert!(start_index <= value_count);
@@ -816,6 +850,36 @@ fn recascade_font_size_batch(
                 continue;
             }
             StyleValueData::Length { value, unit } => {
+                let directly_resolved = match length_unit_kinds().get(*unit as usize) {
+                    Some(LengthUnitKind::Px) => Some((*value, false)),
+                    Some(LengthUnitKind::Absolute { px_per_unit }) => Some((*value * px_per_unit, false)),
+                    Some(LengthUnitKind::FontRelative {
+                        metric: FontMetricSelector::FontSize,
+                        root: true,
+                    }) => Some((
+                        *value * document_inputs.root_font_size,
+                        document_inputs.root_font_metrics_depend_on_viewport_metrics,
+                    )),
+                    Some(LengthUnitKind::FontRelative {
+                        metric: FontMetricSelector::FontSize,
+                        root: false,
+                    }) => Some((*value * current_size.to_double(), depends_on_viewport_metrics)),
+                    Some(LengthUnitKind::ViewportRelative { axis }) => {
+                        let basis = match axis {
+                            ViewportAxis::Width => document_inputs.viewport_width,
+                            ViewportAxis::Height => document_inputs.viewport_height,
+                            ViewportAxis::Min => document_inputs.viewport_width.min(document_inputs.viewport_height),
+                            ViewportAxis::Max => document_inputs.viewport_width.max(document_inputs.viewport_height),
+                        };
+                        Some((basis * *value / 100.0, true))
+                    }
+                    _ => None,
+                };
+                if let Some((px, resolved_viewport_relative_length)) = directly_resolved {
+                    current_size = CssPixels::nearest_value_for(px);
+                    depends_on_viewport_metrics = resolved_viewport_relative_length;
+                    continue;
+                }
                 let Some(length_resolution_context) = (index == start_index)
                     .then_some(supplied_length_resolution_context)
                     .flatten()
@@ -883,6 +947,7 @@ pub unsafe extern "C" fn rust_recascade_font_size_batch(
     current_size_raw: i32,
     current_depends_on_viewport_metrics: bool,
     default_size_raw: i32,
+    document_inputs: FfiFontSizeRecascadeDocumentInputs,
     length_resolution_context: *const FfiLengthResolutionContext,
 ) -> FfiFontSizeRecascadeBatch {
     crate::css::ffi_stats::bump(crate::css::ffi_stats::FfiOp::NestedPropertyComputeEntry);
@@ -908,8 +973,37 @@ pub unsafe extern "C" fn rust_recascade_font_size_batch(
         current_size_raw,
         current_depends_on_viewport_metrics,
         default_size_raw,
+        document_inputs,
         length_resolution_context,
     )
+}
+
+/// Whether a computed `content` value reads its tree scope's counter-style registry: whether it
+/// holds a counter in a named counter style, a predefined one included. A record holding one names
+/// the registry it was computed against, whichever side computed it.
+pub(crate) fn content_reads_counter_style_environment(value: &StyleValueData) -> bool {
+    match value {
+        StyleValueData::Counter { counter_style, .. } => matches!(
+            counter_style.optional_data(),
+            Some(StyleValueData::CounterStyle { is_symbols: false, .. })
+        ),
+        StyleValueData::Content { content, alt_text } => [content, alt_text].into_iter().any(|part| {
+            part.optional_data()
+                .is_some_and(content_reads_counter_style_environment)
+        }),
+        StyleValueData::ValueList { values, .. } => values.as_slice().iter().any(|item| {
+            item.optional_data()
+                .is_some_and(content_reads_counter_style_environment)
+        }),
+        _ => false,
+    }
+}
+
+/// # Safety
+/// `value` must point to a live style value.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rust_content_reads_counter_style_environment(value: *const c_void) -> bool {
+    content_reads_counter_style_environment(unsafe { &*value.cast::<StyleValueData>() })
 }
 
 /// Some pseudo-elements are generated regardless of CSS rules, so their
@@ -1384,7 +1478,26 @@ fn container_relative_length_unit_bit(unit: u8) -> u8 {
     }
 }
 
-fn collect_external_value_dependencies(value: &StyleValueData) -> ExternalValueDependencies {
+/// Which physical axes, width and height, the units of a `container_relative_length_unit_mask`
+/// read the bases of, for a subject whose inline axis is or is not the horizontal one.
+pub(crate) fn container_relative_axes_read(unit_mask: u8, subject_inline_axis_is_horizontal: bool) -> (bool, bool) {
+    const CQW: u8 = 1 << 0;
+    const CQH: u8 = 1 << 1;
+    const CQI: u8 = 1 << 2;
+    const CQB: u8 = 1 << 3;
+    const CQMIN_OR_CQMAX: u8 = (1 << 4) | (1 << 5);
+    let (width_axis, height_axis) = if subject_inline_axis_is_horizontal {
+        (CQW | CQI, CQH | CQB)
+    } else {
+        (CQW | CQB, CQH | CQI)
+    };
+    (
+        unit_mask & (width_axis | CQMIN_OR_CQMAX) != 0,
+        unit_mask & (height_axis | CQMIN_OR_CQMAX) != 0,
+    )
+}
+
+pub(crate) fn collect_external_value_dependencies(value: &StyleValueData) -> ExternalValueDependencies {
     fn collect_optional(value: &RetainedStyleValueData, dependencies: &mut ExternalValueDependencies) {
         if let Some(value) = value.optional_data() {
             collect(value, dependencies);
@@ -1677,6 +1790,24 @@ pub(crate) fn external_value_dependencies(value: &StyleValueData) -> ExternalVal
         || !value_is_computationally_independent(value)
             .expect("computational independence requested for an unsupported value");
     dependencies
+}
+
+/// The random caching key a random function's `<random-value-sharing>` gives it, as its name and
+/// whether its element is null: a sharing that names a `<dashed-ident>` is shared by every element,
+/// as an `element-shared` one is.
+/// https://drafts.csswg.org/css-values-5/#random-caching
+pub(crate) fn random_caching_key(sharing: &StyleValueData) -> (&[u16], bool) {
+    let StyleValueData::RandomValueSharing {
+        has_name,
+        name,
+        element_shared,
+        is_auto,
+        ..
+    } = sharing
+    else {
+        unreachable!("a random caching key is a random sharing's");
+    };
+    (if *has_name { name.units() } else { &[] }, *element_shared || !*is_auto)
 }
 
 /// Collects the element- or document-cached random sharing nodes reachable through the
@@ -2147,13 +2278,15 @@ fn value_contains_percentage(value: &StyleValueData) -> bool {
     }
 }
 
-/// Whether a value's computed value depends on inherited font metrics because
+/// Whether a value's computed value depends on inherited information because
 /// of the property it belongs to: a font-weight of bolder or lighter (relative
 /// to the inherited weight), a font-size that is a percentage, a percentage-
 /// bearing calc(), or one of larger/smaller/math (relative to the inherited
-/// size), or a line-height that is a percentage or percentage-bearing calc()
-/// (relative to the computed font size). This is the property-specific part of
-/// the flow's inheritance-dependency decision; the property-agnostic parts
+/// size), a line-height that is a percentage or percentage-bearing calc()
+/// (relative to the computed font size), or a text-align of match-parent or
+/// -libweb-inherit-or-center (relative to the parent's text-align and
+/// direction). This is the property-specific part of the flow's
+/// inheritance-dependency decision; the property-agnostic parts
 /// (depends-on-current-color and computational independence) stay with the
 /// value's own operations.
 ///
@@ -2171,6 +2304,8 @@ pub(crate) fn value_depends_on_inherited_info_for_property(value: &StyleValueDat
                     if matches!(*keyword, keyword::LARGER | keyword::SMALLER | keyword::MATH))
         }
         prop::LINE_HEIGHT => value_contains_percentage(value),
+        prop::TEXT_ALIGN => matches!(value, StyleValueData::Keyword { keyword }
+            if matches!(*keyword, keyword::MATCH_PARENT | keyword::_LIBWEB_INHERIT_OR_CENTER)),
         _ => false,
     }
 }
@@ -2697,6 +2832,10 @@ pub struct FfiComputedAnimationList {
 #[repr(C)]
 pub struct FfiComputePropertiesInput {
     pub store: *const CascadedPropertyStore,
+    /// The custom properties the computation resolves for the element, null where it resolves
+    /// none, and the registry their names may be registered in.
+    pub custom_property_store: *const c_void,
+    pub custom_property_registry: *const c_void,
     pub style_engine: *const c_void,
     pub style_node: u32,
     pub pseudo_kind: u8,
@@ -2737,6 +2876,17 @@ pub struct FfiEffectiveColorSchemeInput {
     pub has_document_supported_schemes: bool,
     pub document_supported_scheme_codes: *const u8,
     pub document_supported_scheme_count: usize,
+}
+
+/// The record a highlight pseudo-element inherits from, as the style engine has it assigned; what
+/// the host read when the engine assigns none.
+fn retained_highlight_inheritance_parent_style_record(
+    style_engine: &crate::css::style::StyleEngine,
+    input: &FfiComputePropertiesInput,
+) -> u64 {
+    crate::css::style::tree::StyleNodeID::from_raw(input.style_node)
+        .and_then(|node| style_engine.retained_highlight_inheritance_parent_style_record(node, input.pseudo_kind))
+        .map_or(input.highlight_parent_style_record, |record| record.raw())
 }
 
 #[repr(C)]
@@ -3110,8 +3260,8 @@ pub(crate) fn parent_snapshot_for_style_record<'a>(
 /// What a highlight pseudo-element's applicable properties inherit from: the record of the
 /// corresponding highlight pseudo-element of the originating element's parent, when it has one.
 pub(crate) struct HighlightInheritance<'a> {
-    pseudo_kind: u8,
-    snapshot: Option<ParentSnapshot<'a>>,
+    pub(crate) pseudo_kind: u8,
+    pub(crate) snapshot: Option<ParentSnapshot<'a>>,
 }
 
 fn keyframe_parent_snapshot_for_style_record(
@@ -3275,11 +3425,17 @@ fn needs_computed_style_sheet_context(value: *const StyleValueData) -> bool {
     }
 }
 
-fn store_computed_value(longhand_table: &mut ComputedLonghandTable, entry: &ComputedStoreEntry) {
+/// Store what a drive found for one longhand: its computed value, and the specified value its
+/// inheritance depends on, if it does.
+fn store_driven_value(longhand_table: &mut ComputedLonghandTable, entry: &ComputedStoreEntry) {
     let specified_value = entry.inheritance_dependent.then(|| unsafe {
         RetainedStyleValueData::from_retained_pointer(crate::css::style_value::retain_style_value(entry.data.cast()))
     });
     longhand_table.set_drive_inheritance_dependent_value(entry.property_id, specified_value);
+    store_computed_value(longhand_table, entry);
+}
+
+fn store_computed_value(longhand_table: &mut ComputedLonghandTable, entry: &ComputedStoreEntry) {
     let source_slot = if entry.has_style_sheet_context
         && entry.computed_kind == COMPUTED_KIND_UNCHANGED
         && needs_computed_style_sheet_context(entry.data.cast())
@@ -4525,7 +4681,7 @@ pub(crate) unsafe fn drive_property_computation(
 
             let longhand_table = unsafe { &mut *longhand_table };
             let mut store = |entry: ComputedStoreEntry| {
-                store_computed_value(longhand_table, &entry);
+                store_driven_value(longhand_table, &entry);
             };
             if property_id == prop::OVERFLOW_X {
                 pending_overflow_x_store = Some(entry);
@@ -4729,6 +4885,8 @@ unsafe fn compute_longhands(
                 final_value_hits: 0,
                 final_value_misses: 0,
                 cycle_participants: 0,
+                depends_on_viewport_metrics: false,
+                left_a_value_uncomputed: false,
             },
             storage: std::ptr::null_mut(),
         }
@@ -5196,8 +5354,26 @@ pub unsafe extern "C" fn rust_compute_properties(input: *const FfiComputePropert
         has_relevant_animations_other_than_transitions: input.has_relevant_animations_other_than_transitions,
         has_css_defined_animations: input.has_css_defined_animations,
     };
-    let requirements =
-        unsafe { crate::css::cascaded_properties::collect_style_computation_requirements(input.store, Some(&plan)) };
+    // SAFETY: The host lends the custom properties and the registry for the call.
+    let custom_properties = unsafe {
+        input
+            .custom_property_store
+            .cast::<crate::css::custom_properties::CustomPropertyStore>()
+            .as_ref()
+            .zip(
+                input
+                    .custom_property_registry
+                    .cast::<crate::css::custom_properties::CustomPropertyRegistry>()
+                    .as_ref(),
+            )
+    };
+    let requirements = unsafe {
+        crate::css::cascaded_properties::collect_style_computation_requirements(
+            input.store,
+            custom_properties,
+            Some(&plan),
+        )
+    };
     let parent_snapshot = if input.inheritance_parent_style_record != 0 {
         Some(parent_snapshot_for_style_record(
             style_engine,
@@ -5211,8 +5387,10 @@ pub unsafe extern "C" fn rust_compute_properties(input: *const FfiComputePropert
         && crate::css::property_metadata::pseudo_element_is_highlight(input.pseudo_kind))
     .then(|| HighlightInheritance {
         pseudo_kind: input.pseudo_kind,
-        snapshot: (input.highlight_parent_style_record != 0)
-            .then(|| parent_snapshot_for_style_record(style_engine, input.highlight_parent_style_record, None)),
+        snapshot: match retained_highlight_inheritance_parent_style_record(style_engine, input) {
+            0 => None,
+            record => Some(parent_snapshot_for_style_record(style_engine, record, None)),
+        },
     });
     let mut drive_input = std::mem::MaybeUninit::<FfiLonghandDriveInput>::uninit();
     let rebuilds_over_previous_properties =
@@ -5743,15 +5921,18 @@ fn apply_post_compute_adjustments(
         computed_kind,
         value,
     };
+    // An adjustment moves only a computed value. Whether the value depends on the parent stays
+    // what the drive recorded for the specified value, as for a match-parent text-align a table
+    // adjusts.
+    let mut store = |entry: ComputedStoreEntry| store_computed_value(longhand_table, &entry);
     let mut post_adjusted_longhands = 0;
-    let mut adjustments = Vec::new();
     if transformation.set_float_none {
         post_adjusted_longhands |= POST_ADJUSTED_FLOAT;
-        adjustments.push(adjusted_entry(prop::FLOAT, COMPUTED_KIND_KEYWORD, keyword::NONE as f64));
+        store(adjusted_entry(prop::FLOAT, COMPUTED_KIND_KEYWORD, keyword::NONE as f64));
     }
     if adjusted_display != adjustment.display_before {
         post_adjusted_longhands |= POST_ADJUSTED_DISPLAY;
-        adjustments.push(adjusted_entry(
+        store(adjusted_entry(
             prop::DISPLAY,
             COMPUTED_KIND_DISPLAY,
             adjusted_display.encoded() as f64,
@@ -5760,7 +5941,7 @@ fn apply_post_compute_adjustments(
     let line_height_changed = element_adjustment.set_line_height_normal || clamp_input_line_height;
     if line_height_changed {
         post_adjusted_longhands |= POST_ADJUSTED_LINE_HEIGHT;
-        adjustments.push(adjusted_entry(
+        store(adjusted_entry(
             prop::LINE_HEIGHT,
             COMPUTED_KIND_KEYWORD,
             keyword::NORMAL as f64,
@@ -5768,7 +5949,7 @@ fn apply_post_compute_adjustments(
     }
     if element_adjustment.set_position_static {
         post_adjusted_longhands |= POST_ADJUSTED_POSITION;
-        adjustments.push(adjusted_entry(
+        store(adjusted_entry(
             prop::POSITION,
             COMPUTED_KIND_KEYWORD,
             keyword::STATIC as f64,
@@ -5776,28 +5957,11 @@ fn apply_post_compute_adjustments(
     }
     if element_adjustment.changed_text_align {
         post_adjusted_longhands |= POST_ADJUSTED_TEXT_ALIGN;
-        adjustments.push(adjusted_entry(
+        store(adjusted_entry(
             prop::TEXT_ALIGN,
             COMPUTED_KIND_KEYWORD,
             element_adjustment.text_align as f64,
         ));
-    }
-    if !adjustments.is_empty() {
-        for entry in &adjustments {
-            store_computed_value(longhand_table, entry);
-        }
-        longhand_table.finish_drive_inheritance_dependent_values();
-    }
-    if matches!(
-        adjustment.text_align_before,
-        keyword::MATCH_PARENT | keyword::_LIBWEB_INHERIT_OR_CENTER
-    ) {
-        longhand_table.add_inheritance_dependent_value(
-            prop::TEXT_ALIGN,
-            retained_new(StyleValueData::Keyword {
-                keyword: adjustment.text_align_before,
-            }),
-        );
     }
 
     let mut clear_adjusted_flags = |changed, property_id| {
@@ -6988,6 +7152,10 @@ pub(crate) mod ffi_test_stubs {
         FONT_CASCADE_LIST_UNREFS.set(FONT_CASCADE_LIST_UNREFS.get() + 1);
     }
     #[unsafe(no_mangle)]
+    extern "C" fn ladybird_gfx_font_cascade_list_equals(list: *const c_void, other: *const c_void) -> bool {
+        list == other
+    }
+    #[unsafe(no_mangle)]
     extern "C" fn ladybird_gfx_font_ref(_raw: *const std::ffi::c_void) {}
     #[unsafe(no_mangle)]
     extern "C" fn ladybird_gfx_font_unref(_raw: *const std::ffi::c_void) {}
@@ -7088,6 +7256,11 @@ pub(crate) mod ffi_test_stubs {
         _append: unsafe extern "C" fn(*mut std::ffi::c_void, *const u8, usize),
         _context: *mut std::ffi::c_void,
     ) {
+    }
+    #[unsafe(no_mangle)]
+    extern "C" fn ladybird_gfx_process_next_structural_epoch() -> u64 {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     }
     #[unsafe(no_mangle)]
     extern "C" fn unicode_layout_segmenter_destroy(_handle: *mut std::ffi::c_void) {}
@@ -7378,7 +7551,7 @@ mod tests {
     }
 
     #[test]
-    fn font_size_recascade_batches_until_length_context_is_needed() {
+    fn font_size_recascade_resolves_em_without_a_host_context() {
         let percentage = StyleValueData::Percentage { value: 200.0 };
         let em = StyleValueData::Length {
             value: 2.0,
@@ -7392,34 +7565,84 @@ mod tests {
             (&final_percentage as *const StyleValueData).cast(),
         ];
         let default_size = CssPixels::from_integer(13);
-
-        let first_batch = recascade_font_size_batch(
+        let batch = recascade_font_size_batch(
             values.len(),
             |index| values[index],
             0,
             default_size.raw_value(),
             false,
             default_size.raw_value(),
+            FfiFontSizeRecascadeDocumentInputs {
+                root_font_size: 16.0,
+                root_font_metrics_depend_on_viewport_metrics: false,
+                viewport_width: 800.0,
+                viewport_height: 600.0,
+            },
             std::ptr::null(),
         );
-        assert!(first_batch.status == FontSizeRecascadeStatus::NeedsLengthResolution);
-        assert_eq!(first_batch.next_index, 2);
-        assert_eq!(first_batch.current_size_raw, CssPixels::from_integer(26).raw_value());
+        assert!(batch.status == FontSizeRecascadeStatus::Complete);
+        assert_eq!(batch.next_index, values.len());
+        assert_eq!(batch.current_size_raw, CssPixels::from_integer(26).raw_value());
+    }
 
-        let mut context = test_context();
-        context.font_metrics.font_size = 26.0;
-        let resumed_batch = recascade_font_size_batch(
+    #[test]
+    fn font_size_recascade_resolves_document_lengths() {
+        let rem = StyleValueData::Length {
+            value: 2.0,
+            unit: unit_code("rem") as u8,
+        };
+        let vw = StyleValueData::Length {
+            value: 10.0,
+            unit: unit_code("vw") as u8,
+        };
+        let values: [*const std::ffi::c_void; 2] = [
+            (&rem as *const StyleValueData).cast(),
+            (&vw as *const StyleValueData).cast(),
+        ];
+        let batch = recascade_font_size_batch(
             values.len(),
             |index| values[index],
-            first_batch.next_index,
-            first_batch.current_size_raw,
-            first_batch.depends_on_viewport_metrics,
-            default_size.raw_value(),
-            &context,
+            0,
+            CssPixels::from_integer(13).raw_value(),
+            false,
+            CssPixels::from_integer(13).raw_value(),
+            FfiFontSizeRecascadeDocumentInputs {
+                root_font_size: 20.0,
+                root_font_metrics_depend_on_viewport_metrics: false,
+                viewport_width: 800.0,
+                viewport_height: 600.0,
+            },
+            std::ptr::null(),
         );
-        assert!(resumed_batch.status == FontSizeRecascadeStatus::Complete);
-        assert_eq!(resumed_batch.next_index, values.len());
-        assert_eq!(resumed_batch.current_size_raw, CssPixels::from_integer(26).raw_value());
+        assert!(batch.status == FontSizeRecascadeStatus::Complete);
+        assert_eq!(batch.current_size_raw, CssPixels::from_integer(80).raw_value());
+        assert!(batch.depends_on_viewport_metrics);
+    }
+
+    #[test]
+    fn font_size_recascade_stops_for_a_length_that_needs_font_metrics() {
+        let ex = StyleValueData::Length {
+            value: 2.0,
+            unit: unit_code("ex") as u8,
+        };
+        let values: [*const std::ffi::c_void; 1] = [(&ex as *const StyleValueData).cast()];
+        let batch = recascade_font_size_batch(
+            values.len(),
+            |index| values[index],
+            0,
+            CssPixels::from_integer(13).raw_value(),
+            false,
+            CssPixels::from_integer(13).raw_value(),
+            FfiFontSizeRecascadeDocumentInputs {
+                root_font_size: 16.0,
+                root_font_metrics_depend_on_viewport_metrics: false,
+                viewport_width: 800.0,
+                viewport_height: 600.0,
+            },
+            std::ptr::null(),
+        );
+        assert!(batch.status == FontSizeRecascadeStatus::NeedsLengthResolution);
+        assert_eq!(batch.next_index, 0);
     }
 
     #[test]

@@ -50,7 +50,7 @@ pub(crate) struct RetainedCustomPropertyData {
 impl RetainedCustomPropertyData {
     /// # Safety
     /// `data` must be a live `Web::CSS::CustomPropertyData`.
-    unsafe fn retain(data: *const std::ffi::c_void) -> Self {
+    pub(super) unsafe fn retain(data: *const std::ffi::c_void) -> Self {
         unsafe { web_css_custom_property_data_reference(data) };
         Self {
             data: crate::css::host_shared::HostShared::new(data),
@@ -60,6 +60,28 @@ impl RetainedCustomPropertyData {
     pub(crate) fn data(&self) -> *const std::ffi::c_void {
         self.data.as_ptr()
     }
+}
+
+/// The custom-property environment an element or one of its synthetic pseudo-elements holds, with
+/// what a move of the environment it inherits reads of it.
+pub(crate) struct HeldCustomPropertyEnvironment {
+    /// The identity the host's object names the environment by.
+    pub(crate) identity: u64,
+    /// Whether it is the element's animation overlay, over the environment its style resolves to.
+    pub(crate) is_animation_overlay: bool,
+    /// Whether the environment the style resolves to declares custom properties of its own, over
+    /// the one it inherits.
+    pub(crate) declares: bool,
+    pub(crate) data: RetainedCustomPropertyData,
+}
+
+/// What the style C++ computed for an element reads of its custom-property environment through
+/// `var()`, kept while the element holds that computation's input record.
+pub(crate) enum HostVarReads {
+    /// The names it reads, sorted.
+    Names(Box<[StyleAtomID]>),
+    /// Reads no list of names can say, such as a `var()` whose name is itself substituted.
+    Unknown,
 }
 
 impl Drop for RetainedCustomPropertyData {
@@ -227,15 +249,25 @@ impl RetainedState {
         program
     }
 
+    /// Moves whenever an attribute name comes to require its value text: a selector's here, or an
+    /// `attr()`'s anywhere in the process.
     pub fn attribute_value_text_requirements_version(&self) -> u64 {
         self.attribute_value_text_requirements_version
+            .wrapping_add(crate::css::parser::arbitrary_substitution::attr_names_read_generation())
     }
 
+    /// Whether the host records what the values of an attribute name spell: for a selector whose
+    /// operator an atom cannot answer, or for an `attr()`, which reads an attribute in no namespace
+    /// by its local name.
     #[must_use]
     pub fn attribute_name_requires_value_text(&self, name: StyleAtomID) -> bool {
         self.facts
             .attribute_name_keys(name)
             .any(|key| self.attribute_value_text_names.contains(&key))
+            || self
+                .facts
+                .attribute_substitution_name(name)
+                .is_some_and(crate::css::parser::arbitrary_substitution::attr_may_read_name)
     }
 
     #[must_use]
@@ -565,6 +597,18 @@ impl RetainedState {
             .is_some_and(crate::css::computed_value_views::ComputedValuesView::content_is_single_image)
     }
 
+    /// The tree scope a counter style name `node` uses is looked up from: its own, unless its shadow
+    /// tree takes the document's styles, which looks names up in the document's scope instead.
+    #[must_use]
+    pub(crate) fn counter_style_tree_scope(&self, node: StyleNodeID) -> u32 {
+        let tree_scope = self.tree.tree_scope(node);
+        if self.program.scope_uses_document_sheets(tree_scope) {
+            TreeScopeID::DOCUMENT.0
+        } else {
+            tree_scope.0
+        }
+    }
+
     /// The element's published style record, or its record for one pseudo-element kind, as a view.
     /// `None` while there is no such record.
     #[must_use]
@@ -590,7 +634,8 @@ impl RetainedState {
         ))
     }
 
-    /// Record what an attribute-value atom spells, for the operators an atom cannot answer.
+    /// Record what an attribute-value atom spells, for the operators an atom cannot answer and for
+    /// `attr()`.
     pub fn set_attribute_value_text(&mut self, value: StyleAtomID, text: &[u16]) {
         self.facts.set_attribute_value_text(value, text);
     }
@@ -609,6 +654,46 @@ impl RetainedState {
     /// See `ElementFactStore::note_attribute_name_forms`.
     pub fn note_attribute_name_forms(&mut self, name: StyleAtomID, forms: index::AttributeNameForms) {
         self.facts.note_attribute_name_forms(name, forms);
+    }
+
+    /// Record the id an element answers to, or clear it with atom zero.
+    pub fn set_element_id_name(&mut self, node: StyleNodeID, name: StyleAtomID) {
+        self.tree.set_element_id_name(node, name, &mut self.memory);
+    }
+
+    /// The first element in tree order that answers to `name` inside `tree_scope`.
+    #[must_use]
+    pub fn element_by_id(&self, tree_scope: TreeScopeID, name: StyleAtomID) -> Option<StyleNodeID> {
+        self.tree.element_by_id(tree_scope, name)
+    }
+
+    /// The style group payloads the element's published record holds, for a reader that reaches an
+    /// element by identity rather than through a layout row. `None` while the element has no
+    /// record.
+    #[must_use]
+    pub fn element_published_style_payloads(&self, node: StyleNodeID) -> Option<&[*const std::ffi::c_void]> {
+        let record = self.computed_group_sets.assigned_style_record(node)?;
+        let payloads = self.computed_group_sets.style_record_payloads(record.raw())?;
+        Some(SharedPayload::as_pointer_slice(payloads))
+    }
+
+    /// Keep the atom a layout publication names live for as long as the publication does.
+    ///
+    /// A published SVG reference names an id that may name no element at all, and an atom nothing
+    /// answers to has no other owner: a sweep would reclaim it and hand its number to the next
+    /// name interned, which the publication would then read as the element it points at.
+    pub fn retain_published_atom(&mut self, atom: StyleAtomID) {
+        self.atoms.retain_published(atom);
+    }
+
+    /// Give up the retention `retain_published_atom` took, as a publication is cleared or replaced.
+    pub fn release_published_atom(&mut self, atom: StyleAtomID) {
+        self.atoms.release_published(atom);
+    }
+
+    /// See `ElementFactStore::note_attribute_substitution_name`.
+    pub fn note_attribute_substitution_name(&mut self, name: StyleAtomID, local_name: &[u16]) {
+        self.facts.note_attribute_substitution_name(name, local_name);
     }
 
     pub fn set_shadow_root(&mut self, host: StyleNodeID, shadow_root: StyleNodeID) {
@@ -698,8 +783,15 @@ impl RetainedState {
     /// elements that hold one have an entry.
     ///
     /// # Safety
-    /// `data` must be null or a live `Web::CSS::CustomPropertyData`.
-    pub(crate) unsafe fn set_element_custom_property_data(&mut self, node: StyleNodeID, data: *const std::ffi::c_void) {
+    /// `data` must be null or a live `Web::CSS::CustomPropertyData` named by `identity`.
+    pub(crate) unsafe fn set_element_custom_property_data(
+        &mut self,
+        node: StyleNodeID,
+        data: *const std::ffi::c_void,
+        identity: u64,
+        is_animation_overlay: bool,
+        declares: bool,
+    ) {
         if data.is_null() {
             self.element_custom_property_data.remove(&node);
             return;
@@ -707,31 +799,39 @@ impl RetainedState {
         if self
             .element_custom_property_data
             .get(&node)
-            .is_some_and(|existing| existing.data() == data)
+            .is_some_and(|existing| existing.data.data() == data)
         {
             return;
         }
-        self.element_custom_property_data
-            .insert(node, unsafe { RetainedCustomPropertyData::retain(data) });
+        self.element_custom_property_data.insert(
+            node,
+            HeldCustomPropertyEnvironment {
+                identity,
+                is_animation_overlay,
+                declares,
+                data: unsafe { RetainedCustomPropertyData::retain(data) },
+            },
+        );
     }
 
     /// The custom-property environment an element holds, or null.
     pub(crate) fn element_custom_property_data(&self, node: StyleNodeID) -> *const std::ffi::c_void {
         self.element_custom_property_data
             .get(&node)
-            .map_or(std::ptr::null(), RetainedCustomPropertyData::data)
+            .map_or(std::ptr::null(), |held| held.data.data())
     }
 
     /// Keep the custom-property environment one of an element's synthetic pseudo-elements now
     /// holds; a null `data` is none.
     ///
     /// # Safety
-    /// `data` must be null or a live `Web::CSS::CustomPropertyData`.
+    /// `data` must be null or a live `Web::CSS::CustomPropertyData` named by `identity`.
     pub(crate) unsafe fn set_pseudo_element_custom_property_data(
         &mut self,
         node: StyleNodeID,
         pseudo: u8,
         data: *const std::ffi::c_void,
+        identity: u64,
     ) {
         // Clearing is the common install, and must not make an entry only to drop it again.
         if data.is_null() {
@@ -744,11 +844,17 @@ impl RetainedState {
             }
             return;
         }
+        let held = || HeldCustomPropertyEnvironment {
+            identity,
+            is_animation_overlay: false,
+            declares: false,
+            data: unsafe { RetainedCustomPropertyData::retain(data) },
+        };
         let environments = self.pseudo_element_custom_property_data.entry(node).or_default();
         match environments.iter_mut().find(|(kind, _)| *kind == pseudo) {
-            Some((_, environment)) if environment.data() == data => {}
-            Some((_, environment)) => *environment = unsafe { RetainedCustomPropertyData::retain(data) },
-            None => environments.push((pseudo, unsafe { RetainedCustomPropertyData::retain(data) })),
+            Some((_, environment)) if environment.data.data() == data => {}
+            Some((_, environment)) => *environment = held(),
+            None => environments.push((pseudo, held())),
         }
     }
 
@@ -757,7 +863,7 @@ impl RetainedState {
         self.pseudo_element_custom_property_data
             .get(&node)
             .and_then(|environments| environments.iter().find(|(kind, _)| *kind == pseudo))
-            .map_or(std::ptr::null(), |(_, environment)| environment.data())
+            .map_or(std::ptr::null(), |(_, environment)| environment.data.data())
     }
 
     /// The kinds of an element's synthetic pseudo-elements that hold a custom-property environment,
@@ -784,6 +890,157 @@ impl RetainedState {
     #[must_use]
     pub fn element_recomputes_on_environment_move(&self, node: StyleNodeID) -> bool {
         self.environment_move_recompute_nodes.contains(&node)
+    }
+
+    /// Record the element-backed pseudo-element kind an element in its host's shadow tree stands
+    /// for, one plus the kind, or zero for none.
+    pub fn set_element_associated_pseudo_kind(&mut self, node: StyleNodeID, pseudo_kind_plus_one: u8) {
+        self.computed_group_sets
+            .set_associated_pseudo_kind(node, pseudo_kind_plus_one);
+    }
+
+    /// What the last layout commit and scroll state say of a container's box.
+    pub(crate) fn layout_style_snapshot(
+        &self,
+        node: StyleNodeID,
+    ) -> Option<crate::layout::style_snapshot::LayoutStyleSnapshotRow> {
+        self.layout_style_snapshots.get(&node).copied()
+    }
+
+    /// Take the box geometry a completed layout commit gathered, keeping each row's scroll state.
+    pub(crate) fn apply_layout_style_snapshot_commit(
+        &mut self,
+        rows: &[crate::layout::style_snapshot::CommittedGeometry],
+    ) {
+        for geometry in rows {
+            let row = self.layout_style_snapshots.entry(geometry.node).or_default();
+            row.content_width_raw = geometry.content_width_raw;
+            row.content_height_raw = geometry.content_height_raw;
+            row.has_committed_box = geometry.has_committed_box;
+        }
+    }
+
+    /// Record the scroll state a scroll-state container's queries read, as the host snapshots it
+    /// after layout, keeping the row's box geometry.
+    pub fn set_element_scroll_state(
+        &mut self,
+        node: StyleNodeID,
+        stuck: u8,
+        snapped: u8,
+        scrollable: u8,
+        scrolled: u8,
+    ) {
+        let row = self.layout_style_snapshots.entry(node).or_default();
+        row.stuck = stuck;
+        row.snapped = snapped;
+        row.scrollable = scrollable;
+        row.scrolled = scrolled;
+    }
+
+    /// Record the identity of the counter-style registry a tree scope's style scope has now.
+    pub fn set_counter_style_environment_identity(&mut self, tree_scope: TreeScopeID, identity: u64) {
+        self.counter_style_environment_identities.insert(tree_scope, identity);
+    }
+
+    /// Record the style record an element holds; zero is none. Only elements that hold one have an
+    /// entry. Keep it alive until the host replaces it, even when the engine publishes a newer
+    /// assignment. Whether the element is a query container is what that record says.
+    pub fn set_held_style_record(&mut self, node: StyleNodeID, style_record: u64) {
+        let previous = if style_record == 0 {
+            self.held_style_records.remove(&node)
+        } else {
+            self.held_style_records.insert(node, style_record)
+        };
+        if previous != Some(style_record) {
+            if style_record != 0 {
+                self.computed_group_sets.pin_style_record(style_record);
+            }
+            if let Some(previous) = previous {
+                self.computed_group_sets.unpin_style_record(previous);
+            }
+        }
+        self.set_element_container_query_inputs(node, style_record);
+    }
+
+    /// Record that a child of an element or shadow root explicitly inherits a non-inherited
+    /// property, as the host marks the node. The mark lasts as long as the node's identity.
+    pub fn note_children_explicitly_inherit(&mut self, node: StyleNodeID) {
+        self.children_explicitly_inherit_marks.insert(node);
+    }
+
+    /// Whether, and as what, an element is a query container.
+    pub(super) fn container_query_inputs(&self, node: StyleNodeID) -> Option<&tree::ContainerQueryInputRow> {
+        self.container_query_inputs.get(node)
+    }
+
+    /// Refresh whether, and as what, an element is a query container from a record it is published
+    /// with. A record without its box group makes it none, and so does one naming no container
+    /// type or name: such an element holds no row.
+    pub(super) fn set_element_container_query_inputs(&mut self, node: StyleNodeID, style_record: u64) {
+        match self.container_query_input_row(style_record, false) {
+            Some(row) => self.container_query_inputs.set(node, row),
+            None => self.container_query_inputs.clear(node),
+        }
+    }
+
+    /// What a record says of its element as a query container: none for a record without its box
+    /// group, nor, unless `any_element` asks for every element's, for one naming no container type
+    /// or name.
+    pub(super) fn container_query_input_row(
+        &self,
+        style_record: u64,
+        any_element: bool,
+    ) -> Option<tree::ContainerQueryInputRow> {
+        let payloads = self
+            .computed_group_sets
+            .style_record_payloads(style_record)
+            .filter(|payloads| payloads.len() > crate::css::computed_value_types::STYLE_GROUP_INDEX_BOX)?;
+        let values =
+            crate::css::computed_value_views::ComputedValuesView::new(SharedPayload::as_pointer_slice(payloads));
+        let box_values = values.box_values();
+        if !any_element
+            && !box_values.is_size_container
+            && !box_values.is_inline_size_container
+            && !box_values.is_scroll_state_container
+            && box_values.container_name.raws().is_empty()
+        {
+            return None;
+        }
+        let names = box_values
+            .container_name
+            .raws()
+            .iter()
+            .map(|raw| match unsafe { ak::utf16_string_units(raw) } {
+                ak::Utf16StringUnits::Ascii(units) => units.iter().copied().map(u16::from).collect(),
+                ak::Utf16StringUnits::Utf16(units) => units.to_vec(),
+            })
+            .collect();
+        Some(tree::ContainerQueryInputRow {
+            style_record,
+            names,
+            is_size_container: box_values.is_size_container,
+            is_inline_size_container: box_values.is_inline_size_container,
+            is_scroll_state_container: box_values.is_scroll_state_container,
+            writing_mode: values.writing_mode(),
+            direction: values.direction(),
+        })
+    }
+
+    /// Record what the style C++ computed for an element reads through `var()`: nothing held when
+    /// the element holds no input record of that computation, else the names it reads, sorted, or
+    /// that it reads more than they say.
+    pub fn set_element_var_reads(&mut self, node: StyleNodeID, held: bool, complete: bool, name_atoms: &[StyleAtomID]) {
+        if !held {
+            self.host_var_reads.remove(&node);
+            return;
+        }
+        debug_assert!(name_atoms.is_sorted(), "an input record's reads are sorted");
+        let reads = if complete {
+            HostVarReads::Names(name_atoms.into())
+        } else {
+            HostVarReads::Unknown
+        };
+        self.host_var_reads.insert(node, reads);
     }
 
     /// Record the names of the CSS animations the host holds for one of an element's animation
@@ -1198,7 +1455,20 @@ impl StyleEngineState {
                 cascade_compaction_scratch: ordering::CascadeCompactionWorkspace::default(),
                 cascade_compaction_scratch_memory: MemoryLease::new(MemoryCategory::BatchScratch),
                 next_style_transaction_version: StyleTransactionVersion(1),
-                document_style_computation_inputs: None,
+                document_style_computation_inputs: Default::default(),
+                driven_viewport: (0.0, 0.0),
+                document_resource_contexts: Default::default(),
+                document_media: Default::default(),
+                document_functions: Default::default(),
+                monospace_font_family: RetainedStyleValueData::from_owned(
+                    crate::css::parser::value_parser::value_list(
+                        vec![StyleValueData::Keyword {
+                            keyword: crate::css::style_compute::keyword::MONOSPACE,
+                        }],
+                        1,
+                        true,
+                    ),
+                ),
                 font_resolution: None,
                 layer_topology_version: 0,
                 sheet_order_version: 0,
@@ -1207,19 +1477,37 @@ impl StyleEngineState {
                 computed_group_sets: ComputedGroupSets::default(),
                 custom_property_environments: Default::default(),
                 nodes_with_substituted_records: HashSet::default(),
+                custom_declaration_reads: HashMap::default(),
+                nodes_with_tree_counting_records: HashMap::default(),
+                nodes_with_rolled_back_records: HashMap::default(),
                 element_custom_property_data: HashMap::default(),
                 pseudo_element_custom_property_data: HashMap::default(),
                 environment_move_recompute_nodes: HashSet::default(),
+                container_effects_for_host: HashMap::default(),
+                published_container_verdicts: HashMap::default(),
+                container_gates_unheld: HashSet::default(),
+                container_input_nodes: HashSet::default(),
+                container_query_inputs: Default::default(),
+                layout_style_snapshots: HashMap::default(),
+                size_container_queries: Default::default(),
+                counter_style_environment_identities: HashMap::default(),
+                held_style_records: HashMap::default(),
+                children_explicitly_inherit_marks: HashSet::default(),
+                host_var_reads: HashMap::default(),
                 css_defined_animations: Default::default(),
+                random_base_values: Default::default(),
                 transition_baselines: HashMap::default(),
                 custom_property_registrations_changed: false,
                 pending_element_style_computation_selections: HashMap::default(),
                 pending_pseudo_style_computation_selections: HashMap::default(),
                 engine_computed_records_pending: HashMap::default(),
+                demand_records: HashMap::default(),
                 flush_stamp: 0,
-                style_input_nodes_for_cpp: HashSet::default(),
                 parent_inputs_moved_nodes: HashSet::default(),
                 engine_pseudo_record_cache: HashMap::default(),
+                batch_answers_complete_but_for_custom_properties: HashMap::default(),
+                batch_custom_property_matches: HashMap::default(),
+                batch_backing_pseudo_matches: HashMap::default(),
                 engine_cold_record_cache: HashMap::default(),
                 engine_cold_record_donors: HashMap::default(),
                 computed_group_set_memory: MemoryLease::new(MemoryCategory::ComputedGroupSet),
@@ -1272,6 +1560,7 @@ impl StyleEngineState {
                 diagnostic_plan_capture: None,
             },
             host: HostState {
+                batch_moves_for_retries: Default::default(),
                 font_resolver: None,
                 #[cfg(feature = "style-recording")]
                 recording_id: None,
@@ -1282,7 +1571,8 @@ impl StyleEngineState {
                 flushing_deferred_geometry_journal: false,
                 deferred_element_style_inputs: Vec::new(),
                 deferred_element_style_inputs_are_pending: false,
-                externally_recorded_style_input_nodes: HashSet::default(),
+                environment_move_changed_names: Default::default(),
+                environment_move_actions: Vec::new(),
                 deferred_element_style_input_memory: MemoryLease::new(MemoryCategory::NormalizationJournal),
                 initial_tree_batch_applied: false,
                 initial_tree_bulk_load_is_pending: false,
@@ -1513,40 +1803,35 @@ impl StyleEngineState {
         !self.host.deferred_element_style_inputs.is_empty()
     }
 
-    /// Record an exact style reaction for one element, merged with what the element already owes.
-    /// It joins the next transaction.
-    pub fn record_element_style_input(&mut self, node: StyleNodeID, reaction: u8, inherited_style_groups: u8) {
-        if reaction == 0 {
-            return;
-        }
-        // A recorded input asks for the C++ computation, whatever the engine derived for the
-        // element beside it. For the style pass accounting, a transaction stays one of derived
-        // child reactions when the recorded inputs join reactions the engine derived.
-        let derived_already = self.has_deferred_element_style_input(node);
-        let externally_recorded_already = self.host.externally_recorded_style_input_nodes.contains(&node);
-        self.record_derived_element_style_input(node, reaction, inherited_style_groups);
-        if !derived_already || externally_recorded_already {
-            self.host.externally_recorded_style_input_nodes.insert(node);
-        }
-        self.retained.style_input_nodes_for_cpp.insert(node);
+    /// Record that what a container query or a container-relative length read of the node's
+    /// containers moved: a container's size, scroll state or style. The engine settles it where it
+    /// can, deciding the node's gated rules again and publishing its winners anew from its
+    /// retained answer where a verdict moved.
+    pub fn record_container_query_input(&mut self, node: StyleNodeID) {
+        self.retained.container_input_nodes.insert(node);
+        self.record_derived_element_style_input(
+            node,
+            transaction::STYLE_REACTION_PUBLISHED_STYLE | transaction::STYLE_REACTION_RECOMPUTE_STYLE,
+            0,
+        );
     }
 
-    /// Record a style reaction the engine derived itself for one element, or one C++ derived from
-    /// a reaction it applied: the engine settles it where it can.
+    /// Record a style reaction for one element, which the engine derived itself or C++ derived
+    /// from what it saw move, merged with what the element already owes. It joins the next
+    /// transaction, and the engine settles it where it can.
     pub fn record_derived_element_style_input(&mut self, node: StyleNodeID, reaction: u8, inherited_style_groups: u8) {
         if reaction == 0 {
             return;
         }
         self.defer_element_style_input(node, reaction, inherited_style_groups);
         self.host.deferred_element_style_inputs_are_pending = true;
-        self.host.externally_recorded_style_input_nodes.remove(&node);
     }
 
     /// Fold the style input an element owes into the reaction C++ is about to apply to it, when
     /// that reaction covers it: a materialization covers anything, while a record delta covers
-    /// only what it already carries. The folded input is consumed; one not covered stays owed to
-    /// the next transaction. Returns the merged reaction in the low byte and the merged inherited
-    /// style groups in the next, or zero when nothing was folded.
+    /// what it already carries and a descendant recompute. The folded input is consumed; one not
+    /// covered stays owed to the next transaction. Returns the merged reaction in the low byte and
+    /// the merged inherited style groups in the next, or zero when nothing was folded.
     pub fn absorb_element_style_input(
         &mut self,
         node: StyleNodeID,
@@ -1568,13 +1853,15 @@ impl StyleEngineState {
         else {
             unreachable!();
         };
+        // A descendant recompute asks nothing of the element its own reaction does not answer, and
+        // the applied reaction carries what it asks of the descendants to the element's children.
         if !absorbs_any
-            && (pending_reaction & !reaction != 0 || pending_inherited_style_groups & !inherited_style_groups != 0)
+            && (pending_reaction & !reaction & !transaction::STYLE_REACTION_RECOMPUTE_DESCENDANT_STYLES != 0
+                || pending_inherited_style_groups & !inherited_style_groups != 0)
         {
             return 0;
         }
         self.host.deferred_element_style_inputs.remove(index);
-        self.host.externally_recorded_style_input_nodes.remove(&node);
         u32::from(reaction | pending_reaction)
             | (u32::from(inherited_style_groups | pending_inherited_style_groups) << 8)
     }
@@ -1588,7 +1875,31 @@ impl StyleEngineState {
         {
             self.host.deferred_element_style_inputs.remove(index);
         }
-        self.host.externally_recorded_style_input_nodes.remove(&node);
+    }
+
+    /// Drop the style input an element owes but the descendant recompute it carries: a demand
+    /// answers the element's own style, which reaches none of its descendants.
+    pub(super) fn consume_element_style_input_but_descendants(&mut self, node: StyleNodeID) {
+        let Ok(index) = self
+            .host
+            .deferred_element_style_inputs
+            .binary_search_by_key(&InputKey::ElementStyleInput(node), |pending| pending.key)
+        else {
+            return;
+        };
+        let InputValue::ElementStyleInput {
+            reaction,
+            inherited_style_groups,
+        } = &mut self.host.deferred_element_style_inputs[index].new
+        else {
+            unreachable!();
+        };
+        if *reaction & transaction::STYLE_REACTION_RECOMPUTE_DESCENDANT_STYLES != 0 {
+            *reaction = transaction::STYLE_REACTION_RECOMPUTE_DESCENDANT_STYLES;
+            *inherited_style_groups = 0;
+        } else {
+            self.host.deferred_element_style_inputs.remove(index);
+        }
     }
 
     /// Whether one element still owes a deferred style input, asked per node the way the recorded
@@ -2114,6 +2425,10 @@ impl StyleEngineState {
     }
 
     /// Record an exact style reaction for every flat-tree descendant of a node.
+    ///
+    /// The reaction is one C++ derived from a reaction it applied to `root`, not a fact only C++
+    /// holds: a descendant is here because what it inherits moved, which the engine settles itself
+    /// wherever its record computation admits it.
     pub fn record_flat_tree_descendant_style_inputs(
         &mut self,
         root: StyleNodeID,
@@ -2126,7 +2441,7 @@ impl StyleEngineState {
         let mut descendants = Vec::new();
         self.for_each_flat_tree_descendant(root, |node| descendants.push(node));
         for node in descendants {
-            self.record_element_style_input(node, reaction, inherited_style_groups);
+            self.record_derived_element_style_input(node, reaction, inherited_style_groups);
         }
     }
 
@@ -2427,6 +2742,9 @@ impl StyleEngineState {
         self.retained
             .computed_group_sets
             .set_adjustment_facts(node, arrival.adjustment_facts);
+        self.retained
+            .computed_group_sets
+            .set_associated_pseudo_kind(node, arrival.associated_pseudo_kind_plus_one);
         for &state in custom_states {
             self.record_batched_input(
                 InputKey::LocalFeature(node, LocalFeatureKey::CustomState(state)),
@@ -2655,7 +2973,12 @@ impl RetainedState {
             cascade_compaction_scratch_memory: _,
             next_style_transaction_version: _,
             document_style_computation_inputs: _,
+            driven_viewport: _,
+            document_resource_contexts: _,
+            document_media: _,
+            document_functions: _,
             font_resolution: _,
+            monospace_font_family: _,
             layer_topology_version: _,
             sheet_order_version: _,
             specified_values: _,
@@ -2663,10 +2986,25 @@ impl RetainedState {
             computed_group_sets,
             custom_property_environments: _,
             nodes_with_substituted_records,
+            custom_declaration_reads,
+            nodes_with_tree_counting_records,
+            nodes_with_rolled_back_records,
             element_custom_property_data,
             pseudo_element_custom_property_data,
             environment_move_recompute_nodes,
+            container_effects_for_host,
+            published_container_verdicts,
+            container_gates_unheld,
+            container_input_nodes,
+            container_query_inputs,
+            layout_style_snapshots,
+            size_container_queries,
+            counter_style_environment_identities: _,
+            held_style_records,
+            children_explicitly_inherit_marks,
+            host_var_reads,
             css_defined_animations,
+            random_base_values,
             transition_baselines,
             custom_property_registrations_changed: _,
             pending_element_style_computation_selections,
@@ -2674,11 +3012,15 @@ impl RetainedState {
             // Settled or reverted when the transaction's outputs are discarded, before identities are
             // released.
             engine_computed_records_pending: _,
+            demand_records,
             flush_stamp: _,
             // Taken by the transaction that fills them.
-            style_input_nodes_for_cpp: _,
             parent_inputs_moved_nodes: _,
             engine_pseudo_record_cache: _,
+            // Filled and cleared within one transaction's record loop.
+            batch_answers_complete_but_for_custom_properties: _,
+            batch_custom_property_matches: _,
+            batch_backing_pseudo_matches: _,
             engine_cold_record_cache: _,
             engine_cold_record_donors: _,
             computed_group_set_memory: _,
@@ -2743,10 +3085,33 @@ impl RetainedState {
         winner_groups.remove(node);
         computed_group_sets.remove(node);
         nodes_with_substituted_records.remove(&node);
+        custom_declaration_reads.remove(&node);
+        nodes_with_tree_counting_records.remove(&node);
+        nodes_with_rolled_back_records.remove(&node);
         element_custom_property_data.remove(&node);
         pseudo_element_custom_property_data.remove(&node);
         environment_move_recompute_nodes.remove(&node);
+        container_effects_for_host.remove(&node);
+        published_container_verdicts.remove(&node);
+        container_gates_unheld.remove(&node);
+        container_input_nodes.remove(&node);
+        container_query_inputs.clear(node);
+        layout_style_snapshots.remove(&node);
+        demand_records.retain(|target, record| {
+            let retired = target.node() == node;
+            if retired {
+                computed_group_sets.unpin_style_record(record.raw());
+            }
+            !retired
+        });
+        size_container_queries.retire(node);
+        if let Some(style_record) = held_style_records.remove(&node) {
+            computed_group_sets.unpin_style_record(style_record);
+        }
+        children_explicitly_inherit_marks.remove(&node);
+        host_var_reads.remove(&node);
         css_defined_animations.retire(node);
+        random_base_values.retire(node);
         pending_element_style_computation_selections.remove(&node);
         pending_pseudo_style_computation_selections.remove(&node);
         // A retired identity can name another element before the epoch commits.

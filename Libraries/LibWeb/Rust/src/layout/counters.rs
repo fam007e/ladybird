@@ -16,14 +16,14 @@ use crate::css::css_string::CssString;
 use crate::css::style::StyleEngine;
 use crate::css::style::fast_hash::FastMap as HashMap;
 use crate::css::style::tree::StyleNodeID;
-use std::rc::Rc;
+use std::sync::Arc;
 
 // "UAs may have implementation-specific limits on the maximum or minimum value of a counter.
 // If a counter reset, set, or increment would push the value outside of that range, the value
 // must be clamped to that range." - https://drafts.csswg.org/css-lists-3/#auto-numbering
 pub(crate) type CounterValue = i32;
 
-const LIST_ITEM_COUNTER_NAME: [u16; 9] = [
+pub(crate) const LIST_ITEM_COUNTER_NAME: [u16; 9] = [
     b'l' as u16,
     b'i' as u16,
     b's' as u16,
@@ -39,17 +39,27 @@ fn is_list_item_counter_name(name: &[u16]) -> bool {
     name == LIST_ITEM_COUNTER_NAME
 }
 
-fn name_matches(name: &ak::Utf16StringUnits<'_>, counter_name: &CssString) -> bool {
-    let counter_name = counter_name.units();
-    match name {
-        ak::Utf16StringUnits::Ascii(bytes) => {
-            bytes.len() == counter_name.len()
-                && bytes
-                    .iter()
-                    .zip(counter_name)
-                    .all(|(&byte, &unit)| u16::from(byte) == unit)
+/// A counter name as a reader of the counters set has it.
+pub(crate) enum CounterName<'a> {
+    /// A name a computed style spells.
+    Css(&'a CssString),
+    Units(&'a [u16]),
+}
+
+impl CounterName<'_> {
+    fn matches(&self, counter_name: &CssString) -> bool {
+        let counter_name = counter_name.units();
+        match self {
+            Self::Css(name) => name.units() == counter_name,
+            Self::Units(units) => *units == counter_name,
         }
-        ak::Utf16StringUnits::Utf16(units) => *units == counter_name,
+    }
+
+    fn to_css_string(&self) -> CssString {
+        match self {
+            Self::Css(name) => (*name).clone(),
+            Self::Units(units) => CssString::from_utf16(units),
+        }
     }
 }
 
@@ -69,6 +79,19 @@ impl CounterOwner {
             generated_for: 0,
         }
     }
+
+    /// The element and each of its pseudo-elements that can own a counters set or generated content.
+    pub(crate) fn every_owner_of(element: StyleNodeID) -> impl Iterator<Item = Self> {
+        [
+            0,
+            GENERATED_FOR_AFTER,
+            GENERATED_FOR_BACKDROP,
+            GENERATED_FOR_BEFORE,
+            GENERATED_FOR_MARKER,
+        ]
+        .into_iter()
+        .map(move |generated_for| Self { element, generated_for })
+    }
 }
 
 // https://drafts.csswg.org/css-lists-3/#counter
@@ -82,7 +105,7 @@ struct Counter {
 
 // https://drafts.csswg.org/css-lists-3/#css-counters-set
 // NB: Most elements inherit their parent's set unchanged, so a set is shared until it is written.
-type CountersSet = Rc<Vec<Counter>>;
+type CountersSet = Arc<Vec<Counter>>;
 
 /// Every non-empty counters set, keyed by its owner. An empty set is simply absent.
 #[derive(Default)]
@@ -94,14 +117,8 @@ pub(crate) struct CountersSets {
 impl CountersSets {
     /// Drops the sets of an element and its pseudo-elements, once its identity is retired.
     pub(crate) fn forget(&mut self, element: StyleNodeID) {
-        for generated_for in [
-            0,
-            GENERATED_FOR_AFTER,
-            GENERATED_FOR_BACKDROP,
-            GENERATED_FOR_BEFORE,
-            GENERATED_FOR_MARKER,
-        ] {
-            self.sets.remove(&CounterOwner { element, generated_for });
+        for owner in CounterOwner::every_owner_of(element) {
+            self.sets.remove(&owner);
         }
     }
 
@@ -116,17 +133,13 @@ impl CountersSets {
     // a new counter of the given name with a starting value of 0 before setting or incrementing its value."
     /// Returns every value named `name` in `owner`'s set, outermost first, instantiating the counter
     /// first when there is none.
-    pub(crate) fn counter_values_for_use(
-        &mut self,
-        owner: CounterOwner,
-        name: &ak::Utf16StringUnits<'_>,
-    ) -> Vec<CounterValue> {
+    pub(crate) fn counter_values_for_use(&mut self, owner: CounterOwner, name: &CounterName<'_>) -> Vec<CounterValue> {
         if let Some(set) = self.sets.get(&owner)
-            && set.iter().any(|counter| name_matches(name, &counter.name))
+            && set.iter().any(|counter| name.matches(&counter.name))
         {
             return set
                 .iter()
-                .filter(|counter| name_matches(name, &counter.name))
+                .filter(|counter| name.matches(&counter.name))
                 .map(|counter| counter.value.unwrap_or(0))
                 .collect();
         }
@@ -136,13 +149,9 @@ impl CountersSets {
 
     /// The value of the innermost counter named `name` in `owner`'s set, instantiating it first when
     /// there is none.
-    pub(crate) fn counter_value_for_use(
-        &mut self,
-        owner: CounterOwner,
-        name: &ak::Utf16StringUnits<'_>,
-    ) -> CounterValue {
+    pub(crate) fn counter_value_for_use(&mut self, owner: CounterOwner, name: &CounterName<'_>) -> CounterValue {
         if let Some(set) = self.sets.get(&owner)
-            && let Some(counter) = set.iter().rev().find(|counter| name_matches(name, &counter.name))
+            && let Some(counter) = set.iter().rev().find(|counter| name.matches(&counter.name))
         {
             return counter.value.unwrap_or(0);
         }
@@ -152,14 +161,9 @@ impl CountersSets {
 
     // NB: No counter of this name exists, so instantiating one never removes another and needs no
     //     tree order.
-    fn instantiate_unused_counter(&mut self, owner: CounterOwner, name: &ak::Utf16StringUnits<'_>) {
-        let name = match name {
-            ak::Utf16StringUnits::Ascii(bytes) => {
-                CssString::from_utf16(&bytes.iter().map(|&byte| u16::from(byte)).collect::<Vec<_>>())
-            }
-            ak::Utf16StringUnits::Utf16(units) => CssString::from_utf16(units),
-        };
-        Rc::make_mut(self.sets.entry(owner).or_default()).push(Counter {
+    fn instantiate_unused_counter(&mut self, owner: CounterOwner, name: &CounterName<'_>) {
+        let name = name.to_css_string();
+        Arc::make_mut(self.sets.entry(owner).or_default()).push(Counter {
             name,
             originating_element: owner,
             reversed: false,
@@ -183,7 +187,7 @@ impl CountersSets {
 
 /// The published style `owner` resolves its counters from. The style store settles no record for
 /// `::backdrop`, so that one is read from the box it was built with.
-fn style_of<'a>(
+pub(crate) fn style_of<'a>(
     arena: &'a LayoutNodeArena,
     engine: &'a StyleEngine,
     owner: CounterOwner,
@@ -538,7 +542,7 @@ fn inherit_counters(
         let element_counters = element_counters.get_or_insert_with(Default::default);
         for counter in sibling_counters.iter() {
             if !element_counters.iter().any(|existing| existing.name == counter.name) {
-                Rc::make_mut(element_counters).push(counter.clone());
+                Arc::make_mut(element_counters).push(counter.clone());
             }
         }
     }
@@ -558,7 +562,7 @@ fn inherit_counters(
             if let Some(index) = existing
                 && element_counters[index].value != source_counter.value
             {
-                Rc::make_mut(element_counters)[index].value = source_counter.value;
+                Arc::make_mut(element_counters)[index].value = source_counter.value;
             }
         }
     }
@@ -590,7 +594,7 @@ pub(crate) fn resolve_counters(arena: &LayoutNodeArena, element: CounterOwner) {
                 instantiate_a_counter(
                     arena,
                     engine,
-                    Rc::make_mut(counters.get_or_insert_with(Default::default)),
+                    Arc::make_mut(counters.get_or_insert_with(Default::default)),
                     counter.name().clone(),
                     element,
                     counter.is_reversed(),
@@ -609,7 +613,7 @@ pub(crate) fn resolve_counters(arena: &LayoutNodeArena, element: CounterOwner) {
                 increment_a_counter(
                     arena,
                     engine,
-                    Rc::make_mut(counters.get_or_insert_with(Default::default)),
+                    Arc::make_mut(counters.get_or_insert_with(Default::default)),
                     counter.name(),
                     element,
                     counter.integer().expect("an increment has a value"),
@@ -618,7 +622,7 @@ pub(crate) fn resolve_counters(arena: &LayoutNodeArena, element: CounterOwner) {
 
             if style_has_implicit_list_item_increment(style) {
                 let list_item_counter_name = sets.list_item_counter_name();
-                let counters = Rc::make_mut(counters.get_or_insert_with(Default::default));
+                let counters = Arc::make_mut(counters.get_or_insert_with(Default::default));
                 let reversed = counters
                     .iter()
                     .rev()
@@ -639,7 +643,7 @@ pub(crate) fn resolve_counters(arena: &LayoutNodeArena, element: CounterOwner) {
                 set_a_counter(
                     arena,
                     engine,
-                    Rc::make_mut(counters.get_or_insert_with(Default::default)),
+                    Arc::make_mut(counters.get_or_insert_with(Default::default)),
                     counter.name(),
                     element,
                     counter.integer().expect("a counter-set has a value"),

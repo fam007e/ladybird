@@ -65,6 +65,7 @@
 #include <LibWeb/HTML/EventLoop/TaskQueue.h>
 #include <LibWeb/HTML/FormAssociatedElement.h>
 #include <LibWeb/HTML/HTMLElement.h>
+#include <LibWeb/HTML/HTMLIFrameElement.h>
 #include <LibWeb/HTML/HTMLInputElement.h>
 #include <LibWeb/HTML/HTMLMediaElement.h>
 #include <LibWeb/HTML/HistoryExecutor.h>
@@ -1365,6 +1366,14 @@ Utf16String Internals::dump_session_store_tab_state()
     return dump_string_to_utf16(window().associated_document().page().client().page_did_request_session_store_tab_state_for_testing());
 }
 
+bool Internals::has_populated_document(HTML::HTMLIFrameElement& iframe)
+{
+    auto navigable = iframe.content_navigable();
+    if (!navigable)
+        return false;
+    return window().associated_document().page().client().page_did_request_has_populated_document_for_testing(navigable->id());
+}
+
 Utf16String Internals::dump_site_isolation_process_tree()
 {
     return dump_string_to_utf16(window().associated_document().page().client().dump_site_isolation_process_tree_for_testing());
@@ -2285,7 +2294,7 @@ GC::Ref<JS::Object> Internals::style_invalidation_counters_object() const
     object->define_direct_property("registeredPropertiesCacheRebuilds"_utf16_fly_string, JS::Value(counters.registered_properties_cache_rebuilds), JS::default_attributes);
     object->define_direct_property("scopeRuleCacheBuilds"_utf16_fly_string, JS::Value(counters.scope_rule_cache_builds), JS::default_attributes);
     object->define_direct_property("styleQueryContainerScans"_utf16_fly_string, JS::Value(counters.style_query_container_scans), JS::default_attributes);
-    object->define_direct_property("sizeQueryContainerScanVisits"_utf16_fly_string, JS::Value(counters.size_query_container_scan_visits), JS::default_attributes);
+    object->define_direct_property("sizeQueryContainerScanVisits"_utf16_fly_string, JS::Value(document.style_computer().style_engine().size_query_container_scan_visits(false)), JS::default_attributes);
     object->define_direct_property("styleEngineTransactionSetups"_utf16_fly_string, JS::Value(counters.style_engine_transaction_setups), JS::default_attributes);
     object->define_direct_property("styleEngineTransactionSetupMicroseconds"_utf16_fly_string, JS::Value(counters.style_engine_transaction_setup_microseconds), JS::default_attributes);
     object->define_direct_property("styleEnginePlanningMicroseconds"_utf16_fly_string, JS::Value(counters.style_update_bridge_microseconds), JS::default_attributes);

@@ -6,6 +6,7 @@
 
 use super::batch_matcher::insert_scope_rule;
 use super::capacity::ShallowCapacityBytes;
+use super::container_queries::PublishedContainerVerdict;
 use super::index::CandidateEntries;
 use super::index::ParentDispatchFacts;
 use super::index::SelectorPostingKey;
@@ -555,7 +556,7 @@ fn prepare_route_liveness(engine: &mut StyleEngine) {
         .prepare_route_liveness(&retained.program, &retained.programs);
 }
 
-fn discard_transaction(engine: &mut StyleEngine) {
+pub(super) fn discard_transaction(engine: &mut StyleEngine) {
     let transaction = engine.take_transaction();
     engine.release_transaction(transaction);
 }
@@ -984,6 +985,56 @@ fn flat_tree_descendant_collection_follows_shadow_and_slot_relations() {
 
     assert_eq!(descendants, vec![*wrapper, *slot, *assigned, *assigned_child]);
     assert_eq!(engine.memory().bytes_in_category(MemoryCategory::BatchScratch), 0);
+}
+
+#[test]
+fn size_container_dependents_are_found_along_the_flat_tree() {
+    let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
+    let mut raw = [0_u32; 7];
+    engine.allocate_style_nodes(&mut raw);
+    let nodes: Vec<_> = raw.iter().filter_map(|&raw| StyleNodeID::from_raw(raw)).collect();
+    let [host, assigned, unassigned, shadow_root, wrapper, slot, assigned_child]: [StyleNodeID; 7] =
+        std::array::from_fn(|index| nodes[index]);
+
+    engine.tree.set_first_element_child(host, Some(assigned));
+    engine.tree.set_parent(assigned, Some(host));
+    engine.tree.set_next_element_sibling(assigned, Some(unassigned));
+    engine.tree.set_previous_element_sibling(unassigned, Some(assigned));
+    engine.tree.set_parent(unassigned, Some(host));
+    engine.tree.set_first_element_child(shadow_root, Some(wrapper));
+    engine.tree.set_parent(wrapper, Some(shadow_root));
+    engine.tree.set_first_element_child(wrapper, Some(slot));
+    engine.tree.set_parent(slot, Some(wrapper));
+    engine.tree.set_first_element_child(assigned, Some(assigned_child));
+    engine.tree.set_parent(assigned_child, Some(assigned));
+    let retained = &mut engine.state.retained;
+    retained.tree.set_shadow_root(host, shadow_root, &mut retained.memory);
+    retained
+        .tree
+        .set_assigned_slot(assigned, Some(slot), &mut retained.memory);
+    retained
+        .tree
+        .set_assigned_nodes(slot, &[assigned], &mut retained.memory);
+
+    // The host is the container: its shadow tree, and the light child its slot renders, are what
+    // the container's box decides. Its light child no slot takes is in no box below it.
+    engine.set_element_size_container_query_facts(host, true, false);
+    for dependent in [slot, assigned_child, unassigned] {
+        engine.set_element_size_container_query_facts(dependent, false, true);
+    }
+    engine.record_size_container_query_dependents(host);
+
+    assert_eq!(engine.size_query_container_scan_visits(true), 4);
+    let recorded = &engine.state.retained.container_input_nodes;
+    assert!(recorded.contains(&slot));
+    assert!(recorded.contains(&assigned_child));
+    assert!(!recorded.contains(&unassigned));
+    assert!(!recorded.contains(&wrapper));
+
+    // A container nothing asked about has no dependents to find.
+    engine.set_element_size_container_query_facts(host, false, false);
+    engine.record_size_container_query_dependents(host);
+    assert_eq!(engine.size_query_container_scan_visits(true), 0);
 }
 
 #[test]
@@ -2383,7 +2434,7 @@ fn moving_back_after_an_intermediate_tree_apply_restores_depth() {
 }
 
 /// Builds `root -> [a, b, c]` through the same delta path C++ drives.
-fn linear_document() -> (StyleEngine, Vec<StyleNodeID>) {
+pub(super) fn linear_document() -> (StyleEngine, Vec<StyleNodeID>) {
     let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
     let mut raw = [0_u32; 4];
     engine.allocate_style_nodes(&mut raw);
@@ -2402,6 +2453,91 @@ fn linear_document() -> (StyleEngine, Vec<StyleNodeID>) {
         Some(relations(Some(nodes[0].raw()), Some(nodes[2].raw()), None)),
     );
     (engine, nodes)
+}
+
+#[test]
+fn a_node_scoped_acknowledgement_leaves_other_inputs_queued() {
+    let (mut engine, nodes) = linear_document();
+    discard_transaction(&mut engine);
+    for &node in &nodes[1..3] {
+        add_feature(&mut engine, node, LocalFeatureKey::Class(StyleAtomID(200)));
+    }
+    engine
+        .state
+        .host
+        .journal
+        .acknowledge_node(nodes[1], &mut engine.state.retained.memory);
+    assert_eq!(engine.host.journal.len(), 1);
+    assert_eq!(
+        engine.host.journal.pending_old(InputKey::LocalFeature(
+            nodes[2],
+            LocalFeatureKey::Class(StyleAtomID(200))
+        )),
+        Some(InputValue::Feature(FeatureValue::Absent))
+    );
+}
+
+#[test]
+fn a_read_only_record_demand_leaves_the_match_state_as_it_was() {
+    let (mut engine, nodes) = linear_document();
+    for &node in &nodes {
+        set_atom_feature(&mut engine, node, LocalFeatureKey::TagName, StyleAtomID(100));
+    }
+    discard_transaction(&mut engine);
+    let retained_answers = engine.retained_match_answers.column.clone();
+    let retained_cascade_inputs = engine.retained_match_answers.cascade_input_column.clone();
+    let winner_generation = engine.winner_groups.generation();
+    let published_count = engine.published_match_answers.entries.len();
+
+    // An engine no document hosts computes no records: the demand matches, then declines.
+    let demand = bridge::FfiRecordDemand {
+        read_only: true,
+        ..bridge::FfiRecordDemand::default()
+    };
+    assert!(engine.answer_record_demand(nodes[1], demand).is_err());
+    assert_eq!(engine.retained_match_answers.column, retained_answers);
+    assert_eq!(
+        engine.retained_match_answers.cascade_input_column,
+        retained_cascade_inputs
+    );
+    assert_eq!(engine.winner_groups.generation(), winner_generation);
+    assert_eq!(engine.published_match_answers.entries.len(), published_count);
+    assert!(engine.batch_matching_traversal.is_none());
+    assert!(engine.demand_records.is_empty());
+}
+
+#[test]
+fn a_pseudo_record_demand_answers_absence_without_rules() {
+    let (mut engine, nodes) = linear_document();
+    for &node in &nodes {
+        set_atom_feature(&mut engine, node, LocalFeatureKey::TagName, StyleAtomID(100));
+    }
+    discard_transaction(&mut engine);
+    engine.publish_computed_groups(
+        computed::ComputedStyleTarget::new(nodes[1], u8::MAX),
+        &[],
+        0,
+        0,
+        computed::ComputedMetadataInput {
+            pseudo_element_styles: 0,
+            dependency_flags: 0,
+            counter_style_environment_identity: 0,
+            animation_overlay_identity: 0,
+            animated_overlay: HostShared::null(),
+            animation_overlay_payloads: &[],
+            longhand_table: HostShared::null(),
+        },
+    );
+    // ::before, which no rule styles.
+    let demand = bridge::FfiRecordDemand {
+        pseudo_kind_plus_one: 3,
+        ..bridge::FfiRecordDemand::default()
+    };
+    let answer = engine.answer_record_demand(nodes[1], demand);
+    assert!(
+        matches!(answer, Ok(publication::RecordDemandAnswer::Absent)),
+        "{answer:?}"
+    );
 }
 
 /// Builds `root -> outer -> inner -> target`.
@@ -4335,7 +4471,7 @@ fn retained_answer_patching_matches_only_unresolved_rules_after_signed_deltas() 
 }
 
 #[test]
-fn retained_answer_patching_preserves_incomplete_cascade_winners() {
+fn retained_answer_patching_preserves_held_container_cascade_winners() {
     let (mut engine, nodes) = linear_document();
     let target = StyleAtomID(200);
     let winning_target = StyleAtomID(201);
@@ -4382,7 +4518,8 @@ fn retained_answer_patching_preserves_incomplete_cascade_winners() {
         )
         .unwrap();
     let incremental = outcome.incremental_cascade_answer.unwrap();
-    assert!(!incremental.cascade_winners_are_complete);
+    // A pseudo-element's gated rule is held like the element's: the winners decide it.
+    assert!(incremental.cascade_winners_are_complete);
 }
 
 #[test]
@@ -7277,8 +7414,26 @@ fn closure_identity_stop_verification_is_observer_only() {
 }
 
 #[test]
-fn a_cached_prefix_answer_preserves_incomplete_cascade_winners() {
-    let (mut engine, nodes) = nested_document();
+fn gated_prefix_answers_publish_complete_node_specific_winners() {
+    let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
+    let mut raw = [0_u32; 4];
+    engine.allocate_style_nodes(&mut raw);
+    let nodes: Vec<StyleNodeID> = raw.iter().map(|&raw| StyleNodeID::from_raw(raw).unwrap()).collect();
+    engine.record_tree_delta(nodes[0], None, Some(relations(None, None, None)));
+    engine.record_tree_delta(nodes[1], None, Some(relations(Some(nodes[0].raw()), None, None)));
+    engine.record_tree_delta(
+        nodes[2],
+        None,
+        Some(relations(Some(nodes[1].raw()), None, Some(nodes[3].raw()))),
+    );
+    engine.record_tree_delta(
+        nodes[3],
+        None,
+        Some(relations(Some(nodes[1].raw()), Some(nodes[2].raw()), None)),
+    );
+    for &node in &nodes {
+        set_atom_feature(&mut engine, node, LocalFeatureKey::TagName, StyleAtomID(100));
+    }
     let guard = StyleAtomID(200);
     let target = StyleAtomID(201);
     let rule = add_guard_target_rule(&mut engine, guard, target);
@@ -7312,11 +7467,66 @@ fn a_cached_prefix_answer_preserves_incomplete_cascade_winners() {
             Some(&mut second_complete),
         )
         .unwrap();
-    assert!(!first_complete);
-    assert!(!second_complete);
-    assert_eq!(engine.counters().get(Counter::PrefixAnswerCacheMisses), 1);
-    assert_eq!(engine.counters().get(Counter::PrefixAnswerCacheHits), 1);
+    // A gated rule's verdict belongs to the node, so neither sibling may reuse the other's
+    // compacted prefix winners. Both exact answers must still publish complete winners.
+    assert!(first_complete);
+    assert!(second_complete);
+    assert_eq!(engine.counters().get(Counter::PrefixAnswerCacheMisses), 2);
+    assert_eq!(engine.counters().get(Counter::PrefixAnswerCacheHits), 0);
     engine.end_cold_matching_batch();
+}
+
+#[test]
+fn an_undecided_container_verdict_has_not_moved() {
+    let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
+    let mut raw = [0_u32; 3];
+    engine.allocate_style_nodes(&mut raw);
+    let nodes: Vec<StyleNodeID> = raw.iter().filter_map(|&raw| StyleNodeID::from_raw(raw)).collect();
+    engine.record_tree_delta(nodes[0], None, Some(relations(None, None, None)));
+    engine.record_tree_delta(nodes[1], None, Some(relations(Some(nodes[0].raw()), None, None)));
+    engine.record_tree_delta(nodes[2], None, Some(relations(Some(nodes[1].raw()), None, None)));
+    for &node in &nodes {
+        set_atom_feature(&mut engine, node, LocalFeatureKey::TagName, StyleAtomID(100));
+    }
+    let guard = StyleAtomID(200);
+    let target = StyleAtomID(201);
+    // The rule holds no native conditions for the engine to read, so it cannot decide them, as for
+    // a container whose record it holds no view of.
+    let rule = add_guard_target_rule(&mut engine, guard, target);
+    engine.set_rule_declared_properties(rule, &[(1, false)], true);
+    engine.set_rule_gated_by_container_query(rule);
+    add_feature(&mut engine, nodes[1], LocalFeatureKey::Class(guard));
+    add_feature(&mut engine, nodes[2], LocalFeatureKey::Class(target));
+    discard_transaction(&mut engine);
+
+    assert!(engine.begin_cold_matching_batch(nodes[0]));
+    let mut compact = None;
+    let mut complete = false;
+    let matched = engine.match_element_for_purpose_with_compact_answer(
+        nodes[2],
+        true,
+        CompletionExactness::AllowPruning,
+        Some(&mut compact),
+        Some(&mut complete),
+    );
+    assert!(matched.is_ok());
+    assert!(complete);
+    engine.end_cold_matching_batch();
+
+    // The verdict is published undecided, which keeps the node the host's, not as one that
+    // failed; a flush that still cannot decide it keeps the winners it was published with.
+    let undecided = vec![PublishedContainerVerdict {
+        rule,
+        pseudo: false,
+        held: None,
+    }];
+    assert_eq!(engine.published_container_verdicts.get(&nodes[2]), Some(&undecided));
+    engine.refresh_winners_whose_container_verdicts_moved(
+        false,
+        publication::WinnerRepublication::for_flush(),
+        &mut Counters::default(),
+    );
+    assert_eq!(engine.published_container_verdicts.get(&nodes[2]), Some(&undecided));
 }
 
 #[test]
@@ -10060,15 +10270,15 @@ fn a_scope_dispatch_can_extend_a_finished_prefix_template() {
 
     let mut template = RuleDispatch::new();
     insert_scope_rule(&mut template, &programs, rules[0], base, true);
-    template.finish_prefixes();
+    template.finish_prefixes(&mut Default::default());
     let mut extended = RuleDispatch::rebind_rules_for_extension(&template, &rules[..1]);
     insert_scope_rule(&mut extended, &programs, rules[1], suffix, true);
-    extended.finish_prefixes();
+    extended.finish_prefixes(&mut Default::default());
 
     let mut cold = RuleDispatch::new();
     insert_scope_rule(&mut cold, &programs, rules[0], base, true);
     insert_scope_rule(&mut cold, &programs, rules[1], suffix, true);
-    cold.finish_prefixes();
+    cold.finish_prefixes(&mut Default::default());
 
     assert_eq!(extended.entry_count(), cold.entry_count());
     for index in 0..extended.entry_count() {
@@ -11345,7 +11555,7 @@ fn replay_ffi_reclaims_the_non_empty_recorded_atom_set() {
     let output =
         unsafe { bridge::style_engine_take_style_transaction(engine_pointer, nodes[0].raw(), computation_inputs) };
 
-    assert_eq!(engine.document_style_computation_inputs, Some(computation_inputs));
+    assert_eq!(engine.document_style_computation_inputs, computation_inputs);
 
     assert!(output.style_atoms_swept);
     assert_eq!(output.reclaimed_style_atom_count, 1);
@@ -11670,12 +11880,11 @@ fn engine_atom_reuse_replaces_custom_property_names() {
 fn owed_element_style_inputs_fold_into_covering_reactions() {
     use super::transaction::{STYLE_REACTION_INHERITED_STYLE, STYLE_REACTION_RECOMPUTE_STYLE};
     let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
-    let mut raw_nodes = [0; 2];
+    let mut raw_nodes = [0; 1];
     engine.allocate_style_nodes(&mut raw_nodes);
     let node = StyleNodeID::from_raw(raw_nodes[0]).unwrap();
-    let other = StyleNodeID::from_raw(raw_nodes[1]).unwrap();
 
-    engine.record_element_style_input(node, STYLE_REACTION_INHERITED_STYLE, 0b0010);
+    engine.record_derived_element_style_input(node, STYLE_REACTION_INHERITED_STYLE, 0b0010);
     assert!(engine.has_deferred_element_style_input(node));
     // A record delta covers only what it already carries.
     assert_eq!(
@@ -11690,7 +11899,7 @@ fn owed_element_style_inputs_fold_into_covering_reactions() {
     assert!(!engine.has_deferred_element_style_input(node));
 
     // A materialization covers anything, and the merge carries both sides.
-    engine.record_element_style_input(node, STYLE_REACTION_INHERITED_STYLE, 0b0010);
+    engine.record_derived_element_style_input(node, STYLE_REACTION_INHERITED_STYLE, 0b0010);
     let merged = engine.absorb_element_style_input(node, STYLE_REACTION_RECOMPUTE_STYLE, 0b0100, true);
     assert_eq!(
         merged & 0xff,
@@ -11698,19 +11907,61 @@ fn owed_element_style_inputs_fold_into_covering_reactions() {
     );
     assert_eq!(merged >> 8, 0b0110);
     assert!(!engine.has_deferred_element_style_input(node));
+}
 
-    // Inputs the engine derived make the next transaction one more generation of the same style
-    // change; one C++ records for a node the engine did not derive makes it a new pass.
-    engine.record_derived_element_style_input(other, STYLE_REACTION_RECOMPUTE_STYLE, 0);
-    assert!(engine.host.externally_recorded_style_input_nodes.is_empty());
-    engine.record_element_style_input(other, STYLE_REACTION_INHERITED_STYLE, 0);
-    assert!(engine.host.externally_recorded_style_input_nodes.is_empty());
-    engine.record_element_style_input(node, STYLE_REACTION_RECOMPUTE_STYLE, 0);
-    assert!(engine.host.externally_recorded_style_input_nodes.contains(&node));
-    engine.record_element_style_input(node, STYLE_REACTION_INHERITED_STYLE, 0);
-    assert!(engine.host.externally_recorded_style_input_nodes.contains(&node));
-    engine.consume_element_style_input(node);
-    assert!(engine.host.externally_recorded_style_input_nodes.is_empty());
+#[test]
+fn held_style_records_outlive_engine_assignments_and_release_on_retirement() {
+    let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
+    let mut raw_nodes = [0; 2];
+    engine.allocate_style_nodes(&mut raw_nodes);
+    let [first, second] = raw_nodes.map(|node| StyleNodeID::from_raw(node).unwrap());
+    let publish = |engine: &mut StyleEngine, node, pseudo_element_styles| {
+        engine
+            .publish_computed_groups(
+                computed::ComputedStyleTarget::new(node, u8::MAX),
+                &[],
+                0,
+                0,
+                computed::ComputedMetadataInput {
+                    pseudo_element_styles,
+                    dependency_flags: 0,
+                    counter_style_environment_identity: 0,
+                    animation_overlay_identity: 0,
+                    animated_overlay: HostShared::null(),
+                    animation_overlay_payloads: &[],
+                    longhand_table: HostShared::null(),
+                },
+            )
+            .style_record_identity
+            .raw()
+    };
+    let held_record = publish(&mut engine, first, 1);
+    assert_eq!(publish(&mut engine, second, 1), held_record);
+    engine.set_held_style_record(first, held_record);
+    engine.set_held_style_record(first, held_record);
+    engine.set_held_style_record(second, held_record);
+
+    // The engine can publish a replacement before the host installs it.
+    let replacement = publish(&mut engine, first, 2);
+    engine.computed_group_sets.remove(second);
+    engine.computed_group_sets.reclaim_unreachable();
+    assert!(engine.computed_group_sets.final_style_record_is_live(held_record));
+
+    engine.set_held_style_record(first, replacement);
+    engine.computed_group_sets.reclaim_unreachable();
+    assert!(engine.computed_group_sets.final_style_record_is_live(held_record));
+    assert!(engine.computed_group_sets.final_style_record_is_live(replacement));
+
+    // Clearing one holder must not release another holder's shared record.
+    engine.set_held_style_record(first, 0);
+    engine.computed_group_sets.remove(first);
+    engine.computed_group_sets.reclaim_unreachable();
+    assert!(engine.computed_group_sets.final_style_record_is_live(held_record));
+    assert!(!engine.computed_group_sets.final_style_record_is_live(replacement));
+
+    engine.retire_node_state(second);
+    engine.computed_group_sets.reclaim_unreachable();
+    assert!(!engine.computed_group_sets.final_style_record_is_live(held_record));
 }
 
 #[test]
@@ -11740,7 +11991,7 @@ fn shared_computation_context_checks_fixed_inputs_and_record_liveness() {
     let parent_record = publish(&mut engine, nodes[0], 0);
     let record = publish(&mut engine, nodes[1], 1);
     let other_parent_record = publish(&mut engine, nodes[2], 2);
-    engine.document_style_computation_inputs = Some(bridge::FfiDocumentStyleComputationInputs::default());
+    engine.document_style_computation_inputs = bridge::FfiDocumentStyleComputationInputs::default();
     engine.begin_style_record_view_epoch();
     let context = computed::SharedComputationContext {
         parent_record,
@@ -11788,7 +12039,7 @@ fn shared_computation_context_checks_fixed_inputs_and_record_liveness() {
     ] {
         let mut inputs = bridge::FfiDocumentStyleComputationInputs::default();
         change(&mut inputs);
-        engine.document_style_computation_inputs = Some(inputs);
+        engine.document_style_computation_inputs = inputs;
         engine
             .computed_group_sets
             .remember_shared_computation_context(nodes[1], context);
@@ -11797,7 +12048,7 @@ fn shared_computation_context_checks_fixed_inputs_and_record_liveness() {
             None
         );
     }
-    engine.document_style_computation_inputs = Some(bridge::FfiDocumentStyleComputationInputs::default());
+    engine.document_style_computation_inputs = bridge::FfiDocumentStyleComputationInputs::default();
     for (environment, shape, pseudos) in [(4, [4, 5, 6, 7], 1), (3, [4, 9, 6, 7], 1), (3, [4, 5, 6, 7], 2)] {
         engine
             .computed_group_sets

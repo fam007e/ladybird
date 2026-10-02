@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/HashTable.h>
 #include <AK/QuickSort.h>
 #include <AK/SetUnion.h>
 #include <LibWeb/CSS/CSSPropertyRule.h>
@@ -23,11 +24,17 @@
 #include <LibWeb/DOM/Text.h>
 #include <LibWeb/HTML/CustomElements/CustomStateSet.h>
 #include <LibWeb/HTML/HTMLBRElement.h>
+#include <LibWeb/HTML/HTMLBodyElement.h>
 #include <LibWeb/HTML/HTMLHeadingElement.h>
 #include <LibWeb/HTML/HTMLInputElement.h>
 #include <LibWeb/HTML/HTMLSlotElement.h>
+#include <LibWeb/HTML/HTMLTableCellElement.h>
+#include <LibWeb/HTML/HTMLTableElement.h>
+#include <LibWeb/HTML/LocalNavigable.h>
+#include <LibWeb/HTML/NavigableContainer.h>
 #include <LibWeb/SVG/SVGClipPathElement.h>
 #include <LibWeb/SVG/SVGElement.h>
+#include <LibWeb/SVG/SVGGraphicsElement.h>
 #include <LibWeb/SVG/SVGMaskElement.h>
 #include <LibWeb/SVG/SVGPatternElement.h>
 #include <LibWeb/SVG/SVGSwitchElement.h>
@@ -290,6 +297,8 @@ void record_element_connected(DOM::Element& element)
     // A newly minted identity holds none of the facts the element's style noted before.
     if (element.style_recomputes_on_environment_move())
         element.publish_style_recomputes_on_environment_move();
+    if (element.is_size_query_container() || element.style_depends_on_size_container_query())
+        element.publish_size_container_query_facts();
     record_element_arrival_delta(element, *style_engine, tree_scope_of(element.root()));
     ensure_dom_order_parent_identity(element.parent(), *style_engine);
     link_in_dom_order(*style_engine, element);
@@ -391,6 +400,8 @@ void record_subtree_connecting(DOM::Node& root)
                 style_computer.register_style_node(identity, *element);
                 if (element->style_recomputes_on_environment_move())
                     element->publish_style_recomputes_on_environment_move();
+                if (element->is_size_query_container() || element->style_depends_on_size_container_query())
+                    element->publish_size_container_query_facts();
             } else {
                 auto identity = identities[next_shadow_root_identity++];
                 auto& shadow_root = as<DOM::ShadowRoot>(*arrival.node);
@@ -421,6 +432,14 @@ void record_subtree_connecting(DOM::Node& root)
 }
 
 // Publish every selector-visible fact intrinsic to one element.
+// The element-backed pseudo-element an element in its host's shadow tree stands for, as one plus
+// its kind, or zero.
+static u8 associated_pseudo_kind_plus_one(DOM::Element const& element)
+{
+    auto pseudo_element = element.associated_shadow_host_pseudo_element();
+    return pseudo_element.has_value() ? static_cast<u8>(to_underlying(*pseudo_element) + 1) : 0;
+}
+
 template<typename PublishFeature, typename PublishEmptiness>
 static void publish_element_selector_features(StyleEngine& style_engine, DOM::Element& element, StyleNodeID node, PublishFeature publish_feature, PublishEmptiness publish_emptiness)
 {
@@ -484,20 +503,32 @@ static void publish_element_selector_features(StyleEngine& style_engine, DOM::El
                                             .custom_state_count = 0,
                                             .heading_level = heading_level,
                                             .is_slot = is_slot,
+                                            .associated_pseudo_kind_plus_one = associated_pseudo_kind_plus_one(element),
                                             .reserved = 0,
                                             .adjustment_facts = element_style_adjustment_facts(element),
                                         },
         custom_states);
 }
 
-// Whether the element's cascade may include presentational hints. The hints themselves are
-// collected during the C++ computation, and a table cell's read the table's computed style, so
-// this decides from the element kind and its attributes alone, conservatively.
-// Hints mapped from another element's attributes, which move without the element's own moving.
-static bool element_may_have_derived_presentational_hints(DOM::Element const& element)
+// An element's hints move when something beside its own attributes that they are mapped from
+// moves: the table a cell is under, the <source> an image takes its dimensions from, the body's
+// link colours for a link, an input entering or leaving the Image Button state. Publish them again.
+void republish_presentational_hints(DOM::Element& element)
 {
-    // A table cell's hints also come from its table's attributes, and an image's from the
-    // <source> its <picture> selected.
+    auto* style_engine = style_engine_for(element);
+    if (!style_engine || element.style_node_id() == no_style_node)
+        return;
+    StyleComputer::collect_presentational_hint_properties({ element });
+    // The hints moved, and so does the style they are cascaded into.
+    record_element_declarations_changed(element, ElementDeclarationKind::SvgPresentationAttribute, true, true);
+}
+
+static bool element_has_presentational_hints_to_publish(DOM::Element const& element)
+{
+    if (element.publishes_presentational_hints_on_arrival())
+        return true;
+    // A table cell can take hints from its table's border and cellpadding, and an image from its
+    // <picture>'s <source>, without a presentational attribute of its own.
     if (element.namespace_uri() == Namespace::HTML && first_is_one_of(element.local_name(), HTML::TagNames::td, HTML::TagNames::th, HTML::TagNames::img))
         return true;
     // A body's link, vlink and alink attributes are presentational hints on every link, by the
@@ -505,19 +536,16 @@ static bool element_may_have_derived_presentational_hints(DOM::Element const& el
     if ((element.matches_link_pseudo_class() || element.matches_visited_pseudo_class())
         && (element.document().normal_link_color().has_value() || element.document().visited_link_color().has_value() || element.document().active_link_color().has_value()))
         return true;
-    return false;
-}
-
-static bool element_may_have_presentational_hints(DOM::Element const& element)
-{
-    if (element_may_have_derived_presentational_hints(element))
-        return true;
-    if (element.publishes_presentational_hints_on_arrival())
-        return false;
     // The cascade also reads the width and height attributes of an element that supports them.
     if (element.supports_dimension_attributes()
         && (element.has_attribute(HTML::AttributeNames::width) || element.has_attribute(HTML::AttributeNames::height)))
         return true;
+    // A body takes its margins from its frame's marginwidth and marginheight.
+    if (is<HTML::HTMLBodyElement>(element)) {
+        if (auto navigable = element.document().navigable(); navigable && navigable->container()
+            && (navigable->container()->has_attribute(HTML::AttributeNames::marginwidth) || navigable->container()->has_attribute(HTML::AttributeNames::marginheight)))
+            return true;
+    }
     bool has_presentational_hint = false;
     element.for_each_attribute([&](Utf16FlyString const& name, Utf16View) {
         if (!has_presentational_hint && element.is_presentational_hint(name))
@@ -629,15 +657,15 @@ u32 element_style_adjustment_facts(DOM::Element const& element)
         if (condition)
             facts |= fact;
     };
-    // Admission facts do not participate in box transformations. In particular, collecting
-    // presentational hints can scan every attribute, so only collect them for the engine.
+    // Admission facts do not participate in box transformations.
     // An animation the element is associated with composes into its style once it is relevant,
     // which its timeline can make it after the element's arrival.
     set(element.has_relevant_animations() || element.has_associated_animations(), ElementStyleAdjustmentFact::HasAnimations);
-    set(element_may_have_presentational_hints(element), ElementStyleAdjustmentFact::HasPresentationalHints);
     set(element.associated_shadow_host_pseudo_element().has_value(), ElementStyleAdjustmentFact::IsShadowHostPseudoElement);
-    set(element_may_have_derived_presentational_hints(element), ElementStyleAdjustmentFact::HasDerivedPresentationalHints);
     set(is<SVG::SVGElement>(element), ElementStyleAdjustmentFact::IsSvgElement);
+    set(is<SVG::SVGGraphicsElement>(element), ElementStyleAdjustmentFact::IsSvgGraphicsElement);
+    set(element.is_html_html_element(), ElementStyleAdjustmentFact::IsHtmlHtmlElement);
+    set(is<HTML::HTMLBodyElement>(element), ElementStyleAdjustmentFact::IsHtmlBodyElement);
     set(is<SVG::SVGSwitchElement>(element), ElementStyleAdjustmentFact::IsSvgSwitchElement);
     set(element.is_svg_container(), ElementStyleAdjustmentFact::IsSvgContainer);
     set(element.requires_svg_container(), ElementStyleAdjustmentFact::RequiresSvgContainer);
@@ -655,6 +683,7 @@ void record_element_adjustment_facts(DOM::Element& element)
     if (!style_engine || element.style_node_id() == no_style_node)
         return;
     style_engine->set_element_adjustment_facts(element.style_node_id(), element_style_adjustment_facts(element));
+    style_engine->set_element_associated_pseudo_kind(element.style_node_id(), associated_pseudo_kind_plus_one(element));
 }
 
 void publish_required_attribute_value_texts(StyleEngine& style_engine, StyleComputer& style_computer)
@@ -715,12 +744,15 @@ static void record_element_initial_features(DOM::Element& element)
             });
         });
 
+    if (auto const& id = element.id(); id.has_value())
+        style_engine->set_element_id_name(element.style_node_id(), style_engine->intern_atom(*id));
+
     if (!element.part_names().is_empty())
         record_element_parts_changed(element);
     // NB: Asking the block itself does not build the views of its declarations.
     if (auto const inline_style = element.inline_style(); inline_style && !inline_style->declaration_block().is_empty())
         record_element_inline_style_properties(element);
-    if (element.publishes_presentational_hints_on_arrival() && !element_may_have_derived_presentational_hints(element))
+    if (element_has_presentational_hints_to_publish(element))
         StyleComputer::collect_presentational_hint_properties({ element });
 }
 
@@ -776,6 +808,10 @@ void record_element_moved(DOM::Element& element, DOM::Node* old_parent, DOM::Ele
                 style_engine->set_element_adjustment_facts(descendant->style_node_id(), element_style_adjustment_facts(*descendant));
                 style_engine->record_derived_element_style_input_change(descendant->style_node_id(), StyleEngine::RecomputeStyle);
             }
+            // A table cell's hints come from the table it is now under.
+            if (auto* descendant = as_if<DOM::Element>(node); descendant && descendant->namespace_uri() == Namespace::HTML && descendant->style_node_id() != no_style_node
+                && first_is_one_of(descendant->local_name(), HTML::TagNames::td, HTML::TagNames::th))
+                republish_presentational_hints(*descendant);
             return TraversalDecision::Continue;
         });
 
@@ -1185,28 +1221,23 @@ static void record_element_inline_style_properties(DOM::Element& element)
     style_engine->set_element_inline_style_properties(element.style_node_id(), inline_style ? &inline_style->declaration_block() : nullptr);
 }
 
-// The hints an element's attributes map to are published from where the cascade collects them
-// rather than from the element's arrival, because one of them cannot be mapped before style: a
-// table cell takes its border colour from the table's *computed* border colour, which no element
-// has while the document is still being parsed. Asking for them on arrival crashes on the first
-// bordered table for that reason. The cascade builds the block anyway, so this costs the call.
-//
-// An element that publishes its hints on arrival gets its own kind, which tells the engine the hints
-// are current and lets it compute the element's style itself.
+// The hints an element's attributes map to, published at its arrival, wherever what they are mapped
+// from moves, and from where the cascade collects them.
 bool record_element_presentational_hint_properties(DOM::Element& element, ReadonlySpan<StyleProperty> hints)
 {
     auto* style_engine = style_engine_for(element);
     if (!style_engine || element.style_node_id() == no_style_node || has_pending_initial_features(element))
         return false;
-    auto kind = element.publishes_presentational_hints_on_arrival()
-        ? StyleEngineFFI::FfiElementDeclarationKind::SvgPresentationAttribute
-        : StyleEngineFFI::FfiElementDeclarationKind::PresentationalHint;
-    style_engine->set_element_presentational_hint_properties(element.style_node_id(), kind, hints);
+    // NB: The SvgPresentationAttribute kind is the one whose declarations the engine takes as
+    //     current: every element's hints are published where they move.
+    style_engine->set_element_presentational_hint_properties(element.style_node_id(), StyleEngineFFI::FfiElementDeclarationKind::SvgPresentationAttribute, hints);
     return true;
 }
 
 void record_element_declarations_changed(DOM::Element& element, ElementDeclarationKind kind, bool had_declarations, bool has_declarations)
 {
+    if (element.style_node_id() != no_style_node)
+        element.document().style_computer().style_engine().note_element_declarations_changed(element.style_node_id());
     element.document().flush_deferred_style_change_event();
     auto* style_engine = style_engine_for(element);
     if (!style_engine || element.style_node_id() == no_style_node || has_pending_initial_features(element))
@@ -1734,6 +1765,8 @@ void record_stylesheet_rules_replaced(StyleSheetState& sheet)
 void record_stylesheet_attached(StyleSheetState& sheet, DOM::Node& document_or_shadow_root, StyleSheetState* before)
 {
     document_or_shadow_root.document().flush_deferred_style_change_event();
+    // The attachment may compile the sheet's rules into a shared snapshot, whose native sheet they then name.
+    document_or_shadow_root.document().note_style_sheet_set_change();
     publish_document_kind(document_or_shadow_root.document());
     auto& style_computer = document_or_shadow_root.document().style_computer();
     auto& style_engine = style_computer.style_engine();
@@ -1932,6 +1965,7 @@ void record_stylesheet_conditions(StyleSheetState& sheet, DOM::Node& document_or
 void record_stylesheet_detached(StyleSheetState& sheet, DOM::Node& document_or_shadow_root)
 {
     document_or_shadow_root.document().flush_deferred_style_change_event();
+    document_or_shadow_root.document().note_style_sheet_set_change();
     auto& style_computer = document_or_shadow_root.document().style_computer();
     auto sheet_id = style_computer.style_engine_sheet_id_for(sheet);
     if (sheet_id == 0)
@@ -2027,6 +2061,10 @@ void record_element_id_changed(DOM::Element& element, Optional<Utf16FlyString> c
     };
 
     record_feature(element, StyleEngineFFI::FfiFeatureKind::Id, 0, kind_of(old_value), atom_of(old_value), kind_of(new_value), atom_of(new_value));
+
+    // `getElementById` is case-sensitive in every mode, so the name the inverse index is keyed by
+    // is the one written rather than the one a quirks-mode selector folds it to.
+    style_engine->set_element_id_name(element.style_node_id(), new_value.has_value() ? style_engine->intern_atom(*new_value) : StyleAtomID {});
 }
 
 void record_element_class_list_changed(DOM::Element& element, ReadonlySpan<Utf16FlyString> old_classes, ReadonlySpan<Utf16FlyString> new_classes)
@@ -2086,12 +2124,19 @@ void record_element_attribute_changed(DOM::Element& element, Utf16FlyString cons
     // box adjustments and whether it supports dimension attributes.
     if (old_value.has_value() != new_value.has_value() || name == HTML::AttributeNames::type)
         record_element_adjustment_facts(element);
+    // A table's border attribute moves its cells' border hints.
+    if (name == HTML::AttributeNames::border && is<HTML::HTMLTableElement>(element)) {
+        element.for_each_in_subtree_of_type<HTML::HTMLTableCellElement>([](auto& cell) {
+            republish_presentational_hints(cell);
+            return TraversalDecision::Continue;
+        });
+    }
 
     // Both values cross as atoms. Their text is recorded once per distinct value only when a
-    // compiled selector for this attribute uses an operator that cannot compare atom identities.
-    // This lets the match evaluator reconstruct either side of such a transaction without asking
-    // the DOM, and two different values cannot cancel in the journal merely because both are
-    // present.
+    // compiled selector for this attribute uses an operator that cannot compare atom identities,
+    // or when an attr() can read the name. This lets the match evaluator reconstruct either side
+    // of such a transaction without asking the DOM, and two different values cannot cancel in the
+    // journal merely because both are present.
     // The same name an arriving attribute publishes, with the same other forms noted alongside it.
     // See `StyleEngine::intern_attribute_name`.
     auto atom = style_engine->intern_attribute_name(name, namespace_uri);

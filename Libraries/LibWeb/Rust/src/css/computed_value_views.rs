@@ -142,6 +142,13 @@ impl ComputedStyleValueHandle {
             value: unsafe { &*self.pointer.cast::<StyleValueData>() },
         })
     }
+
+    /// The retained style value itself, for the properties whose computed value is not a
+    /// length-percentage.
+    pub(crate) fn style_value<'a>(&self) -> Option<&'a StyleValueData> {
+        // SAFETY: As above.
+        unsafe { self.pointer.cast::<StyleValueData>().as_ref() }
+    }
 }
 
 impl ComputedSize {
@@ -528,6 +535,16 @@ impl<'a> ComputedValuesView<'a> {
         }
     }
 
+    /// The computed `content` value.
+    pub(crate) fn content_value(self) -> Option<&'a StyleValueData> {
+        self.content().content.data()
+    }
+
+    /// The computed `quotes` value.
+    pub(crate) fn quotes_value(self) -> Option<&'a StyleValueData> {
+        self.inherited_list().quotes.data()
+    }
+
     /// The `counter-reset` list, empty for `none`.
     pub(crate) fn counter_reset(self) -> &'a [crate::css::style_value::RetainedCounterDefinition] {
         counter_definitions(&self.content().counter_reset)
@@ -705,6 +722,21 @@ impl<'a> ComputedValuesView<'a> {
     #[allow(dead_code)]
     pub(crate) fn inherited_list(self) -> &'a InheritedListValues {
         self.native_group(STYLE_GROUP_INDEX_INHERITED_LIST)
+    }
+
+    /// Whether `list-style-image` names an image, which a list marker then shows instead of its
+    /// marker string.
+    pub(crate) fn list_style_image_is_set(self) -> bool {
+        matches!(
+            self.inherited_list().list_style_image.data(),
+            Some(
+                StyleValueData::Image { .. }
+                    | StyleValueData::ImageSet { .. }
+                    | StyleValueData::LinearGradient { .. }
+                    | StyleValueData::ConicGradient { .. }
+                    | StyleValueData::RadialGradient { .. }
+            )
+        )
     }
 
     #[inline]

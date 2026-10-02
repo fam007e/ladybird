@@ -20,6 +20,7 @@ set(TEST_SOURCES
     TestSessionHistoryTraversalQueue.cpp
     TestSessionStore.cpp
     TestSiteCompatibilityDataLoading.cpp
+    TestSpoofingSettings.cpp
     TestStorageJar.cpp
     TestTabPerformanceStats.cpp
     TestWebViewURL.cpp
@@ -199,6 +200,12 @@ if (BUILD_TESTING AND NOT WIN32)
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-webdriver-content-blockers.py $<TARGET_FILE:WebDriver>
     )
     set_tests_properties(TestWebDriverContentBlockers PROPERTIES TIMEOUT 180)
+
+    add_test(
+        NAME TestWebDriverSearchEngineSettings
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-webdriver-search-engine-settings.py $<TARGET_FILE:WebDriver>
+    )
+    set_tests_properties(TestWebDriverSearchEngineSettings PROPERTIES TIMEOUT 120)
 
     add_test(
         NAME TestWebDriverSessionHistory

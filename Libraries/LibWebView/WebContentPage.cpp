@@ -1553,11 +1553,11 @@ void WebContentPage::did_resolve_dom_node_url(u64 request_id, String resolved_ur
     }
 }
 
-void WebContentPage::did_receive_network_response_headers(u64 request_id, u32 status_code, Optional<String> reason_phrase, Vector<HTTP::Header> response_headers, Requests::CameFromCache came_from_cache)
+void WebContentPage::did_receive_network_response_headers(u64 request_id, u32 status_code, Optional<String> reason_phrase, Vector<HTTP::Header> response_headers, Requests::CacheState cache_state)
 {
     if (displays_tab()) {
         if (view().on_network_response_headers_received)
-            view().on_network_response_headers_received(request_id, status_code, reason_phrase, response_headers, came_from_cache);
+            view().on_network_response_headers_received(request_id, status_code, reason_phrase, response_headers, cache_state);
     }
 }
 
@@ -2530,6 +2530,19 @@ Messages::WebContentTestClient::DidRequestRegisterSessionStoreTabForTestingRespo
     if (displays_tab())
         return { view().register_session_store_tab_for_testing({}) };
     return { false };
+}
+
+// A document populated for a navigable is one the browser process created for it, and has not made active yet.
+Messages::WebContentTestClient::DidRequestHasPopulatedDocumentForTestingResponse WebContentPage::did_request_has_populated_document_for_testing(Web::HTML::CrossProcessId navigable_id) const
+{
+    auto navigable = traversable().top_level_traversable().find(navigable_id);
+    if (!navigable.has_value())
+        return false;
+    bool has_populated_document = false;
+    navigable->for_each_populated_document([&](auto const&) {
+        has_populated_document = true;
+    });
+    return has_populated_document;
 }
 
 Messages::WebContentTestClient::DidRequestSessionStoreTabStateForTestingResponse WebContentPage::did_request_session_store_tab_state_for_testing()

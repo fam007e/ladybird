@@ -372,7 +372,27 @@ public:
     // The synthetic pseudo-element records the style engine settled beside an engine-computed record: a kind it
     // decided holds the record, or none when the pseudo-element is not generated; a kind it left alone is unchanged.
     using EnginePseudoElementRecords = Array<Optional<CSS::StyleRecordID>, to_underlying(CSS::PseudoElement::KnownPseudoElementCount)>;
-    CSS::RequiredInvalidationAfterStyleChange apply_engine_computed_style_record(CSS::StyleRecordID new_style_record, EnginePseudoElementRecords const&, bool uses_substitution, bool& did_change_custom_properties);
+    // What the style engine answered a record's installation damages, for the move between the two
+    // records it names. Any other move is compared at installation.
+    struct EngineRecordDamage {
+        CSS::StyleRecordID old_style_record;
+        CSS::StyleRecordID new_style_record;
+        u32 packed { 0 };
+
+        [[nodiscard]] bool answers(CSS::StyleRecordID old_record, CSS::StyleRecordID new_record) const { return old_style_record == old_record && new_style_record == new_record; }
+    };
+    // A pseudo-element's move is decided against the originating element's record as well, so its
+    // answer also names that record.
+    struct EnginePseudoElementRecordDamage {
+        EngineRecordDamage move;
+        CSS::StyleRecordID originating_style_record;
+    };
+    // The damages the style engine answered an element's row and its pseudo-element rows with.
+    struct EngineRecordDamages {
+        Optional<EngineRecordDamage> element;
+        Array<Optional<EnginePseudoElementRecordDamage>, to_underlying(CSS::PseudoElement::KnownPseudoElementCount)> pseudo_elements {};
+    };
+    CSS::RequiredInvalidationAfterStyleChange apply_engine_computed_style_record(CSS::StyleRecordID new_style_record, EnginePseudoElementRecords const&, bool uses_substitution, u8 record_reads, u32 explicitly_inherited_non_inherited_style_groups, bool& did_change_custom_properties, EngineRecordDamages const* = nullptr);
     // The custom-property environment an engine-computed record was published with: the one the
     // element inherits, or one the engine resolved over it. Nothing when it cannot be installed.
     [[nodiscard]] RefPtr<CSS::CustomPropertyData const> custom_property_environment_of_engine_record(CSS::StyleRecordID, bool& installable) const;
@@ -411,6 +431,8 @@ public:
     }
     void set_computed_style(Optional<CSS::PseudoElement>, CSS::StyleRecordID);
     void refresh_computed_style(Optional<CSS::PseudoElement>, CSS::StyleRecordID);
+    // Install the custom properties beside a pseudo-element record the style engine derived.
+    void install_engine_pseudo_element_custom_property_data(CSS::PseudoElement, CSS::StyleRecordID);
     void update_animated_properties(Badge<Web::Animations::KeyframeEffect> const&, Optional<CSS::PseudoElement>, Web::Animations::KeyframeEffect&, Web::Animations::AnimationUpdateContext&);
     void update_animated_properties_for_abstract_element(Badge<Web::Animations::KeyframeEffect> const&, DOM::AbstractElement, Web::Animations::KeyframeEffect&, Web::Animations::AnimationUpdateContext&);
 
@@ -585,15 +607,7 @@ public:
     bool style_uses_tree_counting_function() const { return m_style_uses_tree_counting_function; }
     // Whether this element's style resolution called a custom function. Which one is not reported by
     // the substitution machinery, so an `@function` change reaches the elements that called any.
-    void set_style_uses_custom_function()
-    {
-        if (m_style_uses_custom_function)
-            return;
-        bool const publishes = !style_recomputes_on_environment_move();
-        m_style_uses_custom_function = true;
-        if (publishes)
-            publish_style_recomputes_on_environment_move();
-    }
+    void set_style_uses_custom_function();
     bool style_uses_custom_function() const { return m_style_uses_custom_function; }
 
     bool style_uses_if_css_function() const { return m_style_uses_if_css_function; }
@@ -611,7 +625,13 @@ public:
             publish_style_recomputes_on_environment_move();
     }
     bool style_depends_on_size_container_query() const { return m_style_depends_on_size_container_query; }
-    void set_style_depends_on_size_container_query() { m_style_depends_on_size_container_query = true; }
+    void set_style_depends_on_size_container_query()
+    {
+        if (m_style_depends_on_size_container_query)
+            return;
+        m_style_depends_on_size_container_query = true;
+        publish_size_container_query_facts();
+    }
     bool style_depends_on_style_container_query() const { return m_style_depends_on_style_container_query; }
     void set_style_depends_on_style_container_query()
     {
@@ -637,7 +657,16 @@ public:
     void set_is_style_query_container() { m_is_style_query_container = true; }
     bool is_style_query_container() const { return m_is_style_query_container; }
     bool is_size_query_container() const { return m_is_size_query_container; }
-    void set_is_size_query_container() { m_is_size_query_container = true; }
+    void set_is_size_query_container()
+    {
+        if (m_is_size_query_container)
+            return;
+        m_is_size_query_container = true;
+        publish_size_container_query_facts();
+    }
+    // Tell the style engine what this element's styles asked of size query containers, which is what
+    // finds the dependents a container's new box moves.
+    void publish_size_container_query_facts();
     void invalidate_descendant_styles_depending_on_style_container_query();
 
     bool child_style_uses_tree_counting_function() const { return m_child_style_uses_tree_counting_function; }
@@ -871,8 +900,6 @@ public:
     // https://html.spec.whatwg.org/multipage/urls-and-fetching.html#implicitly-potentially-render-blocking
     virtual bool is_implicitly_potentially_render_blocking() const { return false; }
 
-    double ensure_css_random_base_value(CSS::RandomCachingKey const&);
-
     struct PointerLockOptions {
         bool unadjusted_movement { false };
     };
@@ -926,6 +953,7 @@ private:
     void append_to_attribute_list(QualifiedName, Utf16String value);
 
     void install_custom_property_data(Optional<CSS::PseudoElement>, RefPtr<CSS::CustomPropertyData const>);
+    void publish_var_reads();
     void synchronize_attribute(Utf16FlyString const& qualified_name) const;
     void synchronize_attribute_ns(Optional<Utf16FlyString> const&, Utf16FlyString const& local_name) const;
     void synchronize_style_attribute() const;
@@ -954,10 +982,11 @@ private:
     Utf16FlyString make_html_uppercased_qualified_name() const;
 
     void exit_fullscreen_on_element_removal();
-    CSS::RequiredInvalidationAfterStyleChange recompute_pseudo_element_styles(bool& did_change_custom_properties, bool had_list_marker, CSS::ComputedValues const* old_originating_style, CSS::StyleEngineMatchResult* = nullptr, PreservedPseudoElementStyles* = nullptr, EnginePseudoElementRecords const* = nullptr);
+    CSS::RequiredInvalidationAfterStyleChange recompute_pseudo_element_styles(bool& did_change_custom_properties, bool had_list_marker, CSS::ComputedValues const* old_originating_style, CSS::StyleEngineMatchResult* = nullptr, PreservedPseudoElementStyles* = nullptr, EnginePseudoElementRecords const* = nullptr, EngineRecordDamages const* = nullptr);
     void apply_computed_style_to_layout_node_if_needed(CSS::RequiredInvalidationAfterStyleChange const&);
     void apply_computed_pseudo_element_styles_to_layout_nodes_if_needed(CSS::RequiredInvalidationAfterStyleChange const&);
     void publish_custom_property_names();
+    void update_anchor_name_registry(CSS::ComputedValues const* old_computed_values, CSS::ComputedValues const& new_computed_values);
     void replace_style_record(CSS::StyleRecordID);
     void clear_computed_styles_from_display_none_descendants();
 

@@ -371,6 +371,7 @@ void StyleScope::populate_rule_cache(StyleRuleCache& rule_cache)
 
 void StyleScope::invalidate_style_cache()
 {
+    document().note_style_sheet_set_change();
     invalidate_counter_style_cache();
     m_style_cache = nullptr;
     m_published_layer_order_generation = 0;
@@ -948,8 +949,11 @@ void StyleScope::build_counter_style_cache()
                 }
             }
         }
-        if (counter_style_environment_changed)
+        if (counter_style_environment_changed) {
             m_counter_style_environment_identity = document().next_counter_style_environment_identity();
+            // The style engine names the same registry on every record it computes against it.
+            document().style_computer().style_engine().set_counter_style_environment_identity(style_engine_tree_scope(), m_counter_style_environment_identity);
+        }
 
         m_is_doing_counter_style_cache_update = false;
         m_needs_counter_style_cache_update = false;
@@ -1058,6 +1062,11 @@ u64 StyleScope::counter_style_environment_identity() const
 {
     if (m_needs_counter_style_cache_update && !m_is_doing_counter_style_cache_update)
         const_cast<StyleScope*>(this)->build_counter_style_cache();
+    // NB: This is asked for whenever a style that depends on the counter style environment is published, which is
+    //     what the layout tree build and the generated content counter style comparison resolve counter styles
+    //     for, against the published registry.
+    if (!m_is_doing_counter_style_cache_update)
+        publish_counter_style_lookup_chain();
     return m_counter_style_environment_identity;
 }
 

@@ -17,7 +17,6 @@
 #include <AK/InsertionSort.h>
 #include <AK/JsonObjectSerializer.h>
 #include <AK/NeverDestroyed.h>
-#include <AK/Random.h>
 #include <AK/ScopeGuard.h>
 #include <AK/StringBuilder.h>
 #include <AK/Time.h>
@@ -62,7 +61,6 @@
 #include <LibWeb/CSS/FontFaceSet.h>
 #include <LibWeb/CSS/HypotheticalElement.h>
 #include <LibWeb/CSS/Invalidation/AdoptedStyleSheetInvalidator.h>
-#include <LibWeb/CSS/Invalidation/ContainerQueryInvalidator.h>
 #include <LibWeb/CSS/Invalidation/ElementStateInvalidator.h>
 #include <LibWeb/CSS/Invalidation/LinkInvalidator.h>
 #include <LibWeb/CSS/Invalidation/MediaQueryInvalidator.h>
@@ -86,7 +84,6 @@
 #include <LibWeb/CSS/StyleValues/FilterStyleValue.h>
 #include <LibWeb/CSS/StyleValues/ImageStyleValue.h>
 #include <LibWeb/CSS/StyleValues/OpacityValueStyleValue.h>
-#include <LibWeb/CSS/StyleValues/RandomValueSharingStyleValue.h>
 #include <LibWeb/CSS/StyleValues/StyleValueList.h>
 #include <LibWeb/CSS/StyleValues/TransformationStyleValue.h>
 #include <LibWeb/CSS/TransitionEvent.h>
@@ -234,6 +231,7 @@
 #include <LibWeb/ResizeObserver/ResizeObserverEntry.h>
 #include <LibWeb/SVG/SVGDecodedImageData.h>
 #include <LibWeb/SVG/SVGElement.h>
+#include <LibWeb/SVG/SVGPatternElement.h>
 #include <LibWeb/SVG/SVGSVGElement.h>
 #include <LibWeb/SVG/SVGScriptElement.h>
 #include <LibWeb/SVG/SVGStyleElement.h>
@@ -706,6 +704,7 @@ Layout::NodeArena& Document::layout_node_arena()
 void Document::reset_style_invalidation_counters() const
 {
     m_style_invalidation_counters = {};
+    (void)const_cast<CSS::StyleEngine&>(style_computer().style_engine()).size_query_container_scan_visits(true);
     if (m_layout_node_arena)
         Layout::RustFFI::layout_arena_scrollable_overflow_recalculation_count(m_layout_node_arena->handle(), true);
     CSS::reset_longhand_wrappers_minted();
@@ -860,7 +859,6 @@ void Document::visit_edges(Cell::Visitor& visitor)
     visitor.visit(m_document_observers_being_notified);
     for (auto& pending_scroll_event : m_pending_scroll_events)
         visitor.visit(pending_scroll_event.event_target);
-    visitor.visit(m_query_containers_needing_container_query_evaluation_after_layout);
     m_scroll_state_query_containers.visit_edges(visitor);
     visitor.visit(m_list_owners_pending_item_renumber);
     visitor.visit(m_list_owners_with_stale_item_counters);
@@ -1555,6 +1553,7 @@ Layout::Node* Document::layout_root_if_live() const
 // retire the tree that was replaced and give the new one a paint state.
 Layout::RustFFI::FfiLayoutTreeBuildOutcome Document::build_layout_tree()
 {
+    m_needs_throttled_animation_style_update_check = true;
     auto replaced_root = layout_root_slot();
     auto outcome = Layout::build_layout_tree(*this);
     VERIFY(is<Layout::Viewport>(layout_node_arena().node_if_live(outcome.viewport)));
@@ -1742,6 +1741,17 @@ void Document::respond_to_base_url_changes(URL::URL const& old_document_url, URL
         return TraversalDecision::Continue;
     });
 
+    // A table's, a table section's, a row's or a cell's background attribute maps to an image hint
+    // resolved against the base URL when it is published, so publish those hints again.
+    if (!base_url_unchanged) {
+        for_each_shadow_including_descendant([&](Node& node) {
+            if (auto* element = as_if<Element>(node); element && element->has_attribute(HTML::AttributeNames::background)
+                && element->is_presentational_hint(HTML::AttributeNames::background))
+                CSS::republish_presentational_hints(*element);
+            return TraversalDecision::Continue;
+        });
+    }
+
     // FIXME: 3. For each descendant of document's shadow-including descendants:
     //        ...
 
@@ -1868,9 +1878,16 @@ void Document::record_partial_relayout_escape(PartialRelayoutEscapeReason reason
         Layout::RustFFI::layout_arena_record_partial_relayout_escape(m_layout_node_arena->handle());
 }
 
+// The style engine keeps the containers, and records their dependents once a full layout has committed their
+// boxes.
 void Document::set_needs_container_query_evaluation_after_layout(Element const& query_container)
 {
-    m_query_containers_needing_container_query_evaluation_after_layout.set(const_cast<Element&>(query_container));
+    style_computer().style_engine().note_size_container_needs_evaluation_after_layout(query_container.style_node_id());
+}
+
+bool Document::has_size_containers_needing_evaluation_after_layout() const
+{
+    return style_computer().style_engine().has_size_containers_needing_evaluation_after_layout();
 }
 
 void Document::begin_style_stabilization_epoch()
@@ -1973,7 +1990,7 @@ bool Document::is_clean_for_layout_geometry_read() const
         && !style_computer().style_engine().has_pending_transaction()
         && !m_needs_media_rule_evaluation
         && !m_needs_animated_style_update
-        && m_query_containers_needing_container_query_evaluation_after_layout.is_empty()
+        && !has_size_containers_needing_evaluation_after_layout()
         && m_elements_with_pending_top_layer_membership_change.is_empty()
         && !m_top_layer_needs_layout_zone_rebuild;
 }
@@ -2014,7 +2031,7 @@ void Document::update_layout_if_needed_for_node(Node const& node, UpdateLayoutRe
         && layout_is_up_to_date()
         && !m_needs_media_rule_evaluation
         && !m_needs_animated_style_update
-        && m_query_containers_needing_container_query_evaluation_after_layout.is_empty()
+        && !has_size_containers_needing_evaluation_after_layout()
         && m_elements_with_pending_top_layer_membership_change.is_empty()
         && !m_top_layer_needs_layout_zone_rebuild
         && !style_computer().style_engine().css_transitions_may_observe_style_changes()
@@ -2130,7 +2147,7 @@ bool Document::reconcile_stale_list_item_counters_after_tree_build()
 
 bool Document::needs_style_update_after_layout()
 {
-    return !m_query_containers_needing_container_query_evaluation_after_layout.is_empty()
+    return has_size_containers_needing_evaluation_after_layout()
         || m_needs_animated_style_update
         || style_computer().style_engine().has_pending_transaction();
 }
@@ -2233,18 +2250,24 @@ void Document::invalidate_style_for_viewport_change()
     invalidate_registered_initial_values(m_cached_registered_properties_from_css_property_rules);
 
     if (registered_initial_value_depends_on_viewport_metrics) {
+        // The custom-property registry holds the initial values just dropped, so the next style
+        // update has to publish the recomputed ones before it reads them.
+        m_rust_custom_property_registry_synced = false;
         // A registered initial value is shared by every element that does not specify the custom
         // property, so its consumers cannot be identified from their computed styles.
         record_style_environment_change();
         return;
     }
 
+    // The viewport is one of the document's published inputs, and the style engine drives a record
+    // that read it again once it moves, so the readers are rows the engine settles. They are still
+    // named here: what moved is in none of their winners.
     auto& style_engine = style_computer().style_engine();
     for (auto style_node : style_engine.viewport_dependent_style_nodes()) {
         auto element = style_computer().element_for_style_node(style_node.value());
         if (!element || !element->is_connected() || &element->document() != this)
             continue;
-        style_engine.record_element_style_input_change(style_node);
+        style_engine.record_derived_element_style_input_change(style_node, CSS::StyleEngine::PublishedStyle | CSS::StyleEngine::RecomputeStyle);
     }
 
     // Descendants that inherit changed values are reached by the normal inherited-style reaction path.
@@ -2252,11 +2275,11 @@ void Document::invalidate_style_for_viewport_change()
     // computed-value dependency for the retained style engine to discover.
     auto elements = move(m_elements_with_viewport_dependent_style);
     for (auto& element : elements) {
-        if (&element.document() != this || (!element.style_uses_if_css_function() && !element.style_depends_on_viewport_metrics()))
+        if (&element.document() != this || (!element.style_uses_if_css_function() && !element.style_uses_custom_function() && !element.style_depends_on_viewport_metrics()))
             continue;
         m_elements_with_viewport_dependent_style.set(element);
         if (element.is_connected())
-            style_engine.record_element_style_input_change(element.style_node_id());
+            style_engine.record_derived_element_style_input_change(element.style_node_id(), CSS::StyleEngine::PublishedStyle | CSS::StyleEngine::RecomputeStyle);
     }
 }
 
@@ -2343,8 +2366,23 @@ void Document::sample_animation_effects_needing_style_update()
     m_force_throttled_animation_style_update = false;
 }
 
+void Document::note_animations_that_can_skip_per_frame_style_updates()
+{
+    if (!m_needs_throttled_animation_style_update_check || m_has_throttled_animation_style_update || !layout_is_up_to_date())
+        return;
+    m_needs_throttled_animation_style_update_check = false;
+    for (auto& animation : m_associated_animations) {
+        auto* effect = as_if<Animations::KeyframeEffect>(animation.effect().ptr());
+        if (effect && effect->can_skip_per_frame_style_update()) {
+            note_throttled_animation_style_update();
+            return;
+        }
+    }
+}
+
 void Document::flush_throttled_animation_style_update()
 {
+    note_animations_that_can_skip_per_frame_style_updates();
     if (!m_has_throttled_animation_style_update)
         return;
     auto task_generation = relevant_settings_object().responsible_event_loop().task_generation();
@@ -2358,10 +2396,12 @@ void Document::flush_throttled_animation_style_update()
 
 void Document::flush_throttled_animation_style_update_for_node(Node const& node)
 {
-    // Only an animation that skipped a per-frame style update has anything for this read to catch
-    // up on. The last sampling pass recorded whether any did, and the document-wide flush above
-    // already trusts that record, so walking every associated animation to find none is wasted on
-    // every synchronous geometry read of a page that animates.
+    // Only an animation that can skip a per-frame style update has anything for this read to catch
+    // up on. Sampling and painting record whether any can, as do reads after a visibility or layout
+    // tree change, and the document-wide flush above already trusts that record, so walking every
+    // associated animation to find none is wasted on every synchronous geometry read of a page that
+    // animates.
+    note_animations_that_can_skip_per_frame_style_updates();
     if (!m_has_throttled_animation_style_update)
         return;
 
@@ -2452,8 +2492,10 @@ bool Document::compositor_animation_observation_timer_is_active() const
 
 void Document::throttled_animation_visibility_changed()
 {
-    if (!m_has_throttled_animation_style_update)
+    if (!m_has_throttled_animation_style_update) {
+        m_needs_throttled_animation_style_update_check = true;
         return;
+    }
     flush_throttled_animation_style_update();
     page().client().request_frame();
 }
@@ -2526,6 +2568,7 @@ void Document::update_paint_and_hit_testing_properties_if_needed()
     drain_invalidation_journal();
 
     prepare_for_rendering();
+    Painting::publish_image_map_area_facts_if_needed(*this);
     if (m_needs_accumulated_visual_contexts_update) {
         m_needs_accumulated_visual_contexts_update = false;
         if (has_committed_viewport_box())
@@ -7836,6 +7879,8 @@ void Document::update_compositor_animations()
                 effect.request_observation_sample();
                 requested_withdrawn_effect_sample = true;
             }
+            if (!m_has_throttled_animation_style_update && effect.can_skip_per_frame_style_update())
+                note_throttled_animation_style_update();
         };
         auto abstract_target = effect.target_abstract_element();
         if (!abstract_target.has_value() || effect.target_properties().is_empty())
@@ -8400,6 +8445,10 @@ void Document::element_id_changed(Badge<DOM::Element>, GC::Ref<DOM::Element> ele
         element->document_or_shadow_root_element_by_id_map().add(new_id.value(), element);
     }
     note_svg_paint_resources_changed();
+    if (old_id.has_value())
+        republish_svg_patterns_inheriting_from(*old_id);
+    if (new_id.has_value())
+        republish_svg_patterns_inheriting_from(*new_id);
 }
 
 void Document::element_with_id_was_added(Badge<DOM::Element>, GC::Ref<DOM::Element> element)
@@ -8416,6 +8465,7 @@ void Document::element_with_id_was_added(Badge<DOM::Element>, GC::Ref<DOM::Eleme
     if (auto id = element->id(); id.has_value()) {
         element->document_or_shadow_root_element_by_id_map().add(id.value(), element);
         note_svg_paint_resources_changed();
+        republish_svg_patterns_inheriting_from(*id);
     }
 }
 
@@ -8429,6 +8479,7 @@ void Document::element_with_id_was_removed(Badge<DOM::Element>, GC::Ref<DOM::Ele
     if (auto id = element->id(); id.has_value()) {
         element->document_or_shadow_root_element_by_id_map().remove(id.value(), element);
         note_svg_paint_resources_changed();
+        republish_svg_patterns_inheriting_from(*id);
     }
 }
 
@@ -9019,14 +9070,6 @@ void Document::for_each_active_css_style_sheet(Function<void(CSS::StyleSheetStat
     }
 }
 
-double Document::ensure_element_shared_css_random_base_value(CSS::RandomCachingKey const& random_caching_key)
-{
-    return m_element_shared_css_random_base_value_cache.ensure(random_caching_key, []() {
-        static XorShift128PlusRNG random_number_generator;
-        return random_number_generator.get();
-    });
-}
-
 static Optional<CSS::StyleSheetState&> find_style_sheet_with_url(Utf16View url, CSS::StyleSheetState& style_sheet)
 {
     if (style_sheet.href_for_bindings() == url)
@@ -9097,11 +9140,13 @@ Optional<Utf16String> Document::get_style_sheet_source(CSS::StyleSheetIdentifier
 void Document::register_shadow_root(Badge<DOM::ShadowRoot>, DOM::ShadowRoot& shadow_root)
 {
     m_shadow_roots.append(shadow_root);
+    note_style_sheet_set_change();
 }
 
 void Document::unregister_shadow_root(Badge<DOM::ShadowRoot>, DOM::ShadowRoot& shadow_root)
 {
     m_shadow_roots.remove(shadow_root);
+    note_style_sheet_set_change();
 }
 
 // https://drafts.csswg.org/css-position-4/#add-an-element-to-the-top-layer
@@ -9853,6 +9898,39 @@ void Document::set_needs_accumulated_visual_contexts_update(bool value)
         set_needs_repaint(InvalidateDisplayList::No);
 }
 
+// A pattern connecting or disconnecting needs no republication of its own here: one that can be named has an id, and
+// the id's arrival or departure republishes the patterns that name it.
+void Document::register_svg_pattern_element(Badge<SVG::SVGPatternElement>, SVG::SVGPatternElement& pattern)
+{
+    m_svg_pattern_elements.append(pattern);
+}
+
+void Document::unregister_svg_pattern_element(Badge<SVG::SVGPatternElement>, SVG::SVGPatternElement& pattern)
+{
+    m_svg_pattern_elements.remove(pattern);
+}
+
+// A <pattern> that names another pattern inherits the attributes it does not carry from it, so its published facts
+// are not a function of its own attributes: anything that changes what an id along its `href` chain names, or what a
+// pattern along that chain carries, changes them. Republish the patterns whose chain passes through `id`.
+void Document::republish_svg_patterns_inheriting_from(Utf16FlyString const& id)
+{
+    HashTable<SVG::SVGPatternElement const*> republished;
+    republish_svg_patterns_inheriting_from(id, republished);
+}
+
+void Document::republish_svg_patterns_inheriting_from(Utf16FlyString const& id, HashTable<SVG::SVGPatternElement const*>& republished)
+{
+    for (auto& pattern : m_svg_pattern_elements) {
+        // Each pattern is republished once, which also ends the walk along a cyclic chain.
+        if (pattern.linked_id() != id.view() || republished.set(&pattern) != AK::HashSetResult::InsertedNewEntry)
+            continue;
+        pattern.publish_svg_attribute_facts();
+        if (auto pattern_id = pattern.id(); pattern_id.has_value())
+            republish_svg_patterns_inheriting_from(*pattern_id, republished);
+    }
+}
+
 void Document::note_svg_paint_resources_changed()
 {
     if (!m_layout_node_arena)
@@ -10584,15 +10662,21 @@ void Document::sync_custom_property_registrations_to_rust()
 
     Vector<Utf16String> names;
     Vector<Optional<Utf16String>> initial_values;
+    Vector<NonnullRefPtr<CSS::StyleValue const>> computed_initial_values;
     Vector<CSS::ComputedValuesFFI::FfiCustomPropertyRegistration> registrations;
     names.ensure_capacity(effective_registrations.size());
     initial_values.ensure_capacity(effective_registrations.size());
+    computed_initial_values.ensure_capacity(effective_registrations.size());
     registrations.ensure_capacity(effective_registrations.size());
     for (auto const& [name, registration] : effective_registrations) {
         names.unchecked_append(name.to_utf16_string());
         initial_values.unchecked_append(registration->initial_value
                 ? Optional<Utf16String> { registration->initial_value->to_utf16_string(CSS::SerializationMode::ResolvedValueForReparse) }
                 : Optional<Utf16String> {});
+        // What the initial value computes to is a fact of the registration, computed against the
+        // document rather than any element, and memoized on it for every reader: the style engine
+        // takes it from here rather than computing it again.
+        computed_initial_values.unchecked_append(CSS::compute_registered_custom_property_initial_value(*this, *registration));
         auto const& name_string = names.last();
         auto const& initial_value = initial_values.last();
         registrations.unchecked_append({
@@ -10601,6 +10685,7 @@ void Document::sync_custom_property_registrations_to_rust()
             .inherits = registration->inherit,
             .has_initial_value = initial_value.has_value(),
             .initial_value = initial_value.has_value() ? ffi_utf16_view(*initial_value) : CSS::ComputedValuesFFI::FfiUtf16View {},
+            .computed_initial_value = computed_initial_values.last()->rust_style_value_data(),
         });
     }
     auto const& document_url = serialized_url();

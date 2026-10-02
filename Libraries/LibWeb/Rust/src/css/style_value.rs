@@ -103,7 +103,7 @@ fn component_values_without_whitespace(mut values: &[ComponentValue]) -> &[Compo
     values
 }
 
-fn utf16_equals_ascii_case_insensitive(value: &[u16], expected: &[u8]) -> bool {
+pub(crate) fn utf16_equals_ascii_case_insensitive(value: &[u16], expected: &[u8]) -> bool {
     value.len() == expected.len()
         && value
             .iter()
@@ -1784,6 +1784,11 @@ impl Drop for OwnedBasicShapeData {
     }
 }
 
+/// The `function` of `StyleValueData::Counter`, as the C++ `CounterStyleValue::CounterFunction`
+/// enum numbers it.
+pub(crate) const COUNTER_FUNCTION_COUNTER: u8 = 0;
+pub(crate) const COUNTER_FUNCTION_COUNTERS: u8 = 1;
+
 /// The data of a single immutable CSS style value.
 ///
 /// Variant payload fields are read directly by the corresponding C++ StyleValue subclass, so
@@ -1985,8 +1990,8 @@ pub enum StyleValueData {
         name: CssString,
     },
     /// A counter style reference: either a retained counter style name, or a symbols() function
-    /// with its type (the C++ `enum class SymbolsType : u8`, opaque to Rust) and retained
-    /// symbol strings.
+    /// with its type (the C++ `enum class SymbolsType : u8`, whose values counter style
+    /// resolution reads as the `SYMBOLS_TYPE_*` constants) and retained symbol strings.
     CounterStyle {
         is_symbols: bool,
         name: CssString,
@@ -2111,8 +2116,8 @@ pub enum StyleValueData {
         implicit_start_name: CssString,
         implicit_end_name: CssString,
     },
-    /// counter() or counters(). The function is the C++ CounterFunction enum, opaque to Rust;
-    /// the join string is empty for counter().
+    /// counter() or counters(). The function is `COUNTER_FUNCTION_COUNTER` or
+    /// `COUNTER_FUNCTION_COUNTERS`; the join string is empty for counter().
     Counter {
         function: u8,
         counter_name: CssString,
@@ -3562,8 +3567,12 @@ pub unsafe extern "C" fn rust_style_value_create_unresolved_from_source(
     } else {
         &value_comparison_text
     };
+    let components = RetainedComponentValueList::from_source(component_source);
+    if presence_attr {
+        crate::css::parser::arbitrary_substitution::note_attr_names_read_by(components.as_slice());
+    }
     Arc::into_raw(Arc::new(StyleValueData::Unresolved {
-        components: RetainedComponentValueList::from_source(component_source),
+        components,
         source_text: CssString::from_utf16(&source_text),
         value_comparison_text: CssString::from_utf16(&value_comparison_text),
         presence_attr,
@@ -4084,8 +4093,8 @@ mod replay_tests {
 }
 
 /// Whether a value's computed color depends on the element's used currentcolor: the
-/// currentcolor keyword itself, a color function whose nested colors do, or an Effects
-/// list whose shadow or filter colors do.
+/// currentcolor keyword itself, a color function whose nested colors do, an Effects list
+/// whose shadow or filter colors do, or a scrollbar color whose thumb or track color does.
 pub(crate) fn value_depends_on_current_color(value: &StyleValueData) -> bool {
     let retained_data_depends =
         |retained: &RetainedStyleValueData| retained.optional_data().is_some_and(value_depends_on_current_color);
@@ -4102,6 +4111,10 @@ pub(crate) fn value_depends_on_current_color(value: &StyleValueData) -> bool {
         StyleValueData::LightDark { light, dark, .. } => retained_data_depends(light) || retained_data_depends(dark),
         StyleValueData::Shadow { color, .. } => retained_data_depends(color),
         StyleValueData::Filter { value, .. } => retained_data_depends(value),
+        StyleValueData::ScrollbarColor {
+            thumb_color,
+            track_color,
+        } => retained_data_depends(thumb_color) || retained_data_depends(track_color),
         StyleValueData::ValueList { values, .. } => list_depends(values),
         _ => false,
     }

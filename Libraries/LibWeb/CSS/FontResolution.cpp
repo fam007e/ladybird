@@ -10,7 +10,9 @@
 #include <AK/QuickSort.h>
 #include <LibGfx/Font/Font.h>
 #include <LibGfx/Font/FontDatabase.h>
+#include <LibGfx/Font/SystemFallbackFonts.h>
 #include <LibGfx/Font/TypefaceSkia.h>
+#include <LibWeb/CSS/ComputedStyleWorkingSet.h>
 #include <LibWeb/CSS/FontFaceState.h>
 #include <LibWeb/CSS/FontResolution.h>
 #include <LibWeb/CSS/StyleValues/CustomIdentStyleValue.h>
@@ -459,13 +461,14 @@ NonnullRefPtr<Gfx::FontCascadeList const> resolve_font_cascade(FontFaceSnapshot 
         }
     } else {
         font_list->set_system_font_fallback_callback([](u32 code_point, Gfx::EmojiPresentation presentation, Gfx::Font const& reference_font) -> RefPtr<Gfx::Font const> {
-            return Gfx::FontDatabase::the().get_font_for_code_point(
-                code_point,
-                reference_font.point_size(),
-                reference_font.weight(),
-                reference_font.typeface().width(),
-                reference_font.slope(),
-                presentation == Gfx::EmojiPresentation::Emoji);
+            Gfx::SystemFallbackFontKey key {
+                .code_point = code_point,
+                .weight = static_cast<u16>(reference_font.weight()),
+                .width = reference_font.typeface().width(),
+                .slope = static_cast<u8>(reference_font.slope()),
+                .prefer_color_emoji = presentation == Gfx::EmojiPresentation::Emoji,
+            };
+            return Gfx::system_fallback_font(key, reference_font.point_size());
         });
     }
 
@@ -490,6 +493,36 @@ Vector<ComputedFontFamily> computed_font_families_from_style_value(StyleValue co
         }
     }
     return font_families;
+}
+
+FontFeatureData font_feature_data_from_style_values(FontResolutionFeatureValues const& values)
+{
+    auto keyword_of = [&](FontResolutionFeatureInput input, Keyword initial) {
+        auto const& value = values[to_underlying(input)];
+        return value ? value->to_keyword() : initial;
+    };
+    auto convert = [&]<typename T>(FontResolutionFeatureInput input, T (*converter)(StyleValue const&)) -> T {
+        auto const& value = values[to_underlying(input)];
+        return value ? converter(*value) : T {};
+    };
+    return {
+        .font_variant_alternates = convert(FontResolutionFeatureInput::FontVariantAlternates, font_variant_alternates_from_style_value),
+        .font_variant_caps = keyword_to_font_variant_caps(keyword_of(FontResolutionFeatureInput::FontVariantCaps, Keyword::Normal)).release_value(),
+        .font_variant_east_asian = convert(FontResolutionFeatureInput::FontVariantEastAsian, font_variant_east_asian_from_style_value),
+        .font_variant_emoji = keyword_to_font_variant_emoji(keyword_of(FontResolutionFeatureInput::FontVariantEmoji, Keyword::Normal)).release_value(),
+        .font_variant_ligatures = convert(FontResolutionFeatureInput::FontVariantLigatures, font_variant_ligatures_from_style_value),
+        .font_variant_numeric = convert(FontResolutionFeatureInput::FontVariantNumeric, font_variant_numeric_from_style_value),
+        .font_variant_position = keyword_to_font_variant_position(keyword_of(FontResolutionFeatureInput::FontVariantPosition, Keyword::Normal)).release_value(),
+        .font_feature_settings = convert(FontResolutionFeatureInput::FontFeatureSettings, font_feature_settings_from_style_value),
+        .font_kerning = keyword_to_font_kerning(keyword_of(FontResolutionFeatureInput::FontKerning, Keyword::Auto)).release_value(),
+        .text_rendering = keyword_to_text_rendering(keyword_of(FontResolutionFeatureInput::TextRendering, Keyword::Auto)).release_value(),
+    };
+}
+
+HashMap<Utf16FlyString, double> font_variation_settings_from_style_values(FontResolutionFeatureValues const& values)
+{
+    auto const& value = values[to_underlying(FontResolutionFeatureInput::FontVariationSettings)];
+    return value ? font_variation_settings_from_style_value(*value) : HashMap<Utf16FlyString, double> {};
 }
 
 NonnullRefPtr<Gfx::FontCascadeList const> resolve_font_for_style_values(FontComputer const& font_computer, ComputedFontCacheKey key)
@@ -527,8 +560,16 @@ extern "C" Web::CSS::StyleEngineFFI::FfiResolvedFont web_css_resolve_font(void* 
 {
     using namespace Web;
     using namespace Web::CSS;
-    auto font_family = StyleValue::adopt_rust_style_value_data(StyleValueFFI::rust_style_value_retain(
-        reinterpret_cast<StyleValueFFI::StyleValueData const*>(request.font_family)));
+    auto value_of = [](StyleEngineFFI::FfiHostHandle handle) {
+        return StyleValue::adopt_rust_style_value_data(StyleValueFFI::rust_style_value_retain(reinterpret_cast<StyleValueFFI::StyleValueData const*>(handle)));
+    };
+    auto font_family = value_of(request.font_family);
+    // The engine names a value for each feature input whose property does not have its initial value.
+    FontResolutionFeatureValues feature_values;
+    for (size_t index = 0; index < feature_values.size(); ++index) {
+        if (auto handle = request.font_feature_values[index])
+            feature_values[index] = value_of(handle);
+    }
     ComputedFontCacheKey key {
         .font_families = computed_font_families_from_style_value(*font_family),
         .font_optical_sizing = static_cast<FontOpticalSizing>(request.font_optical_sizing),
@@ -536,13 +577,14 @@ extern "C" Web::CSS::StyleEngineFFI::FfiResolvedFont web_css_resolve_font(void* 
         .font_slope = request.font_slope,
         .font_weight = request.font_weight,
         .font_width = Percentage(request.font_width),
-        .font_variation_settings = {},
-        .font_feature_data = {},
+        .font_variation_settings = font_variation_settings_from_style_values(feature_values),
+        .font_feature_data = font_feature_data_from_style_values(feature_values),
         .font_feature_values_scope = {},
     };
-    // NB: The request carries no font-variant-alternates, so no @font-feature-values reach it.
-    FontFeatureValues const no_font_feature_values;
-    auto font_list = static_cast<FontCascadeMemo*>(memo)->resolve(*static_cast<FontFaceSnapshot const*>(snapshot), key, [&](auto const&) -> FontFeatureValues const& { return no_font_feature_values; });
+    // NB: The engine names font-variant-alternates only for an element in the document's tree scope, whose
+    //     @font-feature-values the snapshot carries.
+    auto const& font_faces = *static_cast<FontFaceSnapshot const*>(snapshot);
+    auto font_list = static_cast<FontCascadeMemo*>(memo)->resolve(font_faces, key, [&](Utf16FlyString const& family) -> FontFeatureValues const& { return font_faces.font_feature_values(family); });
     // The metric probe must not load a face: the first available font answers without one.
     auto const& first_available_font = font_list->first_available_font();
     auto const metrics = first_available_font.pixel_metrics();

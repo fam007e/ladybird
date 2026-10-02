@@ -990,12 +990,51 @@ impl StyleEngine {
         self.state.acknowledge_engine_computed_record(node, &mut self.counters);
     }
 
+    /// C++ computes `node` itself rather than install what a record demand derived for it.
+    #[inline]
+    pub(crate) fn abandon_demanded_records(&mut self, node: StyleNodeID) {
+        self.state.abandon_demanded_records(node, &mut self.counters);
+    }
+
     /// Retry a record after C++ has installed earlier records in the same preorder batch. A record
     /// rejected while the batch was planned may become computable once its inheritance parent is
     /// authoritative.
     #[inline]
     pub(crate) fn retry_engine_record_after_ancestor(&mut self, node: StyleNodeID) -> publication::RetriedEngineRecord {
         self.state.retry_engine_record_after_ancestor(node, &mut self.counters)
+    }
+
+    /// Answer a read of one element's style the host makes before the next style update.
+    #[inline]
+    pub(super) fn answer_record_demand(
+        &mut self,
+        node: StyleNodeID,
+        demand: bridge::FfiRecordDemand,
+    ) -> publication::Drive<publication::RecordDemandAnswer> {
+        self.state.answer_record_demand(node, demand, &mut self.counters)
+    }
+
+    /// The record of an element no rule reaches, from its own declarations alone.
+    #[inline]
+    pub(super) fn declared_only_record(
+        &mut self,
+        subject: StyleNodeID,
+        facts: u32,
+        declarations: &[(ElementDeclarationKind, &crate::css::declaration_block::DeclaredProperty)],
+    ) -> publication::Drive<computed::FinalStyleRecordID> {
+        self.state
+            .declared_only_record(subject, facts, declarations, &mut self.counters)
+    }
+
+    /// Settle the pseudo-element records of an element whose record C++ just installed.
+    #[inline]
+    pub(crate) fn settle_pseudo_records_after_host_record(
+        &mut self,
+        node: StyleNodeID,
+        old_is_list_item: bool,
+    ) -> (publication::RetriedEngineRecord, bool) {
+        self.state
+            .settle_pseudo_records_after_host_record(node, old_is_list_item, &mut self.counters)
     }
 
     /// Publish the immutable computed-group payloads of one element's base style. This assigns

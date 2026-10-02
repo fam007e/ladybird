@@ -189,6 +189,7 @@ pub(crate) struct PaintableRowStore {
     committed_fragment_links: RefCell<Vec<CommittedFragmentLinkSlot>>,
     chrome_state_callback: Cell<Option<ChromeStateCallback>>,
     paint_recording_in_progress: Cell<bool>,
+    image_map_areas: crate::painting::image_map_areas::ImageMapAreaColumn,
 }
 
 pub(crate) struct PaintableRows<Arena> {
@@ -770,7 +771,15 @@ impl LayoutNodeArena {
         store.row_paint_states.borrow()[index].clear();
         store.visual_context_records.borrow_mut()[index] = None;
         store.stacking_context_entries.borrow_mut()[index] = None;
+        if reset.kind == crate::painting::paintable_data::PaintableRowResetKind::Freed {
+            store.image_map_areas.forget(id);
+        }
         self.notify_committed_box_changed(id);
+    }
+
+    /// The areas of the image map each image is associated with, as the document published them.
+    pub(crate) fn image_map_areas(&self) -> &crate::painting::image_map_areas::ImageMapAreaColumn {
+        &self.paintable_rows.image_map_areas
     }
 
     pub(crate) fn paintable_visual_context_record(
@@ -971,7 +980,7 @@ impl LayoutNodeArena {
         };
         // Replacement preserves current paint geometry until the next layout commit. Give that
         // version new node identities without modifying retained run outputs or copying glyphs.
-        let content = std::rc::Rc::make_mut(content);
+        let content = std::sync::Arc::make_mut(content);
         for fragment in &mut content.fragments {
             if fragment.layout_node == old_node {
                 fragment.layout_node = new_node;

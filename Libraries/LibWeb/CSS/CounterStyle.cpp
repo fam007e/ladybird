@@ -7,7 +7,6 @@
 #include "CounterStyle.h"
 #include <LibWeb/CSS/StyleScope.h>
 #include <LibWeb/DOM/Document.h>
-#include <LibWeb/Layout/NodeArena.h>
 #include <LibWeb/ValueParserRustFFI.h>
 
 namespace Web::CSS {
@@ -89,23 +88,9 @@ bool CounterStyle::representation_is_constant() const
         && m_range.first().end == NumericLimits<i32>::max();
 }
 
-// https://drafts.csswg.org/css-counter-styles-3/#generate-a-counter
-Utf16String generate_a_counter_representation(RefPtr<CounterStyle const> const& counter_style, StyleScope const& style_scope, i32 value)
-{
-    // NB: The fallback chain is followed through the counter styles each tree scope publishes to the layout node arena,
-    //     so every scope a fallback name may be looked up in has to be settled and published first.
-    style_scope.publish_counter_style_lookup_chain();
-    auto representation = Parser::ValueParserFFI::rust_generate_a_counter_representation(
-        style_scope.document().layout_node_arena().handle(),
-        style_scope.style_engine_tree_scope().value(),
-        counter_style ? counter_style->rust_counter_style() : nullptr,
-        value);
-    return Utf16String::adopt_raw(representation);
-}
-
 // The descriptors travel as flat columns of `AK::Utf16FlyString` raw words; the Rust side takes ownership of the one
 // reference each leaked word carries.
-static Parser::ValueParserFFI::FfiRegisteredCounterStyle* create_rust_counter_style(Utf16FlyString const& name, CounterStyleAlgorithm const& algorithm, CounterStyleNegativeSign const& negative_sign, Vector<CounterStyleRangeEntry> const& range, Optional<Utf16FlyString> const& fallback, CounterStylePad const& pad)
+static Parser::ValueParserFFI::FfiRegisteredCounterStyle* create_rust_counter_style(Utf16FlyString const& name, CounterStyleAlgorithm const& algorithm, CounterStyleNegativeSign const& negative_sign, Utf16FlyString const& prefix, Utf16FlyString const& suffix, Vector<CounterStyleRangeEntry> const& range, Optional<Utf16FlyString> const& fallback, CounterStylePad const& pad)
 {
     Vector<size_t> symbols;
     Vector<i32> additive_weights;
@@ -170,6 +155,8 @@ static Parser::ValueParserFFI::FfiRegisteredCounterStyle* create_rust_counter_st
         .range_count = ranges.size(),
         .negative_prefix = negative_sign.prefix.to_raw_leaked(),
         .negative_suffix = negative_sign.suffix.to_raw_leaked(),
+        .prefix = prefix.to_raw_leaked(),
+        .suffix = suffix.to_raw_leaked(),
         .fallback = fallback.has_value() ? fallback->to_raw_leaked() : 0,
         .pad_symbol = pad.symbol.to_raw_leaked(),
         .pad_minimum_length = pad.minimum_length,
@@ -197,7 +184,7 @@ CounterStyle::~CounterStyle()
 Parser::ValueParserFFI::FfiRegisteredCounterStyle const* CounterStyle::rust_counter_style() const
 {
     if (!m_rust_counter_style)
-        m_rust_counter_style = create_rust_counter_style(m_name, m_algorithm, m_negative_sign, m_range, m_fallback, m_pad);
+        m_rust_counter_style = create_rust_counter_style(m_name, m_algorithm, m_negative_sign, m_prefix, m_suffix, m_range, m_fallback, m_pad);
     return m_rust_counter_style;
 }
 

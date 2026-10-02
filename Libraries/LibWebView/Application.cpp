@@ -828,7 +828,7 @@ void Application::start_next_content_blocker_list_update()
     timeout->start();
 
     m_content_blocker_list_update_request->set_unbuffered_request_callbacks(
-        [this](NonnullRefPtr<HTTP::HeaderList> headers, Optional<u32> response_code, Optional<String> const& reason_phrase, Optional<Core::ImmutableBytes>, Optional<u64>, Requests::CameFromCache) {
+        [this](NonnullRefPtr<HTTP::HeaderList> headers, Optional<u32> response_code, Optional<String> const& reason_phrase, Optional<Core::ImmutableBytes>, Optional<u64>, Requests::CacheState) {
             if (m_content_blocker_list_update_cancelled)
                 return;
             if (response_code.has_value() && Web::Fetch::Infrastructure::is_redirect_status(*response_code)) {
@@ -2384,9 +2384,10 @@ void Application::initialize_actions()
         };
     };
 
-    auto add_spoofed_value = [](auto& menu, auto name, auto value, auto& cached_value, auto request) {
-        auto action = Action::create_checkable(name, ActionID::SpoofUserAgent, [value, &cached_value, request]() {
+    auto add_spoofed_value = [](auto& menu, auto name, auto value, auto& cached_value, auto request, auto persist) {
+        auto action = Action::create_checkable(name, ActionID::SpoofUserAgent, [value, &cached_value, request, persist]() {
             cached_value = value;
+            persist();
 
             ViewImplementation::for_each_view([&](ViewImplementation& view) {
                 view.debug_request(request, cached_value);
@@ -2642,21 +2643,37 @@ void Application::initialize_actions()
     m_debug_menu->add_action(Action::create("Crash Compositor Process"sv, ActionID::CrashCompositorProcess, [this]() { crash_compositor_process(); }));
     m_debug_menu->add_separator();
 
+    // Both spoofing choices persist in the profile's settings. The --user-agent-preset flag overrides the saved preset for
+    // this session only, and test mode ignores the saved choices so test results can't depend on the developer's profile.
+    auto use_saved_spoofing_choices = m_web_content_options.is_test_mode == IsTestMode::No;
+
     auto spoof_user_agent_menu = Menu::create_group("Spoof User Agent"sv);
-    m_user_agent_string = m_web_content_options.user_agent_preset.has_value()
-        ? *WebView::user_agents.get(*m_web_content_options.user_agent_preset)
+    auto user_agent_preset = m_web_content_options.user_agent_preset;
+    if (!user_agent_preset.has_value() && use_saved_spoofing_choices)
+        user_agent_preset = m_settings->user_agent_preset();
+    m_user_agent_string = user_agent_preset.has_value()
+        ? *WebView::user_agents.get(*user_agent_preset)
         : Web::default_user_agent;
 
-    add_spoofed_value(spoof_user_agent_menu, "Disabled"sv, Web::default_user_agent, m_user_agent_string, "spoof-user-agent"sv);
-    for (auto const& user_agent : WebView::user_agents)
-        add_spoofed_value(spoof_user_agent_menu, user_agent.key, user_agent.value, m_user_agent_string, "spoof-user-agent"sv);
+    add_spoofed_value(spoof_user_agent_menu, "Disabled"sv, Web::default_user_agent, m_user_agent_string, "spoof-user-agent"sv,
+        [this] { m_settings->set_user_agent_preset({}); });
+    for (auto const& user_agent : WebView::user_agents) {
+        add_spoofed_value(spoof_user_agent_menu, user_agent.key, user_agent.value, m_user_agent_string, "spoof-user-agent"sv,
+            [this, name = user_agent.key] { m_settings->set_user_agent_preset(name); });
+    }
 
     auto navigator_compatibility_mode_menu = Menu::create_group("Navigator Compatibility Mode"sv);
-    m_navigator_compatibility_mode = "chrome"sv;
+    m_navigator_compatibility_mode = navigator_compatibility_mode_to_string(use_saved_spoofing_choices
+            ? m_settings->navigator_compatibility_mode()
+            : Web::default_navigator_compatibility_mode);
 
-    add_spoofed_value(navigator_compatibility_mode_menu, "Chrome"sv, "chrome"sv, m_navigator_compatibility_mode, "navigator-compatibility-mode"sv);
-    add_spoofed_value(navigator_compatibility_mode_menu, "Gecko"sv, "gecko"sv, m_navigator_compatibility_mode, "navigator-compatibility-mode"sv);
-    add_spoofed_value(navigator_compatibility_mode_menu, "WebKit"sv, "webkit"sv, m_navigator_compatibility_mode, "navigator-compatibility-mode"sv);
+    auto add_navigator_compatibility_mode = [&](StringView name, Web::NavigatorCompatibilityMode mode) {
+        add_spoofed_value(navigator_compatibility_mode_menu, name, navigator_compatibility_mode_to_string(mode), m_navigator_compatibility_mode, "navigator-compatibility-mode"sv,
+            [this, mode] { m_settings->set_navigator_compatibility_mode(mode); });
+    };
+    add_navigator_compatibility_mode("Chrome"sv, Web::NavigatorCompatibilityMode::Chrome);
+    add_navigator_compatibility_mode("Gecko"sv, Web::NavigatorCompatibilityMode::Gecko);
+    add_navigator_compatibility_mode("WebKit"sv, Web::NavigatorCompatibilityMode::WebKit);
 
     m_debug_menu->add_submenu(move(spoof_user_agent_menu));
     m_debug_menu->add_submenu(move(navigator_compatibility_mode_menu));
@@ -3014,7 +3031,7 @@ void Application::navigate_tab(DevTools::TabDescription const& description, Stri
     if (!view.has_value())
         return;
 
-    auto parsed_url = sanitize_url(url, Application::settings().search_engine());
+    auto parsed_url = sanitize_url(url, Application::settings().search_engine_settings().engine);
     if (!parsed_url.has_value())
         return;
 
@@ -3829,8 +3846,8 @@ void Application::listen_for_network_events(DevTools::TabDescription const& desc
         });
     };
 
-    view->on_network_response_headers_received = [on_response_headers = move(on_response_headers)](u64 request_id, u32 status_code, Optional<String> const& reason_phrase, Vector<HTTP::Header> const& headers, Requests::CameFromCache came_from_cache) {
-        on_response_headers({ request_id, status_code, reason_phrase, headers, came_from_cache });
+    view->on_network_response_headers_received = [on_response_headers = move(on_response_headers)](u64 request_id, u32 status_code, Optional<String> const& reason_phrase, Vector<HTTP::Header> const& headers, Requests::CacheState cache_state) {
+        on_response_headers({ request_id, status_code, reason_phrase, headers, cache_state });
     };
 
     view->on_network_response_body_received = [on_response_body = move(on_response_body)](u64 request_id, ByteBuffer data) {

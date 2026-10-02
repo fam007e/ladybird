@@ -315,6 +315,7 @@ private:
     virtual void page_did_request_fully_exit_fullscreen() override;
     virtual void page_did_request_unload_check(Web::HTML::CrossProcessId navigable_id, GC::Ref<GC::Function<void(Web::HTML::CheckIfUnloadingIsCanceledResult)>>) override;
     virtual String page_did_request_ui_process_session_history_for_testing() override;
+    virtual bool page_did_request_has_populated_document_for_testing(Web::HTML::CrossProcessId navigable_id) override;
     virtual bool page_did_request_capture_session_history_snapshot_for_testing() override;
     virtual bool page_did_request_restore_session_history_snapshot_for_testing() override;
     virtual bool page_did_request_register_session_store_tab_for_testing() override;
@@ -352,7 +353,7 @@ private:
     virtual void page_did_take_screenshot(Gfx::ShareableBitmap const& screenshot) override;
     virtual void received_message_from_web_ui(Utf16String const& name, JS::Value data) override;
     virtual void page_did_start_network_request(u64 request_id, URL::URL const&, ByteString const&, Vector<HTTP::Header> const&, ReadonlyBytes, Optional<String>, String const& referrer_policy, bool is_navigation_request, Web::Fetch::Infrastructure::Request::Priority) override;
-    virtual void page_did_receive_network_response_headers(u64 request_id, u32 status_code, Optional<String>, Vector<HTTP::Header> const&, Requests::CameFromCache) override;
+    virtual void page_did_receive_network_response_headers(u64 request_id, u32 status_code, Optional<String>, Vector<HTTP::Header> const&, Requests::CacheState) override;
     virtual void page_did_receive_network_response_body(u64 request_id, ReadonlyBytes) override;
     virtual void page_did_finish_network_request(u64 request_id, u64 body_size, Requests::RequestTimingInfo const&, Optional<Requests::NetworkError> const&) override;
     virtual void page_did_register_javascript_source(Web::DOM::Document&, Web::HTML::ScriptRegistry::Description const&) override;

@@ -60,6 +60,7 @@
 #include <LibWeb/Painting/HitTestResult.h>
 #include <LibWeb/Painting/ScrollSnap.h>
 #include <LibWeb/ResizeObserver/ResizeObserver.h>
+#include <LibWeb/SVG/SVGPatternElement.h>
 #include <LibWeb/SVG/SVGUseElement.h>
 #include <LibWeb/WebIDL/ExceptionOr.h>
 #include <LibWeb/XPath/EvaluateResult.h>
@@ -381,8 +382,6 @@ public:
 
     void for_each_active_css_style_sheet(Function<void(CSS::StyleSheetState&)> const& callback) const;
 
-    double ensure_element_shared_css_random_base_value(CSS::RandomCachingKey const&);
-
     Optional<Utf16String> get_style_sheet_source(CSS::StyleSheetIdentifier const&) const;
 
     virtual Utf16FlyString node_name() const override { return "#document"_utf16_fly_string; }
@@ -485,6 +484,7 @@ public:
 
     void update_style();
     void note_throttled_animation_style_update() { m_has_throttled_animation_style_update = true; }
+    void note_animations_that_can_skip_per_frame_style_updates();
     void flush_throttled_animation_style_update();
     void flush_throttled_animation_style_update_for_node(Node const&);
     void schedule_compositor_animation_wakeup(double delay_ms);
@@ -870,6 +870,7 @@ public:
     }
     void set_needs_registered_properties_cache_update() { m_needs_registered_properties_cache_update = true; }
     void set_needs_container_query_evaluation_after_layout(Element const& query_container);
+    [[nodiscard]] bool has_size_containers_needing_evaluation_after_layout() const;
 
     [[nodiscard]] bool needs_full_layout_tree_update() const;
     void set_needs_full_layout_tree_update(bool);
@@ -1169,7 +1170,6 @@ public:
         u64 registered_properties_cache_rebuilds { 0 };
         u64 scope_rule_cache_builds { 0 };
         u64 style_query_container_scans { 0 };
-        u64 size_query_container_scan_visits { 0 };
         u64 style_engine_transaction_setups { 0 };
         u64 style_engine_transaction_setup_microseconds { 0 };
         // Exclusive intervals within style_update_microseconds. Rust phases subdivide bridge.
@@ -1204,7 +1204,12 @@ public:
         Structure,
     };
     void set_needs_accumulated_visual_contexts_update(bool);
+    void set_image_map_areas_need_publication() { m_image_map_areas_need_publication = true; }
+    [[nodiscard]] bool take_image_map_areas_need_publication() { return exchange(m_image_map_areas_need_publication, false); }
     void note_svg_paint_resources_changed();
+    void register_svg_pattern_element(Badge<SVG::SVGPatternElement>, SVG::SVGPatternElement&);
+    void unregister_svg_pattern_element(Badge<SVG::SVGPatternElement>, SVG::SVGPatternElement&);
+    void republish_svg_patterns_inheriting_from(Utf16FlyString const& id);
     bool has_enrolled_svg_paint_resources() const;
     void schedule_full_accumulated_visual_context_rebuild(Layout::RustFFI::FfiVisualContextGlobalRebuildReason);
     bool can_compute_client_rects_without_accumulated_visual_contexts_update(Layout::Node const&) const;
@@ -1236,6 +1241,11 @@ public:
     [[nodiscard]] size_t broadcast_active_resize_observations();
     [[nodiscard]] bool has_active_resize_observations();
     [[nodiscard]] bool has_skipped_resize_observations();
+
+    // Moves on whenever a style sheet may have come or gone for the document or one of its shadow roots, as with a
+    // scope's rule cache or the document's shadow roots.
+    u64 style_sheet_set_generation() const { return m_style_sheet_set_generation; }
+    void note_style_sheet_set_change() { ++m_style_sheet_set_generation; }
 
     void register_shadow_root(Badge<DOM::ShadowRoot>, DOM::ShadowRoot&);
     void unregister_shadow_root(Badge<DOM::ShadowRoot>, DOM::ShadowRoot&);
@@ -1521,6 +1531,8 @@ private:
     void did_add_supported_property_name();
     friend struct AdoptedStyleSheetsAccess;
 
+    void republish_svg_patterns_inheriting_from(Utf16FlyString const& id, HashTable<SVG::SVGPatternElement const*>& republished);
+
     void finish_animated_style_update();
     void service_compositor_animation_wakeup(double timestamp);
 
@@ -1777,7 +1789,6 @@ private:
     GC::WeakHashSet<Element> m_elements_with_dirty_style_attributes;
     GC::WeakHashSet<Element> m_elements_with_viewport_dependent_style;
     bool m_suppresses_attribute_style_invalidation { false };
-    HashTable<GC::Ref<Element>> m_query_containers_needing_container_query_evaluation_after_layout;
     CSS::ScrollStateQueryContainers m_scroll_state_query_containers;
 
     bool m_is_decoded_svg { false };
@@ -1787,6 +1798,7 @@ private:
     GC::WeakHashSet<Animations::KeyframeEffect> m_effects_needing_animated_style_update_after_current_update;
     bool m_is_updating_animated_style { false };
     bool m_has_throttled_animation_style_update { false };
+    bool m_needs_throttled_animation_style_update_check { false };
     bool m_force_throttled_animation_style_update { false };
     Optional<u64> m_last_forced_throttled_animation_style_update_task_generation;
 
@@ -1955,11 +1967,16 @@ private:
 
     Vector<GC::Ref<DOM::Element>> m_potentially_named_elements;
 
+    // Every connected <pattern>, which is what lets a pattern that inherits attributes from the pattern its `href` names
+    // be republished when the chain changes.
+    SVG::SVGPatternElement::DocumentPatternElementList m_svg_pattern_elements;
+
     AnchorNameMap m_anchor_name_map;
 
     bool m_design_mode_enabled { false };
 
     bool m_needs_accumulated_visual_contexts_update { false };
+    bool m_image_map_areas_need_publication { false };
 
     HashMap<Web::AsyncScrollNodeStableID, Compositing::SnappedAreas> m_scroll_container_snapped_areas;
     Vector<Compositing::RustFFI::NodeSlotId> m_scroll_snap_containers;
@@ -1982,6 +1999,7 @@ private:
     // Document should not visit ShadowRoot list to avoid leaks.
     // It's responsibility of object that allocated ShadowRoot to keep it alive.
     ShadowRoot::DocumentShadowRootList m_shadow_roots;
+    u64 m_style_sheet_set_generation { 0 };
 
     Optional<Utf16String> m_content_blocker_style_sheet;
     // Class/id tokens already covered by the cached content blocker stylesheet.
@@ -2102,9 +2120,6 @@ private:
     bool m_rust_custom_property_registry_synced { false };
 
     CSS::StyleScope m_style_scope;
-
-    // https://drafts.csswg.org/css-values-5/#random-caching
-    HashMap<CSS::RandomCachingKey, double> m_element_shared_css_random_base_value_cache;
 
     // Cache of parsed selector queries for querySelectorAll/querySelector/matches/closest.
     // A null value means the selector string failed to parse.

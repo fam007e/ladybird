@@ -267,7 +267,7 @@ private:
     virtual void did_mutate_dom(Mutation mutation) override;
     virtual void did_get_dom_node_html(String html) override;
     virtual void did_resolve_dom_node_url(u64 request_id, String resolved_url) override;
-    virtual void did_receive_network_response_headers(u64 request_id, u32 status_code, Optional<String> reason_phrase, Vector<HTTP::Header> response_headers, Requests::CameFromCache came_from_cache) override;
+    virtual void did_receive_network_response_headers(u64 request_id, u32 status_code, Optional<String> reason_phrase, Vector<HTTP::Header> response_headers, Requests::CacheState cache_state) override;
     virtual void did_change_storage_item(Web::StorageAPI::StorageEndpointType storage_endpoint, String url, Optional<Utf16String> key, Optional<Utf16String> old_value, Optional<Utf16String> new_value) override;
     virtual void did_update_indexed_database(String update) override;
     virtual void did_request_clipboard_entries(u64 request_id) override;
@@ -334,6 +334,7 @@ private:
     virtual void did_request_reload_for_testing() override;
     virtual void did_request_traverse_history_by_delta_for_testing(i32 delta) override;
     virtual void did_reset_session_history_for_testing(Web::HTML::SessionHistoryEntryDescriptor) override;
+    Messages::WebContentTestClient::DidRequestHasPopulatedDocumentForTestingResponse did_request_has_populated_document_for_testing(Web::HTML::CrossProcessId navigable_id) const;
     Messages::WebContentTestClient::DidRequestCaptureSessionHistorySnapshotForTestingResponse did_request_capture_session_history_snapshot_for_testing();
     Messages::WebContentTestClient::DidRequestRestoreSessionHistorySnapshotForTestingResponse did_request_restore_session_history_snapshot_for_testing();
     Messages::WebContentTestClient::DidRequestRegisterSessionStoreTabForTestingResponse did_request_register_session_store_tab_for_testing();

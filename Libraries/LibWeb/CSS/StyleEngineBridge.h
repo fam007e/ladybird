@@ -42,6 +42,24 @@ class StyleComputer;
 class RustDeclarationBlock;
 struct StyleProperty;
 
+// A style sheet's resource context as a rule's cascaded values read it, keyed by its native
+// sheet: an imported sheet has its own.
+struct CollectedStyleSheetResourceContext {
+    u64 source_identity { 0 };
+    String base_url;
+    bool has_base_url { false };
+    bool origin_clean { false };
+};
+
+// The resource contexts of the document's style sheets as the last transaction was lent them,
+// and what they were collected against. A document can have a shadow root, and a sheet, per
+// element, so they are collected again only once either has moved on.
+struct StyleSheetResourceContexts {
+    Vector<CollectedStyleSheetResourceContext> contexts;
+    u64 style_sheet_set_generation { 0 };
+    String document_api_base_url;
+};
+
 // Owns one document's StyleEngine. The engine itself lives entirely on the Rust side: selector
 // evaluation, cascade, computed values, and every index and identity they are keyed by. C++ keeps
 // what only C++ can own -- DOM and CSSOM object identity, mutation semantics, document lifecycle,
@@ -61,6 +79,13 @@ public:
     void visit_edges(GC::Cell::Visitor&);
 
 #include <LibWeb/StyleEngineBridgeGenerated.h>
+
+    // https://drafts.csswg.org/css-values-5/#random-caching
+    // The random base value of a random caching key: the name, and the element unless the sharing is element-shared.
+    [[nodiscard]] double ensure_random_base_value(StyleNodeID, Utf16View name, bool element_shared);
+    // The random base values of the keys that name an element, as one buffer of name code units with a length and a
+    // value per name.
+    void element_random_base_values(StyleNodeID, Vector<u32>& name_lengths, Vector<u16>& name_units, Vector<u64>& value_bits) const;
 
     // Identity 0 is never returned; it means "no node".
     StyleNodeID allocate_style_node();
@@ -113,7 +138,14 @@ public:
     void begin_computed_record_verification();
     void end_computed_record_verification();
     [[nodiscard]] bool style_records_match_for_verification(StyleNodeID, u8 pseudo_kind, StyleRecordID, StyleRecordID) const;
-    [[nodiscard]] u32 compare_style_records(StyleRecordID old_style_record, StyleRecordID new_style_record, bool font_lists_equal, bool element_folds_transform_into_layout, bool element_propagates_overflow_to_viewport) const;
+    // What moving between two records changes, for no element in particular.
+    [[nodiscard]] u32 compare_style_records(StyleRecordID old_style_record, StyleRecordID new_style_record) const;
+    // What moving the element from one record to another damages, which the engine reads from the
+    // records and its own facts of the element.
+    [[nodiscard]] u32 element_record_damage(StyleNodeID, StyleRecordID old_style_record, StyleRecordID new_style_record) const;
+    // The same for one of its pseudo-elements, whose box appears or goes away when either record is
+    // none. The host compares the counter styles the box was built with.
+    [[nodiscard]] u32 pseudo_element_record_damage(StyleNodeID, PseudoElement, StyleRecordID old_style_record, StyleRecordID new_style_record, StyleRecordID originating_style_record, bool counter_styles_changed) const;
     [[nodiscard]] bool animation_overlay_changed(StyleRecordID old_style_record, void const* animated_overlay) const;
     [[nodiscard]] Optional<u32> current_color_dependent_style_groups(StyleNodeID node, u8 pseudo_kind) const;
     [[nodiscard]] StyleEngineFFI::FfiAnimationInvalidation compare_animation_overlay(StyleRecordID old_style_record, void const* animated_overlay, ReadonlySpan<void const*> payloads, bool is_document_element) const;
@@ -146,6 +178,23 @@ public:
     // to; the new record's identity, or zero when nothing moved.
     [[nodiscard]] StyleRecordID republish_record_environment(StyleNodeID, u64 environment, void const* store);
     [[nodiscard]] StyleEngineFFI::FfiEngineComputedRecord retry_engine_record_after_ancestor(StyleNodeID);
+    // What a read of an element's style, or one of its pseudo-elements', made before the next style update asks of
+    // the style engine.
+    struct RecordDemand {
+        // Drive the record in full against the parent as it is now.
+        bool targeted { false };
+        // Leave the engine as it was: the record is only for reading. Any other is installed and acknowledged as a
+        // style update's would be.
+        bool read_only { false };
+        // Compute the element as though it had no inline declaration. Only a read-only demand of an element may.
+        bool exclude_inline_style { false };
+        // The pseudo-element read, as its PseudoElement value; none reads the element.
+        Optional<u8> pseudo_kind {};
+    };
+    // Answers a record demand: the record the engine derived from the document as it is now, that the pseudo-element
+    // generates no box, or zero where the read is C++'s.
+    [[nodiscard]] StyleEngineFFI::FfiRecordDemandAnswer answer_record_demand(StyleNodeID, RecordDemand);
+    [[nodiscard]] StyleEngineFFI::FfiEngineComputedRecord settle_pseudo_records_after_host_record(StyleNodeID, bool old_is_list_item);
     // Whether an environment identity is one the engine minted for an environment it resolved.
     [[nodiscard]] static bool is_engine_custom_property_environment(u64 identity) { return (identity & (1ull << 62)) != 0; }
     [[nodiscard]] u64 atom_generation() const { return m_atom_generation; }
@@ -165,11 +214,11 @@ public:
     // boundary again merely to recover an already published name.
     StyleAtomID intern_attribute_name(Utf16FlyString const& local_name, Optional<Utf16FlyString> const& namespace_uri);
 
-    // Interns an attribute value and records what it spells when a selector for this name needs
-    // text. Values repeat heavily, so demanded text crosses once per distinct value.
+    // Interns an attribute value and records what it spells when a selector or an attr() can read
+    // this name. Values repeat heavily, so demanded text crosses once per distinct value.
     StyleAtomID intern_attribute_value(StyleAtomID name, Utf16String const& value);
     // Demand expansion already has every value identity. Check the name before interning the text
-    // so attributes no selector reads do not pay another string hash.
+    // so attributes nothing reads as text do not pay another string hash.
     void backfill_attribute_value_text_if_required(StyleAtomID name, Utf16String const& value);
 
     // Deltas accumulate here and cross in one flat batch per style flush, never one call per
@@ -201,12 +250,17 @@ public:
         WasDisplayNone = 1 << 7,
         DisplayChanged = 1 << 11,
     };
-    void record_element_style_input_change(StyleNodeID style_node, u8 reaction = PublishedStyle | RecomputeStyle, u8 inherited_style_groups = 0);
-    // A reaction C++ derived from one it applied, for the engine to settle where it can.
+    // A style reaction of one element, for the engine to settle where it can. It names what moved,
+    // not who computes the element's style again.
     void record_derived_element_style_input_change(StyleNodeID style_node, u8 reaction, u8 inherited_style_groups = 0);
     void record_flat_tree_descendant_style_input_changes(StyleNodeID style_node, u8 reaction, u8 inherited_style_groups = 0);
+    // What a container query or container-relative length read of the element's containers moved.
+    void record_container_query_input_change(StyleNodeID style_node);
+    // Records every element whose style a size query or container-relative unit decided against the container.
+    void record_size_container_query_dependents(StyleNodeID container);
+    // Records the dependents of every container a style computation asked about before it had a box.
+    void evaluate_size_containers_needing_evaluation_after_layout();
     [[nodiscard]] Vector<StyleNodeID> viewport_dependent_style_nodes();
-    [[nodiscard]] bool has_recorded_element_style_input_change(StyleNodeID style_node) const;
     void record_benchmark_marker(Utf16View);
     [[nodiscard]] bool has_recorded_input() const;
     [[nodiscard]] bool has_pending_transaction() const;
@@ -252,6 +306,23 @@ public:
     void sort_style_deltas_for_direct_application(Span<PublishedStyleDelta>) const;
     void discard_style_transaction_outputs();
 
+    // While a batch's reactions are applied, a host's own style application may rewrite the declarations of an element
+    // in its shadow tree, after the engine computed that element's record from the ones it had. These name the
+    // elements whose declarations changed that way.
+    void begin_noting_declaration_changes_during_apply() { ++m_declaration_change_noting_depth; }
+    void end_noting_declaration_changes_during_apply()
+    {
+        VERIFY(m_declaration_change_noting_depth > 0);
+        if (--m_declaration_change_noting_depth == 0)
+            m_declaration_changes_during_apply.clear_with_capacity();
+    }
+    void note_element_declarations_changed(StyleNodeID node)
+    {
+        if (m_declaration_change_noting_depth > 0)
+            m_declaration_changes_during_apply.set(node);
+    }
+    [[nodiscard]] bool declarations_changed_during_apply(StyleNodeID node) const { return m_declaration_changes_during_apply.contains(node); }
+
     using RuleMatch = StyleEngineFFI::FfiRuleMatch;
 
     enum class MatchPurpose {
@@ -294,6 +365,8 @@ private:
     [[nodiscard]] bool attribute_name_requires_value_text(StyleAtomID);
     void publish_attribute_value_text(StyleAtomID, Utf16View);
 
+    Optional<StyleSheetResourceContexts> m_style_sheet_resource_contexts;
+
     void* m_impl { nullptr };
     u64 m_published_font_environment_generation { 0 };
     GC::Ptr<StyleComputer> m_style_computer;
@@ -307,6 +380,8 @@ private:
     u64 m_attribute_value_text_requirements_version { 0 };
     HashTable<StyleNodeID> m_nodes_with_pending_initial_features;
     HashTable<StyleNodeID> m_nodes_awaiting_first_style_computation;
+    u32 m_declaration_change_noting_depth { 0 };
+    HashTable<StyleNodeID> m_declaration_changes_during_apply;
     size_t m_element_match_capacity { 64 };
 
     Vector<StyleEngineFFI::FfiTreeDelta> m_tree_deltas;
