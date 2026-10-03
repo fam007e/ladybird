@@ -143,8 +143,8 @@ define_counters! {
     EngineComputedRecordDeltas => "engineComputedRecordDeltas",
     EngineComputedRecordCohortHits => "engineComputedRecordCohortHits",
     EngineComputedRecordSharedHits => "engineComputedRecordSharedHits",
-    EngineComputedRecordGateIncompleteAnswer => "engineComputedRecordGateIncompleteAnswer",
     EngineComputedPseudoRecords => "engineComputedPseudoRecords",
+    PseudoRecordDemandsLeftToHost => "pseudoRecordDemandsLeftToHost",
     EngineComputedRecordUnchangedWinners => "engineComputedRecordUnchangedWinners",
     EngineComputedRecordsAbandoned => "engineComputedRecordsAbandoned",
     RetryAfterAncestorCalls => "retryAfterAncestorCalls",
@@ -152,10 +152,8 @@ define_counters! {
     RetryAfterAncestorPseudoAbandons => "retryAfterAncestorPseudoAbandons",
     RetryAfterAncestorColdHits => "retryAfterAncestorColdHits",
     RetryAfterAncestorMicroseconds => "retryAfterAncestorMicroseconds",
-    EngineComputedRecordBailPseudoFlip => "engineComputedRecordBailPseudoFlip",
     EngineComputedRecordGateAncestors => "engineComputedRecordGateAncestors",
     EngineComputedLonghandEvaluations => "engineComputedLonghandEvaluations",
-    EngineComputedRecordBailUnchangedWinners => "engineComputedRecordBailUnchangedWinners",
     EngineComputedRecordBailIncompleteWinners => "engineComputedRecordBailIncompleteWinners",
     EngineComputedRecordBailProperty => "engineComputedRecordBailProperty",
     EngineComputedRecordBailWinner => "engineComputedRecordBailWinner",
@@ -170,7 +168,6 @@ define_counters! {
     EngineCustomPropertyEnvironmentsResolved => "engineCustomPropertyEnvironmentsResolved",
     EngineCustomPropertyEnvironmentMemoHits => "engineCustomPropertyEnvironmentMemoHits",
     EngineCustomPropertyEnvironmentBails => "engineCustomPropertyEnvironmentBails",
-    EngineComputedRecordBailFontPhase => "engineComputedRecordBailFontPhase",
     EngineComputedRecordBailMonospaceQuirk => "engineComputedRecordBailMonospaceQuirk",
     EngineComputedRecordBailRecordParent => "engineComputedRecordBailRecordParent",
     EngineComputedRecordBailDrive => "engineComputedRecordBailDrive",
@@ -324,7 +321,6 @@ define_counters! {
     TransitionProofOperatorOrContinuation => "transitionProofOperatorOrContinuation",
     TransitionProofWinnerGap => "transitionProofWinnerGap",
     TransitionProofPriorityWin => "transitionProofPriorityWin",
-    SharedStyleRecordHits => "sharedStyleRecordHits",
 }
 
 /// The counter set for one document.

@@ -10,6 +10,7 @@
 #include <AK/TemporaryChange.h>
 #include <LibCore/EventLoop.h>
 #include <LibGC/Heap.h>
+#include <LibGC/HeapAccess.h>
 #include <LibJS/Runtime/VM.h>
 #include <LibWeb/Animations/ScrollTimeline.h>
 #include <LibWeb/Bindings/MainThreadVM.h>
@@ -18,6 +19,7 @@
 #include <LibWeb/DOM/Element.h>
 #include <LibWeb/HTML/BrowsingContext.h>
 #include <LibWeb/HTML/EventLoop/EventLoop.h>
+#include <LibWeb/HTML/EventLoop/FrameCompletion.h>
 #include <LibWeb/HTML/HTMLMediaElement.h>
 #include <LibWeb/HTML/LocalTraversableNavigable.h>
 #include <LibWeb/HTML/NavigableContainer.h>
@@ -30,6 +32,7 @@
 #include <LibWeb/HighResolutionTime/TimeOrigin.h>
 #include <LibWeb/IndexedDB/Internal/Algorithms.h>
 #include <LibWeb/Layout/Node.h>
+#include <LibWeb/Layout/TreeBuilderRustFFI.h>
 #include <LibWeb/Page/Page.h>
 #include <LibWeb/Painting/BoxViews.h>
 #include <LibWeb/Painting/DocumentPaintState.h>
@@ -44,6 +47,12 @@ GC_DEFINE_ALLOCATOR(EventLoop);
 EventLoop::EventLoop(Type type)
     : m_type(type)
 {
+    if (m_type == Type::Window) {
+        // The threads a window's rendering runs on only read what the host lends them and never touch the heap
+        // themselves. This makes that a debug assertion (and a collection there a verification failure) for whatever
+        // C++ code they call.
+        Layout::RustFFI::stage_thread_set_thread_setup([] { GC::forbid_heap_access_on_this_thread(); });
+    }
     m_task_queue = GC::Heap::the().allocate<TaskQueue>(*this);
 
     m_rendering_task_function = GC::create_function(GC::Heap::the(), [this] {
@@ -73,6 +82,7 @@ void EventLoop::visit_edges(Visitor& visitor)
     visitor.visit(m_rendering_task_function);
     visitor.visit(m_system_event_loop_timer);
     visitor.visit(m_idle_period_timer);
+    visitor.visit(m_navigables_with_recordings_in_flight);
 }
 
 void EventLoop::schedule()
@@ -144,6 +154,10 @@ void EventLoop::process()
     [[maybe_unused]] double task_start_time = 0;
 
     m_task_generation++;
+
+    // AD-HOC: A rendering update's recording flies beside the tasks after it, and is taken in once it has finished,
+    //         between two tasks.
+    take_finished_frames_in();
 
     // Some algorithms request that steps or states only occur once the event loop has reached step 1.
     // Invoke a set of tasks that these algorithms request us to in order to achieve this.
@@ -799,6 +813,49 @@ void EventLoop::update_the_rendering()
             || document->has_pending_style_sheet_requests()
             || !document->layout_is_up_to_date());
     }
+}
+
+void EventLoop::did_let_recording_fly(LocalNavigable& navigable)
+{
+    if (exchange(m_holds_next_frame_for_testing, false))
+        navigable.hold_recording_in_flight_for_testing();
+    if (!m_navigables_with_recordings_in_flight.contains_slow(GC::Ref { navigable }))
+        m_navigables_with_recordings_in_flight.append(navigable);
+}
+
+void EventLoop::ensure_frame_completion_registered()
+{
+    // Every recording that finishes beside the event loop posts to it, so that an idle event loop wakes to take it in.
+    // This is set up before the first recording is submitted, so that not even the first finish goes unseen, and not
+    // in the constructor, which may run before the thread has a Core event loop.
+    if (exchange(m_frame_completion_registered, true))
+        return;
+    Layout::RustFFI::stage_thread_set_flight_finished([] { FrameCompletion::the().post(); });
+    FrameCompletion::the().register_event_loop([] { main_thread_event_loop().schedule(); });
+}
+
+bool EventLoop::has_frame_in_flight() const
+{
+    return any_of(m_navigables_with_recordings_in_flight, [](auto const& navigable) { return navigable->has_recording_in_flight(); });
+}
+
+void EventLoop::take_finished_frames_in()
+{
+    if (m_navigables_with_recordings_in_flight.is_empty())
+        return;
+    auto navigables = move(m_navigables_with_recordings_in_flight);
+    for (auto& navigable : navigables) {
+        if (!navigable->take_recording_in_flight_in(LocalNavigable::TakeIn::IfFinished))
+            m_navigables_with_recordings_in_flight.append(navigable);
+    }
+}
+
+void EventLoop::release_held_frames_for_testing()
+{
+    m_holds_next_frame_for_testing = false;
+    for (auto& navigable : m_navigables_with_recordings_in_flight)
+        navigable->release_recording_in_flight_for_testing();
+    schedule();
 }
 
 void run_when_event_loop_reaches_step_1(GC::Ref<GC::Function<void()>> steps)

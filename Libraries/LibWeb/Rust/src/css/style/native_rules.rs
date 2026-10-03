@@ -192,7 +192,6 @@ mod tests {
     use crate::css::parser::value_parser::ParseContext;
     use crate::css::rule::{rust_rule_identity, rust_rule_list_at, rust_rule_list_clear, rust_rule_retain};
     use crate::css::style::StyleEngine;
-    use crate::css::style::bridge::style_engine_native_rule_id;
     use crate::css::style::memory::DeviceClass;
     use crate::css::style::program::{CascadeOrigin, RuleKind, StyleSheetObjectID};
     use crate::css::style_sheet::NativeStyleSheet;
@@ -231,10 +230,7 @@ mod tests {
             unsafe {
                 engine.register_native_rule(id, identity, rule.cascade_declarations(), source.identity(), &[], &[])
             };
-            assert_eq!(
-                unsafe { style_engine_native_rule_id(std::ptr::from_ref(engine).cast(), identity) },
-                id.0 + 1
-            );
+            assert_eq!(engine.native_rule_id(identity), Some(id));
             ids.push(id);
             assert_eq!(
                 engine.native_rules.targets.get(&id).unwrap().source_identity,
@@ -266,7 +262,7 @@ mod tests {
     #[test]
     fn declaration_edits_resolve_native_owners_and_use_engine_revisions() {
         use crate::css::rule::rust_rule_children;
-        use crate::css::style::bridge::style_engine_native_rule_declarations_changed;
+        use crate::css::style::bridge::{native_rule_declaration_owner, publish_native_rule_declarations};
         let source = source();
         let rule = unsafe { &*rust_rule_list_at(source.rules(), 0) };
         let children = unsafe { &*rust_rule_children(rule) };
@@ -285,42 +281,25 @@ mod tests {
             )
         };
         let mut notifications = Vec::<u32>::new();
-        unsafe extern "C" fn notify(context: *mut std::ffi::c_void, rule: u32) {
-            unsafe { &mut *context.cast::<Vec<u32>>() }.push(rule);
-        }
+        // What the host's entry does: it is told of the owner before the edit is published.
+        let declarations_changed = |engine: &mut StyleEngine, notifications: &mut Vec<u32>| {
+            if let Some(owner) = native_rule_declaration_owner(engine, &child) {
+                notifications.push(owner.0 + 1);
+                publish_native_rule_declarations(engine, &child, owner);
+            }
+        };
         let initial = engine.current_rule_version(id).declaration_block;
-        unsafe {
-            style_engine_native_rule_declarations_changed(
-                (&raw mut engine).cast(),
-                Rc::as_ptr(&child).cast(),
-                (&raw mut notifications).cast(),
-                notify,
-            );
-        }
+        declarations_changed(&mut engine, &mut notifications);
         let first = engine.current_rule_version(id).declaration_block;
         assert_ne!(initial, first);
         // Inline declarations and whole-sheet replacement use the same revision issuer.
         engine.next_declaration_block_version();
-        unsafe {
-            style_engine_native_rule_declarations_changed(
-                (&raw mut engine).cast(),
-                Rc::as_ptr(&child).cast(),
-                (&raw mut notifications).cast(),
-                notify,
-            );
-        }
+        declarations_changed(&mut engine, &mut notifications);
         let second = engine.current_rule_version(id).declaration_block;
         assert_ne!(first, second);
         assert_eq!(notifications, [id.0 + 1, id.0 + 1]);
         rust_rule_list_clear(children);
-        unsafe {
-            style_engine_native_rule_declarations_changed(
-                (&raw mut engine).cast(),
-                Rc::as_ptr(&child).cast(),
-                (&raw mut notifications).cast(),
-                notify,
-            );
-        }
+        declarations_changed(&mut engine, &mut notifications);
         assert_eq!(engine.current_rule_version(id).declaration_block, second);
         assert_eq!(notifications.len(), 2);
     }

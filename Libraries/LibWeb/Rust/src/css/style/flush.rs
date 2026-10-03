@@ -126,6 +126,40 @@ impl RetainedState {
             .then_some(FullDriveReason::FontEnvironment)
     }
 
+    /// Whether a row needs no style because it is in a display:none subtree: the host holds no
+    /// style for the node, and the nearest ancestor it holds one for once it applied the rows
+    /// before this one, the record this flush settled for it or the one it holds, is in that
+    /// subtree, or the flush answered an ancestor in between as hidden. A read or the subtree's
+    /// reveal asks for the node's record.
+    fn row_is_hidden(
+        &self,
+        node: StyleNodeID,
+        row_of: impl Fn(StyleNodeID) -> Option<publication::DerivedChildInputs>,
+    ) -> bool {
+        if self.held_style_records.contains_key(&node) {
+            return false;
+        }
+        let mut ancestor = self.tree.inheritance_parent(node);
+        while let Some(current) = ancestor {
+            let row = row_of(current);
+            if row.is_some_and(|row| row.hidden) {
+                return true;
+            }
+            let record = if row.is_some_and(|row| row.settled) {
+                self.computed_group_sets
+                    .assigned_style_record(current)
+                    .map(computed::FinalStyleRecordID::raw)
+            } else {
+                self.held_style_records.get(&current).copied()
+            };
+            if let Some(record) = record {
+                return self.record_is_in_display_none_subtree(record);
+            }
+            ancestor = self.tree.inheritance_parent(current);
+        }
+        false
+    }
+
     /// Whether the node's record, or the record of one of its pseudo-elements, resolved a counter
     /// style: a `content` counter or a `list-style-type` naming one that can be overridden.
     fn node_reads_counter_styles(&self, node: StyleNodeID) -> bool {
@@ -1869,12 +1903,7 @@ impl StyleEngineState {
                     display: parent_inputs_moved_nodes.contains(&root),
                 };
                 // The probe settles what the root's own row settles, under the same unseen inputs.
-                let can_prepare = !self.retained.computed_group_sets.node_answer_is_incomplete(root)
-                    && !selector_truth_changes.deltas_for(root).iter().any(|delta| {
-                        !self
-                            .program
-                            .declarations_are_complete_but_for_custom_properties(delta.rule)
-                    });
+                let can_prepare = !self.retained.computed_group_sets.node_answer_is_incomplete(root);
                 if can_prepare {
                     let flipped_rules = selector_truth_changes.deltas_for(root);
                     let answer_is_unchanged =
@@ -1927,6 +1956,7 @@ impl StyleEngineState {
                 );
             }
             self.host.batch_moves_for_retries = engine_computed_record_scratch.batch_moves();
+            self.host.retry_full_drive_reasons.clear();
             // What the chain above a node proves, read by its children in the same pass. A
             // published ancestor's change is exact for a descendant only when none of the
             // ancestors can move anything the descendant inherits, so the fold below is the
@@ -1968,8 +1998,12 @@ impl StyleEngineState {
                         !answer.cascade_winners_are_complete
                             && !engine.cascade_winners_are_complete_but_for_custom_properties(ancestor)
                     });
+                    // So is one still to come, such as the slot a slotted element inherits from,
+                    // which the flush reaches after the element: what it moves is decided only once
+                    // it is processed.
                     let unconfined = published
-                        && (answer_is_incomplete
+                        && (row.is_none()
+                            || answer_is_incomplete
                             || !(style_input_reactions
                                 .binary_search_by_key(&ancestor, |&(style_node, _, _)| style_node)
                                 .is_err()
@@ -2000,18 +2034,7 @@ impl StyleEngineState {
                 let Some(answer) = published_match_answers.lookup(node) else {
                     continue;
                 };
-                let mask = match answer.cascade_input {
-                    Some(identity) => self.retained.match_answers.synthetic_pseudo_mask(identity),
-                    None => published_match_answers.matches_for(answer).map(|matches| {
-                        matches.iter().fold(0, |mask, rule_match| {
-                            mask | rule_match
-                                .pseudo_element
-                                .map(|pseudo| pseudo.kind.0)
-                                .filter(|&kind| kind <= bridge::LAST_SYNTHETIC_PSEUDO_ELEMENT_KIND)
-                                .map_or(0, |kind| 1u64 << kind)
-                        })
-                    }),
-                };
+                let mask = self.retained.answer_pseudo_style_mask(answer);
                 self.retained.computed_group_sets.set_node_pseudo_style_mask(node, mask);
                 if self.retained.any_custom_property_is_declared()
                     && let Some(matches) = self
@@ -2035,6 +2058,23 @@ impl StyleEngineState {
                         .insert(node, complete);
                 }
             }
+            // The rows that read style while hidden, an SVG element (which an SVG resource reference
+            // paints) and an element with animations, and every element they inherit from: none of
+            // them is answered as hidden.
+            let mut hidden_style_readers = HashSet::<StyleNodeID>::default();
+            for &node in &published_nodes {
+                use bridge::element_adjustment_fact as fact;
+                if self.computed_group_sets.adjustment_facts(node) & (fact::IS_SVG_ELEMENT | fact::HAS_ANIMATIONS) == 0
+                {
+                    continue;
+                }
+                let mut current = Some(node);
+                while let Some(element) = current
+                    && hidden_style_readers.insert(element)
+                {
+                    current = self.tree.inheritance_parent(element);
+                }
+            }
             let mut next_published_index = 0;
             let mut pending_parent_inputs = None;
             // The reactions rows of the batch derived for children that are rows of it too, which
@@ -2043,6 +2083,22 @@ impl StyleEngineState {
             while next_published_index < published_nodes.len() {
                 let mut suspended_on_font = false;
                 for (published_index, node) in published_nodes.iter().copied().enumerate().skip(next_published_index) {
+                    // The kinds of element-backed pseudo-elements whose rules may have moved for the
+                    // node: those of the pseudo-element rules that flipped, or every kind when its
+                    // answer or the rules' declarations moved in another way.
+                    let element_reference_kinds_moved =
+                        if pseudo_inputs_may_have_changed || !selector_truth_changes.refreshes_for(node).is_empty() {
+                            publication::pseudo_kind::ELEMENT_REFERENCE_KINDS
+                        } else {
+                            selector_truth_changes
+                                .deltas_for(node)
+                                .iter()
+                                .filter_map(|delta| self.retained.programs.entry(delta.entry).1.pseudo_element)
+                                .fold(0, |kinds, pseudo| {
+                                    kinds | 1_u64.checked_shl(u32::from(pseudo.kind.0)).unwrap_or(0)
+                                })
+                                & publication::pseudo_kind::ELEMENT_REFERENCE_KINDS
+                        };
                     let pseudo_inputs_may_have_changed = pseudo_inputs_may_have_changed
                         || !selector_truth_changes.refreshes_for(node).is_empty()
                         || selector_truth_changes
@@ -2071,10 +2127,6 @@ impl StyleEngineState {
                         .computed_group_sets
                         .assigned_style_record(node)
                         .map_or(0, |style_record| style_record.raw());
-                    // A record computed from an answer declaring past its winners (custom properties,
-                    // `all`) is no function of a winner state: the engine derives nothing from it.
-                    let previous_answer_was_incomplete =
-                        self.retained.computed_group_sets.node_answer_is_incomplete(node);
                     // Custom properties alone leave an answer complete enough: the engine computes
                     // the environment they decide.
                     let answer_is_incomplete = !answer.cascade_winners_are_complete
@@ -2095,18 +2147,28 @@ impl StyleEngineState {
                         None
                     };
                     let resuming_font = engine_computed_record_scratch.font_drive.is_pending_for(node);
+                    let hidden = !resuming_font
+                        && !hidden_style_readers.contains(&node)
+                        && self.retained.row_is_hidden(node, |ancestor| {
+                            row_of(&engine_computed_record_scratch.derived_child_inputs, ancestor)
+                        });
                     // The immediate parent's own unresolved fact, which the direct inherited-group
                     // path reads without asking about the chain above it.
                     // A node whose winners hold gated rules is derived where their conditions are
                     // decided again and what they read of the containers is handed to the host.
                     let direct_inherited_delta = (reaction == transaction::STYLE_REACTION_INHERITED_STYLE
                         && !resuming_font
+                        && !hidden
                         && !self.retained.published_container_verdicts.contains_key(&node))
                     .then(|| self.retained.tree.inheritance_parent(node))
                     .flatten()
-                    .filter(|parent| {
-                        !row_of(&engine_computed_record_scratch.derived_child_inputs, *parent)
-                            .is_some_and(|row| row.inheritance_unresolved)
+                    .filter(|&parent| {
+                        // A parent this flush reaches after the node, a slot a slotted element
+                        // inherits from, has yet to decide what it passes on.
+                        row_of(&engine_computed_record_scratch.derived_child_inputs, parent).map_or_else(
+                            || published_match_answers.lookup(parent).is_none(),
+                            |row| !row.inheritance_unresolved,
+                        )
                     })
                     .and_then(|parent| {
                         self.computed_group_sets.replace_engine_resolvable_inherited_groups(
@@ -2141,7 +2203,7 @@ impl StyleEngineState {
                     //     Its completed originating record must not change that decision.
                     let engine_computed_gate_passes = if resuming_font {
                         true
-                    } else if direct_inherited_delta.is_some() {
+                    } else if hidden || direct_inherited_delta.is_some() {
                         false
                     } else if reaction == transaction::STYLE_REACTION_INHERITED_CUSTOM_PROPERTIES
                         && !parent_inputs_moved.display
@@ -2151,19 +2213,6 @@ impl StyleEngineState {
                         // inherits, beyond the environment move that already reached it. The row
                         // still goes to the host so that what it derives for the children carries
                         // the reaction on to the descendants whose style reads the environment.
-                        false
-                    } else if (previous_answer_was_incomplete
-                        || selector_truth_changes.deltas_for(node).iter().any(|delta| {
-                            !self
-                                .program
-                                .declarations_are_complete_but_for_custom_properties(delta.rule)
-                        }))
-                        // An element standing for its host's pseudo-element takes the host's rules.
-                        && !self.retained.backs_host_pseudo_element(node)
-                    {
-                        // Custom declarations are resolved by the engine's environment computation.
-                        // Other declarations missing from the winner columns still require C++.
-                        counters.bump(Counter::EngineComputedRecordGateIncompleteAnswer);
                         false
                     } else {
                         match self
@@ -2181,8 +2230,7 @@ impl StyleEngineState {
                         {
                             None => {
                                 counters.bump(Counter::EngineComputedRecordGateAncestors);
-                                retry_after_ancestor =
-                                    self.row_may_retry_after_ancestor(node, answer.cascade_winners_are_complete);
+                                retry_after_ancestor = true;
                                 false
                             }
                             Some(relied_on_settled_ancestor) => {
@@ -2252,8 +2300,18 @@ impl StyleEngineState {
                     // once the host has applied the rows before it, as a row behind an unsettled
                     // ancestor is.
                     if let Some(Err(publication::Unanswered::AwaitsParent)) = engine_record_answer {
-                        retry_after_ancestor =
-                            self.row_may_retry_after_ancestor(node, answer.cascade_winners_are_complete);
+                        retry_after_ancestor = true;
+                    }
+                    // The retry drives the record in full where this flush would have.
+                    if retry_after_ancestor
+                        && let Some(reason) = self.full_drive_reason(
+                            node,
+                            reaction,
+                            named_rules_moved,
+                            container_input_nodes.contains(&node),
+                        )
+                    {
+                        self.host.retry_full_drive_reasons.insert(node, reason);
                     }
                     let engine_computed_delta = engine_record_answer.and_then(Result::ok);
                     next_published_index = published_index + 1;
@@ -2269,7 +2327,8 @@ impl StyleEngineState {
                             index as usize,
                             publication::DerivedChildInputs {
                                 settled,
-                                declined: !settled,
+                                declined: !settled && !hidden,
+                                hidden,
                                 inheritance_unresolved: !settled
                                     && reaction == transaction::STYLE_REACTION_INHERITED_STYLE,
                                 // A child folds the chain when it asks; this node's own facts
@@ -2296,7 +2355,9 @@ impl StyleEngineState {
                                 old_style_record,
                                 0,
                                 FfiStyleDeltaDamage::None,
-                                if retry_after_ancestor {
+                                if hidden {
+                                    FfiStyleDeltaGap::Hidden
+                                } else if retry_after_ancestor {
                                     FfiStyleDeltaGap::RetryAfterAncestor
                                 } else {
                                     FfiStyleDeltaGap::Materialize
@@ -2416,6 +2477,13 @@ impl StyleEngineState {
                                 composed_by_the_host: false,
                             });
                         }
+                    }
+                    // A host's element-backed pseudo-elements are elements of its shadow tree, which
+                    // take the host's rules: the moved ones restyle as their own rows.
+                    if element_reference_kinds_moved != 0
+                        && matches!(gap, FfiStyleDeltaGap::None | FfiStyleDeltaGap::Computed)
+                    {
+                        self.record_backing_element_inputs(node, element_reference_kinds_moved);
                     }
                     // What applying a row the engine settled derives for the element's children is read
                     // from the row's records and their damage. A child that is a row of this batch takes
@@ -2603,11 +2671,13 @@ impl StyleEngineState {
 }
 
 impl StyleEngineState {
-    /// Whether the host can ask for a declined row again once it has applied the rows before it:
-    /// a document-scope row whose winners the engine holds.
-    fn row_may_retry_after_ancestor(&self, node: StyleNodeID, cascade_winners_are_complete: bool) -> bool {
-        self.retained.tree.tree_scope(node) == TreeScopeID::DOCUMENT
-            && (cascade_winners_are_complete || self.cascade_winners_are_complete_but_for_custom_properties(node))
+    /// Restyle the elements of a host's shadow tree that back its pseudo-elements of the given
+    /// `kinds`, as the rules they take, the host's, moved.
+    fn record_backing_element_inputs(&mut self, host: StyleNodeID, kinds: u64) {
+        let backing_elements: SmallVec<[StyleNodeID; 2]> = self.retained.backing_elements(host, kinds).collect();
+        for node in backing_elements {
+            self.record_derived_element_style_input(node, transaction::STYLE_REACTION_RECOMPUTE_STYLE, 0);
+        }
     }
 
     pub fn take_style_transaction(

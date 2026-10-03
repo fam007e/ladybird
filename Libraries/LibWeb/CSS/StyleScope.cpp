@@ -657,7 +657,7 @@ void StyleScope::publish_cascade_layer_order(StyleSheetState* pending_attachment
         sheets.append(pending_attachment->native_sheet().handle());
 
     m_has_published_named_layer_order = Parser::ValueParserFFI::rust_style_sheet_publish_layer_order(
-        sheets.data(), sheets.size(), document().style_computer().style_engine().rust_handle(),
+        sheets.data(), sheets.size(), document().style_computer().style_engine().host(),
         style_engine_tree_scope().value(), m_has_published_named_layer_order, &document(),
         [](void* document) { static_cast<DOM::Document*>(document)->flush_deferred_style_change_event(); });
 }
@@ -685,7 +685,7 @@ void StyleScope::publish_animation_keyframes()
     if (published.is_empty() && m_published_keyframe_sets.is_empty())
         return;
     StyleEngineFFI::style_engine_set_tree_scope_animation_keyframes(
-        document().style_computer().style_engine().rust_handle(), style_engine_tree_scope().value(),
+        document().style_computer().style_engine().host(), style_engine_tree_scope().value(),
         bit_cast<FlatPtr>(as_if<DOM::ShadowRoot>(*m_node)), name_lengths.data(), name_units.data(), name_units.size(),
         keyframe_sets.data(), name_lengths.size());
     m_published_keyframe_sets = move(published);
@@ -1162,8 +1162,8 @@ void StyleScope::publish_counter_styles_if_changed() const
         names.unchecked_append(name.to_raw_leaked());
         counter_styles.unchecked_append(counter_style->rust_counter_style());
     }
-    Parser::ValueParserFFI::rust_publish_counter_styles(
-        document().layout_node_arena().handle(),
+    Parser::ValueParserFFI::render_state_publish_counter_styles(
+        document().layout_node_arena().host(),
         style_engine_tree_scope().value(),
         parent_tree_scope.has_value() ? parent_tree_scope->value() : 0,
         parent_tree_scope.has_value(),

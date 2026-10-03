@@ -213,6 +213,11 @@ interface Internals {
     undefined resetRenderingSchedulerCounters();
     undefined setManualRenderingOpportunities(boolean enabled);
     undefined injectRenderingOpportunity(double frameTimeMs);
+    // "in-flight" while a rendering update's recording flies beside the event loop, "idle" otherwise.
+    DOMString frameSchedulerState();
+    // Keeps the next recording that flies in flight until releaseHeldFrame(), or until a read waits for it.
+    undefined holdNextFrame();
+    undefined releaseHeldFrame();
     undefined updateCompositorAnimations();
     boolean runEmptyAnimationStyleUpdateForTesting();
     undefined armCompositorAnimationTimersForTesting();
@@ -245,6 +250,8 @@ interface Internals {
     // layout node. Useful for asserting that incremental tree builds preserve unaffected nodes.
     unsigned long long layoutNodeIdentity(Node node);
     unsigned long long layoutArenaLiveSlotCount();
+    // Makes the document's render state panic answering this call, which waits for it: the WebContent process crashes.
+    undefined panicRenderStateForTesting();
     unsigned long long layoutArenaShellCount();
     double styleEngineMatchDocument();
     // Reports a snapshot of StyleEngine's matched rules for the whole document.

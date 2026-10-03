@@ -661,40 +661,49 @@ Layout::NodeArena& Document::layout_node_arena()
     // Created on first layout node so documents that never build a layout tree (e.g. temporary
     // fragment-parsing documents) skip the Rust arena round-trip entirely.
     if (!m_layout_node_arena) {
-        m_layout_node_arena = make_ref_counted<Layout::NodeArena>();
+        m_layout_node_arena = make_ref_counted<Layout::NodeArena>(style_computer().style_engine().render_document());
         m_layout_node_arena->set_document({}, this);
         Layout::register_layout_host(*m_layout_node_arena, *this);
-        Layout::RustFFI::layout_arena_set_layout_update_host_callbacks(m_layout_node_arena->handle(), layout_update_host_callbacks());
+        Layout::RustFFI::document_host_set_layout_update_host_callbacks(m_layout_node_arena->host(), layout_update_host_callbacks());
         Layout::RustFFI::FfiStyleRecordHostCallbacks style_record_host_callbacks {
-            .style_engine = style_computer().style_engine().rust_handle(),
             .context = this,
             .shell_style_changed = [](void*, void* shell, u64 record, void const* payloads, bool attach_resources) {
                 as<Layout::NodeWithStyle>(*static_cast<Layout::Node*>(shell)).refresh_style_from_arena(CSS::StyleRecordID { record }, payloads, attach_resources);
             },
         };
-        Layout::RustFFI::layout_arena_set_style_record_host_callbacks(m_layout_node_arena->handle(), style_record_host_callbacks);
+        Layout::RustFFI::document_host_set_style_record_host_callbacks(m_layout_node_arena->host(), style_record_host_callbacks);
         m_layout_node_arena->start_reporting_box_presence({});
-        Layout::RustFFI::layout_arena_set_shell_factory(m_layout_node_arena->handle(), this, [](void* context, Compositing::RustFFI::NodeSlotId slot, Layout::RustFFI::NodeKind kind) {
+        Layout::RustFFI::document_host_set_shell_factory(m_layout_node_arena->host(), this, [](void* context, Compositing::RustFFI::NodeSlotId slot, Layout::RustFFI::NodeKind kind) {
             auto& document = *static_cast<Document*>(context);
             switch (kind) {
-            case Layout::RustFFI::NodeKind::BlockContainer:
-            case Layout::RustFFI::NodeKind::TableWrapper:
-            case Layout::RustFFI::NodeKind::Box:
+            case Layout::RustFFI::NodeKind::InlineNode:
+            case Layout::RustFFI::NodeKind::BreakNode:
+                Layout::allocate_layout_node<Layout::NodeWithStyle>(document, Layout::BindToPreparedArenaSlot::Yes, slot, kind);
+                return;
+            case Layout::RustFFI::NodeKind::TextNode:
+                Layout::allocate_layout_node<Layout::TextNode>(document, Layout::BindToPreparedArenaSlot::Yes, slot, kind);
+                return;
+            case Layout::RustFFI::NodeKind::Viewport:
+                Layout::allocate_layout_node<Layout::Viewport>(document, Layout::BindToPreparedArenaSlot::Yes, slot, kind);
+                return;
+            case Layout::RustFFI::NodeKind::GeneratedTextNode:
+                Layout::allocate_layout_node<Layout::GeneratedTextNode>(document, Layout::BindToPreparedArenaSlot::Yes, slot, kind);
+                return;
+            case Layout::RustFFI::NodeKind::Unset:
+            case Layout::RustFFI::NodeKind::Node:
+            case Layout::RustFFI::NodeKind::NodeWithStyle:
+                VERIFY_NOT_REACHED();
+            default:
                 Layout::allocate_layout_node<Layout::Box>(document, Layout::BindToPreparedArenaSlot::Yes, slot, kind);
                 return;
-            case Layout::RustFFI::NodeKind::InlineNode:
-                Layout::allocate_layout_node<Layout::NodeWithStyle>(document, Layout::BindToPreparedArenaSlot::Yes, slot, kind).attach_style_resources();
-                return;
-            default:
-                VERIFY_NOT_REACHED();
             }
         });
-        Layout::RustFFI::layout_arena_set_chrome_state_callback(
-            m_layout_node_arena->handle(), this,
+        Layout::RustFFI::document_host_set_chrome_state_callback(
+            m_layout_node_arena->host(), this,
             [](void* context, Compositing::RustFFI::NodeSlotId slot, Layout::RustFFI::PaintableRowResetKind kind) {
                 auto& document = *static_cast<Document*>(context);
                 document.chrome_widget_registry().drop_widgets_for_slot(slot);
-                if (kind == Layout::RustFFI::PaintableRowResetKind::Recommitted && Painting::viewport_row_slot(document).index == slot.index)
+                if (kind == Layout::RustFFI::PaintableRowResetKind::ViewportRecommitted)
                     document.paint_state().viewport_row_was_reset();
             });
     }
@@ -706,40 +715,40 @@ void Document::reset_style_invalidation_counters() const
     m_style_invalidation_counters = {};
     (void)const_cast<CSS::StyleEngine&>(style_computer().style_engine()).size_query_container_scan_visits(true);
     if (m_layout_node_arena)
-        Layout::RustFFI::layout_arena_scrollable_overflow_recalculation_count(m_layout_node_arena->handle(), true);
+        Layout::RustFFI::render_state_scrollable_overflow_recalculation_count(m_layout_node_arena->host(), true);
     CSS::reset_longhand_wrappers_minted();
 }
 
 bool Document::needs_full_layout_tree_update() const
 {
-    return m_layout_node_arena && Layout::RustFFI::layout_arena_needs_full_layout_tree_update(m_layout_node_arena->handle());
+    return m_layout_node_arena && Layout::RustFFI::render_state_needs_full_layout_tree_update(m_layout_node_arena->host());
 }
 
 // A document without an arena has no layout nodes, so its next build creates every box anyway.
 void Document::set_needs_full_layout_tree_update(bool value)
 {
     if (m_layout_node_arena)
-        Layout::RustFFI::layout_arena_set_needs_full_layout_tree_update(m_layout_node_arena->handle(), value);
+        Layout::RustFFI::render_state_set_needs_full_layout_tree_update(m_layout_node_arena->host(), value);
 }
 
 bool Document::is_running_update_layout() const
 {
-    return m_layout_node_arena && Layout::RustFFI::layout_arena_update_layout_is_running(m_layout_node_arena->handle());
+    return m_layout_node_arena && Layout::RustFFI::document_host_update_layout_is_running(m_layout_node_arena->host());
 }
 
 u64 Document::partial_layout_count() const
 {
-    return m_layout_node_arena ? Layout::RustFFI::layout_arena_partial_layout_count(m_layout_node_arena->handle()) : 0;
+    return m_layout_node_arena ? Layout::RustFFI::render_state_layout_counts(m_layout_node_arena->host()).partial_layouts : 0;
 }
 
 u64 Document::full_layout_count() const
 {
-    return m_layout_node_arena ? Layout::RustFFI::layout_arena_full_layout_count(m_layout_node_arena->handle()) : 0;
+    return m_layout_node_arena ? Layout::RustFFI::render_state_layout_counts(m_layout_node_arena->host()).full_layouts : 0;
 }
 
-Layout::RustFFI::FfiLayoutTreeBuildStats Document::layout_tree_build_stats() const
+Layout::RustFFI::FfiLayoutCounts Document::layout_counts() const
 {
-    return m_layout_node_arena ? Layout::RustFFI::layout_arena_layout_tree_build_stats(m_layout_node_arena->handle()) : Layout::RustFFI::FfiLayoutTreeBuildStats {};
+    return m_layout_node_arena ? Layout::RustFFI::render_state_layout_counts(m_layout_node_arena->host()) : Layout::RustFFI::FfiLayoutCounts {};
 }
 
 void Document::finalize()
@@ -749,12 +758,12 @@ void Document::finalize()
         m_layout_node_arena->stop_reporting_box_presence({});
     tear_down_layout_tree();
     if (m_layout_node_arena) {
-        Layout::RustFFI::layout_arena_clear_chrome_state_callback(m_layout_node_arena->handle());
-        Layout::RustFFI::layout_arena_clear_style_record_host_callbacks(m_layout_node_arena->handle());
-        Layout::RustFFI::layout_arena_clear_layout_host_callbacks(m_layout_node_arena->handle());
-        Layout::RustFFI::layout_arena_clear_layout_update_host_callbacks(m_layout_node_arena->handle());
-        Layout::RustFFI::layout_arena_clear_shell_factory(m_layout_node_arena->handle());
-        VERIFY(Layout::RustFFI::layout_arena_live_slot_count(m_layout_node_arena->handle()) == 0);
+        Layout::RustFFI::document_host_clear_chrome_state_callback(m_layout_node_arena->host());
+        Layout::RustFFI::document_host_clear_style_record_host_callbacks(m_layout_node_arena->host());
+        Layout::RustFFI::document_host_clear_layout_host_callbacks(m_layout_node_arena->host());
+        Layout::RustFFI::document_host_clear_layout_update_host_callbacks(m_layout_node_arena->host());
+        Layout::RustFFI::document_host_clear_shell_factory(m_layout_node_arena->host());
+        VERIFY(Layout::RustFFI::render_state_layout_counts(m_layout_node_arena->host()).live_slots == 0);
         m_layout_node_arena->set_document({}, nullptr);
     }
     CSS::ComputedValuesFFI::rust_custom_property_registry_destroy(m_rust_custom_property_registry);
@@ -1478,7 +1487,7 @@ WebIDL::ExceptionOr<void> Document::set_title(Utf16View title)
 
     // -> If the document element is an SVG svg element
     if (is<SVG::SVGSVGElement>(document_element)) {
-        GC::Ptr<Element> element;
+        GC::Ptr<SVG::SVGTitleElement> element;
 
         // 1. If there is an SVG title element that is a child of the document element, let element be the first such
         //    element.
@@ -1489,14 +1498,14 @@ WebIDL::ExceptionOr<void> Document::set_title(Utf16View title)
         else {
             // 1. Let element be the result of creating an element given the document element's node document, "title",
             //    and the SVG namespace.
-            element = TRY(DOM::create_element(*this, HTML::TagNames::title, Namespace::SVG));
+            element = as<SVG::SVGTitleElement>(*TRY(DOM::create_element(*this, HTML::TagNames::title, Namespace::SVG)));
 
             // 2. Insert element as the first child of the document element.
             document_element->insert_before(*element, document_element->first_child());
         }
 
         // 3. String replace all with the given value within element.
-        element->string_replace_all(title);
+        element->set_text(title);
     }
 
     // -> If the document element is in the HTML namespace
@@ -1508,7 +1517,7 @@ WebIDL::ExceptionOr<void> Document::set_title(Utf16View title)
         if (title_element == nullptr && head_element == nullptr)
             return {};
 
-        GC::Ptr<Element> element;
+        GC::Ptr<HTML::HTMLTitleElement> element;
 
         // 2. If the title element is non-null, let element be the title element.
         if (title_element) {
@@ -1518,14 +1527,14 @@ WebIDL::ExceptionOr<void> Document::set_title(Utf16View title)
         else {
             // 1. Let element be the result of creating an element given the document element's node document, "title",
             //    and the HTML namespace.
-            element = TRY(DOM::create_element(*this, HTML::TagNames::title, Namespace::HTML));
+            element = as<HTML::HTMLTitleElement>(*TRY(DOM::create_element(*this, HTML::TagNames::title, Namespace::HTML)));
 
             // 2. Append element to the head element.
             TRY(head_element->append_child(*element));
         }
 
         // 4. String replace all with the given value within element.
-        element->string_replace_all(title);
+        element->set_text(title);
     }
 
     // -> Otherwise
@@ -1541,30 +1550,12 @@ Compositing::RustFFI::NodeSlotId Document::layout_root_slot() const
 {
     if (!m_layout_node_arena)
         return Compositing::RustFFI::NodeSlotId_INVALID;
-    return Layout::RustFFI::layout_arena_layout_root(m_layout_node_arena->handle());
+    return Layout::RustFFI::render_state_layout_root(m_layout_node_arena->host());
 }
 
 Layout::Node* Document::layout_root_if_live() const
 {
     return m_layout_node_arena ? m_layout_node_arena->node_if_live(layout_root_slot()) : nullptr;
-}
-
-// The build records the root it placed in the arena itself, so what is left for the document is to
-// retire the tree that was replaced and give the new one a paint state.
-Layout::RustFFI::FfiLayoutTreeBuildOutcome Document::build_layout_tree()
-{
-    m_needs_throttled_animation_style_update_check = true;
-    auto replaced_root = layout_root_slot();
-    auto outcome = Layout::build_layout_tree(*this);
-    VERIFY(is<Layout::Viewport>(layout_node_arena().node_if_live(outcome.viewport)));
-    if (replaced_root.index == outcome.viewport.index)
-        return outcome;
-    if (auto* replaced_layout_root = layout_node_arena().node_if_live(replaced_root)) {
-        replaced_layout_root->prepare_subtree_for_detach_from_layout_tree();
-        layout_node_arena().free_subtree(replaced_root);
-    }
-    m_paint_state = make<Painting::DocumentPaintState>(layout_node_arena());
-    return outcome;
 }
 
 void Document::tear_down_layout_tree()
@@ -1875,7 +1866,7 @@ void Document::record_partial_relayout_escape(PartialRelayoutEscapeReason reason
     // A document without an arena has no layout root either, and the full pass that builds one
     // clears the bit before any boundary can be registered.
     if (m_layout_node_arena)
-        Layout::RustFFI::layout_arena_record_partial_relayout_escape(m_layout_node_arena->handle());
+        Layout::RustFFI::render_state_record_partial_relayout_escape(m_layout_node_arena->host());
 }
 
 // The style engine keeps the containers, and records their dependents once a full layout has committed their
@@ -1958,7 +1949,7 @@ void Document::end_style_stabilization_epoch()
 void Document::after_layout_commit(LayoutTreeChanged layout_tree_changed)
 {
     // NB: Called during layout update.
-    Layout::RustFFI::layout_arena_invalidate_searchable_text(layout_node_arena().handle());
+    Layout::RustFFI::render_state_invalidate_searchable_text(layout_node_arena().host());
 
     set_needs_to_record_display_list();
 
@@ -1973,7 +1964,7 @@ void Document::after_layout_commit(LayoutTreeChanged layout_tree_changed)
         // Broadcast the current viewport rect to any new committed boxes, so they know whether
         // they're visible or not. If necessary, re-collect the content-visibility:auto set.
         inform_all_viewport_clients_about_the_current_viewport_rect();
-        if (m_may_have_content_visibility_auto_style)
+        if (Layout::RustFFI::render_state_may_have_auto_content_visibility(layout_node_arena().host()))
             collect_boxes_with_auto_content_visibility();
     }
 
@@ -2117,18 +2108,22 @@ bool Document::reconcile_stale_list_item_counters_after_tree_build()
 
     // A rebuilt subtree has re-resolved the counters sets of any stale owner inside it, and an owner that has left
     // the document renders nothing.
-    HashTable<Node const*> rebuilt_dom_roots;
-    Layout::RustFFI::layout_arena_for_each_pending_rebuilt_subtree_root(
-        layout_node_arena().handle(), &rebuilt_dom_roots,
-        [](void* context, void* layout_node) {
-            if (auto const* dom_node = static_cast<Layout::Node const*>(layout_node)->dom_node())
-                static_cast<HashTable<Node const*>*>(context)->set(dom_node);
+    struct RebuiltRoots {
+        GC::Ref<Document> document;
+        HashTable<GC::Ptr<Node const>> dom_roots;
+    } rebuilt_roots { *this, {} };
+    Layout::RustFFI::render_state_for_each_pending_rebuilt_subtree_root(
+        layout_node_arena().host(), &rebuilt_roots,
+        [](void* context, Layout::RustFFI::FfiNodeIdentity root) {
+            auto& rebuilt_roots = *static_cast<RebuiltRoots*>(context);
+            if (auto dom_node = Painting::node_identity_of(root).resolve(*rebuilt_roots.document))
+                rebuilt_roots.dom_roots.set(dom_node);
         });
     m_list_owners_with_stale_item_counters.remove_all_matching([&](GC::Ref<Element> const& list_owner) {
         if (!list_owner->is_connected())
             return true;
         for (Node const* node = list_owner.ptr(); node; node = node->parent()) {
-            if (rebuilt_dom_roots.contains(node))
+            if (rebuilt_roots.dom_roots.contains(node))
                 return true;
         }
         return false;
@@ -2156,8 +2151,8 @@ bool Document::needs_style_update_after_layout()
 void Document::collect_boxes_with_auto_content_visibility()
 {
     Vector<Compositing::RustFFI::NodeSlotId> boxes_with_auto_content_visibility;
-    Layout::RustFFI::layout_arena_collect_boxes_with_auto_content_visibility(
-        layout_node_arena().handle(), Layout::Node::slot_id(unsafe_layout_node()), &boxes_with_auto_content_visibility,
+    Layout::RustFFI::render_state_collect_boxes_with_auto_content_visibility(
+        layout_node_arena().host(), Layout::Node::slot_id(unsafe_layout_node()), &boxes_with_auto_content_visibility,
         [](void* context, Compositing::RustFFI::NodeSlotId slot) {
             static_cast<Vector<Compositing::RustFFI::NodeSlotId>*>(context)->append(slot);
         });
@@ -2185,14 +2180,13 @@ bool Document::layout_is_up_to_date() const
     // Without an arena there is no layout root either, so there is a tree to build.
     if (!m_layout_node_arena)
         return false;
-    return Layout::RustFFI::layout_arena_layout_is_up_to_date(m_layout_node_arena->handle(),
+    return Layout::RustFFI::render_state_layout_is_up_to_date(m_layout_node_arena->host(),
         needs_layout_tree_update() || child_needs_layout_tree_update());
 }
 
 void Document::update_style_computer_viewport_rect()
 {
-    // A viewport unit is resolved against this. A style input record names the viewport environment
-    // apart from the rest, so only a computation that read a viewport metric moves with it.
+    // A viewport unit is resolved against this.
     if (style_computer().viewport_rect_for_style_environment() != viewport_rect())
         style_computer().bump_viewport_environment_version();
     style_computer().set_viewport_rect({}, viewport_rect());
@@ -2534,22 +2528,6 @@ void Document::prepare_for_rendering()
     if (!m_layout_node_arena)
         return;
 
-    // The update reads each box's scroll-offset flag in place of the offset it mirrors.
-    static bool const verify_scroll_offset_flags = getenv("LIBWEB_VERIFY_SCROLL_OFFSET_FLAGS") != nullptr;
-    if (verify_scroll_offset_flags) {
-        for_each_shadow_including_inclusive_descendant([](DOM::Node& node) {
-            if (auto const* layout_node = node.unsafe_layout_node())
-                layout_node->verify_has_scroll_offset_flag();
-            if (auto const* element = as_if<DOM::Element>(node)) {
-                element->for_each_synthetic_pseudo_element([](CSS::PseudoElement, DOM::SyntheticPseudoElement const& pseudo_element) {
-                    if (auto const* layout_node = pseudo_element.unsafe_layout_node())
-                        layout_node->verify_has_scroll_offset_flag();
-                });
-            }
-            return TraversalDecision::Continue;
-        });
-    }
-
     auto outcome = Painting::rust_prepare_for_rendering(*this, m_needs_accumulated_visual_contexts_update);
     if (outcome.requires_visual_context_update)
         set_needs_accumulated_visual_contexts_update(true);
@@ -2588,8 +2566,8 @@ bool Document::can_compute_client_rects_without_accumulated_visual_contexts_upda
 
     auto navigable = this->navigable();
     bool viewport_scroll_offset_is_zero = !navigable || navigable->viewport_scroll_offset().is_zero();
-    return Layout::RustFFI::layout_arena_can_compute_client_rects_without_visual_context_update(
-        layout_node.arena_handle(), Layout::Node::slot_id(&layout_node), viewport_scroll_offset_is_zero);
+    return Layout::RustFFI::layout_script_can_compute_client_rects_without_visual_context_update(
+        layout_node.document_host(), Layout::Node::slot_id(&layout_node), viewport_scroll_offset_is_zero);
 }
 
 void Document::set_normal_link_color(Optional<Color> color)
@@ -3577,6 +3555,12 @@ void Document::adopt_node_steps(Node& node)
 
     // 3. If document is not oldDocument, then:
     if (&old_document != this) {
+        // NB: A node brings its blocking wheel listeners and the state it inherited from them with it, and this
+        //     document was never told that either exists. The old document's answer covers both, and both only ever
+        //     make the answer more conservative.
+        if (old_document.may_have_blocking_wheel_event_listener())
+            set_may_have_blocking_wheel_event_listener();
+
         Vector<GC::Ref<ShadowRoot>> shadow_roots_with_adopted_sheets;
 
         // A sheet adopted into a shadow root travels with it, and its identity in the style engine
@@ -3724,6 +3708,22 @@ void Document::update_active_element()
     set_active_element(calculate_active_element(*this));
 }
 
+// Both sides of a change of the focused area republish whether the nodes of a text control's shadow tree sit in the
+// focused text control.
+static void publish_focused_text_control_nodes(GC::Ptr<Node> area)
+{
+    auto* element = as_if<Element>(area.ptr());
+    if (!element || !is<HTML::FormAssociatedTextControlElement>(*element))
+        return;
+    auto shadow_root = element->shadow_root();
+    if (!shadow_root || !shadow_root->is_user_agent_internal())
+        return;
+    shadow_root->for_each_in_inclusive_subtree([](Node& node) {
+        Layout::publish_is_in_focused_text_control(node);
+        return TraversalDecision::Continue;
+    });
+}
+
 void Document::set_focused_area(GC::Ptr<Node> node, InvalidateFocusPseudoClasses invalidate_focus_pseudo_classes)
 {
     if (m_focused_area == node)
@@ -3742,6 +3742,8 @@ void Document::set_focused_area(GC::Ptr<Node> node, InvalidateFocusPseudoClasses
     }
 
     m_focused_area = node;
+    publish_focused_text_control_nodes(old_focused_area);
+    publish_focused_text_control_nodes(node);
     set_needs_selection_style_update();
 
     auto* new_focused_element = as_if<Element>(node.ptr());
@@ -5899,7 +5901,7 @@ void Document::set_style_node_id(CSS::StyleNodeID style_node_id)
     // The identity may have named a node that has since left, and the layout arena keys layout tree update marks by
     // identity alone, so the document starts with none.
     if (m_layout_node_arena && style_node_id != 0)
-        Layout::RustFFI::layout_arena_clear_layout_tree_update_marks(m_layout_node_arena->handle(), style_node_id.value());
+        Layout::RustFFI::render_state_clear_layout_tree_update_marks(m_layout_node_arena->host(), style_node_id.value());
 }
 
 void Document::ensure_style_engine_tracks_tree()
@@ -6389,8 +6391,8 @@ static CSSPixelRect compute_intersection(GC::Ref<Element> target, CSSPixelRect t
             scroll_margin[3].to_px(clip_rect.width()));
         return clip_rect;
     };
-    return Layout::RustFFI::layout_arena_intersection_observer_intersection_rect(
-        document.layout_node_arena().handle(), Layout::Node::slot_id(target->layout_node()), target_rect,
+    return Layout::RustFFI::layout_script_intersection_observer_intersection_rect(
+        document.layout_node_arena().host(), Layout::Node::slot_id(target->layout_node()), target_rect,
         Layout::Node::slot_id(root_layout_box), root_bounds,
         Painting::rect_to_viewport_transform(document, visual_context_tree),
         const_cast<Vector<CSS::LengthPercentage>*>(&scroll_margin), inflate_scroll_container_clip_rect_by_scroll_margin);
@@ -7521,8 +7523,8 @@ void Document::update_compositor_animations()
         auto const* layout_node = animated_target.unsafe_layout_node();
         if (!layout_node)
             return false;
-        return Layout::RustFFI::layout_arena_transform_subtree_is_clipped_outside(
-            layout_node->arena_handle(), Layout::Node::slot_id(layout_node), root_bounds,
+        return Layout::RustFFI::layout_script_transform_subtree_is_clipped_outside(
+            layout_node->document_host(), Layout::Node::slot_id(layout_node), root_bounds,
             Painting::rect_to_viewport_transform(*this, *visual_context_tree));
     };
 
@@ -7626,8 +7628,8 @@ void Document::update_compositor_animations()
         auto viewport_bounds = CSSPixelRect { { 0, 0 }, viewport_rect().size() };
         auto rect_to_viewport_transform = Painting::rect_to_viewport_transform(*this, *visual_context_tree);
         auto bounds_in_viewport = [&](Layout::Node const& node) -> CSSPixelRect {
-            return Layout::RustFFI::layout_arena_bounding_client_rect(
-                node.arena_handle(), Layout::Node::slot_id(&node), rect_to_viewport_transform);
+            return Layout::RustFFI::layout_script_bounding_client_rect(
+                node.document_host(), Layout::Node::slot_id(&node), rect_to_viewport_transform);
         };
         HashTable<Layout::Node const*> containing_blocks;
         for (auto const* container = layout_node->containing_block(); container; container = container->containing_block())
@@ -8519,24 +8521,6 @@ void Document::element_with_name_was_removed(Badge<DOM::Element>, GC::Ref<DOM::E
     }
 }
 
-GC::Ptr<Element> Document::element_by_anchor_name(Utf16FlyString const& name, Node const& querying_node, Function<bool(Element&)> const& is_acceptable) const
-{
-    // https://drafts.csswg.org/css-shadow-1/#tree-scoped-name
-    // If a tree-scoped name is global (such as @font-face names), then when a tree-scoped reference is dereferenced to
-    // find it, first search only the tree-scoped names associated with the same root as the tree-scoped reference. If
-    // no relevant tree-scoped name is found, and the root is a shadow root, then repeat this search in the root's
-    // host's node tree (recursively).
-    auto const* node = &querying_node;
-    while (auto const* shadow_root = as_if<ShadowRoot>(node->root())) {
-        if (auto element = shadow_root->anchor_name_map().last_element_by_name_matching(name, is_acceptable))
-            return element;
-        node = shadow_root->host();
-        if (!node)
-            return {};
-    }
-    return m_anchor_name_map.last_element_by_name_matching(name, is_acceptable);
-}
-
 HTML::RadioButtonGroupRegistry& Document::ensure_radio_button_group_registry()
 {
     if (!m_radio_button_group_registry)
@@ -9164,9 +9148,9 @@ void Document::publish_animation_keyframes_for_style_update()
         return;
     // NB: Read before the walk, so that a change the walk itself makes walks again next time.
     m_animation_keyframes_published_generation = m_style_sheet_set_generation;
-    auto* engine = style_computer().style_engine().rust_handle();
+    auto* host = style_computer().style_engine().host();
     for (auto const& departed : m_departed_animation_keyframes)
-        CSS::StyleEngineFFI::style_engine_set_tree_scope_animation_keyframes(engine, departed.tree_scope.value(), departed.shadow_root_identity, nullptr, nullptr, 0, nullptr, 0);
+        CSS::StyleEngineFFI::style_engine_set_tree_scope_animation_keyframes(host, departed.tree_scope.value(), departed.shadow_root_identity, nullptr, nullptr, 0, nullptr, 0);
     m_departed_animation_keyframes.clear();
     style_scope().build_rule_cache_if_needed();
     for_each_shadow_root([](DOM::ShadowRoot& shadow_root) {
@@ -9196,6 +9180,7 @@ void Document::add_an_element_to_the_top_layer(GC::Ref<Element> element)
     // FIXME: 4. At the UA !important cascade origin, add a rule targeting el containing an overlay: auto declaration.
     element->set_rendered_in_top_layer(true);
     m_elements_with_pending_top_layer_membership_change.append(element);
+    CSS::record_top_layer_changed(*this);
 }
 
 // https://drafts.csswg.org/css-position-4/#request-an-element-to-be-removed-from-the-top-layer
@@ -9229,6 +9214,7 @@ void Document::remove_an_element_from_the_top_layer_immediately(GC::Ref<Element>
     element->set_rendered_in_top_layer(false);
 
     m_elements_with_pending_top_layer_membership_change.append(element);
+    CSS::record_top_layer_changed(*this);
 }
 
 // https://drafts.csswg.org/css-position-4/#process-top-layer-removals
@@ -9248,6 +9234,8 @@ void Document::process_top_layer_removals()
         m_top_layer_elements.remove(element);
         m_top_layer_pending_removals.remove(element);
     }
+    if (!elements_to_remove.is_empty())
+        CSS::record_top_layer_changed(*this);
 }
 
 // The top layer is treated as a single rebuild zone: any membership change detaches the box
@@ -9343,31 +9331,40 @@ Vector<GC::Root<Range>> Document::find_matching_text(Utf16View query, CaseSensit
     if (!layout_node())
         return {};
 
-    Vector<GC::Root<Range>> matches;
+    struct Search {
+        GC::Ref<Document> document;
+        Vector<GC::Root<Range>> matches;
+
+        DOM::Text* text_node(u32 identity) const
+        {
+            return as_if<DOM::Text>(document->style_computer().node_for_style_node(CSS::StyleNodeID { identity }).ptr());
+        }
+    };
+    Search search { *this, {} };
     auto query_view = Layout::RustFFI::FfiUtf16View {
         .ascii = query.has_ascii_storage() ? reinterpret_cast<u8 const*>(query.ascii_span().data()) : nullptr,
         .utf16 = query.has_ascii_storage() ? nullptr : reinterpret_cast<u16 const*>(query.utf16_span().data()),
         .length = query.length_in_code_units(),
     };
-    Layout::RustFFI::layout_arena_find_matching_text(
-        layout_node()->arena_handle(), Layout::Node::slot_id(layout_node()), query_view,
+    Layout::RustFFI::layout_script_find_matching_text(
+        layout_node()->document_host(), Layout::Node::slot_id(layout_node()), query_view,
         case_sensitivity == CaseSensitivity::CaseSensitive,
-        [](void* layout_node) {
+        [](void* context, u32 identity) {
             // Inert text is excluded from find-in-page.
-            auto const* text = as_if<DOM::Text>(static_cast<Layout::Node const*>(layout_node)->dom_node());
+            auto const* text = static_cast<Search*>(context)->text_node(identity);
             return text && !text->is_inert();
         },
-        &matches, [](void* context, Layout::RustFFI::FfiDomTextRange match) {
-            auto* start = as_if<DOM::Text>(static_cast<Layout::Node*>(match.start_layout_node)->dom_node());
-            auto* end = as_if<DOM::Text>(static_cast<Layout::Node*>(match.end_layout_node)->dom_node());
+        &search, [](void* context, Layout::RustFFI::FfiDomTextRange match) {
+            auto& search = *static_cast<Search*>(context);
+            auto* start = search.text_node(match.start_text_node);
+            auto* end = search.text_node(match.end_text_node);
             if (!start || !end || &start->root() != &end->root()
                 || !start->is_connected() || !end->is_connected()
                 || match.start_offset > start->length() || match.end_offset > end->length())
                 return;
-            static_cast<Vector<GC::Root<Range>>*>(context)->append(
-                Range::create(*start, match.start_offset, *end, match.end_offset)); });
+            search.matches.append(Range::create(*start, match.start_offset, *end, match.end_offset)); });
 
-    return matches;
+    return move(search.matches);
 }
 
 // https://dom.spec.whatwg.org/#document-allow-declarative-shadow-roots
@@ -9807,8 +9804,8 @@ Optional<CSSPixelRect> Document::current_caret_rect()
     };
 
     if (is<DOM::Text>(dom_node)) {
-        auto result = Layout::RustFFI::layout_arena_text_caret_rect_in_dom_range(
-            layout_node->arena_handle(), Layout::Node::slot_id(layout_node), position->offset());
+        auto result = Layout::RustFFI::layout_script_text_caret_rect_in_dom_range(
+            layout_node->document_host(), Layout::Node::slot_id(layout_node), position->offset());
         if (result.has_value)
             return to_viewport_rect(result.rect);
     }
@@ -9901,8 +9898,13 @@ void Document::set_needs_repaint(InvalidateDisplayList should_invalidate_display
 void Document::request_frame_for_pending_repaint()
 {
     auto navigable = this->navigable();
-    if (!navigable)
+    if (!navigable) {
+        // NB: SVG image documents only have a navigable while being rendered. A resource that finishes
+        //     loading between renders must still invalidate the image's cached rendering and notify its clients.
+        if (page().client().is_svg_page_client())
+            page().client().request_frame();
         return;
+    }
 
     navigable->set_needs_repaint();
 
@@ -9960,19 +9962,19 @@ void Document::note_svg_paint_resources_changed()
 {
     if (!m_layout_node_arena)
         return;
-    if (Layout::RustFFI::layout_arena_note_svg_paint_resources_changed(m_layout_node_arena->handle()))
+    if (Layout::RustFFI::render_state_note_svg_paint_resources_changed(m_layout_node_arena->host()))
         set_needs_accumulated_visual_contexts_update(true);
 }
 
 bool Document::has_enrolled_svg_paint_resources() const
 {
-    return m_layout_node_arena && Layout::RustFFI::layout_arena_has_enrolled_svg_paint_resources(m_layout_node_arena->handle());
+    return m_layout_node_arena && Layout::RustFFI::render_state_has_enrolled_svg_paint_resources(m_layout_node_arena->host());
 }
 
 void Document::schedule_full_accumulated_visual_context_rebuild(Layout::RustFFI::FfiVisualContextGlobalRebuildReason reason)
 {
     if (m_layout_node_arena)
-        Layout::RustFFI::layout_arena_visual_context_request_full_rebuild(m_layout_node_arena->handle(), reason);
+        Layout::RustFFI::render_state_visual_context_request_full_rebuild(m_layout_node_arena->host(), reason);
     set_needs_accumulated_visual_contexts_update(true);
 }
 
@@ -9981,8 +9983,8 @@ void Document::schedule_accumulated_visual_context_update(Layout::Node const& la
     if (!Painting::has_committed_box(layout_node))
         return;
     auto slot = Painting::committed_row_slot(layout_node);
-    Layout::RustFFI::layout_arena_visual_context_note_box_dirty(
-        layout_node_arena().handle(),
+    Layout::RustFFI::render_state_note_visual_context_box_dirty(
+        layout_node_arena().host(),
         slot,
         scope == AccumulatedVisualContextUpdateScope::Values
             ? Layout::RustFFI::FfiVisualContextBoxDirtyKind::StyleValueChange
@@ -10067,6 +10069,18 @@ void Document::set_needs_to_record_display_list_keeping_hit_test_display_list()
 
 RefPtr<Compositing::DisplayList> Document::record_display_list(HTML::PaintConfig config, Compositing::DisplayListResourceStorage& resource_storage, Painting::PaintCommandCacheMode cache_mode)
 {
+    // The host reads this recording right after it, so a recording in flight is taken in first: it has the recorder
+    // state.
+    if (auto navigable = this->navigable())
+        navigable->take_recording_in_flight_in(HTML::LocalNavigable::TakeIn::Wait);
+    auto recording = start_display_list_recording(config, cache_mode, Layout::RustFFI::FfiFlightBlocker::NotInRenderingUpdate);
+    if (!recording.has_value())
+        return nullptr;
+    return finish_display_list_recording(*recording, resource_storage);
+}
+
+Optional<Painting::DisplayListRecording> Document::start_display_list_recording(HTML::PaintConfig config, Painting::PaintCommandCacheMode cache_mode, Layout::RustFFI::FfiFlightBlocker blocker)
+{
     update_paint_and_hit_testing_properties_if_needed();
     VERIFY(has_committed_viewport_box());
 
@@ -10105,15 +10119,21 @@ RefPtr<Compositing::DisplayList> Document::record_display_list(HTML::PaintConfig
     if (config.should_show_caret_hit_test_debug_overlay)
         overlay_inputs.caret_debug_rect = m_caret_hit_test_debug_rect;
 
-    auto display_list = Painting::record_rust_display_list(*this, *placeholder_display_list, resource_storage, cache_mode, config, overlay_inputs);
+    return Painting::start_rust_display_list_recording(*this, move(visual_context_tree), move(placeholder_display_list), cache_mode, config, overlay_inputs, blocker);
+}
+
+RefPtr<Compositing::DisplayList> Document::finish_display_list_recording(Painting::DisplayListRecording const& recording, Compositing::DisplayListResourceStorage& resource_storage)
+{
+    auto display_list = Painting::finish_rust_display_list_recording(*this, recording, resource_storage);
     if (!display_list)
         return nullptr;
 
+    auto& document_paint_state = paint_state();
     bool const recording_returned_the_paint_command_cache_source = display_list == document_paint_state.display_list_used_as_paint_command_cache_source();
     if (!recording_returned_the_paint_command_cache_source || !m_hit_test_display_list || !m_hit_test_display_list->is_current())
-        m_hit_test_display_list = Painting::HitTestDisplayList::create_from_rust_recording(visual_context_tree.structural_epoch(), layout_node_arena(), *m_chrome_widget_registry);
+        m_hit_test_display_list = Painting::HitTestDisplayList::create_from_rust_recording(recording.visual_context_tree.structural_epoch(), layout_node_arena(), *m_chrome_widget_registry);
 
-    if (cache_mode == Painting::PaintCommandCacheMode::ReadWrite && !recording_returned_the_paint_command_cache_source) {
+    if (recording.cache_mode == Painting::PaintCommandCacheMode::ReadWrite && !recording_returned_the_paint_command_cache_source) {
         document_paint_state.set_display_list_used_as_paint_command_cache_source(display_list, resource_storage.collect_referenced_resources(*display_list));
     }
 
@@ -10130,12 +10150,12 @@ void Document::set_caret_hit_test_debug_rect(Optional<CSSPixelRect> rect)
     page().client().request_frame();
 }
 
-Painting::HitTestDisplayList const* Document::ensure_hit_test_display_list()
+Optional<Painting::HitTestQuery> Document::prepare_hit_test_query()
 {
     update_paint_and_hit_testing_properties_if_needed();
 
     if (!has_committed_viewport_box())
-        return nullptr;
+        return {};
 
     auto rebuild_hit_test_display_list = [&] {
         set_needs_to_record_display_list();
@@ -10150,16 +10170,37 @@ Painting::HitTestDisplayList const* Document::ensure_hit_test_display_list()
         (void)record_display_list(paint_config, throwaway_resource_storage_for_hit_test_only_recording, Painting::PaintCommandCacheMode::ReadOnly);
     };
 
-    if (!m_hit_test_display_list || !m_hit_test_display_list->is_current() || m_hit_test_display_list->visual_context_tree_structural_epoch() != visual_context_tree_structural_epoch())
+    // The paint properties were prepared above, and a query reads them as they were left there: preparing them again
+    // for every item a query converts would find nothing to do, but still ask the render state to do it.
+    auto hit_test_display_list_is_current = [&] {
+        return m_hit_test_display_list && m_hit_test_display_list->is_current() && m_hit_test_display_list->visual_context_tree_structural_epoch() == paint_state().visual_context_tree_structural_epoch_without_update();
+    };
+    // The recording in flight replaces the hit-test list once it lands, so a list that is not current waits for it
+    // first.
+    if (!hit_test_display_list_is_current()) {
+        if (auto navigable = this->navigable())
+            navigable->take_recording_in_flight_in(HTML::LocalNavigable::TakeIn::Wait);
+    }
+    if (!hit_test_display_list_is_current()) {
         rebuild_hit_test_display_list();
+        if (!hit_test_display_list_is_current())
+            return {};
+    }
 
-    return m_hit_test_display_list.ptr();
+    return Painting::HitTestQuery {
+        *m_hit_test_display_list,
+        paint_state().visual_context_tree_without_update(*this),
+        scroll_state_snapshot(),
+        page().client().device_pixels_per_css_pixel(),
+        page().chrome_metrics(),
+        Painting::overflow_values_applied_to_viewport_for_wheel_scrolling(*this),
+    };
 }
 
 Optional<Painting::HitTestResult> Document::hit_test(CSSPixelPoint position)
 {
-    auto hit_test_display_list = ensure_hit_test_display_list();
-    if (!hit_test_display_list)
+    auto query = prepare_hit_test_query();
+    if (!query.has_value())
         return {};
     // https://w3c.github.io/pointerevents/#hit-test
     // 1. Let pos be the x,y coordinates relative to the viewport
@@ -10173,7 +10214,7 @@ Optional<Painting::HitTestResult> Document::hit_test(CSSPixelPoint position)
     // 2. If there is a box in the viewport that would be a target for hit testing at coordinates x,y, when applying
     //    the transforms that apply to the descendants of the viewport, return the associated element and terminate
     //    these steps.
-    auto result = hit_test_display_list->hit_test(position, *this, page().client().device_pixels_per_css_pixel(), page().chrome_metrics());
+    auto result = query->list().hit_test(position, *query);
     if (result.has_value() && (result->chrome_widget || result->dom_node()))
         return result;
 
@@ -10186,58 +10227,58 @@ Optional<Painting::HitTestResult> Document::hit_test(CSSPixelPoint position)
 
 Optional<Painting::CaretPosition> Document::caret_position_from_point(CSSPixelPoint position)
 {
-    auto hit_test_display_list = ensure_hit_test_display_list();
-    if (!hit_test_display_list)
+    auto query = prepare_hit_test_query();
+    if (!query.has_value())
         return {};
-    return hit_test_display_list->caret_position_from_point(position, *this, page().client().device_pixels_per_css_pixel(), page().chrome_metrics(), Painting::CaretPositionMode::Normal);
+    return query->list().caret_position_from_point(position, *query, Painting::CaretPositionMode::Normal);
 }
 
 Optional<Painting::CaretPosition> Document::caret_position_from_point_for_selection_start(CSSPixelPoint position)
 {
-    auto hit_test_display_list = ensure_hit_test_display_list();
-    if (!hit_test_display_list)
+    auto query = prepare_hit_test_query();
+    if (!query.has_value())
         return {};
-    return hit_test_display_list->caret_position_from_point(position, *this, page().client().device_pixels_per_css_pixel(), page().chrome_metrics(), Painting::CaretPositionMode::SelectionStart);
+    return query->list().caret_position_from_point(position, *query, Painting::CaretPositionMode::SelectionStart);
 }
 
 Optional<Painting::CaretPosition> Document::caret_position_from_point_for_selection(CSSPixelPoint position, GC::Ptr<Node const> constraint_scope)
 {
-    auto hit_test_display_list = ensure_hit_test_display_list();
-    if (!hit_test_display_list)
+    auto query = prepare_hit_test_query();
+    if (!query.has_value())
         return {};
-    return hit_test_display_list->caret_position_from_point(position, *this, page().client().device_pixels_per_css_pixel(), page().chrome_metrics(), Painting::CaretPositionMode::Selection, constraint_scope);
+    return query->list().caret_position_from_point(position, *query, Painting::CaretPositionMode::Selection, constraint_scope);
 }
 
 Optional<Painting::CaretPosition> Document::caret_position_at_line_edge(Node const& node, size_t offset, TextAffinity affinity, Painting::CaretLineEdge edge)
 {
-    auto hit_test_display_list = ensure_hit_test_display_list();
-    if (!hit_test_display_list)
+    auto query = prepare_hit_test_query();
+    if (!query.has_value())
         return {};
-    return hit_test_display_list->caret_position_at_line_edge(node, offset, affinity, edge);
+    return query->list().caret_position_at_line_edge(node, offset, affinity, edge);
 }
 
 Optional<Painting::CaretPosition> Document::caret_position_on_adjacent_line(Node const& node, size_t offset, TextAffinity affinity, Painting::CaretLineDirection direction, CSSPixels inline_coordinate, Node const& scope)
 {
-    auto hit_test_display_list = ensure_hit_test_display_list();
-    if (!hit_test_display_list)
+    auto query = prepare_hit_test_query();
+    if (!query.has_value())
         return {};
-    return hit_test_display_list->caret_position_on_adjacent_line(node, offset, affinity, direction, inline_coordinate, scope);
+    return query->list().caret_position_on_adjacent_line(node, offset, affinity, direction, inline_coordinate, scope);
 }
 
 Optional<CSSPixels> Document::caret_line_block_coordinate(Node const& node, size_t offset, TextAffinity affinity)
 {
-    auto hit_test_display_list = ensure_hit_test_display_list();
-    if (!hit_test_display_list)
+    auto query = prepare_hit_test_query();
+    if (!query.has_value())
         return {};
-    return hit_test_display_list->caret_line_block_coordinate(node, offset, affinity);
+    return query->list().caret_line_block_coordinate(node, offset, affinity);
 }
 
 TraversalDecision Document::hit_test_all(CSSPixelPoint position, Function<TraversalDecision(Painting::HitTestResult)> const& callback)
 {
-    auto hit_test_display_list = ensure_hit_test_display_list();
-    if (!hit_test_display_list)
+    auto query = prepare_hit_test_query();
+    if (!query.has_value())
         return TraversalDecision::Continue;
-    return hit_test_display_list->hit_test_all(position, *this, page().client().device_pixels_per_css_pixel(), page().chrome_metrics(), callback);
+    return query->list().hit_test_all(position, *query, callback);
 }
 
 Unicode::Segmenter& Document::grapheme_segmenter() const
@@ -10721,7 +10762,8 @@ void Document::sync_custom_property_registrations_to_rust()
         .document_base_url = document_base_url.bytes().data(),
         .document_base_url_length = document_base_url.bytes().size(),
     };
-    CSS::ComputedValuesFFI::rust_custom_property_registry_update(
+    // A style transaction may still read the registry this replaces, so the registry is made anew.
+    m_rust_custom_property_registry = CSS::ComputedValuesFFI::rust_custom_property_registry_update(
         m_rust_custom_property_registry, &context, registrations.data(), registrations.size());
 }
 

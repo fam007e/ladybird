@@ -32,13 +32,11 @@ impl RetainedState {
     fn retry_engine_record_after_ancestor_step(
         &mut self,
         node: StyleNodeID,
+        full_drive_reason: Option<FullDriveReason>,
         scratch: &mut EngineComputedRecordScratch,
         counters: &mut Counters,
     ) -> Drive<u64> {
         let facts = self.computed_group_sets.adjustment_facts(node);
-        if facts & bridge::element_adjustment_fact::DISALLOW_DISPLAY_CONTENTS != 0 {
-            return Err(Unanswered::Refused);
-        }
         // An element standing for its host's pseudo-element is its host's to cascade, and is
         // driven in full against its parent as it is now, from an answer as complete as any.
         if self.backs_host_pseudo_element(node) {
@@ -58,7 +56,7 @@ impl RetainedState {
                     backing_answer_is_complete,
                     None,
                     parent_inputs_moved,
-                    None,
+                    full_drive_reason,
                     scratch,
                     counters,
                 )
@@ -82,7 +80,9 @@ impl RetainedState {
         else {
             return Err(Unanswered::Refused);
         };
-        if !scratch.font_drive.is_pending_for(node)
+        // A record driven in full for inputs no winner shows is no cohort's.
+        if full_drive_reason.is_none()
+            && !scratch.font_drive.is_pending_for(node)
             && !self.node_declares_custom_properties(node)
             && let Some(old_style_record) = self.computed_group_sets.assigned_style_record(node)
             && let Some(parent) = self.tree.inheritance_parent(node)
@@ -166,11 +166,21 @@ impl RetainedState {
                 inherited_style: true,
                 display: true,
             },
-            None,
+            full_drive_reason,
             scratch,
             counters,
         )?;
         Ok(record.raw())
+    }
+
+    /// What the host owes an element when it installs the record `settled` names over the one it
+    /// holds, as it owes a flush row: the animation plan the record decides, the transition step,
+    /// and whether it composes the record before anything inherits from it.
+    pub(super) fn note_what_installing_owes(&self, node: StyleNodeID, settled: &mut RetriedEngineRecord) {
+        let held_style_record = self.held_style_records.get(&node).copied().unwrap_or(0);
+        settled.owes_an_animation_plan = self.row_owes_an_animation_plan(node, held_style_record, settled.style_record);
+        settled.owes_a_transition_step = self.row_owes_a_transition_step(node);
+        settled.composed_by_the_host = self.host_composes_row(node, held_style_record, settled.style_record);
     }
 }
 
@@ -193,9 +203,15 @@ impl StyleEngineState {
         counters.bump(Counter::RetryAfterAncestorCalls);
         let started_at = std::time::Instant::now();
         let mut scratch = EngineComputedRecordScratch::for_retry(self.host.batch_moves_for_retries);
+        let full_drive_reason = self.host.retry_full_drive_reasons.get(&node).copied();
         let mut suspended_memory = MemoryLease::new(MemoryCategory::BatchScratch);
-        let style_record =
-            self.retry_engine_record_after_ancestor_loop(node, &mut scratch, &mut suspended_memory, counters);
+        let style_record = self.retry_engine_record_after_ancestor_loop(
+            node,
+            full_drive_reason,
+            &mut scratch,
+            &mut suspended_memory,
+            counters,
+        );
         counters.add(
             Counter::RetryAfterAncestorMicroseconds,
             u64::try_from(started_at.elapsed().as_micros()).unwrap_or(u64::MAX),
@@ -206,12 +222,7 @@ impl StyleEngineState {
         };
         if style_record != 0 {
             retried.explicitly_inherited_groups = scratch.element_explicitly_inherited_groups;
-            let held_style_record = self.retained.held_style_records.get(&node).copied().unwrap_or(0);
-            retried.owes_an_animation_plan =
-                self.retained
-                    .row_owes_an_animation_plan(node, held_style_record, style_record);
-            retried.owes_a_transition_step = self.retained.row_owes_a_transition_step(node);
-            retried.composed_by_the_host = self.retained.host_composes_row(node, held_style_record, style_record);
+            self.retained.note_what_installing_owes(node, &mut retried);
             for delta in &scratch.pseudo_deltas {
                 let kind = usize::from(delta.kind);
                 if kind < bridge::RETRY_PSEUDO_RECORD_SLOTS {
@@ -226,12 +237,13 @@ impl StyleEngineState {
     fn retry_engine_record_after_ancestor_loop(
         &mut self,
         node: StyleNodeID,
+        full_drive_reason: Option<FullDriveReason>,
         scratch: &mut EngineComputedRecordScratch,
         suspended_memory: &mut MemoryLease,
         counters: &mut Counters,
     ) -> u64 {
         loop {
-            match self.retry_engine_record_after_ancestor_step(node, scratch, counters) {
+            match self.retry_engine_record_after_ancestor_step(node, full_drive_reason, scratch, counters) {
                 Ok(record) => {
                     if record != 0 {
                         counters.bump(Counter::RetryAfterAncestorSettled);

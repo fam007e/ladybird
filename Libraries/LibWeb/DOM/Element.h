@@ -20,7 +20,6 @@
 #include <LibWeb/Bindings/Element.h>
 #include <LibWeb/CSS/ComputedValues.h>
 #include <LibWeb/CSS/Selector.h>
-#include <LibWeb/CSS/StyleInputRecord.h>
 #include <LibWeb/CSS/StyleProperty.h>
 #include <LibWeb/DOM/ChildNode.h>
 #include <LibWeb/DOM/NonDocumentTypeChildNode.h>
@@ -358,11 +357,6 @@ public:
 
     void run_attribute_change_steps(Utf16FlyString const& local_name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_);
 
-    enum class PseudoElementInputs {
-        Changed,
-        Unchanged,
-    };
-    CSS::RequiredInvalidationAfterStyleChange apply_style_engine_reaction(bool& did_change_custom_properties, PseudoElementInputs = PseudoElementInputs::Changed);
     // Apply a base style record the style engine computed itself from this element's moved cascade
     // winners: no style computation runs here, only the diff against the old record and its effects.
     // The synthetic pseudo-element records the style engine settled beside an engine-computed record: a kind it
@@ -450,7 +444,7 @@ public:
     void set_computed_style(Optional<CSS::PseudoElement>, CSS::StyleRecordID);
     void refresh_computed_style(Optional<CSS::PseudoElement>, CSS::StyleRecordID);
     // Install the custom properties beside a pseudo-element record the style engine derived.
-    void install_engine_pseudo_element_custom_property_data(CSS::PseudoElement, CSS::StyleRecordID);
+    void install_engine_pseudo_element_custom_property_data(CSS::PseudoElement, u64 environment);
     void update_animated_properties(Badge<Web::Animations::KeyframeEffect> const&, Optional<CSS::PseudoElement>, Web::Animations::KeyframeEffect&, Web::Animations::AnimationUpdateContext&);
     void update_animated_properties_for_abstract_element(Badge<Web::Animations::KeyframeEffect> const&, DOM::AbstractElement, Web::Animations::KeyframeEffect&, Web::Animations::AnimationUpdateContext&);
 
@@ -600,12 +594,7 @@ public:
         CSS::PseudoElement pseudo_element;
         Vector<Utf16FlyString> references;
     };
-    [[nodiscard]] CSS::StyleInputRecord const* style_input_record() const { return m_style_input_record.ptr(); }
-    [[nodiscard]] CSS::StyleInputRecord* style_input_record() { return m_style_input_record.ptr(); }
-    void set_style_input_record(OwnPtr<CSS::StyleInputRecord>);
-    [[nodiscard]] OwnPtr<CSS::StyleInputRecord> take_style_input_record();
     void record_style_query_custom_property_reference(Optional<CSS::PseudoElement>, Utf16FlyString const&);
-    void finish_recording_style_dependencies();
 
     bool style_uses_attr_css_function() const { return m_style_uses_attr_css_function; }
     void set_style_uses_attr_css_function() { m_style_uses_attr_css_function = true; }
@@ -702,22 +691,18 @@ public:
     [[nodiscard]] CSSPixelRect bounding_client_rect_assuming_layout_clean() const;
     [[nodiscard]] CSSPixelRect bounding_client_rect_assuming_layout_clean(Compositing::AccumulatedVisualContextTree const&) const;
 
-    virtual Layout::Node* create_layout_node(CSS::LayoutStyle);
+    // Which principal box this element asks for, before its computed style has a say.
+    virtual CSS::ElementBoxKind box_kind() const;
 
     virtual void did_receive_focus() { }
     virtual void did_lose_focus() { }
     bool should_indicate_focus() const;
     virtual bool is_focusable() const override;
 
-    static Layout::NodeWithStyle* create_layout_node_for_display_type(DOM::Document&, CSS::Display const&, CSS::LayoutStyle, Element*);
-
-    void set_synthetic_pseudo_element_node(Badge<Layout::LayoutTreeBuilderAccess>, CSS::PseudoElement, Layout::NodeWithStyle*);
-
     Layout::NodeWithStyle* pseudo_element_layout_node(CSS::PseudoElement) const;
     Layout::NodeWithStyle* pseudo_element_unsafe_layout_node(CSS::PseudoElement) const;
 
     bool has_synthetic_pseudo_elements() const;
-    void clear_synthetic_pseudo_element_layout_nodes(Badge<Layout::LayoutTreeBuilderAccess, Node>) { clear_synthetic_pseudo_element_layout_nodes(); }
 
     void serialize_children_as_json(JsonObjectSerializer<Utf16StringBuilder>&) const;
 
@@ -970,7 +955,6 @@ private:
     void append_to_attribute_list(QualifiedName, Utf16String value);
 
     void install_custom_property_data(Optional<CSS::PseudoElement>, RefPtr<CSS::CustomPropertyData const>);
-    void publish_var_reads();
     void synchronize_attribute(Utf16FlyString const& qualified_name) const;
     void synchronize_attribute_ns(Optional<Utf16FlyString> const&, Utf16FlyString const& local_name) const;
     void synchronize_style_attribute() const;
@@ -980,7 +964,6 @@ private:
     void handle_attribute_changes(QualifiedName, Optional<Utf16String> old_value, Optional<Utf16String> new_value);
     void remove_attribute_at(size_t index);
 
-    using PreservedPseudoElementStyles = Array<CSS::StyleRecordID, to_underlying(CSS::PseudoElement::KnownPseudoElementCount)>;
     using PseudoElementData = HashMap<CSS::PseudoElement, GC::Ref<PseudoElement>>;
 
     virtual OwnPtr<Node::RareData> create_rare_data() const override;
@@ -999,7 +982,7 @@ private:
     Utf16FlyString make_html_uppercased_qualified_name() const;
 
     void exit_fullscreen_on_element_removal();
-    CSS::RequiredInvalidationAfterStyleChange recompute_pseudo_element_styles(bool& did_change_custom_properties, bool had_list_marker, CSS::ComputedValues const* old_originating_style, CSS::StyleEngineMatchResult* = nullptr, PreservedPseudoElementStyles* = nullptr, EnginePseudoElementRecords const* = nullptr, EngineRecordDamages const* = nullptr);
+    CSS::RequiredInvalidationAfterStyleChange recompute_pseudo_element_styles(bool& did_change_custom_properties, bool had_list_marker, CSS::ComputedValues const* old_originating_style, EnginePseudoElementRecords const* = nullptr, EngineRecordDamages const* = nullptr);
     void apply_computed_style_to_layout_node_if_needed(CSS::RequiredInvalidationAfterStyleChange const&);
     void apply_computed_pseudo_element_styles_to_layout_nodes_if_needed(CSS::RequiredInvalidationAfterStyleChange const&);
     void publish_custom_property_names();
@@ -1032,13 +1015,11 @@ private:
     CSS::StyleRecordID m_style_record_identity;
     u64 m_animation_style_generation { 0 };
     u64 m_animation_subtree_style_generation { 0 };
-    OwnPtr<CSS::StyleInputRecord> m_style_input_record;
     PublishedCustomPropertyNames m_published_custom_property_names;
     Vector<CSS::StyleProperty> m_published_presentational_hint_properties;
 
     void register_element_reference_pseudo_element(CSS::PseudoElement type, GC::Ref<Element> element);
     SyntheticPseudoElement& ensure_synthetic_pseudo_element(CSS::PseudoElement) const;
-    void clear_synthetic_pseudo_element_layout_nodes();
 
     CSS::StyleNodeID m_style_node_id;
 

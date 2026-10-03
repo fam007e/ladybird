@@ -14,7 +14,6 @@
 #include <LibWeb/CSS/Invalidation/SlotInvalidator.h>
 #include <LibWeb/CSS/StyleComputer.h>
 #include <LibWeb/CSS/StyleEngineInput.h>
-#include <LibWeb/CSS/StyleInputRecord.h>
 #include <LibWeb/CSS/StyleInvalidation.h>
 #include <LibWeb/DOM/AbstractElement.h>
 #include <LibWeb/DOM/Document.h>
@@ -307,7 +306,7 @@ static void move_custom_property_environment_below(DOM::Document& document, DOM:
         .new_inheritable_data = new_inheritable.ptr(),
         .new_inheritable_declares = new_inheritable && new_inheritable->declared_count() > 0,
     };
-    auto answer = StyleEngineFFI::style_engine_move_custom_property_environment(style_engine.rust_handle(), element.style_node_id().value(), moved);
+    auto answer = StyleEngineFFI::style_engine_move_custom_property_environment(style_engine.host(), element.style_node_id().value(), moved);
     // The answer lives until the engine is next called, which acting on it does.
     Vector<StyleEngineFFI::FfiEnvironmentMoveAction> actions;
     actions.append(answer.actions, answer.count);
@@ -351,6 +350,114 @@ static void propagate_custom_property_environment_move(DOM::Document& document, 
     move_custom_property_environment_below(document, origin, old_origin_base, new_origin_base, old_origin_base.ptr(), new_origin_base.ptr());
 }
 
+// A record the engine settled for a row it published unsettled, by a retry or a demand: the row installs it as one
+// the engine computed, with the pseudo-element records settled beside it.
+static DOM::Element::EnginePseudoElementRecords take_engine_record(StyleEngine::PublishedStyleDelta& reaction, StyleEngineFFI::FfiEngineComputedRecord const& record)
+{
+    reaction.new_style_record = record.style_record;
+    reaction.uses_substitution = record.uses_substitution;
+    reaction.record_reads = record.record_reads;
+    reaction.explicitly_inherited_groups = record.explicitly_inherited_groups;
+    reaction.owes_an_animation_plan = record.owes_an_animation_plan;
+    reaction.owes_a_transition_step = record.owes_a_transition_step;
+    reaction.composed_by_the_host = record.composed_by_the_host;
+    reaction.damage = StyleEngineFFI::FfiStyleDeltaDamage::Full;
+    reaction.gap = StyleEngineFFI::FfiStyleDeltaGap::Computed;
+    DOM::Element::EnginePseudoElementRecords pseudo_element_records {};
+    for (size_t kind = 0; kind < array_size(record.pseudo_records); ++kind) {
+        if ((record.pseudo_records_present >> kind) & 1)
+            pseudo_element_records[kind] = StyleRecordID { record.pseudo_records[kind] };
+    }
+    return pseudo_element_records;
+}
+
+// Install the record the engine settled for a row, and the pseudo-element records beside it. A C++ computation applied
+// the animation plan it decided beside the record it computed and collected the element's animations, those the plan
+// starts among them, into that record; the host composes them over the record the engine settled once it is installed,
+// and runs the transition step the row owes.
+static RequiredInvalidationAfterStyleChange install_engine_computed_records(DOM::Element& element, StyleEngine::PublishedStyleDelta const& reaction, DOM::Element::EnginePseudoElementRecords const& pseudo_element_records, DOM::Element::EngineRecordDamages const& engine_record_damages, bool acknowledge, bool& did_change_custom_properties)
+{
+    auto& document = element.document();
+    auto& style_engine = document.style_computer().style_engine();
+    // A C++ computation applies a change of the element's display once the record holds the element's animations and
+    // its transition step has run, and refreshes its pseudo-elements after its own style; so does the installation of
+    // the record the engine settled, below, from the style the element held.
+    auto const old_computed_values = element.computed_style();
+    // https://drafts.csswg.org/css-transitions-1/#starting
+    // The transition step the row owes compares the record the element moved away from with the one it installs, so
+    // the old record has to outlive its replacement until the step has read it.
+    StyleRecordPin const before_change { document.style_computer(), StyleRecordID { reaction.owes_a_transition_step ? reaction.old_style_record : 0 } };
+    // The record answers any style input the element owes, as the C++ computation it equals would: nothing is left for
+    // a later transaction to plan.
+    style_engine.consume_recorded_element_style_input_change(reaction.style_node);
+    auto invalidation = element.apply_engine_computed_style_record(StyleRecordID { reaction.new_style_record }, pseudo_element_records, reaction.uses_substitution, reaction.record_reads, reaction.explicitly_inherited_groups, did_change_custom_properties, DOM::Element::DisplayNoneChange::LeftToCaller, &engine_record_damages);
+    if (acknowledge)
+        style_engine.acknowledge_engine_computed_record(StyleNodeID { reaction.style_node });
+    // The engine asks for the element's children only after the host composed the record. Which rows the host composes
+    // is the engine's to say, since it settles the pseudo-elements of every other row beside the record, and every
+    // element with animations is among them.
+    ASSERT(reaction.composed_by_the_host || !(element.has_relevant_animations() || element.has_associated_animations()));
+    if (reaction.composed_by_the_host) {
+        DOM::AbstractElement abstract_element { element };
+        if (reaction.owes_an_animation_plan)
+            document.style_computer().apply_settled_animation_plan(abstract_element);
+        // https://drafts.csswg.org/css-transitions-2/#defining-before-change-style
+        // Sampling the installed record can keep the epoch's before-change style, and the record the element holds by
+        // then is the after-change one. A row that owes the step keeps the record it moved away from first.
+        if (!!before_change.style_record() && document.is_in_style_stabilization_epoch())
+            document.style_computer().record_transition_stabilization_baseline(abstract_element, before_change.style_record());
+        if (element.has_relevant_animations() || element.has_associated_animations())
+            sample_animations_for_installed_record(abstract_element);
+    }
+    if (!!before_change.style_record())
+        invalidation |= document.style_computer().run_transition_step_for_installed_record({ element }, before_change.style_record());
+    if (old_computed_values)
+        element.apply_display_none_change(DOM::Element::DisplayNoneState::of(*old_computed_values));
+    // The pseudo-elements of a record the host composes inherit the composition, so the engine settles them only now.
+    if (reaction.composed_by_the_host)
+        invalidation |= element.refresh_pseudo_element_styles_over_composition(old_computed_values ? &*old_computed_values : nullptr, did_change_custom_properties);
+    return invalidation;
+}
+
+// The engine's answer to a targeted demand for the element's record, where the host can install it. The engine
+// resolved the record's environment over the parent's own; where the parent's inheritable environment differs, it
+// takes back what the demand derived.
+static Optional<StyleEngineFFI::FfiEngineComputedRecord> answer_targeted_record_demand(DOM::Element& element)
+{
+    auto& style_engine = element.document().style_computer().style_engine();
+    auto answer = style_engine.answer_record_demand(element.style_node_id(), StyleEngine::RecordDemand::TargetedElement).record;
+    if (answer.style_record == 0)
+        return {};
+    if (!engine_computed_record_environment_is_installable(element, StyleRecordID { answer.style_record })) {
+        style_engine.abandon_demanded_records(element.style_node_id());
+        return {};
+    }
+    return answer;
+}
+
+// The engine declined the row. Nothing else computes styles: the element keeps the record it holds.
+static RequiredInvalidationAfterStyleChange refuse_style_row(DOM::Element& element)
+{
+    element.document().style_computer().style_engine().consume_recorded_element_style_input_change(element.style_node_id());
+    if (!element.has_style())
+        dbgln("StyleEngine: refused the first style of <{}> (style node {})", element.local_name(), element.style_node_id().value());
+    return {};
+}
+
+// A row the engine did not settle in its transaction, or a targeted update: ask the engine for the element's record
+// now, and install it as one the engine computed, moving the element from the record it holds.
+static RequiredInvalidationAfterStyleChange apply_engine_record_demand(DOM::Element& element, bool& did_change_custom_properties)
+{
+    auto answer = answer_targeted_record_demand(element);
+    if (!answer.has_value())
+        return refuse_style_row(element);
+    StyleEngine::PublishedStyleDelta reaction {};
+    reaction.style_node = element.style_node_id().value();
+    reaction.old_style_record = element.style_record_identity().value();
+    auto pseudo_element_records = take_engine_record(reaction, *answer);
+    return install_engine_computed_records(element, reaction, pseudo_element_records, {}, true, did_change_custom_properties);
+}
+
 static RequiredInvalidationAfterStyleChange apply_style_engine_reactions(DOM::Document& document, Vector<StyleEngine::PublishedStyleDelta> const& reactions)
 {
     // Reactions are applied in preorder, so every element's inheritance inputs are ready when it is
@@ -360,70 +467,40 @@ static RequiredInvalidationAfterStyleChange apply_style_engine_reactions(DOM::Do
     RequiredInvalidationAfterStyleChange transaction_invalidation;
     document.style_computer().style_engine().begin_noting_declaration_changes_during_apply();
     ScopeGuard end_noting_declaration_changes = [&] { document.style_computer().style_engine().end_noting_declaration_changes_during_apply(); };
-    // Unstyled descendants of display:none need no record until a targeted read or visibility
-    // change asks for one. SVG resources and existing animations can still consume style while
-    // hidden, so retain their inheritance prerequisites in this batch. An element has animations when
-    // any animation is associated with it, relevant or not: a timeline can make one relevant later,
-    // and the style engine keeps the same rows.
-    HashTable<StyleNodeID> required_in_hidden_subtrees;
-    for (auto const& reaction : reactions) {
-        auto element = document.style_computer().element_for_style_node(reaction.style_node);
-        if (!element || (!element->is_svg_element() && !element->has_associated_animations()))
-            continue;
-        for (Optional<DOM::AbstractElement> ancestor = DOM::AbstractElement { *element }; ancestor.has_value(); ancestor = ancestor->element_to_inherit_style_from()) {
-            if (required_in_hidden_subtrees.set(ancestor->element().style_node_id()) == HashSetResult::KeptExistingEntry)
-                break;
-        }
-    }
     {
         for (size_t reaction_index = 0; reaction_index < reactions.size(); ++reaction_index) {
             auto const& published_reaction = reactions[reaction_index];
             // A pseudo-element record installs with its element's, which leads it.
             if (published_reaction.pseudo_kind != NumericLimits<u8>::max())
                 continue;
+            // An element the engine answered as hidden needs no style until a read or its subtree's
+            // reveal asks for one.
+            if (published_reaction.gap == StyleEngineFFI::FfiStyleDeltaGap::Hidden)
+                continue;
             auto element = document.style_computer().element_for_style_node(published_reaction.style_node);
             if (!element)
                 continue;
             auto reaction = published_reaction;
 
-            if (!element->has_style() && !required_in_hidden_subtrees.contains(element->style_node_id())) {
-                bool hidden = false;
-                for (auto ancestor = DOM::AbstractElement { *element }.element_to_inherit_style_from(); ancestor.has_value(); ancestor = ancestor->element_to_inherit_style_from()) {
-                    auto identity = ancestor->style_record_identity();
-                    if (!!identity) {
-                        hidden = has_flag(document.style_computer().style_engine().style_record_dependency_flags(identity), StyleRecordDependencyFlag::InDisplayNoneSubtree);
-                        break;
-                    }
-                }
-                if (hidden)
-                    continue;
-            }
-
-            // The pseudo-element records a retry settled beside the element's record.
-            Optional<DOM::Element::EnginePseudoElementRecords> retried_pseudo_element_records;
+            // The pseudo-element records a retry or a demand settled beside the element's record.
+            Optional<DOM::Element::EnginePseudoElementRecords> settled_pseudo_element_records;
             if (reaction.gap == StyleEngineFFI::FfiStyleDeltaGap::RetryAfterAncestor) {
-                if (auto retried = element->namespace_uri() == Namespace::HTML
-                        ? document.style_computer().style_engine().retry_engine_record_after_ancestor(reaction.style_node)
-                        : StyleEngineFFI::FfiEngineComputedRecord {};
-                    retried.style_record != 0) {
-                    reaction.new_style_record = retried.style_record;
-                    reaction.uses_substitution = retried.uses_substitution;
-                    reaction.record_reads = retried.record_reads;
-                    reaction.explicitly_inherited_groups = retried.explicitly_inherited_groups;
-                    reaction.owes_an_animation_plan = retried.owes_an_animation_plan;
-                    reaction.owes_a_transition_step = retried.owes_a_transition_step;
-                    reaction.composed_by_the_host = retried.composed_by_the_host;
-                    reaction.damage = StyleEngineFFI::FfiStyleDeltaDamage::Full;
-                    reaction.gap = StyleEngineFFI::FfiStyleDeltaGap::Computed;
-                    DOM::Element::EnginePseudoElementRecords pseudo_element_records {};
-                    for (size_t kind = 0; kind < array_size(retried.pseudo_records); ++kind) {
-                        if ((retried.pseudo_records_present >> kind) & 1)
-                            pseudo_element_records[kind] = StyleRecordID { retried.pseudo_records[kind] };
-                    }
-                    retried_pseudo_element_records = pseudo_element_records;
+                if (auto retried = document.style_computer().style_engine().retry_engine_record_after_ancestor(reaction.style_node); retried.style_record != 0) {
+                    settled_pseudo_element_records = take_engine_record(reaction, retried);
                 } else {
                     reaction.gap = StyleEngineFFI::FfiStyleDeltaGap::Materialize;
                 }
+            }
+
+            // A host that rewrote the element's declarations while an earlier row was applied (a form control restyling
+            // its shadow tree as its own style moves) leaves the record the engine computed from the old ones: the row is
+            // answered from its demand, over the declarations as they are now.
+            if (reaction.gap == StyleEngineFFI::FfiStyleDeltaGap::Computed && document.style_computer().style_engine().declarations_changed_during_apply(StyleNodeID { reaction.style_node })) {
+                reaction.gap = StyleEngineFFI::FfiStyleDeltaGap::Materialize;
+                reaction.new_style_record = 0;
+                reaction.damage = StyleEngineFFI::FfiStyleDeltaDamage::None;
+                reaction.reaction |= StyleEngine::RecomputeStyle;
+                settled_pseudo_element_records.clear();
             }
 
             // A reaction the engine derived for this element while applying an earlier one in
@@ -437,18 +514,8 @@ static RequiredInvalidationAfterStyleChange apply_style_engine_reactions(DOM::Do
                 reaction.inherited_style_groups = static_cast<u8>(absorbed >> 8);
             }
 
-            // An element whose style was cleared on entry to display:none computes it here, before its descendants,
-            // unless the engine computed it for an ancestor that became visible, or for an SVG element whose style
-            // was cleared under a hidden ancestor: that record installs like a first one.
-            if (!element->has_style() && reaction.gap == StyleEngineFFI::FfiStyleDeltaGap::Computed && reaction.old_style_record != 0
-                && !(reaction.reaction & StyleEngine::AncestorBecameVisible) && !element->is_svg_element()) {
-                reaction.gap = StyleEngineFFI::FfiStyleDeltaGap::Materialize;
-                reaction.new_style_record = 0;
-                reaction.damage = StyleEngineFFI::FfiStyleDeltaDamage::None;
-                reaction.reaction |= StyleEngine::RecomputeStyle;
-            }
-            // An engine-computed first record installs on an element without style; other record
-            // deltas assume the style they move.
+            // An engine-computed record installs on an element without style as a first record does, its style cleared
+            // on entry to display:none included; other record deltas assume the style they move.
             if (!element->has_style()
                 && reaction.gap != StyleEngineFFI::FfiStyleDeltaGap::Materialize
                 && reaction.gap != StyleEngineFFI::FfiStyleDeltaGap::Computed)
@@ -458,6 +525,27 @@ static RequiredInvalidationAfterStyleChange apply_style_engine_reactions(DOM::Do
             // compute against a missing inheritance parent.
             if (reaction.gap == StyleEngineFFI::FfiStyleDeltaGap::Materialize && reaction.reaction == 0 && !element->has_style())
                 reaction.reaction = StyleEngine::RecomputeStyle;
+
+            bool const needs_regular_style_recompute = reaction.reaction & (StyleEngine::PublishedStyle | StyleEngine::RecomputeStyle | StyleEngine::RecomputeDescendantStyles | StyleEngine::AncestorBecameVisible);
+            bool const needs_custom_property_recompute = reaction.reaction & StyleEngine::InheritedCustomProperties;
+            bool const needs_inherited_style_recompute = reaction.reaction & StyleEngine::InheritedStyle;
+            // An element declaring custom properties of its own layers them over the environment it
+            // inherits, which its cascade decides.
+            bool const cascade_declares_custom_properties = document.style_computer().style_engine().node_declares_custom_properties(reaction.style_node);
+            bool const needs_full_custom_property_recompute = needs_custom_property_recompute && (element->style_uses_var_css_function() || element->style_uses_inherit_css_function() || cascade_declares_custom_properties);
+
+            bool answered_by_demand = false;
+            // A row the engine did not settle in its transaction, and that computes the element's style, is answered
+            // from its record demand, as a targeted update of the element is: the record installs as one the engine
+            // computed, moving the element from the record it holds.
+            if (reaction.gap == StyleEngineFFI::FfiStyleDeltaGap::Materialize && (needs_regular_style_recompute || needs_inherited_style_recompute || needs_full_custom_property_recompute)) {
+                if (auto answer = answer_targeted_record_demand(*element); answer.has_value()) {
+                    reaction.old_style_record = element->style_record_identity().value();
+                    reaction.record_damage = 0;
+                    settled_pseudo_element_records = take_engine_record(reaction, *answer);
+                    answered_by_demand = true;
+                }
+            }
 
             bool const has_published_style_reaction = reaction.reaction & StyleEngine::PublishedStyle;
             if (has_published_style_reaction) {
@@ -493,67 +581,13 @@ static RequiredInvalidationAfterStyleChange apply_style_engine_reactions(DOM::Do
             auto const previous_visibility = previous_inherited_box_values
                 ? Optional<Visibility> { static_cast<Visibility>(previous_inherited_box_values->visibility) }
                 : Optional<Visibility> {};
-            bool const needs_regular_style_recompute = reaction.reaction & (StyleEngine::PublishedStyle | StyleEngine::RecomputeStyle | StyleEngine::RecomputeDescendantStyles | StyleEngine::AncestorBecameVisible);
-            bool const needs_custom_property_recompute = reaction.reaction & StyleEngine::InheritedCustomProperties;
-            bool const needs_inherited_style_recompute = reaction.reaction & StyleEngine::InheritedStyle;
             bool did_change_custom_properties = false;
             RequiredInvalidationAfterStyleChange invalidation;
 
-            // An element declaring custom properties of its own layers them over the environment it
-            // inherits, which its cascade decides.
-            bool const cascade_declares_custom_properties = document.style_computer().style_engine().node_declares_custom_properties(reaction.style_node);
-            bool const needs_full_custom_property_recompute = needs_custom_property_recompute && (element->style_uses_var_css_function() || element->style_uses_inherit_css_function() || cascade_declares_custom_properties);
             // The engine answered its records with what the moves from the records they name damage.
             DOM::Element::EngineRecordDamages engine_record_damages;
             if (reaction.record_damage & to_underlying(StyleEngineFFI::FfiStyleInvalidationField::EngineComputed))
                 engine_record_damages.element = DOM::Element::EngineRecordDamage { StyleRecordID { reaction.old_style_record }, StyleRecordID { reaction.new_style_record }, reaction.record_damage };
-            // The engine settled the element's record, and the pseudo-element records beside it:
-            // C++ installs them.
-            auto apply_engine_computed_records = [&](DOM::Element::EnginePseudoElementRecords const& pseudo_element_records, bool acknowledge) {
-                auto& style_engine = document.style_computer().style_engine();
-                // A C++ computation applies a change of the element's display once the record holds the element's
-                // animations and its transition step has run, and refreshes its pseudo-elements after its own style;
-                // so does the installation of the record the engine settled, below, from the style the element held.
-                auto const old_computed_values = element->computed_style();
-                // https://drafts.csswg.org/css-transitions-1/#starting
-                // The transition step the row owes compares the record the element moved away from with the one it
-                // installs, so the old record has to outlive its replacement until the step has read it.
-                StyleRecordPin const before_change { document.style_computer(), StyleRecordID { reaction.owes_a_transition_step ? reaction.old_style_record : 0 } };
-                // The record answers any style input the element owes, as the C++ computation it
-                // equals would: nothing is left for a later transaction to plan.
-                style_engine.consume_recorded_element_style_input_change(reaction.style_node);
-                invalidation = element->apply_engine_computed_style_record(StyleRecordID { reaction.new_style_record }, pseudo_element_records, reaction.uses_substitution, reaction.record_reads, reaction.explicitly_inherited_groups, did_change_custom_properties, DOM::Element::DisplayNoneChange::LeftToCaller, &engine_record_damages);
-                if (acknowledge)
-                    style_engine.acknowledge_engine_computed_record(StyleNodeID { reaction.style_node });
-                // A C++ computation applies the animation plan it decides beside the record it computes and collects the
-                // element's animations, those the plan starts among them, into that record. The host composes them over
-                // the record the engine settled once it is installed; the engine asks for the element's children only
-                // after that. Which rows the host composes is the engine's to say, since it settles the pseudo-elements
-                // of every other row beside the record, and every element with animations is among them.
-                bool const composed_by_the_host = reaction.composed_by_the_host;
-                ASSERT(composed_by_the_host || !(element->has_relevant_animations() || element->has_associated_animations()));
-                if (composed_by_the_host) {
-                    DOM::AbstractElement abstract_element { *element };
-                    if (reaction.owes_an_animation_plan)
-                        document.style_computer().apply_settled_animation_plan(abstract_element);
-                    // https://drafts.csswg.org/css-transitions-2/#defining-before-change-style
-                    // Sampling the installed record can keep the epoch's before-change style, and the record the element
-                    // holds by then is the after-change one. A row that owes the step keeps the record it moved away from
-                    // first.
-                    if (!!before_change.style_record() && document.is_in_style_stabilization_epoch())
-                        document.style_computer().record_transition_stabilization_baseline(abstract_element, before_change.style_record());
-                    if (element->has_relevant_animations() || element->has_associated_animations())
-                        sample_animations_for_installed_record(abstract_element);
-                }
-                if (!!before_change.style_record())
-                    invalidation |= document.style_computer().run_transition_step_for_installed_record({ *element }, before_change.style_record(), StyleComputer::TransitionStepFollowUp::Request);
-                if (old_computed_values)
-                    element->apply_display_none_change(DOM::Element::DisplayNoneState::of(*old_computed_values));
-                // The pseudo-elements of a record the host composes inherit the composition, so the engine settles them
-                // only now.
-                if (reaction.composed_by_the_host)
-                    invalidation |= element->refresh_pseudo_element_styles_over_composition(old_computed_values ? &*old_computed_values : nullptr, did_change_custom_properties);
-            };
             if (reaction.gap == StyleEngineFFI::FfiStyleDeltaGap::None) {
                 VERIFY(!needs_regular_style_recompute);
                 VERIFY(needs_inherited_style_recompute);
@@ -562,20 +596,23 @@ static RequiredInvalidationAfterStyleChange apply_style_engine_reactions(DOM::Do
                 // The engine swapped the element's inherited groups for its parent's: the record
                 // installs as an engine record. The engine refuses the swap to an element that
                 // animates, declares transitions, or inherits from an animating parent. A parent
-                // this batch recomputed may have taken animated values from its own ancestors
-                // since the engine swapped, which the element inherits in place of the base ones.
+                // this batch installed may have taken animated values from its own ancestors since
+                // the engine swapped, which the element inherits in place of the base ones: the
+                // row is answered from its demand.
                 if (parent_style_has_animated_values(*element))
-                    invalidation = element->apply_style_engine_reaction(did_change_custom_properties);
+                    invalidation = apply_engine_record_demand(*element, did_change_custom_properties);
                 else
-                    apply_engine_computed_records({}, false);
+                    invalidation = install_engine_computed_records(*element, reaction, {}, engine_record_damages, false, did_change_custom_properties);
             } else if (reaction.gap == StyleEngineFFI::FfiStyleDeltaGap::Computed) {
                 // The engine computed the new record from this element's moved cascade winners,
                 // from its parent's moved inherited style or display, or from its moved
                 // inherited custom-property environment.
                 VERIFY(needs_regular_style_recompute || needs_inherited_style_recompute || needs_custom_property_recompute);
                 VERIFY(reaction.pseudo_kind == NumericLimits<u8>::max());
-                auto pseudo_element_records = retried_pseudo_element_records.value_or({});
-                for (auto next = reaction_index + 1; next < reactions.size() && reactions[next].style_node == published_reaction.style_node && reactions[next].pseudo_kind != NumericLimits<u8>::max(); ++next) {
+                auto pseudo_element_records = settled_pseudo_element_records.value_or({});
+                // A demand settled the pseudo-elements beside the element's record; the rows the batch published beside
+                // the element's moved from a record the demand replaced.
+                for (auto next = reaction_index + 1; !answered_by_demand && next < reactions.size() && reactions[next].style_node == published_reaction.style_node && reactions[next].pseudo_kind != NumericLimits<u8>::max(); ++next) {
                     auto const& pseudo_reaction = reactions[next];
                     pseudo_element_records[pseudo_reaction.pseudo_kind] = StyleRecordID { pseudo_reaction.new_style_record };
                     if (pseudo_reaction.record_damage & to_underlying(StyleEngineFFI::FfiStyleInvalidationField::EngineComputed)) {
@@ -585,31 +622,16 @@ static RequiredInvalidationAfterStyleChange apply_style_engine_reactions(DOM::Do
                         };
                     }
                 }
-                if (!engine_computed_record_environment_is_installable(*element, StyleRecordID { reaction.new_style_record })
-                    || document.style_computer().style_engine().declarations_changed_during_apply(StyleNodeID { reaction.style_node })) {
-                    // The engine resolved the record's environment over the parent's own; when the
-                    // parent's inheritable environment differs, C++ computes the style. So it does
-                    // when a host rewrote the element's declarations after the engine computed it.
-                    document.style_computer().style_engine().consume_recorded_element_style_input_change(reaction.style_node);
-                    invalidation = element->apply_style_engine_reaction(did_change_custom_properties);
+                if (!engine_computed_record_environment_is_installable(*element, StyleRecordID { reaction.new_style_record })) {
+                    // The engine resolved the record's environment over the parent's own, which an earlier row of the
+                    // batch moved: the row is answered from a fresh demand.
+                    invalidation = apply_engine_record_demand(*element, did_change_custom_properties);
                 } else {
-                    apply_engine_computed_records(pseudo_element_records, true);
+                    invalidation = install_engine_computed_records(*element, reaction, pseudo_element_records, engine_record_damages, true, did_change_custom_properties);
                 }
             } else if (needs_regular_style_recompute || needs_inherited_style_recompute || needs_full_custom_property_recompute) {
-                if (needs_regular_style_recompute)
-                    document.style_computer().style_engine().consume_recorded_element_style_input_change(reaction.style_node);
-                auto pseudo_element_inputs = (reaction.reaction & StyleEngine::PseudoInputsMayHaveChanged)
-                    ? DOM::Element::PseudoElementInputs::Changed
-                    : DOM::Element::PseudoElementInputs::Unchanged;
-                // A reaction the engine derived from an ancestor's application, rather than from a
-                // published match answer, changes nothing the element's style input record does not
-                // name: the element may answer with its own last style when the record still holds.
-                bool const is_derived_reaction = !has_published_style_reaction && reaction.gap == StyleEngineFFI::FfiStyleDeltaGap::Materialize;
-                document.style_computer().set_materializing_for_derived_reaction(is_derived_reaction);
-                ScopeGuard reset_derived_reaction = [&] {
-                    document.style_computer().set_materializing_for_derived_reaction(false);
-                };
-                invalidation = element->apply_style_engine_reaction(did_change_custom_properties, pseudo_element_inputs);
+                // The engine declined the row's demand above.
+                invalidation = refuse_style_row(*element);
             }
             // A row that owes only a moved inherited environment on an element whose style reads none
             // has nothing left for the host: the engine moved the element's environment, and the
@@ -741,6 +763,8 @@ static void update_style(DOM::Document& document, DocumentWithoutBrowsingContext
     timing_counters.style_update_submission_microseconds += (MonotonicTime::now() - submission_started_at).to_truncated_microseconds();
     if (document.has_completed_style_update()
         && !document.style_computer().style_engine().has_pending_transaction()) {
+        if (!document.needs_animated_style_update())
+            return;
         document.sample_animation_effects_needing_style_update();
         if (!document.style_computer().style_engine().has_pending_transaction())
             return;
@@ -835,8 +859,11 @@ static void update_style(DOM::Document& document, DocumentWithoutBrowsingContext
 
         // A reaction can name an element created by editing after its new inheritance parent was
         // inserted. Close the batch over unstyled inheritance prerequisites, which are bounded by
-        // the reaction paths rather than discovered by a document traversal.
+        // the reaction paths rather than discovered by a document traversal. An element the engine
+        // answered as hidden needs no style to inherit from.
         for (size_t index = 0; index < style_engine_reactions.size(); ++index) {
+            if (style_engine_reactions[index].gap == StyleEngineFFI::FfiStyleDeltaGap::Hidden)
+                continue;
             auto element = document.style_computer().element_for_style_node(style_engine_reactions[index].style_node);
             if (!element || !element->is_connected() || &element->document() != &document)
                 continue;
@@ -853,10 +880,12 @@ static void update_style(DOM::Document& document, DocumentWithoutBrowsingContext
         // A published descendant may have an inheritance ancestor in the batch while the nodes
         // between them have no selector reaction of their own. Keep zero-bit scheduling slots for
         // that gap so derived inheritance bits can reach the descendant before its published
-        // reaction is consumed.
+        // reaction is consumed, unless the descendant is hidden.
         auto reaction_count_before_inheritance_closure = style_engine_reactions.size();
         Vector<StyleNodeID, 16> inheritance_gap;
         for (size_t index = 0; index < reaction_count_before_inheritance_closure; ++index) {
+            if (style_engine_reactions[index].gap == StyleEngineFFI::FfiStyleDeltaGap::Hidden)
+                continue;
             auto element = document.style_computer().element_for_style_node(style_engine_reactions[index].style_node);
             if (!element)
                 continue;
@@ -959,50 +988,6 @@ static void apply_targeted_style_invalidation(DOM::Element& element, RequiredInv
     apply_element_style_invalidation_after_style_change(element, invalidation);
     note_targeted_style_reaction_applied(element, invalidation, did_change_custom_properties, descendant_style_recompute_needed, was_unstyled, was_display_none, display_changed);
     apply_document_style_invalidation_after_style_change(element.document(), invalidation);
-}
-
-// Install the engine's answer to a targeted demand for the element's record, or return nothing where the read is
-// C++'s.
-static Optional<RequiredInvalidationAfterStyleChange> install_targeted_record_demand_answer(DOM::Element& element, bool& did_change_custom_properties)
-{
-    auto& style_engine = element.document().style_computer().style_engine();
-    auto answer = style_engine.answer_record_demand(element.style_node_id(), { .targeted = true, .read_only = false }).record;
-    if (answer.style_record == 0)
-        return {};
-    // The engine resolved the record's environment over the parent's own; when the parent's inheritable environment
-    // differs, C++ computes the style, and the engine takes back what the demand derived.
-    if (!engine_computed_record_environment_is_installable(element, StyleRecordID { answer.style_record })) {
-        style_engine.abandon_demanded_records(element.style_node_id());
-        return {};
-    }
-    DOM::Element::EnginePseudoElementRecords pseudo_element_records {};
-    for (size_t kind = 0; kind < array_size(answer.pseudo_records); ++kind) {
-        if ((answer.pseudo_records_present >> kind) & 1)
-            pseudo_element_records[kind] = StyleRecordID { answer.pseudo_records[kind] };
-    }
-    auto invalidation = element.apply_engine_computed_style_record(StyleRecordID { answer.style_record }, pseudo_element_records, answer.uses_substitution, answer.record_reads, answer.explicitly_inherited_groups, did_change_custom_properties, DOM::Element::DisplayNoneChange::Apply);
-    style_engine.acknowledge_engine_computed_record(element.style_node_id());
-    return invalidation;
-}
-
-static RequiredInvalidationAfterStyleChange materialize_style_for_targeted_update(DOM::Element& element, bool& did_change_custom_properties)
-{
-    auto& style_computer = element.document().style_computer();
-
-    if (element.parent()) {
-        if (auto invalidation = install_targeted_record_demand_answer(element, did_change_custom_properties); invalidation.has_value())
-            return *invalidation;
-    }
-
-    style_computer.style_engine().consume_recorded_element_style_input_change(element.style_node_id());
-
-    if (element.parent())
-        return element.apply_style_engine_reaction(did_change_custom_properties);
-
-    StyleEngine::StyleRecordDelta style_record_delta {};
-    auto new_style = element.document().style_computer().materialize_style_record({ element }, did_change_custom_properties, nullptr, style_record_delta);
-    element.set_computed_style({}, style_record_delta.new_style_record);
-    return {};
 }
 
 // A targeted style update has nothing to do when every source of style work in the document is settled: A full style
@@ -1213,14 +1198,16 @@ static bool update_style_for_element(DOM::Document& document, DOM::AbstractEleme
         auto const* previous_box_values = element->style_group<ComputedValues::BoxValues>();
         bool const was_display_none = previous_box_values && display_from_ffi_display(previous_box_values->display).is_none();
         auto const previous_display = previous_box_values ? Optional<Display> { display_from_ffi_display(previous_box_values->display) } : Optional<Display> {};
-        auto invalidation = materialize_style_for_targeted_update(element, did_change_custom_properties);
+        auto invalidation = apply_engine_record_demand(element, did_change_custom_properties);
         auto const* current_box_values = element->style_group<ComputedValues::BoxValues>();
         bool const display_changed = previous_display.has_value() && current_box_values && *previous_display != display_from_ffi_display(current_box_values->display);
         apply_targeted_style_invalidation(element, invalidation, did_change_custom_properties, descendant_style_recompute_needed, was_unstyled, was_display_none, display_changed);
 
         descendant_style_recompute_needed |= invalidation.recompute_descendant_styles;
 
-        VERIFY(element->has_style());
+        // The engine can refuse a first style, which leaves the rest of the chain nothing to inherit from.
+        if (!element->has_style())
+            return abstract_element.has_style();
         auto const* box_values = element->style_group<ComputedValues::BoxValues>();
         VERIFY(box_values);
         if (display_from_ffi_display(box_values->display).is_none()) {
@@ -1297,13 +1284,17 @@ void Document::update_style()
 
 bool Document::update_style_for_element(AbstractElement const& abstract_element)
 {
-    update_selection_style_observability();
-    flush_throttled_animation_style_update_for_node(abstract_element.element());
-    return CSS::update_style_for_element(*this, abstract_element, StyleUpdateMode::Normal);
+    return update_style_for_element(abstract_element, StyleUpdateMode::Normal);
 }
 
 bool Document::update_style_for_element(AbstractElement const& abstract_element, StyleUpdateMode mode)
 {
+    // A script API reads the element's style: its waits for the render state are one forced read.
+    auto* host = style_computer().style_engine().render_document().host();
+    Layout::RustFFI::document_host_begin_forced_read(host, true);
+    ScopeGuard end_forced_read = [&] {
+        Layout::RustFFI::document_host_end_forced_read(host);
+    };
     update_selection_style_observability();
     flush_throttled_animation_style_update_for_node(abstract_element.element());
     return CSS::update_style_for_element(*this, abstract_element, mode);

@@ -31,7 +31,7 @@ void DocumentPaintState::ensure_visual_context_tree(DOM::Document const& documen
 
 bool DocumentPaintState::has_visual_context_tree() const
 {
-    return Layout::RustFFI::layout_arena_has_visual_context_tree(m_layout_node_arena->handle());
+    return Layout::RustFFI::render_state_has_visual_context_tree(m_layout_node_arena->host());
 }
 
 Compositing::AccumulatedVisualContextTree DocumentPaintState::visual_context_tree_without_update(DOM::Document const& document) const
@@ -48,7 +48,12 @@ Compositing::AccumulatedVisualContextTree DocumentPaintState::visual_context_tre
 u64 DocumentPaintState::visual_context_tree_structural_epoch(DOM::Document const& document) const
 {
     ensure_visual_context_tree(document);
-    return Layout::RustFFI::layout_arena_visual_context_tree_structural_epoch(m_layout_node_arena->handle());
+    return visual_context_tree_structural_epoch_without_update();
+}
+
+u64 DocumentPaintState::visual_context_tree_structural_epoch_without_update() const
+{
+    return Layout::RustFFI::render_state_visual_context_tree_structural_epoch(m_layout_node_arena->host());
 }
 
 BlockingWheelEventRegionState DocumentPaintState::collect_root_blocking_wheel_event_regions(DOM::Document& document)
@@ -108,13 +113,13 @@ void DocumentPaintState::update_visual_viewport_accumulated_visual_context(DOM::
 void DocumentPaintState::begin_compositor_animation_update(DOM::Document& document)
 {
     ensure_visual_context_tree(document);
-    Layout::RustFFI::layout_arena_begin_compositor_animation_update(m_layout_node_arena->handle());
+    Layout::RustFFI::render_state_begin_compositor_animation_update(m_layout_node_arena->host());
 }
 
 void DocumentPaintState::publish_compositor_animations(DOM::Document& document, PublishPendingCompositorAnimations publish_pending)
 {
     ensure_visual_context_tree(document);
-    auto outcome = Layout::RustFFI::layout_arena_publish_compositor_animations(m_layout_node_arena->handle(), publish_pending == PublishPendingCompositorAnimations::Yes);
+    auto outcome = Layout::RustFFI::render_state_publish_compositor_animations(m_layout_node_arena->host(), publish_pending == PublishPendingCompositorAnimations::Yes);
     if (!outcome.published)
         return;
     m_visual_context_tree_needs_compositor_update = true;
@@ -126,7 +131,7 @@ void DocumentPaintState::publish_compositor_animations(DOM::Document& document, 
 
 void DocumentPaintState::republish_visual_animations(DOM::Document& document)
 {
-    if (!Layout::RustFFI::layout_arena_visual_context_tree_has_visual_animations(m_layout_node_arena->handle()))
+    if (!Layout::RustFFI::render_state_visual_context_tree_has_visual_animations(m_layout_node_arena->host()))
         return;
     m_visual_context_tree_needs_compositor_update = true;
     ++document.style_invalidation_counters().compositor_visual_animation_updates;
@@ -139,7 +144,7 @@ void DocumentPaintState::append_paint_command_cache_source_resources(Compositing
 
 void DocumentPaintState::invalidate_all_cached_paint(DOM::Document& document)
 {
-    Layout::RustFFI::layout_arena_invalidate_all_paint_caches(m_layout_node_arena->handle());
+    Layout::RustFFI::render_state_invalidate_all_paint_caches(m_layout_node_arena->host());
     Painting::set_needs_repaint(*document.unsafe_layout_node());
 }
 
@@ -161,7 +166,7 @@ void DocumentPaintState::refresh_scroll_state(DOM::Document& document)
 
 void DocumentPaintState::reset_selection_states(DOM::Document& document)
 {
-    Layout::RustFFI::layout_arena_selection_clear(m_layout_node_arena->handle(), viewport_row_slot(document));
+    Layout::RustFFI::render_state_clear_selection(m_layout_node_arena->host(), viewport_row_slot(document));
 }
 
 void DocumentPaintState::recompute_selection_states(DOM::Document& document, DOM::Range& range)
@@ -189,7 +194,7 @@ void DocumentPaintState::recompute_selection_states(DOM::Document& document, DOM
         }
     };
     auto apply_entries = [&] {
-        Layout::RustFFI::layout_arena_selection_apply(m_layout_node_arena->handle(), viewport_row_slot(document), entries.data(), entries.size(), range.start_offset(), range.end_offset());
+        Layout::RustFFI::render_state_apply_selection(m_layout_node_arena->host(), viewport_row_slot(document), entries.data(), entries.size(), range.start_offset(), range.end_offset());
     };
 
     // https://drafts.csswg.org/css-ui/#valdef-user-select-none

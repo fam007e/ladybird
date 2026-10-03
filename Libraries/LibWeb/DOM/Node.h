@@ -84,17 +84,16 @@ enum class RootNodeComposed {
     X(HTMLCanvasElementWidthOrHeightChange)           \
     X(HTMLImageElementReactToChangesInTheEnvironment) \
     X(HTMLImageElementUpdateTheImageData)             \
+    X(HTMLObjectElementContentDocumentResized)        \
     X(HTMLVideoElementNaturalDimensionsChanged)       \
     X(HTMLVideoElementSetVideoTrack)                  \
     X(KeyframeEffect)                                 \
-    X(LanguageChangeUnderCasingTextTransform)         \
     X(LayoutTreeUpdate)                               \
     X(NavigableSetViewportSize)                       \
     X(SVGImageElementFetchTheDocument)                \
     X(SVGResourceElementAttributeChange)              \
     X(SVGViewBoxChange)                               \
-    X(StyleChange)                                    \
-    X(TableSpanAttributeChange)
+    X(StyleChange)
 
 enum class SetNeedsLayoutReason {
 #define ENUMERATE_SET_NEEDS_LAYOUT_REASON(e) e,
@@ -189,6 +188,16 @@ public:
     virtual bool is_svg_clip_path_element() const { return false; }
     virtual bool is_svg_image_element() const { return false; }
     virtual bool is_svg_text_content_element() const { return false; }
+    virtual bool is_svg_path_element() const { return false; }
+    virtual bool is_svg_rect_element() const { return false; }
+    virtual bool is_svg_circle_element() const { return false; }
+    virtual bool is_svg_ellipse_element() const { return false; }
+    virtual bool is_svg_polyline_element() const { return false; }
+    virtual bool is_svg_polygon_element() const { return false; }
+    virtual bool is_svg_line_element() const { return false; }
+    virtual bool is_svg_text_positioning_element() const { return false; }
+    virtual bool is_svg_text_element() const { return false; }
+    virtual bool is_svg_text_path_element() const { return false; }
 
     bool in_a_document_tree() const;
 
@@ -430,8 +439,8 @@ public:
     }
 
     void set_needs_repaint(InvalidateDisplayList = InvalidateDisplayList::PaintCommandsAndHitTestList);
-    // The facts about this node that its box paints (inertness, editability, and so on) may have changed.
-    void note_dom_paint_facts();
+    // The facts about this node that a box built for it paints (inertness, editability, and so on) may have changed.
+    void publish_dom_paint_facts();
     void set_needs_layout_update(SetNeedsLayoutReason);
     void set_needs_layout_update(SetNeedsLayoutReason, Layout::LayoutUpdatePropagation);
 
@@ -617,7 +626,6 @@ protected:
         virtual void visit_edges(Cell::Visitor&);
         virtual size_t external_memory_size() const;
 
-        mutable Optional<UniqueNodeID> unique_id;
         Optional<String> webdriver_node_id;
 
         // https://dom.spec.whatwg.org/#registered-observer-list
@@ -665,6 +673,8 @@ protected:
     bool m_has_assigned_slot { false };
     bool m_inside_blocking_wheel_event_handler { false };
     u32 m_child_index_generation { 1 };
+    // The slot of the node directory that names the node by its unique id, or 0 before anything asked for the id.
+    mutable u32 m_node_directory_slot { 0 };
 
     void build_accessibility_tree(AccessibilityTreeNode& parent);
 

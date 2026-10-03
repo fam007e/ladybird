@@ -8,65 +8,54 @@
 #include <LibWeb/CSS/StyleComputer.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/Node.h>
+#include <LibWeb/Layout/Node.h>
 #include <LibWeb/Layout/NodeArena.h>
-#include <LibWeb/Layout/TextNode.h>
 #include <LibWeb/Painting/BoxViews.h>
 #include <LibWeb/Painting/PaintingRustBridge.h>
 
 namespace Web::Layout {
 
-NodeArena::NodeArena()
-    : m_handle(RustFFI::layout_arena_create([](void* shell) {
-        return as<TextNode>(*static_cast<Node*>(shell)).text_source();
-    }))
+NodeArena::NodeArena(RenderDocument& render_document)
+    : m_render_document(render_document)
 {
-    VERIFY(m_handle);
     Painting::register_geometry_host(*this);
 }
 
-NodeArena::~NodeArena()
-{
-    RustFFI::layout_arena_destroy(m_handle);
-}
-
-Compositing::RustFFI::NodeSlotId NodeArena::allocate(RustFFI::FfiNodeConstructionFacts const& construction_facts)
-{
-    return RustFFI::layout_arena_allocate(m_handle, construction_facts);
-}
+NodeArena::~NodeArena() = default;
 
 void NodeArena::free_subtree(Compositing::RustFFI::NodeSlotId root)
 {
-    RustFFI::layout_arena_free_subtree(m_handle, root);
+    RustFFI::render_state_drop_subtree(host(), root);
 }
 
 Node* NodeArena::node_if_live(Compositing::RustFFI::NodeSlotId slot) const
 {
-    return static_cast<Node*>(RustFFI::layout_arena_node_shell_if_live(m_handle, slot));
+    return static_cast<Node*>(RustFFI::render_state_node_shell_if_live(host(), slot));
 }
 
 u64 NodeArena::table_cell_measurement_cache_miss_count() const
 {
-    return RustFFI::layout_arena_table_cell_measurement_cache_miss_count(m_handle);
+    return RustFFI::render_state_layout_counts(host()).table_cell_measurement_cache_misses;
 }
 
 u64 NodeArena::intrinsic_measurement_count() const
 {
-    return RustFFI::layout_arena_intrinsic_measurement_count(m_handle);
+    return RustFFI::render_state_layout_counts(host()).intrinsic_measurements;
 }
 
 u64 NodeArena::intrinsic_inline_measurement_count() const
 {
-    return RustFFI::layout_arena_intrinsic_inline_measurement_count(m_handle);
+    return RustFFI::render_state_layout_counts(host()).intrinsic_inline_measurements;
 }
 
 bool destroy_layout_subtree(Node& node)
 {
-    return RustFFI::layout_arena_detach_and_free_subtree(node.arena_handle(), Node::slot_id(&node));
+    return RustFFI::render_state_drop_subtree(node.document_host(), Node::slot_id(&node));
 }
 
 void NodeArena::start_reporting_box_presence(Badge<DOM::Document>)
 {
-    RustFFI::layout_arena_set_box_presence_host(m_handle, this, [](void* context, u32 style_node, u8 bits) {
+    RustFFI::render_state_set_box_presence_host(host(), this, [](void* context, u32 style_node, u8 bits) {
         auto& document = *static_cast<NodeArena*>(context)->m_document;
         // The document has no StyleNodeID; it is named by 0.
         GC::Ptr<DOM::Node> node = &document;
@@ -79,7 +68,7 @@ void NodeArena::start_reporting_box_presence(Badge<DOM::Document>)
 
 void NodeArena::stop_reporting_box_presence(Badge<DOM::Document>)
 {
-    RustFFI::layout_arena_clear_box_presence_host(m_handle);
+    RustFFI::render_state_clear_box_presence_host(host());
 }
 
 void NodeArena::commit_box_presence(DOM::Node& node)
@@ -90,7 +79,7 @@ void NodeArena::commit_box_presence(DOM::Node& node)
 
 void NodeArena::sync_enrolled_content_for_layout()
 {
-    RustFFI::layout_arena_sync_enrolled_content_for_layout(m_handle);
+    RustFFI::render_state_sync_enrolled_content_for_layout(host());
 }
 
 }

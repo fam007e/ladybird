@@ -11,9 +11,11 @@
 #include <LibWeb/CSS/CSSAnimation.h>
 #include <LibWeb/CSS/CSSPropertyRule.h>
 #include <LibWeb/CSS/CSSStyleRule.h>
+#include <LibWeb/CSS/ElementBoxKind.h>
 #include <LibWeb/CSS/Invalidation/LanguageInvalidator.h>
 #include <LibWeb/CSS/Selector.h>
 #include <LibWeb/CSS/SelectorMatching.h>
+#include <LibWeb/CSS/Sizing.h>
 #include <LibWeb/CSS/StyleComputer.h>
 #include <LibWeb/CSS/StyleEngineInput.h>
 #include <LibWeb/CSS/StyleScope.h>
@@ -27,16 +29,25 @@
 #include <LibWeb/HTML/CustomElements/CustomStateSet.h>
 #include <LibWeb/HTML/HTMLBRElement.h>
 #include <LibWeb/HTML/HTMLBodyElement.h>
+#include <LibWeb/HTML/HTMLCanvasElement.h>
+#include <LibWeb/HTML/HTMLFrameSetElement.h>
 #include <LibWeb/HTML/HTMLHeadingElement.h>
+#include <LibWeb/HTML/HTMLImageElement.h>
 #include <LibWeb/HTML/HTMLInputElement.h>
+#include <LibWeb/HTML/HTMLObjectElement.h>
 #include <LibWeb/HTML/HTMLSlotElement.h>
 #include <LibWeb/HTML/HTMLTableCellElement.h>
 #include <LibWeb/HTML/HTMLTableElement.h>
+#include <LibWeb/HTML/HTMLTextAreaElement.h>
+#include <LibWeb/HTML/HTMLVideoElement.h>
 #include <LibWeb/HTML/LocalNavigable.h>
 #include <LibWeb/HTML/NavigableContainer.h>
+#include <LibWeb/Layout/ImageProvider.h>
+#include <LibWeb/Layout/LayoutRustBridge.h>
 #include <LibWeb/SVG/SVGClipPathElement.h>
 #include <LibWeb/SVG/SVGElement.h>
 #include <LibWeb/SVG/SVGGraphicsElement.h>
+#include <LibWeb/SVG/SVGImageElement.h>
 #include <LibWeb/SVG/SVGMaskElement.h>
 #include <LibWeb/SVG/SVGPatternElement.h>
 #include <LibWeb/SVG/SVGSwitchElement.h>
@@ -131,7 +142,7 @@ static TreeScopeID tree_scope_of(DOM::Node&);
 static StyleNodeID identity_of_shadow_root(DOM::ShadowRoot& shadow_root, StyleEngine& style_engine)
 {
     if (shadow_root.style_node_id() == no_style_node) {
-        shadow_root.set_style_node_id(style_engine.allocate_style_node());
+        shadow_root.set_style_node_id(style_engine.mint_style_node());
         shadow_root.document().style_computer().register_style_node(shadow_root.style_node_id(), shadow_root);
         // A shadow root is a scope and a subtree at once. Naming the subtree is what lets a sheet
         // attached here be bounded by the tree it decides in, even when its rules dispatch on
@@ -295,8 +306,12 @@ void record_element_connected(DOM::Element& element)
     auto* style_engine = style_engine_for(element);
     if (!style_engine || element.style_node_id() != no_style_node)
         return;
-    element.set_style_node_id(style_engine->allocate_style_node());
+    element.set_style_node_id(style_engine->mint_style_node());
     element.document().style_computer().register_style_node(element.style_node_id(), element);
+    // The name the document knows the element by arrives with the identity. A box built for one of
+    // the element's pseudo-elements answers by it even when the element itself has no box.
+    style_engine->set_element_unique_node_id(element.style_node_id(), static_cast<u64>(element.unique_id().value()));
+    Layout::publish_table_spans(element);
     // A newly minted identity holds none of the facts the element's style noted before.
     if (element.style_recomputes_on_environment_move())
         element.publish_style_recomputes_on_environment_move();
@@ -308,26 +323,40 @@ void record_element_connected(DOM::Element& element)
     republish_assigned_slot_of(element);
 }
 
+// A text node's row records one of the facts an element's row does, whether it sits in a user agent shadow tree. A
+// text node has no element columns in the mirror, so the fact travels on its own row, published where its identity
+// arrives.
+static bool text_is_in_user_agent_shadow_tree(DOM::Text const& text)
+{
+    auto shadow_root = text.containing_shadow_root();
+    return shadow_root && shadow_root->is_user_agent_internal();
+}
+
 void record_text_connected(DOM::Text& text)
 {
     auto* style_engine = style_engine_for(text);
     if (!style_engine || text.style_node_id() != no_style_node)
         return;
     StyleNodeID identity;
-    style_engine->allocate_text_style_nodes({ &identity, 1 });
+    style_engine->mint_text_style_nodes({ &identity, 1 });
     text.set_style_node_id(identity);
     text.document().style_computer().register_style_node(identity, text);
     style_engine->set_text_is_ascii_whitespace(identity, text.data().is_ascii_whitespace());
+    style_engine->set_text_is_in_user_agent_shadow_tree(identity, text_is_in_user_agent_shadow_tree(text));
+    style_engine->set_text_is_password_input(identity, text.is_password_input());
+    style_engine->set_text_data(identity, text.data());
     ensure_dom_order_parent_identity(text.parent(), *style_engine);
     link_in_dom_order(*style_engine, text);
     republish_assigned_slot_of(text);
 }
 
-void record_text_whitespace_state_changed(DOM::Text& text)
+// Data only ever arrives with the node or is replaced wholesale, so those are the two places it is published from.
+void record_text_data_changed(DOM::Text& text)
 {
     auto* style_engine = style_engine_for(text);
     if (!style_engine || text.style_node_id() == no_style_node)
         return;
+    style_engine->set_text_data(text.style_node_id(), text.data());
     style_engine->set_text_is_ascii_whitespace(text.style_node_id(), text.data().is_ascii_whitespace());
 }
 
@@ -341,8 +370,10 @@ void record_document_tree_tracked(DOM::Document& document)
     if (document.style_node_id() != no_style_node)
         return;
     auto& style_engine = document.style_computer().style_engine();
-    document.set_style_node_id(style_engine.allocate_style_node());
+    document.set_style_node_id(style_engine.mint_style_node());
     style_engine.mark_relation_only_style_node(document.style_node_id());
+    // The viewport's row answers by the document's name, which the document's identity carries.
+    style_engine.set_element_unique_node_id(document.style_node_id(), static_cast<u64>(document.unique_id().value()));
 }
 
 void record_subtree_connecting(DOM::Node& root)
@@ -380,19 +411,22 @@ void record_subtree_connecting(DOM::Node& root)
     if (!text_arrivals.is_empty()) {
         Vector<StyleNodeID, 64> identities;
         identities.resize(text_arrivals.size());
-        style_engine.allocate_text_style_nodes(identities.span());
+        style_engine.mint_text_style_nodes(identities.span());
         style_computer.ensure_style_node_slot(identities.last());
         for (size_t i = 0; i < text_arrivals.size(); ++i) {
             text_arrivals[i]->set_style_node_id(identities[i]);
             style_computer.register_style_node(identities[i], text_arrivals[i]);
             style_engine.set_text_is_ascii_whitespace(identities[i], text_arrivals[i]->data().is_ascii_whitespace());
+            style_engine.set_text_is_in_user_agent_shadow_tree(identities[i], text_is_in_user_agent_shadow_tree(*text_arrivals[i]));
+            style_engine.set_text_is_password_input(identities[i], text_arrivals[i]->is_password_input());
+            style_engine.set_text_data(identities[i], text_arrivals[i]->data());
         }
     }
 
     if (!arrivals.is_empty()) {
         Vector<StyleNodeID, 64> identities;
         identities.resize(arrivals.size());
-        style_engine.allocate_style_nodes(identities.span());
+        style_engine.mint_style_nodes(identities.span());
         style_computer.ensure_style_node_slot(identities.last());
         size_t next_element_identity = 0;
         size_t next_shadow_root_identity = element_count;
@@ -401,6 +435,8 @@ void record_subtree_connecting(DOM::Node& root)
                 auto identity = identities[next_element_identity++];
                 element->set_style_node_id(identity);
                 style_computer.register_style_node(identity, *element);
+                style_engine.set_element_unique_node_id(identity, static_cast<u64>(element->unique_id().value()));
+                Layout::publish_table_spans(*element);
                 if (element->style_recomputes_on_environment_move())
                     element->publish_style_recomputes_on_environment_move();
                 if (element->is_size_query_container() || element->style_depends_on_size_container_query())
@@ -483,6 +519,10 @@ static void publish_element_selector_features(StyleEngine& style_engine, DOM::El
             style_engine.record_state_delta({ .node = node.value(), .fact = *fact, .new_value = true });
     }
 
+    // The tag is computed afresh and not left cached. One cached where the element used to be says nothing about where
+    // it arrives, as a subtree that moves while detached is never reached by the walk a `lang` change runs, and one
+    // read now may not be final, as an XML parser sets attributes after insertion.
+    element.invalidate_lang_value();
     auto const language = element.lang_view();
     auto language_atom = language.has_value() ? style_engine.intern_language_atom(*language) : StyleAtomID {};
     auto const directionality = element.directionality() == DOM::Element::Directionality::Rtl ? "rtl"_utf16_fly_string : "ltr"_utf16_fly_string;
@@ -507,8 +547,9 @@ static void publish_element_selector_features(StyleEngine& style_engine, DOM::El
                                             .heading_level = heading_level,
                                             .is_slot = is_slot,
                                             .associated_pseudo_kind_plus_one = associated_pseudo_kind_plus_one(element),
-                                            .reserved = 0,
+                                            .box_kind = to_underlying(element.box_kind()),
                                             .adjustment_facts = element_style_adjustment_facts(element),
+                                            .construction_facts = element_construction_facts(element),
                                         },
         custom_states);
 }
@@ -653,6 +694,25 @@ u32 element_box_type_adjustment_facts(DOM::Element const& element)
     return facts;
 }
 
+u32 element_construction_facts(DOM::Element const& element)
+{
+    u32 facts = 0;
+    auto set = [&](bool condition, ElementConstructionFact fact) {
+        if (condition)
+            facts |= fact;
+    };
+    auto shadow_root = element.containing_shadow_root();
+    auto const* html_element = as_if<HTML::HTMLElement>(element);
+    set(is<HTML::HTMLInputElement>(element), ElementConstructionFact::IsHtmlInputElement);
+    set(element.is_html_html_element(), ElementConstructionFact::ConstructedAsHtmlHtmlElement);
+    set(shadow_root && shadow_root->is_user_agent_internal(), ElementConstructionFact::IsInUserAgentShadowTree);
+    set(html_element && html_element->uses_button_layout(), ElementConstructionFact::UsesButtonLayout);
+    set(element.is_editing_host(), ElementConstructionFact::IsEditingHost);
+    set(&element == element.document().body(), ElementConstructionFact::IsBody);
+    set(element.is_document_element(), ElementConstructionFact::ConstructedAsDocumentElement);
+    return facts;
+}
+
 u32 element_style_adjustment_facts(DOM::Element const& element)
 {
     auto facts = element_box_type_adjustment_facts(element);
@@ -677,6 +737,7 @@ u32 element_style_adjustment_facts(DOM::Element const& element)
     set(is<SVG::SVGClipPathElement>(element), ElementStyleAdjustmentFact::IsSvgClipPathElement);
     set(is<SVG::SVGPatternElement>(element), ElementStyleAdjustmentFact::IsSvgPatternElement);
     set(element.rendered_in_top_layer(), ElementStyleAdjustmentFact::RenderedInTopLayer);
+    set(is<HTML::HTMLFrameSetElement>(element), ElementStyleAdjustmentFact::IsHtmlFramesetElement);
     return facts;
 }
 
@@ -686,7 +747,132 @@ void record_element_adjustment_facts(DOM::Element& element)
     if (!style_engine || element.style_node_id() == no_style_node)
         return;
     style_engine->set_element_adjustment_facts(element.style_node_id(), element_style_adjustment_facts(element));
+    style_engine->set_element_construction_facts(element.style_node_id(), element_construction_facts(element));
+    style_engine->set_element_box_kind(element.style_node_id(), to_underlying(element.box_kind()));
     style_engine->set_element_associated_pseudo_kind(element.style_node_id(), associated_pseudo_kind_plus_one(element));
+}
+
+void record_element_box_kind(DOM::Element& element)
+{
+    auto* style_engine = style_engine_for(element);
+    if (!style_engine || element.style_node_id() == no_style_node)
+        return;
+    style_engine->set_element_box_kind(element.style_node_id(), to_underlying(element.box_kind()));
+}
+
+static void set_replaced_content_input(StyleEngine& style_engine, StyleNodeID node, StyleEngineFFI::FfiReplacedContentInputKind kind, u8 present, u32 first, u32 second = 0, u32 third = 0, u32 fourth = 0)
+{
+    u32 const values[] { first, second, third, fourth };
+    style_engine.set_element_replaced_content_input(node, to_underlying(kind), present, values);
+}
+
+static void set_natural_size_input(StyleEngine& style_engine, StyleNodeID node, SizeWithAspectRatio const& natural_size, StyleEngineFFI::FfiReplacedContentInputKind kind = StyleEngineFFI::FfiReplacedContentInputKind::NaturalSize)
+{
+    using Present = StyleEngineFFI::FfiReplacedContentInputPresent;
+    u8 present = 0;
+    u32 values[4] {};
+    if (natural_size.width.has_value()) {
+        present |= to_underlying(Present::First);
+        values[0] = bit_cast<u32>(natural_size.width->raw_value());
+    }
+    if (natural_size.height.has_value()) {
+        present |= to_underlying(Present::Second);
+        values[1] = bit_cast<u32>(natural_size.height->raw_value());
+    }
+    if (natural_size.aspect_ratio.has_value()) {
+        present |= to_underlying(Present::ThirdAndFourth);
+        values[2] = bit_cast<u32>(natural_size.aspect_ratio->numerator().raw_value());
+        values[3] = bit_cast<u32>(natural_size.aspect_ratio->denominator().raw_value());
+    }
+    set_replaced_content_input(style_engine, node, kind, present, values[0], values[1], values[2], values[3]);
+}
+
+// An image box's natural size: its image's, or zero while no image is available.
+static void set_image_natural_size_input(StyleEngine& style_engine, StyleNodeID node, Layout::ImageProvider const& image_provider)
+{
+    if (!image_provider.is_image_available()) {
+        set_natural_size_input(style_engine, node, { 0, 0, {} });
+        return;
+    }
+    set_natural_size_input(style_engine, node, { image_provider.intrinsic_width(), image_provider.intrinsic_height(), image_provider.intrinsic_aspect_ratio() });
+}
+
+// What the element gives the natural size of its replaced content, which layout resolves against the style of the
+// element's box: what its attributes say, or the size of what it has loaded.
+void record_element_replaced_content_input(DOM::Element& element)
+{
+    using Kind = StyleEngineFFI::FfiReplacedContentInputKind;
+    auto* style_engine = style_engine_for(element);
+    if (!style_engine || element.style_node_id() == no_style_node)
+        return;
+    auto node = element.style_node_id();
+    if (auto const* text_area = as_if<HTML::HTMLTextAreaElement>(element)) {
+        set_replaced_content_input(*style_engine, node, Kind::TextArea, 0, text_area->cols(), text_area->rows());
+        return;
+    }
+    if (auto const* image = as_if<HTML::HTMLImageElement>(element)) {
+        set_image_natural_size_input(*style_engine, node, *image);
+        return;
+    }
+    if (auto const* object = as_if<HTML::HTMLObjectElement>(element)) {
+        // An object representing its content navigable is sized from the SVG document it shows.
+        if (object->represents_its_content_navigable())
+            set_natural_size_input(*style_engine, node, object->natural_size_of_content_document());
+        else
+            set_image_natural_size_input(*style_engine, node, *object);
+        return;
+    }
+    if (auto const* input = as_if<HTML::HTMLInputElement>(element)) {
+        // An image button's box is an image box, which no size attribute sizes.
+        if (input->type_state() == HTML::HTMLInputElement::TypeAttributeState::ImageButton) {
+            set_image_natural_size_input(*style_engine, node, *input);
+            return;
+        }
+        auto kind = Kind::Input;
+        switch (input->type_state()) {
+        case HTML::HTMLInputElement::TypeAttributeState::Text:
+        case HTML::HTMLInputElement::TypeAttributeState::Search:
+        case HTML::HTMLInputElement::TypeAttributeState::URL:
+        case HTML::HTMLInputElement::TypeAttributeState::Telephone:
+        case HTML::HTMLInputElement::TypeAttributeState::Email:
+        case HTML::HTMLInputElement::TypeAttributeState::Password:
+        case HTML::HTMLInputElement::TypeAttributeState::Number:
+            kind = Kind::TextEntryInput;
+            break;
+        default:
+            break;
+        }
+        set_replaced_content_input(*style_engine, node, kind, 0, input->size());
+        return;
+    }
+    if (auto const* video = as_if<HTML::HTMLVideoElement>(element)) {
+        SizeWithAspectRatio natural_size;
+        if (auto size = video->natural_element_size(); size.has_value()) {
+            if (size->is_empty())
+                natural_size = { 0, 0, {} };
+            else
+                natural_size = { size->width(), size->height(), size->width() / size->height() };
+        }
+        set_natural_size_input(*style_engine, node, natural_size);
+        return;
+    }
+    if (auto const* image = as_if<SVG::SVGImageElement>(element)) {
+        // An SVG <image> takes its image's natural size as the image reports it, and the default object size once
+        // something has decoded.
+        set_natural_size_input(*style_engine, node, { image->intrinsic_width(), image->intrinsic_height(), image->intrinsic_aspect_ratio() },
+            image->decoded_image_data() ? Kind::DecodedSvgImage : Kind::NaturalSize);
+        return;
+    }
+    if (auto const* canvas = as_if<HTML::HTMLCanvasElement>(element))
+        set_replaced_content_input(*style_engine, node, Kind::Canvas, 0, canvas->width(), canvas->height());
+}
+
+void record_element_construction_facts(DOM::Element& element)
+{
+    auto* style_engine = style_engine_for(element);
+    if (!style_engine || element.style_node_id() == no_style_node)
+        return;
+    style_engine->set_element_construction_facts(element.style_node_id(), element_construction_facts(element));
 }
 
 void publish_required_attribute_value_texts(StyleEngine& style_engine, StyleComputer& style_computer)
@@ -757,6 +943,7 @@ static void record_element_initial_features(DOM::Element& element)
         record_element_inline_style_properties(element);
     if (element_has_presentational_hints_to_publish(element))
         StyleComputer::collect_presentational_hint_properties({ element });
+    record_element_replaced_content_input(element);
 }
 
 void record_node_moved_in_dom_order(DOM::Node& node, DOM::Node const& old_parent)
@@ -888,6 +1075,22 @@ void record_slot_assignment_changed(HTML::HTMLSlotElement& slot)
             identities.unchecked_append(identity);
     }
     slot.document().style_computer().style_engine().set_slot_assigned_nodes(slot.style_node_id(), identities.span());
+}
+
+// Only a connected element in a fully active document enters the top layer, so every member has an identity when it
+// does. One that has since disconnected, waiting in the pending removals, has given its identity up.
+void record_top_layer_changed(DOM::Document& document)
+{
+    if (!document.style_engine_tracks_tree())
+        return;
+    auto const& members = document.top_layer_elements();
+    Vector<StyleNodeID, 8> identities;
+    identities.ensure_capacity(members.size());
+    for (auto const& member : members) {
+        if (member->style_node_id() != no_style_node)
+            identities.unchecked_append(member->style_node_id());
+    }
+    document.style_computer().style_engine().set_top_layer_elements(identities.span());
 }
 
 // Assignment runs inside the insertion that connects a node, which happens before the subtree it arrived in is named,
@@ -1047,7 +1250,7 @@ void record_element_animation_effect_descriptions(DOM::Element& element, u8 slot
     versions.ensure_capacity(effects.size());
     for (auto const& effect : effects)
         versions.unchecked_append({ .identity = effect->animation_preparation_identity(), .generation = effect->animation_preparation_generation() });
-    if (StyleEngineFFI::style_engine_describes_animation_effects(style_engine->rust_handle(), element.style_node_id().value(), slot, versions.data(), versions.size()))
+    if (StyleEngineFFI::style_engine_describes_animation_effects(style_engine->host(), element.style_node_id().value(), slot, versions.data(), versions.size()))
         return;
 
     Vector<StyleEngineFFI::FfiPublishedAnimationEffect> ffi_effects;
@@ -1138,7 +1341,7 @@ void record_element_animation_effect_descriptions(DOM::Element& element, u8 slot
         ffi_effects.unchecked_append(row);
     }
 
-    StyleEngineFFI::style_engine_set_element_animation_effect_descriptions(style_engine->rust_handle(),
+    StyleEngineFFI::style_engine_set_element_animation_effect_descriptions(style_engine->host(),
         element.style_node_id().value(), slot,
         ffi_effects.data(), ffi_effects.size(),
         ffi_keyframes.data(), ffi_keyframes.size(),
@@ -1506,7 +1709,7 @@ void record_shadow_root_connected(DOM::ShadowRoot& shadow_root)
 static void publish_document_kind(DOM::Document& document)
 {
     auto& style_engine = document.style_computer().style_engine();
-    style_engine.set_html_element_namespace(
+    style_engine.publish_html_element_namespace(
         document.document_type() == DOM::Document::Type::HTML
             ? style_engine.intern_case_sensitive_text_atom(Namespace::HTML.view())
             : 0);
@@ -1589,7 +1792,7 @@ static void publish_layer_order_for_sheet(StyleSheetState const& sheet, DOM::Doc
 static void compile_rules_into(RuleCompilationContext const& context, StyleSheetState const& sheet, u64 rule_identity = 0, Parser::ValueParserFFI::NativeCompilationPurpose purpose = Parser::ValueParserFFI::NativeCompilationPurpose::Rules)
 {
     Parser::ValueParserFFI::NativeStylePublication publication {
-        .engine = context.style_engine.rust_handle(),
+        .host = context.style_engine.host(),
         .sheet = context.sheet_handle.value(),
         .before_rule = context.before_rule.value(),
     };
@@ -1771,7 +1974,7 @@ static void record_style_rule_inserted_in(u64 identity, bool changes_environment
     RuleCompilationContext context {
         style_computer.style_engine(),
         sheet_id,
-        StyleEngineRuleID { StyleEngineFFI::style_engine_native_rule_successor(style_computer.style_engine().rust_handle(), sheet.native_sheet().handle(), identity) },
+        StyleEngineRuleID { StyleEngineFFI::style_engine_native_rule_successor(style_computer.style_engine().host(), sheet.native_sheet().handle(), identity) },
         document,
         style_computer
     };
@@ -1829,7 +2032,7 @@ void record_style_rule_removed(StyleSheetState& sheet_it_left, RustRule const& r
             StyleSheetState& sheet;
         } context { document, sheet_it_left };
         StyleEngineFFI::style_engine_remove_native_rule(
-            style_computer.style_engine().rust_handle(),
+            style_computer.style_engine().host(),
             sheet_it_left.native_sheet().handle(),
             rule.handle(),
             detached_import ? detached_import->native_sheet().handle() : nullptr,
@@ -1894,7 +2097,7 @@ void record_style_rule_declarations_changed(RustRule const& rule, StyleSheetStat
         } context { document, rule.type() != RustRule::Type::Keyframe && rule_change_needs_style_environment_bump(rule) };
         auto& style_engine = document.style_computer().style_engine();
         if (StyleEngineFFI::style_engine_native_rule_declarations_changed(
-                style_engine.rust_handle(), rule.handle(), &context,
+                style_engine.host(), rule.handle(), &context,
                 [](void* opaque, u32) {
                     auto& context = *static_cast<ChangeContext*>(opaque);
                     if (context.changes_environment)
@@ -2102,7 +2305,7 @@ void record_stylesheet_rule_conditions(StyleSheetState& sheet, DOM::Document& do
     // sheet would lose those gates and could re-enable rules beneath a non-matching import.
     MediaEnvironmentSnapshot environment { document };
     Parser::ValueParserFFI::rust_style_sheet_publish_conditions(
-        engine_sheet->native_sheet().handle(), style_computer.style_engine().rust_handle(), environment.ffi_environment());
+        engine_sheet->native_sheet().handle(), style_computer.style_engine().host(), environment.ffi_environment());
 }
 
 void record_stylesheet_conditions(StyleSheetState& sheet, DOM::Node& document_or_shadow_root, bool conditions_hold)
@@ -2285,6 +2488,12 @@ void record_element_attribute_changed(DOM::Element& element, Utf16FlyString cons
     // box adjustments and whether it supports dimension attributes.
     if (old_value.has_value() != new_value.has_value() || name == HTML::AttributeNames::type)
         record_element_adjustment_facts(element);
+
+    // What the replaced content of a form control or a canvas is sized from.
+    if ((is<HTML::HTMLTextAreaElement>(element) && (name == HTML::AttributeNames::cols || name == HTML::AttributeNames::rows))
+        || (is<HTML::HTMLInputElement>(element) && (name == HTML::AttributeNames::size || name == HTML::AttributeNames::type))
+        || (is<HTML::HTMLCanvasElement>(element) && (name == HTML::AttributeNames::width || name == HTML::AttributeNames::height)))
+        record_element_replaced_content_input(element);
     // A table's border attribute moves its cells' border hints.
     if (name == HTML::AttributeNames::border && is<HTML::HTMLTableElement>(element)) {
         element.for_each_in_subtree_of_type<HTML::HTMLTableCellElement>([](auto& cell) {

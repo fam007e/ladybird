@@ -68,13 +68,17 @@ mod custom_property_environments;
 #[cfg(test)]
 mod differential_tests;
 pub(crate) mod effect_descriptions;
+pub mod engine_calls;
 mod engine_sample;
 mod environment_move;
 pub mod exact_matcher;
+pub(crate) mod style_job;
 pub use crate::fast_hash;
+mod engine_handle;
 mod flush;
 mod fnv;
 mod font_resolution;
+pub mod identities;
 pub mod impact;
 pub mod index;
 mod input_routing;
@@ -101,6 +105,8 @@ mod routing;
 mod sorted_merge;
 mod style_invalidation;
 mod transition_baselines;
+pub(crate) use publication::RecordDemand;
+pub(crate) use transition_baselines::InheritedAnimatedValue;
 mod weak_pool;
 #[cfg(not(feature = "style-recording"))]
 pub mod record_replay {
@@ -178,7 +184,6 @@ use fast_hash::FastMap as HashMap;
 use fast_hash::FastSet as HashSet;
 use planning::*;
 use smallvec::SmallVec;
-use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::hash::{Hash, Hasher};
 use std::rc::Rc;
@@ -187,8 +192,7 @@ use std::sync::Mutex;
 
 use crate::css::cascaded_properties::CascadeOrigin;
 use crate::css::cascaded_properties::CascadedPropertyStore;
-use crate::css::cascaded_properties::FfiCascadeBlock;
-use crate::css::cascaded_properties::FfiSourceSlotAssignment;
+#[cfg(feature = "style-recording")]
 use crate::css::computed_values::computed_group_dependency_mask;
 use crate::css::computed_values::computed_group_output_mask;
 use crate::css::host_shared::{HostShared, SharedPayload};
@@ -205,7 +209,8 @@ use exact_matcher::ExactMatchContext;
 use exact_matcher::ExactMatcher;
 
 pub use counter_context::StyleEngine;
-pub use inputs::{PublishedBoxFacts, TextStyleParentFacts};
+pub use engine_handle::StyleEngineHandle;
+pub use inputs::{NaturalSize, PublishedBoxFacts, PublishedTextSource, ReplacedContentInput, TextStyleParentFacts};
 
 use batch_matcher::AncestorRequirements;
 use batch_matcher::AncestorRequirementsCache;
@@ -282,7 +287,6 @@ use program::RuleID;
 use program::RuleKind;
 use program::RuleVersion;
 use program::SelectorProgramID;
-use program::SemanticDeclarationID;
 use program::SheetID;
 use program::StyleSheetObjectID;
 use program::StyleSheetProgram;
@@ -845,6 +849,10 @@ pub struct RetainedState {
     document_media: custom_property_cascade::DocumentMediaSnapshot,
     /// The `@function` definitions each scope sees, retained from each transaction's inputs.
     document_functions: custom_property_cascade::DocumentFunctionSnapshot,
+    /// The custom-property registry the last transaction's inputs name, which the engine holds a
+    /// reference to for as long as it reads the registry: the document makes its registry anew
+    /// when the registrations change.
+    custom_property_registry: Option<std::sync::Arc<crate::css::custom_properties::CustomPropertyRegistry>>,
     /// Every font resolution this document has been given. An evaluation step reads it; only a
     /// host round between passes adds to it.
     font_resolution: Option<font_resolution::FontResolutionCache>,
@@ -883,6 +891,11 @@ pub struct RetainedState {
     /// substitution produced: what it rolled back to is a declaration the winners do not name, so
     /// the node's records are its alone and are computed again whatever its winners say.
     nodes_with_rolled_back_records: HashMap<StyleNodeID, u64>,
+    /// The nodes whose last winner store, for the element or for one of its pseudo-elements,
+    /// substituted a value that resolves against the element: a `random()` it draws or a
+    /// container-relative length. No record cache keys on the element, so its records are its
+    /// alone.
+    nodes_with_element_relative_substitutions: HashMap<StyleNodeID, publication::ElementRelativeSubstitutions>,
     /// The custom-property environment each element holds, for the elements that hold one. This is
     /// the only copy: the element reads its environment from here.
     element_custom_property_data: HashMap<StyleNodeID, inputs::HeldCustomPropertyEnvironment>,
@@ -921,6 +934,10 @@ pub struct RetainedState {
     /// The style record each element holds, for the elements that hold one, as the host reports
     /// every record it installs or clears.
     held_style_records: HashMap<StyleNodeID, u64>,
+    /// Per shadow host, the elements of its shadow tree that stood for one of its element-backed
+    /// pseudo-elements when the host published them; [`RetainedState::backing_elements`] reads the
+    /// ones that still do.
+    backing_elements: HashMap<StyleNodeID, SmallVec<[StyleNodeID; 2]>>,
     /// The elements and shadow roots the host marked as having a child that explicitly inherits
     /// a non-inherited property: a move of the node's non-inherited groups reaches its children.
     children_explicitly_inherit_marks: HashSet<StyleNodeID>,
@@ -942,6 +959,12 @@ pub struct RetainedState {
     /// The random base value each random caching key has been given, for the random functions the
     /// document's styles hold.
     random_base_values: random_bases::RandomBaseValues,
+    /// What each element that has replaced content gives its natural size, which layout resolves
+    /// against the style of the element's box.
+    replaced_content_inputs: HashMap<StyleNodeID, inputs::ReplacedContentInput>,
+    /// The computed style groups each longhand reaches, which the host registers before it creates
+    /// the engine.
+    style_groups: &'static crate::css::computed_values::StyleGroupMasks,
     /// https://drafts.csswg.org/css-transitions-2/#defining-before-change-style
     /// Per transition target, by element and then pseudo-element kind, the before-change style its
     /// transitions are decided against for the rest of the style stabilization epoch, pinned until
@@ -951,10 +974,6 @@ pub struct RetainedState {
     /// previously substituted record must then be recomputed by C++, which implements registered
     /// custom properties, even when its cascade winners did not move.
     custom_property_registrations_changed: bool,
-    /// Pending selections for elements, and separately for the few pseudo-elements that hold one.
-    /// Both are keyed by the element so that retiring it releases every selection by key.
-    pending_element_style_computation_selections: HashMap<StyleNodeID, StyleComputationSelection>,
-    pending_pseudo_style_computation_selections: HashMap<StyleNodeID, Vec<(u8, StyleComputationSelection)>>,
     /// Records the engine derived for published reactions that C++ has not installed yet. Their
     /// columns already moved so descendants in the same flush build on them; the cascade state
     /// and answer consumption follow C++'s acknowledgement, and a discarded transaction reverts
@@ -1023,7 +1042,7 @@ pub struct RetainedState {
     /// Prefix transitions and their canonical answers have one document-lifetime owner. Matching
     /// traversals and answer patches borrow it synchronously and change its cache-owned lifecycle
     /// between scratch and retained residency without moving the payload.
-    prefix_caches: Rc<RefCell<PrefixCaches>>,
+    prefix_caches: std::sync::Arc<SharedPrefixCaches>,
     /// Test-only: force the bounded completion window regardless of headroom.
     #[cfg(test)]
     force_bounded_prefix_completion: bool,
@@ -1100,6 +1119,8 @@ pub struct RetainedState {
 pub struct HostState {
     /// What the flush whose rows the host is installing moved under every row.
     batch_moves_for_retries: publication::BatchMoves,
+    /// Why the flush would have driven a row it left to a retry in full, its winners standing.
+    retry_full_drive_reasons: HashMap<StyleNodeID, publication::FullDriveReason>,
     /// The host's synchronous font resolver. A step that misses the cache returns `NeedsInput`;
     /// the round outside the step calls this and the node is retried.
     font_resolver: Option<font_resolution::FontResolverHost>,
@@ -1145,9 +1166,6 @@ pub struct HostState {
     /// Borrowed FFI result storage for the most recent style-node query.
     ffi_style_node_query: Vec<u32>,
     ffi_style_node_query_memory: MemoryLease,
-    /// Borrowed FFI result storage for retained cascade source-slot assignments.
-    ffi_retained_cascade_assignments: Vec<FfiSourceSlotAssignment>,
-    ffi_retained_cascade_assignments_memory: MemoryLease,
     /// Identities released at transaction settlement. The FFI keeps this batch borrowed until C++
     /// has removed its matching fly-string references and atom-keyed memo entries.
     reclaimed_style_atoms: Vec<ReclaimedStyleAtom>,
@@ -1178,12 +1196,6 @@ impl std::ops::DerefMut for StyleEngineState {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.retained
     }
-}
-
-#[derive(Clone, Copy)]
-pub(crate) struct StyleComputationSelection {
-    pub computed_property_words: [u64; crate::css::property_metadata::LONGHAND_WORD_COUNT],
-    pub computed_property_closure_is_exact: bool,
 }
 
 #[cfg(test)]

@@ -221,6 +221,9 @@ public:
     void reset_rendering_scheduler_counters();
     void set_manual_rendering_opportunities(bool enabled);
     void inject_rendering_opportunity(double frame_time_ms);
+    Utf16String frame_scheduler_state() const;
+    void hold_next_frame();
+    void release_held_frame();
     void update_compositor_animations();
     bool run_empty_animation_style_update_for_testing();
     void arm_compositor_animation_timers_for_testing();
@@ -239,6 +242,7 @@ public:
     u64 paint_style_record_identity(DOM::Element&);
     u64 layout_node_identity(DOM::Node&);
     u64 layout_arena_live_slot_count();
+    void panic_render_state_for_testing();
     u64 layout_arena_shell_count();
     double style_engine_match_document();
     Utf16String style_engine_matched_rules();

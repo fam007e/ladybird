@@ -515,7 +515,6 @@ public:
     void update_layout(UpdateLayoutReason);
     void update_layout(UpdateLayoutReason, ThrottledAnimationSamplingScope);
     void update_style_and_layout_once(UpdateLayoutReason, ThrottledAnimationSamplingScope);
-    void note_content_visibility_auto_style() { m_may_have_content_visibility_auto_style = true; }
     void update_layout_if_needed_for_node(Node const&, UpdateLayoutReason);
     [[nodiscard]] u64 partial_layout_count() const;
     [[nodiscard]] u64 full_layout_count() const;
@@ -1088,7 +1087,6 @@ public:
 
     // https://drafts.csswg.org/css-anchor-position-1/#determining
     AnchorNameMap& anchor_name_map() { return m_anchor_name_map; }
-    GC::Ptr<Element> element_by_anchor_name(Utf16FlyString const& name, Node const& querying_node, Function<bool(Element&)> const& is_acceptable) const;
 
     void add_form_associated_element_with_form_attribute(HTML::FormAssociatedElement&);
     void remove_form_associated_element_with_form_attribute(HTML::FormAssociatedElement&);
@@ -1197,7 +1195,7 @@ public:
 
     // Confinement report of the most recent layout tree build, for tests observing whether a
     // partial rebuild stayed inside its rebuilt subtrees.
-    [[nodiscard]] Layout::RustFFI::FfiLayoutTreeBuildStats layout_tree_build_stats() const;
+    [[nodiscard]] Layout::RustFFI::FfiLayoutCounts layout_counts() const;
 
     enum class AccumulatedVisualContextUpdateScope : u8 {
         Values,
@@ -1228,6 +1226,17 @@ public:
     [[nodiscard]] bool needs_scroll_container_resnap() const { return m_needs_scroll_container_resnap; }
     void set_may_have_scroll_snap_areas() { m_may_have_scroll_snap_areas = true; }
     [[nodiscard]] bool may_have_scroll_snap_areas() const { return m_may_have_scroll_snap_areas; }
+
+    // Whether a node in this document has ever carried a blocking wheel event listener. It never
+    // goes back to false: a node that stopped carrying one still has descendants whose inherited
+    // state has to be derived when they move.
+    void set_may_have_blocking_wheel_event_listener() { m_may_have_blocking_wheel_event_listener = true; }
+    [[nodiscard]] bool may_have_blocking_wheel_event_listener() const { return m_may_have_blocking_wheel_event_listener; }
+
+    // Whether a node in this document has ever published a paint fact. It never goes back to false:
+    // a node that lost its last fact still has to publish that it did.
+    void set_may_have_dom_paint_facts() { m_may_have_dom_paint_facts = true; }
+    [[nodiscard]] bool may_have_dom_paint_facts() const { return m_may_have_dom_paint_facts; }
 
     void register_scroll_snap_container(Layout::Node const&);
     [[nodiscard]] Vector<Compositing::RustFFI::NodeSlotId> collect_scroll_snap_containers();
@@ -1335,9 +1344,13 @@ public:
     // be asked for when the mark is made.
     void request_frame_for_pending_repaint(Badge<InvalidationJournal>) { request_frame_for_pending_repaint(); }
 
+    // Records the document's display list in step with the host, once a recording in flight has been taken in.
     RefPtr<Compositing::DisplayList> record_display_list(HTML::PaintConfig, Compositing::DisplayListResourceStorage&, Painting::PaintCommandCacheMode);
-    Painting::HitTestDisplayList const* hit_test_display_list() const { return m_hit_test_display_list.ptr(); }
-    Painting::HitTestDisplayList const* ensure_hit_test_display_list();
+    // Starts recording the document's display list as the document is now, beside the event loop where `blocker` is
+    // none, and makes the display list of a recording that has landed and stands.
+    Optional<Painting::DisplayListRecording> start_display_list_recording(HTML::PaintConfig, Painting::PaintCommandCacheMode, Layout::RustFFI::FfiFlightBlocker);
+    RefPtr<Compositing::DisplayList> finish_display_list_recording(Painting::DisplayListRecording const&, Compositing::DisplayListResourceStorage&);
+    Optional<Painting::HitTestQuery> prepare_hit_test_query();
     Optional<Painting::HitTestResult> hit_test(CSSPixelPoint);
     Optional<Painting::CaretPosition> caret_position_from_point(CSSPixelPoint);
     Optional<Painting::CaretPosition> caret_position_from_point_for_selection_start(CSSPixelPoint);
@@ -1550,8 +1563,6 @@ private:
 
     virtual void finalize() override final;
 
-    Layout::RustFFI::FfiLayoutTreeBuildOutcome build_layout_tree();
-
     // The row the document's layout tree is rooted at. The tree build records it in the arena, so
     // the document keeps no copy of its own.
     [[nodiscard]] Compositing::RustFFI::NodeSlotId layout_root_slot() const;
@@ -1637,7 +1648,6 @@ private:
     NonnullOwnPtr<CommitMessages> m_commit_messages;
     OwnPtr<Painting::DocumentPaintState> m_paint_state;
     NonnullRefPtr<Painting::ChromeWidgetRegistry> m_chrome_widget_registry;
-    bool m_may_have_content_visibility_auto_style { false };
 
     GC::Ptr<Node> m_hovered_node;
     GC::Ptr<Node> m_inspected_node;
@@ -1982,7 +1992,14 @@ private:
     HashMap<Web::AsyncScrollNodeStableID, Compositing::SnappedAreas> m_scroll_container_snapped_areas;
     Vector<Compositing::RustFFI::NodeSlotId> m_scroll_snap_containers;
     bool m_needs_scroll_container_resnap { false };
+    // Whether an image box handed the provider it owns after a layout update found its image already there, so it lays
+    // out again with it.
+    bool m_owed_image_provider_arrived_with_image { false };
+    // Whether a layout update requested web faces its layout wanted, which may have resolved at once.
+    bool m_requested_wanted_font_faces { false };
     bool m_may_have_scroll_snap_areas { false };
+    bool m_may_have_blocking_wheel_event_listener { false };
+    bool m_may_have_dom_paint_facts { false };
 
     HashTable<GC::Ref<Element>> m_list_owners_pending_item_renumber;
     HashTable<GC::Ref<Element>> m_list_owners_with_stale_item_counters;
@@ -2121,7 +2138,7 @@ private:
     HashMap<Utf16FlyString, CSS::CustomPropertyRegistration> m_cached_registered_properties_from_css_property_rules;
     bool m_needs_registered_properties_cache_update { true };
     size_t m_custom_property_registration_generation { 0 };
-    void* m_rust_custom_property_registry { nullptr };
+    void const* m_rust_custom_property_registry { nullptr };
     bool m_rust_custom_property_registry_synced { false };
 
     CSS::StyleScope m_style_scope;

@@ -820,21 +820,7 @@ public:
     // pointer is borrowed from this immutable ComputedValues instance.
     void const* style_group_payload(StyleGroupIndex) const;
 
-    // The identity of the half a child inherits. Two styles whose inherited groups are pairwise the
-    // same payload answer the same question for a child, whatever their non-inherited halves say.
     static constexpr size_t inherited_style_group_count = 7;
-    Array<void const*, inherited_style_group_count> inherited_style_group_identities() const
-    {
-        return Array<void const*, inherited_style_group_count> {
-            m_inherited.table.payload_identity(),
-            m_inherited.list.payload_identity(),
-            m_inherited.ui.payload_identity(),
-            m_inherited.svg.payload_identity(),
-            m_inherited.text.payload_identity(),
-            m_inherited.box.payload_identity(),
-            m_inherited.font.payload_identity(),
-        };
-    }
 
     // Calls back with (name, shared_with_parent, is_default) for every style value group,
     // for introspecting how well group sharing is working (see internals.styleGroupSharingInfo()).
@@ -1767,34 +1753,6 @@ private:
     StyleRecordID m_style_record_identity;
     bool m_owns_style_record_pin { false };
     bool m_present { false };
-};
-
-// The input to layout-node construction is either an authoritative style
-// record for a DOM style target or an owned style for an anonymous box.
-class LayoutStyle {
-public:
-    LayoutStyle() = default;
-    LayoutStyle(StyleRecordID style_record_identity)
-        : m_style_record_identity(style_record_identity)
-    {
-        VERIFY(style_record_identity);
-    }
-    LayoutStyle(NonnullRefPtr<ComputedValues const> values)
-        : m_values(move(values))
-    {
-    }
-    LayoutStyle(RefPtr<ComputedValues const> values)
-        : m_values(move(values))
-    {
-    }
-
-    explicit operator bool() const { return !!m_style_record_identity || m_values; }
-    [[nodiscard]] StyleRecordID style_record_identity() const { return m_style_record_identity; }
-    [[nodiscard]] RefPtr<ComputedValues const> const& values() const { return m_values; }
-
-private:
-    RefPtr<ComputedValues const> m_values;
-    StyleRecordID m_style_record_identity;
 };
 
 class ComputedValues::Mutator final {

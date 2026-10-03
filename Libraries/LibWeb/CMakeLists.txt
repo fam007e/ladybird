@@ -34,6 +34,7 @@ set(SOURCES
     Compositor/CompositorConnection.cpp
     Compositor/CompositorHost.cpp
     Compositor/CompositorHostBase.cpp
+    Compositor/NavigablePresenter.cpp
     Compression/CompressionStream.cpp
     Compression/DecompressionStream.cpp
     ContentSecurityPolicy/BlockingAlgorithms.cpp
@@ -86,7 +87,6 @@ set(SOURCES
     Crypto/SubtleCrypto.cpp
     CSS/Angle.cpp
     CSS/AnimationEvent.cpp
-    CSS/CascadedProperties.cpp
     CSS/Clip.cpp
     CSS/ComputedStyleWorkingSet.cpp
     CSS/ComputedValues.cpp
@@ -509,6 +509,7 @@ set(SOURCES
     HTML/ErrorInformation.cpp
     HTML/EventHandler.cpp
     HTML/EventLoop/EventLoop.cpp
+    HTML/EventLoop/FrameCompletion.cpp
     HTML/EventLoop/Task.cpp
     HTML/EventLoop/TaskQueue.cpp
     HTML/EventNames.cpp
@@ -1206,10 +1207,14 @@ foreach(angle_target IN LISTS ANGLE_TARGETS)
     target_compile_options(LibWeb PRIVATE $<TARGET_PROPERTY:${angle_target},INTERFACE_COMPILE_OPTIONS>)
 endforeach()
 
+set(libweb_rust_features style-recording)
+if (ENABLE_THREAD_SANITIZER)
+    list(APPEND libweb_rust_features thread-sanitizer)
+endif()
 import_rust_crate(
     MANIFEST_PATH Rust/Cargo.toml
     CRATE_NAME libweb_rust
-    FEATURES style-recording
+    FEATURES ${libweb_rust_features}
     FFI_HEADERS
         HTML/Parser/RustFFI.h
         RustFFI.h
