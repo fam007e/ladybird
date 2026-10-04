@@ -324,13 +324,32 @@ Document::HTMLCollectionAttributeInvalidationTypes Document::html_collection_att
 
 GC_DEFINE_ALLOCATOR(Document);
 
+// https://html.spec.whatwg.org/multipage/browsers.html#obtain-browsing-context-navigation
+// NB: The UI process performed this algorithm and selected this process. It names the group of the new top-level
+//     browsing context when it switched browsing context groups.
+static GC::Ref<HTML::BrowsingContext> obtain_a_browsing_context_to_use_for_a_navigation_response(HTML::NavigationParams const& navigation_params)
+{
+    // 1. Let browsingContext be navigationParams's navigable's active browsing context.
+    auto& navigable = *navigation_params.navigable;
+    auto browsing_context = navigable.active_browsing_context();
+
+    // NB: Steps 2 to 9 decide whether to switch browsing context groups, and return browsingContext otherwise.
+    if (!navigation_params.new_browsing_context_group_id.has_value())
+        return *browsing_context;
+
+    // 10. Let newBrowsingContext be the first return value of creating a new top-level browsing context and document.
+    auto new_browsing_context = HTML::BrowsingContext::create_a_new_browsing_context_and_document(navigable.page(), nullptr, nullptr).browsing_context;
+    new_browsing_context->set_browsing_context_group_id(*navigation_params.new_browsing_context_group_id);
+
+    // 15. Return newBrowsingContext.
+    return new_browsing_context;
+}
+
 // https://html.spec.whatwg.org/multipage/document-lifecycle.html#initialise-the-document-object
 WebIDL::ExceptionOr<GC::Ref<Document>> Document::create_and_initialize(Type type, Utf16FlyString content_type, HTML::NavigationParams const& navigation_params)
 {
     // 1. Let browsingContext be the result of obtaining a browsing context to use for a navigation response given navigationParams.
-    // NB: The UI process has already performed this algorithm and selected this WebContent process.
-    auto browsing_context = navigation_params.navigable->active_browsing_context();
-    VERIFY(browsing_context);
+    auto browsing_context = obtain_a_browsing_context_to_use_for_a_navigation_response(navigation_params);
 
     // FIXME: 2. Let permissionsPolicy be the result of creating a permissions policy from a response given navigationParams's navigable's container, navigationParams's origin, and navigationParams's response.
 
@@ -2548,6 +2567,16 @@ void Document::update_paint_and_hit_testing_properties_if_needed()
     // Everything that reads paint state comes through here, so the marks that describe it go through first.
     drain_invalidation_journal();
 
+    // Nothing was written to the render state since the properties were prepared from it: every pass below would find
+    // nothing to do, so none is sent to the render owner.
+    auto* host = m_layout_node_arena ? m_layout_node_arena->host() : nullptr;
+    if (host && Layout::RustFFI::document_host_paint_preparation_is_current(host) && !m_needs_accumulated_visual_contexts_update && !m_image_map_areas_need_publication)
+        return;
+
+    // What the passes prepare stays current until something is written to the render state, from here on as well.
+    if (host)
+        Layout::RustFFI::document_host_note_paint_preparation_is_current(host);
+
     prepare_for_rendering();
     Painting::publish_image_map_area_facts_if_needed(*this);
     if (m_needs_accumulated_visual_contexts_update) {
@@ -4496,7 +4525,7 @@ WebIDL::ExceptionOr<Utf16String> Document::cookie()
             return m_cookie;
     }
 
-    auto [cookie_version, cookie] = page().client().page_did_request_cookie(m_url, HTTP::Cookie::Source::NonHttp);
+    auto [cookie_version, cookie] = page().client().page_did_request_cookie(relevant_settings_object().id, m_url, HTTP::Cookie::Source::NonHttp);
 
     if (cookie_version.has_value()) {
         m_cookie_version = *cookie_version;
@@ -4522,7 +4551,7 @@ WebIDL::ExceptionOr<void> Document::set_cookie(Utf16View cookie_string)
     // "non-HTTP" API, consisting of the new value encoded as UTF-8.
     auto cookie_string_utf8 = TRY_OR_THROW_OOM(vm(), cookie_string.to_utf8());
     if (auto cookie = HTTP::Cookie::parse_cookie(url(), cookie_string_utf8); cookie.has_value()) {
-        page().client().page_did_set_cookie(m_url, cookie.value(), HTTP::Cookie::Source::NonHttp);
+        page().client().page_did_set_cookie(relevant_settings_object().id, m_url, cookie.value(), HTTP::Cookie::Source::NonHttp);
         reset_cookie_version();
     }
 

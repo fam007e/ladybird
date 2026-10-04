@@ -108,20 +108,20 @@ pub struct FfiAnimationInvalidation {
     pub requires_style_resource_update: bool,
 }
 
+/// How a row stands. The tags are the ones recordings hold.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum FfiStyleDeltaGap {
-    None,
-    Materialize,
+    None = 0,
+    /// The engine did not settle the row: the host answers it from the element's record demand.
+    Materialize = 1,
     /// The engine computed the new record itself from the moved cascade winners; C++ applies it
     /// without running a style computation.
-    Computed,
-    /// Retry a cold drive while applying the preorder batch, after its parent is authoritative.
-    RetryAfterAncestor,
+    Computed = 2,
     /// The element needs no style: the host holds none for it in a display:none subtree, and
     /// neither it nor any element inheriting from it reads style while hidden. A read or the
     /// subtree's reveal asks for its record.
-    Hidden,
+    Hidden = 4,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -174,7 +174,7 @@ pub struct FfiStyleDelta {
     pub composed_by_the_host: bool,
 }
 
-/// A retried engine record and the metadata needed to install it.
+/// An engine record a demand settled and the metadata needed to install it.
 #[derive(Clone, Copy, Debug, Default)]
 #[repr(C)]
 pub struct FfiEngineComputedRecord {
@@ -193,7 +193,7 @@ pub struct FfiEngineComputedRecord {
     /// The synthetic pseudo-element kinds whose records the engine settled beside the
     /// element's, as a bit per kind; a present slot holding zero is a removal.
     pub pseudo_records_present: u8,
-    pub pseudo_records: [u64; RETRY_PSEUDO_RECORD_SLOTS],
+    pub pseudo_records: [u64; PSEUDO_RECORD_SLOTS],
 }
 
 /// The synthetic pseudo-element records the engine settled beside an element's installed record.
@@ -213,11 +213,11 @@ pub struct FfiSettledPseudoRecords {
     /// The kinds whose records the engine settled, as a bit per kind; a present slot holding zero
     /// is a removal, and an absent kind keeps its record.
     pub pseudo_records_present: u8,
-    pub pseudo_records: [u64; RETRY_PSEUDO_RECORD_SLOTS],
+    pub pseudo_records: [u64; PSEUDO_RECORD_SLOTS],
 }
 
-/// One record slot per synthetic pseudo-element kind in a retried record.
-pub const RETRY_PSEUDO_RECORD_SLOTS: usize = 8;
+/// One record slot per synthetic pseudo-element kind in an engine record answer.
+pub const PSEUDO_RECORD_SLOTS: usize = 8;
 
 #[derive(Default)]
 pub(crate) struct FfiStyleTransactionOutput {
@@ -1308,7 +1308,10 @@ impl StyleEngineState {
                     continue;
                 };
                 let custom_states = custom_states.iter().copied().map(StyleAtomID).collect::<Vec<_>>();
-                self.record_element_arrival(node, arrival, &custom_states, node_is_arriving(node), counters);
+                // The host can submit an element's features a batch after its arrival, where it submitted its input
+                // as the element's subtree was being inserted: the arrival is pending still.
+                let arriving = node_is_arriving(node) || self.node_arrival_is_pending(node);
+                self.record_element_arrival(node, arrival, &custom_states, arriving, counters);
             }
             self.settle_batched_inputs(counters);
         }
@@ -1891,6 +1894,35 @@ pub(crate) fn publish_style_rule(
         super::selector::replay::write(engine.selector_program_for_rule(rule), payload);
     });
     result
+}
+
+/// Publishes a style rule of a user-agent sheet with the selector program the process compiled for
+/// it, or answers `None` when the rule is not one or the engine compiles its own.
+pub(crate) fn publish_user_agent_style_rule(
+    engine: &mut StyleEngine,
+    sheet: u32,
+    before_rule: u32,
+    rule_identity: u64,
+    compiled: &[&CompiledSelector],
+    rules: &crate::css::rule::NativeRuleList,
+    bound_scope: &BoundScopeChain,
+) -> Option<u32> {
+    if sheet == 0 || !bound_scope.levels.is_empty() {
+        return None;
+    }
+    let sheet = SheetID(sheet - 1);
+    if engine.program.sheet_origin(sheet) != crate::css::cascaded_properties::CascadeOrigin::UserAgent
+        || !engine.shares_user_agent_selector_programs()
+    {
+        return None;
+    }
+    let before = (before_rule != 0).then(|| RuleID(before_rule - 1));
+    Some(
+        engine
+            .add_user_agent_style_rule(sheet, before, rule_identity, compiled, rules)
+            .0
+            + 1,
+    )
 }
 
 /// Installs one already compiled semantic selector program.
@@ -3406,59 +3438,6 @@ pub unsafe fn replay_republish_record_environment(
         .unwrap_or(0)
 }
 
-/// Retry after the ancestor's style was installed, returning installation metadata together
-/// with the record instead of requiring a later query of the node.
-///
-/// # Safety
-/// `host` must be a live document host, on its document's thread.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn style_engine_retry_engine_record_after_ancestor(
-    host: *const DocumentHost,
-    node: u32,
-) -> FfiEngineComputedRecord {
-    // SAFETY: Guaranteed by the caller.
-    let host = unsafe { document_host(host) };
-    // SAFETY: Guaranteed by the caller.
-    with_engine(host, |engine| unsafe {
-        retry_engine_record_after_ancestor(engine, node)
-    })
-}
-
-/// [`style_engine_retry_engine_record_after_ancestor`] on `engine`, which the style replay tool
-/// calls as well.
-///
-/// # Safety
-/// As for [`style_engine_retry_engine_record_after_ancestor`], for the arguments after `engine`.
-pub unsafe fn retry_engine_record_after_ancestor(engine: &mut StyleEngine, node: u32) -> FfiEngineComputedRecord {
-    abort_on_panic(|| {
-        let Some(style_node) = StyleNodeID::from_raw(node) else {
-            return FfiEngineComputedRecord::default();
-        };
-        let retried = engine.retry_engine_record_after_ancestor(style_node);
-        let result = FfiEngineComputedRecord {
-            style_record: retried.style_record,
-            uses_substitution: retried.style_record != 0 && engine.nodes_with_substituted_records.contains(&style_node),
-            record_reads: if retried.style_record != 0 {
-                engine.node_record_reads(style_node)
-            } else {
-                0
-            },
-            explicitly_inherited_groups: retried.explicitly_inherited_groups,
-            owes_an_animation_plan: retried.owes_an_animation_plan,
-            owes_a_transition_step: retried.owes_a_transition_step,
-            composed_by_the_host: retried.composed_by_the_host,
-            pseudo_records_present: retried.pseudo_records_present,
-            pseudo_records: retried.pseudo_records,
-        };
-        engine.record_boundary_call(EventKind::RetryEngineRecordAfterAncestor, |payload| {
-            payload.write_u32(node);
-            payload.write_u64(result.style_record);
-            payload.write_bool(result.uses_substitution);
-        });
-        result
-    })
-}
-
 /// What a read of one element's style the host makes before the next style update asks of the
 /// engine; see `StyleEngineState::answer_record_demand`. A read-only demand leaves the engine as it
 /// was: its record is only for the host to read. Any other is installed and acknowledged as a
@@ -4808,11 +4787,16 @@ mod tests {
         let root = StyleNodeID::from_raw(nodes[0]).unwrap();
         let mut published = Vec::new();
         let mut emission_count = 0;
-        assert!(!engine.take_style_transaction(root, |_, _, answers| {
-            emission_count += 1;
-            published.extend_from_slice(answers);
-        }));
-        assert_eq!(emission_count, 1);
+        // The engine of a test computes no records, so each row waits for the host to install the
+        // one above it, in a wave of its own.
+        for _ in 0..nodes.len() {
+            assert!(!engine.take_style_transaction(root, |_, _, answers| {
+                emission_count += 1;
+                published.extend_from_slice(answers);
+            }));
+        }
+        assert!(!engine.has_pending_transaction());
+        assert_eq!(emission_count, 3);
         assert_eq!(
             published.iter().map(|delta| delta.style_node).collect::<Vec<_>>(),
             nodes
@@ -4825,11 +4809,7 @@ mod tests {
         }));
         assert_eq!(
             published.iter().map(|delta| delta.gap).collect::<Vec<_>>(),
-            [
-                FfiStyleDeltaGap::Materialize,
-                FfiStyleDeltaGap::RetryAfterAncestor,
-                FfiStyleDeltaGap::RetryAfterAncestor,
-            ]
+            [FfiStyleDeltaGap::Materialize; 3]
         );
         assert_eq!(engine.counters().get(Counter::InitialBulkMatchLoads), 1);
         assert_eq!(engine.counters().get(Counter::InitialBulkMatchRows), 3);

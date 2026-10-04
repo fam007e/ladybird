@@ -174,6 +174,39 @@ impl Drop for RetainedCustomPropertyData {
     }
 }
 
+/// Compile one rule's selectors, interning the names they test through `atoms`.
+pub(super) fn compile_selector_program(
+    atoms: &mut DocumentAtoms,
+    fold_id_and_class_name_case: bool,
+    html_element_namespace: StyleAtomID,
+    selectors: &[&CompiledSelector],
+    namespaces: NamespaceScope,
+    scope: &ScopeChain<'_>,
+    counters: &mut Counters,
+) -> SelectorProgram {
+    let mut intern = |raw: usize, namespace: Option<StyleAtomID>| -> StyleAtomID {
+        let local = atoms.intern_raw(raw);
+        let Some(namespace) = namespace else {
+            return local;
+        };
+        atoms.intern_qualified(namespace, local)
+    };
+    let mut compiler = SelectorCompiler::new(
+        &mut intern,
+        fold_id_and_class_name_case,
+        html_element_namespace,
+        namespaces,
+    );
+    for selector in selectors {
+        let compiled = compiler.compile_in_scope(selector, scope);
+        if let Some(counter) = compiled.marker.and_then(|marker| marker.counter()) {
+            counters.bump(counter);
+        }
+        counters.bump(Counter::ExactSelectorEntries);
+    }
+    compiler.finish()
+}
+
 impl RetainedState {
     pub(super) fn push_pending_region(&mut self, regions: &mut Vec<ImpactRegion>, region: ImpactRegion) {
         let before = regions.capacity();
@@ -284,43 +317,16 @@ impl RetainedState {
         reusable: Option<SelectorProgramID>,
         counters: &mut Counters,
     ) -> SelectorProgramID {
-        let fold_id_and_class_name_case = self.fold_id_and_class_name_case;
-        let html_element_namespace = self.html_element_namespace;
-        let atoms = &mut self.atoms;
-        let mut intern = |raw: usize, namespace: Option<StyleAtomID>| -> StyleAtomID {
-            let local = atoms.intern_raw(raw);
-            let Some(namespace) = namespace else {
-                return local;
-            };
-            atoms.intern_qualified(namespace, local)
-        };
-
-        let mut compiler = SelectorCompiler::new(
-            &mut intern,
-            fold_id_and_class_name_case,
-            html_element_namespace,
+        let compiled = compile_selector_program(
+            &mut self.atoms,
+            self.fold_id_and_class_name_case,
+            self.html_element_namespace,
+            selectors,
             namespaces,
+            scope,
+            counters,
         );
-        for selector in selectors {
-            let compiled = compiler.compile_in_scope(selector, scope);
-            match compiled.marker {
-                Some(marker) => {
-                    if let Some(counter) = marker.counter() {
-                        counters.bump(counter);
-                    }
-                    counters.bump(Counter::ExactSelectorEntries);
-                }
-                None => counters.bump(Counter::ExactSelectorEntries),
-            }
-        }
-        let compiled = compiler.finish();
-        let mut requirements_changed = false;
-        for name in compiled.attribute_value_text_names() {
-            requirements_changed |= self.attribute_value_text_names.insert(name);
-        }
-        if requirements_changed {
-            self.attribute_value_text_requirements_version += 1;
-        }
+        self.note_attribute_value_text_names(&compiled);
         if let Some(reusable) = reusable
             && self.programs.get(reusable) == &compiled
         {
@@ -330,6 +336,17 @@ impl RetainedState {
         self.selector_programs_need_sweep |= reusable.is_some();
         self.programs.settle_memory(&mut self.memory);
         program
+    }
+
+    /// Record the attribute names whose values `program` reads as text.
+    pub(super) fn note_attribute_value_text_names(&mut self, program: &SelectorProgram) {
+        let mut requirements_changed = false;
+        for name in program.attribute_value_text_names() {
+            requirements_changed |= self.attribute_value_text_names.insert(name);
+        }
+        if requirements_changed {
+            self.attribute_value_text_requirements_version += 1;
+        }
     }
 
     /// Moves whenever an attribute name comes to require its value text: a selector's here, or an
@@ -1841,7 +1858,7 @@ impl StyleEngineState {
                 container_effects_for_host: HashMap::default(),
                 published_container_verdicts: HashMap::default(),
                 container_gates_unheld: HashSet::default(),
-                container_input_nodes: HashSet::default(),
+                row_inputs_moved: flush::RowInputsMoved::default(),
                 container_query_inputs: Default::default(),
                 layout_style_snapshots: HashMap::default(),
                 size_container_queries: Default::default(),
@@ -1862,7 +1879,6 @@ impl StyleEngineState {
                 engine_computed_records_pending: HashMap::default(),
                 demand_records: HashMap::default(),
                 flush_stamp: 0,
-                parent_inputs_moved_nodes: HashSet::default(),
                 engine_pseudo_record_cache: HashMap::default(),
                 batch_answers_complete_but_for_custom_properties: HashMap::default(),
                 batch_custom_property_matches: HashMap::default(),
@@ -1919,8 +1935,7 @@ impl StyleEngineState {
                 diagnostic_plan_capture: None,
             },
             host: HostState {
-                batch_moves_for_retries: Default::default(),
-                retry_full_drive_reasons: HashMap::default(),
+                suspended_style_pass: None,
                 font_resolver: None,
                 #[cfg(feature = "style-recording")]
                 recording_id: None,
@@ -2145,6 +2160,13 @@ impl StyleEngineState {
             || !self.host.tree_staging.is_empty()
             || self.host.program_staging.is_dirty()
             || self.host.sheet_rule_replacement.is_some()
+            || self.host.suspended_style_pass.is_some()
+    }
+
+    /// Whether the host is installing a style pass wave by wave, between two of its waves.
+    #[must_use]
+    pub fn has_suspended_style_pass(&self) -> bool {
+        self.host.suspended_style_pass.is_some()
     }
 
     #[must_use]
@@ -2165,7 +2187,7 @@ impl StyleEngineState {
     /// can, deciding the node's gated rules again and publishing its winners anew from its
     /// retained answer where a verdict moved.
     pub fn record_container_query_input(&mut self, node: StyleNodeID) {
-        self.retained.container_input_nodes.insert(node);
+        self.retained.row_inputs_moved.note_containers_moved(node);
         self.record_derived_element_style_input(
             node,
             transaction::STYLE_REACTION_PUBLISHED_STYLE | transaction::STYLE_REACTION_RECOMPUTE_STYLE,
@@ -2659,6 +2681,19 @@ impl StyleEngineState {
         scope: &ScopeChain<'_>,
         counters: &mut Counters,
     ) -> RuleID {
+        self.add_style_rule_with(sheet, before, counters, |engine, previous_program, counters| {
+            engine.compile_selectors(selectors, namespaces, scope, previous_program, counters)
+        })
+    }
+
+    /// Add a style rule whose selector program `attach` gives it, from the program of the rule it replaces, if any.
+    pub(super) fn add_style_rule_with(
+        &mut self,
+        sheet: SheetID,
+        before: Option<RuleID>,
+        counters: &mut Counters,
+        attach: impl FnOnce(&mut Self, Option<SelectorProgramID>, &mut Counters) -> SelectorProgramID,
+    ) -> RuleID {
         let rule = match before {
             Some(before) => self.insert_rule_before(before, RuleKind::Style, counters),
             None => self
@@ -2668,7 +2703,7 @@ impl StyleEngineState {
         let previous_program = self
             .replacement_rule(rule)
             .and_then(|replacement| replacement.version.selector_program);
-        let program = self.compile_selectors(selectors, namespaces, scope, previous_program, counters);
+        let program = attach(self, previous_program, counters);
         if previous_program != Some(program) {
             self.add_routing_rule(rule, program);
         }
@@ -3266,26 +3301,12 @@ impl StyleEngineState {
         selector_program: SelectorProgram,
         counters: &mut Counters,
     ) -> RuleID {
-        let rule = match before {
-            Some(before) => self.insert_rule_before(before, RuleKind::Style, counters),
-            None => self
-                .reuse_replaced_style_rule(sheet, counters)
-                .unwrap_or_else(|| self.append_rule(sheet, None, RuleKind::Style, counters)),
-        };
-        let previous_program = self
-            .replacement_rule(rule)
-            .and_then(|replacement| replacement.version.selector_program);
-        let program = self.retained.programs.add(selector_program);
-        self.retained.selector_programs_need_sweep |= previous_program.is_some();
-        self.retained.programs.settle_memory(&mut self.retained.memory);
-        if previous_program != Some(program) {
-            self.add_routing_rule(rule, program);
-        }
-        let mut version = self.current_rule_version(rule);
-        version.selector_program = Some(program);
-        self.replace_rule_version(rule, version, counters);
-        counters.bump(Counter::StyleRulesCompiled);
-        rule
+        self.add_style_rule_with(sheet, before, counters, |engine, previous_program, _| {
+            let program = engine.retained.programs.add(selector_program);
+            engine.retained.selector_programs_need_sweep |= previous_program.is_some();
+            engine.retained.programs.settle_memory(&mut engine.retained.memory);
+            program
+        })
     }
 
     #[cfg(feature = "style-recording")]
@@ -3357,7 +3378,7 @@ impl RetainedState {
             container_effects_for_host,
             published_container_verdicts,
             container_gates_unheld,
-            container_input_nodes,
+            row_inputs_moved,
             container_query_inputs,
             layout_style_snapshots,
             size_container_queries,
@@ -3382,8 +3403,6 @@ impl RetainedState {
             engine_computed_records_pending: _,
             demand_records,
             flush_stamp: _,
-            // Taken by the transaction that fills them.
-            parent_inputs_moved_nodes: _,
             engine_pseudo_record_cache: _,
             // Filled and cleared within one transaction's record loop.
             batch_answers_complete_but_for_custom_properties: _,
@@ -3463,7 +3482,7 @@ impl RetainedState {
         container_effects_for_host.remove(&node);
         published_container_verdicts.remove(&node);
         container_gates_unheld.remove(&node);
-        container_input_nodes.remove(&node);
+        row_inputs_moved.forget(node);
         container_query_inputs.clear(node);
         layout_style_snapshots.remove(&node);
         demand_records.retain(|target, record| {

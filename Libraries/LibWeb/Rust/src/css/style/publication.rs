@@ -8,7 +8,6 @@ mod demand;
 mod drive;
 mod pseudo;
 pub(super) use drive::drive_font_metric;
-mod retry;
 mod winner_store;
 
 use winner_store::{WinnerDeclaration, WinnerStore, WinnerValue, shorthand_longhand_data};
@@ -25,7 +24,6 @@ pub(super) use demand::WinnerRepublication;
 pub(crate) use demand::{RecordDemand, RecordDemandAnswer};
 pub(super) use drive::{Drive, OrRefused, Suspension, Unanswered};
 use drive::{DrivenTable, FontDriveGoal, FullDrive, PartialDrive};
-use retry::InstalledAncestors;
 
 #[cfg(feature = "style-recording")]
 /// Another element's published style that a first-time computation may build over: the element
@@ -143,27 +141,17 @@ impl RetainedState {
         None
     }
 
-    /// The inheritance parent a node's record is computed from. C++ styles an element whose
-    /// inheritance parent has no style, such as a slotted element whose slot is in a `display: none`
-    /// subtree, from the initial values, the way it styles the document element. A parent without
-    /// a record is no such parent while the host may still be styling it: the row waits for it.
-    /// Only a retry, which runs once the host applied every row before it, knows the parent has
-    /// no style.
-    pub(super) fn record_inheritance_parent(
-        &self,
-        node: StyleNodeID,
-        installed_ancestors: Option<&InstalledAncestors>,
-    ) -> Drive<Option<StyleNodeID>> {
+    /// The inheritance parent a node's record is computed from, none for the document element. A
+    /// parent without a record is one the host styles before it applies the row, which waits for
+    /// it.
+    pub(super) fn record_inheritance_parent(&self, node: StyleNodeID) -> Drive<Option<StyleNodeID>> {
         let Some(parent) = self.tree.inheritance_parent(node) else {
             return Ok(None);
         };
-        if self.computed_group_sets.assigned_style_record(parent).is_some() {
-            return Ok(Some(parent));
+        if self.computed_group_sets.assigned_style_record(parent).is_none() {
+            return Err(Unanswered::AwaitsParent);
         }
-        match installed_ancestors {
-            Some(_) => Ok(None),
-            None => Err(Unanswered::AwaitsParent),
-        }
+        Ok(Some(parent))
     }
 
     /// The custom-property environment of a node the drive reads as an inheritance parent, which
@@ -366,7 +354,7 @@ impl RetainedState {
         counters: &mut Counters,
     ) -> Drive<RecordDelta> {
         // A child of an element the host composes once it installs the element's record inherits
-        // that composition, which the host has made by the time it asks for the child again.
+        // that composition, which the host has made by the next wave of the pass.
         if self
             .tree
             .inheritance_parent(node)
@@ -721,7 +709,7 @@ impl RetainedState {
         );
         let (mut environment, mut current_environment, parent_environment) = {
             let parent = self
-                .record_inheritance_parent(node, scratch.installed_ancestors.as_ref())
+                .record_inheritance_parent(node)
                 .inspect_err(|_| counters.bump(Counter::EngineComputedRecordBailRecordParent))?;
             let parent_environment = match parent {
                 Some(parent) => self.held_custom_property_environment(parent, counters)?,
@@ -1052,15 +1040,7 @@ impl RetainedState {
         let partial = if full_drive || in_full_after_all {
             None
         } else {
-            Some(self.engine_driven_table(
-                node,
-                underlying_style_record,
-                &store,
-                &selected,
-                &inputs,
-                scratch.installed_ancestors.as_ref(),
-                counters,
-            )?)
+            Some(self.engine_driven_table(node, underlying_style_record, &store, &selected, &inputs, counters)?)
         };
         let driver_input_moved = matches!(partial, Some(PartialDrive::DriverInputMoved));
         let DrivenTable {
@@ -1077,7 +1057,7 @@ impl RetainedState {
                 if driver_input_moved {
                     groups_to_rebuild = (1 << crate::css::table_group_builder::group_index::COUNT) - 1;
                 }
-                let subject = self.element_drive_subject(node, scratch.installed_ancestors.as_ref(), counters)?;
+                let subject = self.element_drive_subject(node, counters)?;
                 let mut driven = self.engine_full_drive(
                     subject,
                     Some(underlying_style_record),
@@ -1430,10 +1410,9 @@ impl RetainedState {
             root_inputs.apply_to(&mut inputs);
         }
         let facts = self.computed_group_sets.adjustment_facts(node);
-        // An element without a styled inheritance parent, the document element among them,
-        // inherits from the initial values.
+        // The document element inherits from the initial values.
         let parent = self
-            .record_inheritance_parent(node, scratch.installed_ancestors.as_ref())
+            .record_inheritance_parent(node)
             .inspect_err(|_| counters.bump(Counter::EngineComputedRecordBailRecordParent))?;
         let parent_record = parent.and_then(|parent| self.computed_group_sets.assigned_style_record(parent));
         // The document element's environment is its own, which is nothing without declarations;
@@ -1626,15 +1605,7 @@ impl RetainedState {
                     longhand_evaluations,
                     explicitly_inherited_groups,
                     ..
-                })) = self.engine_driven_table(
-                    node,
-                    donor.record.record,
-                    &store,
-                    &selected,
-                    &inputs,
-                    scratch.installed_ancestors.as_ref(),
-                    counters,
-                )
+                })) = self.engine_driven_table(node, donor.record.record, &store, &selected, &inputs, counters)
             {
                 let parent_in_display_none_subtree = parent_record
                     .and_then(|record| self.computed_group_sets.style_record_view(record.raw()))
@@ -2585,17 +2556,11 @@ impl RetainedState {
         root_inputs.apply_to(&mut self.document_style_computation_inputs);
     }
 
-    fn element_drive_subject(
-        &mut self,
-        node: StyleNodeID,
-        installed_ancestors: Option<&InstalledAncestors>,
-        counters: &mut Counters,
-    ) -> Drive<DriveSubject> {
+    fn element_drive_subject(&mut self, node: StyleNodeID, counters: &mut Counters) -> Drive<DriveSubject> {
         let facts = self.computed_group_sets.adjustment_facts(node);
-        // An element without a styled inheritance parent, the document element among them,
-        // inherits from the initial values.
+        // The document element inherits from the initial values.
         let parent = self
-            .record_inheritance_parent(node, installed_ancestors)
+            .record_inheritance_parent(node)
             .inspect_err(|_| counters.bump(Counter::EngineComputedRecordBailRecordParent))?;
         Ok(DriveSubject {
             target: computed::ComputedStyleTarget::new(node, u8::MAX),
@@ -3938,6 +3903,10 @@ impl RetainedState {
         self.computed_group_sets.pin_style_record(style_record);
     }
 
+    pub(crate) fn lease_style_records(&self) -> computed::StyleRecordLease {
+        self.computed_group_sets.lease_style_records()
+    }
+
     pub(crate) fn begin_style_record_view_epoch(&mut self) {
         self.computed_group_sets.begin_style_record_view_epoch();
     }
@@ -4508,30 +4477,47 @@ impl RetainedState {
 
 impl StyleEngineState {
     pub(super) fn reclaim_computed_memory_if_needed(&mut self, counters: &mut Counters) {
+        self.reclaim_unreachable_computed_records(counters);
+        self.settle_computed_memory();
+    }
+
+    /// Frees what the engine kept for the leases of published frames, once none is held. The host calls it as it
+    /// takes a recording in, so that a document that styles nothing more still frees what its recording kept.
+    pub(crate) fn free_style_records_kept_for_leases(&mut self, counters: &mut Counters) {
+        let freed_overlays = self.retained.computed_group_sets.free_retired_animation_overlays();
+        if self.reclaim_unreachable_computed_records(counters) || freed_overlays {
+            self.settle_computed_memory();
+        }
+    }
+
+    /// Reclaims the unreachable computed records, if they are due and nothing views them, and answers whether it did.
+    fn reclaim_unreachable_computed_records(&mut self, counters: &mut Counters) -> bool {
         // Recording dictionaries are keyed by computed identities. Reusing an identity for new
         // semantics would make later events refer to the first definition replay saw for it.
-        if self.recording_id().is_none()
-            && let Some(retention) = self.retained.computed_group_sets.reclaim_unreachable_if_needed()
-        {
-            counters.set(Counter::ComputedGroupsRetained, retention.retained as u64);
-            counters.set(Counter::ComputedGroupsReachable, retention.reachable as u64);
-            // An element's animation overlay is named by no record, only by the element holding it.
-            let live: super::fast_hash::FastSet<u64> = self
-                .retained
-                .computed_group_sets
-                .live_custom_property_environments()
-                .chain(
-                    self.retained
-                        .element_custom_property_data
-                        .values()
-                        .map(|held| held.identity),
-                )
-                .collect();
-            self.retained
-                .custom_property_environments
-                .retain_only(|identity| live.contains(&identity));
+        if self.recording_id().is_some() {
+            return false;
         }
-        self.settle_computed_memory();
+        let Some(retention) = self.retained.computed_group_sets.reclaim_unreachable_if_needed() else {
+            return false;
+        };
+        counters.set(Counter::ComputedGroupsRetained, retention.retained as u64);
+        counters.set(Counter::ComputedGroupsReachable, retention.reachable as u64);
+        // An element's animation overlay is named by no record, only by the element holding it.
+        let live: super::fast_hash::FastSet<u64> = self
+            .retained
+            .computed_group_sets
+            .live_custom_property_environments()
+            .chain(
+                self.retained
+                    .element_custom_property_data
+                    .values()
+                    .map(|held| held.identity),
+            )
+            .collect();
+        self.retained
+            .custom_property_environments
+            .retain_only(|identity| live.contains(&identity));
+        true
     }
 
     pub(super) fn publish_animation_overlay_impl(
@@ -4766,7 +4752,7 @@ impl ParentInputsMoved {
 }
 
 /// Why a row's record is driven again in full, its pseudo-elements with it, while its winners
-/// stand: its reaction moved inputs no winner shows.
+/// stand: inputs no winner shows moved under it.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum FullDriveReason {
     /// A descendant recompute, for the root's font metrics or an ancestor's direction, writing
@@ -4782,6 +4768,9 @@ pub(super) enum FullDriveReason {
     /// A container moved that the element's or a pseudo-element's values measure, through a
     /// container-relative length or a substitution.
     ContainerMoved,
+    /// A style pass gave the row up, and with it what moved under the record that only the pass
+    /// saw, such as the viewport.
+    PassGivenUp,
 }
 
 /// Static checks attached to the original declaration spelling at input preparation.
@@ -4834,15 +4823,6 @@ impl EngineComputabilityScratch {
         }
         self.states.insert(key, admitted);
     }
-}
-
-/// What a flush moved under every row: a row the host asks for again once it has installed the
-/// rows before it is driven under the same.
-#[derive(Clone, Copy, Default)]
-pub(super) struct BatchMoves {
-    document_environment: bool,
-    viewport: bool,
-    root_font_inputs: bool,
 }
 
 #[derive(Default)]
@@ -4915,8 +4895,6 @@ pub(super) struct EngineComputedRecordScratch {
     pub(super) boxless_read_environment: u64,
     /// The pseudo-element rules that flipped for the element being derived.
     pub(super) flipped_pseudo_rules: u64,
-    /// Held while a retry runs after the host applied the rows before the one asked for.
-    installed_ancestors: Option<InstalledAncestors>,
     /// Whether the drive answers a read-only demand, which holds no leave to republish winners.
     read_only: bool,
 }
@@ -4942,7 +4920,7 @@ pub(super) struct DerivedChildInputs {
     /// parent's own unresolved fact.
     pub(super) inheritance_unresolved: bool,
     /// The proof about everything from this node upwards, folded on the first ask a child makes
-    /// and kept only once every fact it folds is final.
+    /// and kept for the asks after it.
     pub(super) chain: Option<AncestorChain>,
 }
 
@@ -5054,21 +5032,21 @@ pub(super) struct DriveSubject {
     facts: u32,
 }
 
-/// What a retry after an ancestor settles: the element's record with the groups it explicitly
-/// inherits, and the pseudo-element records the engine settled beside it, one slot per synthetic kind with a present bit each; a present
-/// slot holding zero is a removal.
+/// What a demand for an element's record settles: the record with the groups it explicitly
+/// inherits, and the pseudo-element records the engine settled beside it, one slot per synthetic
+/// kind with a present bit each; a present slot holding zero is a removal.
 #[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct RetriedEngineRecord {
+pub(crate) struct DemandedEngineRecord {
     pub(crate) style_record: u64,
     pub(crate) explicitly_inherited_groups: u32,
     pub(crate) owes_an_animation_plan: bool,
     pub(crate) owes_a_transition_step: bool,
     pub(crate) composed_by_the_host: bool,
     pub(crate) pseudo_records_present: u8,
-    pub(crate) pseudo_records: [u64; bridge::RETRY_PSEUDO_RECORD_SLOTS],
+    pub(crate) pseudo_records: [u64; bridge::PSEUDO_RECORD_SLOTS],
 }
 
-const _: () = assert!(pseudo_kind::SYNTHETIC_COUNT == bridge::RETRY_PSEUDO_RECORD_SLOTS);
+const _: () = assert!(pseudo_kind::SYNTHETIC_COUNT == bridge::PSEUDO_RECORD_SLOTS);
 
 /// A pseudo-element record the engine settled beside its originating element's; a removal when
 /// the new record is none.
@@ -5962,7 +5940,7 @@ impl StyleEngineState {
             counters.bump(Counter::RootFontInputsPrepared);
         } else {
             // NB: Preserve the current host root-metric route. Unproven font inputs do not
-            //     turn every descendant into a host-boundary retry.
+            //     make every descendant wait for the host.
             counters.bump(Counter::RootFontInputsUnprovenFallbacks);
         }
         if scratch.font_drive.is_pending_for(node) {
@@ -5973,12 +5951,15 @@ impl StyleEngineState {
 }
 
 impl EngineComputedRecordScratch {
-    /// What this flush moved under every row, for the rows the host asks for again.
-    pub(super) fn batch_moves(&self) -> BatchMoves {
-        BatchMoves {
-            document_environment: self.document_environment_moved,
-            viewport: self.viewport_moved,
-            root_font_inputs: self.root_font_inputs_changed,
+    /// The scratch of the next wave of a style pass, which drives its rows under what the pass
+    /// moved under every row. What it cached of the rows the host installed since is gone.
+    pub(super) fn for_next_wave(&self) -> Self {
+        Self {
+            document_environment_moved: self.document_environment_moved,
+            viewport_moved: self.viewport_moved,
+            root_font_inputs_changed: self.root_font_inputs_changed,
+            host_applies_animation_plans: true,
+            ..Self::default()
         }
     }
 }

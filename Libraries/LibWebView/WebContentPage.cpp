@@ -306,7 +306,7 @@ bool WebContentPage::continue_navigation_population_in_selected_process(Web::HTM
     if (response_document.has_value()) {
         auto const& request = navigable->ongoing_navigation()->loader->request();
         auto document = navigable->create_and_initialize_a_document(*response_document);
-        navigable->ongoing_navigation()->loader->set_window(document->relevant_global_object());
+        navigable->ongoing_navigation()->loader->set_document(*document, *navigable);
         // NB: A navigation reconstructing a child navigable's history populates the entry it reconstructs.
         auto const& reconstructed_entry = navigable->ongoing_navigation()->reconstructed_entry;
         auto document_state = reconstructed_entry ? reconstructed_entry->document_state : CanonicalDocumentState::create(request.history_entry.document_state.id);
@@ -458,7 +458,7 @@ Web::CompositorContextId WebContentPage::compositor_context_id()
 {
     if (!m_is_open)
         return Web::compositor_context_id_for_page(m_id);
-    return client().compositor_context_id_for_page(m_id);
+    return client().compositor_context_id_for_page(*this);
 }
 
 bool WebContentPage::handle_key_event_in_compositor(Web::KeyEvent const& event)
@@ -673,8 +673,9 @@ void WebContentPage::did_request_window_focus_of_navigable(Web::HTML::CrossProce
 void WebContentPage::did_request_set_opener_of_navigable(Web::HTML::CrossProcessId navigable_id, Web::HTML::CrossProcessId opener_navigable_id)
 {
     // window.open() on a navigable another process hosts sets the opener of its active browsing context there, to that
-    // of a navigable the requesting page hosts.
-    if (!hosted_navigable(opener_navigable_id).has_value())
+    // of a navigable the requesting process hosts. The request comes through the page holding the target's tab, which
+    // is not the opener's when the two are different tabs.
+    if (!client().hosted_navigable(opener_navigable_id).has_value())
         return;
 
     auto endpoint = endpoint_hosting_navigable_represented_by(navigable_id);
@@ -1497,8 +1498,9 @@ void WebContentPage::did_request_close_of_traversable(Web::HTML::CrossProcessId 
     if (traversable().id() != navigable_id)
         return;
 
-    // The page closing it must host the navigable it closes from.
-    if (!hosted_navigable(source_navigable_id).has_value())
+    // The process closing it must host the navigable it closes from. The request comes through the page holding the
+    // traversable's tab, which is not the source's when the two are different tabs.
+    if (!client().hosted_navigable(source_navigable_id).has_value())
         return;
 
     auto endpoint = endpoint_hosting_navigable_represented_by(navigable_id);
@@ -2584,34 +2586,94 @@ void WebContentPage::did_remove_blob_url_entries(Web::HTML::EnvironmentId enviro
     client().session().blob_url_store->remove_entries(urls, environment->origin(), WeakPtr<WebContentClient> { client() });
 }
 
-void WebContentPage::did_set_cookie(URL::URL url, HTTP::Cookie::ParsedCookie cookie, HTTP::Cookie::Source source)
+Optional<bool> WebContentPage::hosted_environment_has_cross_site_ancestor(Web::HTML::EnvironmentId const& environment_id) const
 {
+    auto is_of_environment = [&](CanonicalDocument const& document) {
+        return document.relevant_global_object().relevant_settings_object().id() == environment_id;
+    };
+
+    Optional<bool> result;
+    traversable().for_each_in_inclusive_subtree([&](CanonicalNavigable const& navigable) {
+        if (traversable().hosts(navigable, *this) && is_of_environment(navigable.active_document())) {
+            result = navigable.active_document_has_cross_site_ancestor();
+            return IterationDecision::Break;
+        }
+
+        // NB: A document being populated has a cross-site ancestor if its navigable's parent's active document has one,
+        //     or is of another site.
+        navigable.for_each_populated_document([&](PopulatedDocument const& populated_document) {
+            if (result.has_value() || populated_document.document->host() != this || !is_of_environment(*populated_document.document))
+                return;
+            auto const* parent = navigable.parent();
+            result = parent && (parent->active_document_has_cross_site_ancestor() || !parent->active_document().origin().is_same_site(populated_document.document->origin()));
+        });
+        return result.has_value() ? IterationDecision::Break : IterationDecision::Continue;
+    });
+    return result;
+}
+
+// Script reaches cookies through an environment the page hosts, and only those of that environment's origin. This is
+// the environment's cookie partition context, or nothing if the page hosts no such environment, or if the environment's
+// top-level document has an opaque origin and so is a third-party context of no site, which has no cookies.
+static Optional<HTTP::Cookie::PartitionContext> cookie_partition_context_for(WebContentPage const& page, Optional<Web::HTML::EnvironmentId> const& environment_id, URL::URL const& url)
+{
+    if (!environment_id.has_value())
+        return {};
+
+    auto environment = page.hosted_environment(*environment_id);
+    if (!environment.has_value() || !environment->may_use_cookies_of(url))
+        return {};
+
+    auto top_level_site = network_isolation_top_level_site(*environment);
+    if (!top_level_site.has_value())
+        return {};
+
+    return HTTP::Cookie::PartitionContext {
+        .top_level_site = top_level_site.release_value(),
+        .has_cross_site_ancestor = page.hosted_environment_has_cross_site_ancestor(*environment_id).value_or(true),
+    };
+}
+
+void WebContentPage::did_set_cookie(Optional<Web::HTML::EnvironmentId> environment_id, URL::URL url, HTTP::Cookie::ParsedCookie cookie, HTTP::Cookie::Source source)
+{
+    // NB: Only WebDriver sets cookies like HTTP does, for the top-level documents it drives.
     if (source == HTTP::Cookie::Source::Http) {
         if (!WebContentClient::renderers_may_access_cookies_like_http()) {
             client().did_misbehave("did_set_cookie"sv, "HTTP cookie source"sv);
             return;
         }
-    } else if (!client().hosts_an_environment_that_may_use_cookies_of(url)) {
+        client().session().cookie_jar->set_cookie(url, cookie, source, {});
         return;
     }
 
-    client().session().cookie_jar->set_cookie(url, cookie, source);
+    auto partition_context = cookie_partition_context_for(*this, environment_id, url);
+    if (!partition_context.has_value())
+        return;
+
+    client().session().cookie_jar->set_cookie(url, cookie, source, partition_context);
 }
 
-Messages::WebContentClient::DidRequestAllCookiesCookiestoreResponse WebContentPage::did_request_all_cookies_cookiestore(URL::URL url)
+Messages::WebContentClient::DidRequestAllCookiesCookiestoreResponse WebContentPage::did_request_all_cookies_cookiestore(Web::HTML::EnvironmentId const& environment_id, URL::URL url)
 {
-    if (!client().hosts_an_environment_that_may_use_cookies_of(url))
+    auto partition_context = cookie_partition_context_for(*this, environment_id, url);
+    if (!partition_context.has_value())
         return Vector<HTTP::Cookie::Cookie> {};
-    return client().session().cookie_jar->get_all_cookies_cookiestore(url);
+
+    return client().session().cookie_jar->get_all_cookies_cookiestore(url, partition_context);
 }
 
-Messages::WebContentClient::DidRequestCookieResponse WebContentPage::did_request_cookie(URL::URL url, HTTP::Cookie::Source source)
+Messages::WebContentClient::DidRequestCookieResponse WebContentPage::did_request_cookie(Optional<Web::HTML::EnvironmentId> const& environment_id, URL::URL url, HTTP::Cookie::Source source)
 {
-    if (source == HTTP::Cookie::Source::NonHttp && !client().hosts_an_environment_that_may_use_cookies_of(url))
-        return HTTP::Cookie::VersionedCookie {};
+    // NB: Only WebDriver reads cookies like HTTP does, for the top-level documents it drives.
+    Optional<HTTP::Cookie::PartitionContext> partition_context;
+    if (source == HTTP::Cookie::Source::NonHttp) {
+        partition_context = cookie_partition_context_for(*this, environment_id, url);
+        if (!partition_context.has_value())
+            return HTTP::Cookie::VersionedCookie {};
+    }
 
     HTTP::Cookie::VersionedCookie cookie;
-    cookie.cookie = client().session().cookie_jar->get_cookie(url, source);
+    cookie.cookie = client().session().cookie_jar->get_cookie(url, source, partition_context);
     if (source == HTTP::Cookie::Source::NonHttp)
         cookie.cookie_version = view().document_cookie_version(url);
     return cookie;

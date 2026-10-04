@@ -124,6 +124,21 @@ impl StyleEngine {
             .add_style_rule_in_scope(sheet, before, selectors, namespaces, scope, &mut self.counters)
     }
 
+    /// Add a style rule of a user-agent sheet, compiling its selectors only if no document in the
+    /// process has compiled them with the same inputs before.
+    #[inline]
+    pub(super) fn add_user_agent_style_rule(
+        &mut self,
+        sheet: SheetID,
+        before: Option<RuleID>,
+        rule_identity: u64,
+        selectors: &[&CompiledSelector],
+        rules: &crate::css::rule::NativeRuleList,
+    ) -> RuleID {
+        self.state
+            .add_user_agent_style_rule(sheet, before, rule_identity, selectors, rules, &mut self.counters)
+    }
+
     #[cfg(feature = "style-recording")]
     #[inline]
     pub(crate) fn add_replayed_style_rule(
@@ -986,14 +1001,6 @@ impl StyleEngine {
         self.state.abandon_demanded_records(node, &mut self.counters);
     }
 
-    /// Retry a record after C++ has installed earlier records in the same preorder batch. A record
-    /// rejected while the batch was planned may become computable once its inheritance parent is
-    /// authoritative.
-    #[inline]
-    pub(crate) fn retry_engine_record_after_ancestor(&mut self, node: StyleNodeID) -> publication::RetriedEngineRecord {
-        self.state.retry_engine_record_after_ancestor(node, &mut self.counters)
-    }
-
     /// Answer a read of one element's style the host makes before the next style update.
     #[inline]
     pub(super) fn answer_record_demand(
@@ -1066,6 +1073,11 @@ impl StyleEngine {
             metadata_input,
             &mut self.counters,
         )
+    }
+
+    #[inline]
+    pub(crate) fn free_style_records_kept_for_leases(&mut self) {
+        self.state.free_style_records_kept_for_leases(&mut self.counters);
     }
 
     #[inline]
