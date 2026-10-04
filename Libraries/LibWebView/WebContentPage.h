@@ -77,7 +77,7 @@ public:
 
     WebContentClient& client() const;
     Web::PageId id() const { return m_id; }
-    WebContentClient* routed_connection() const { return m_client.ptr(); }
+    WebContentClient* routed_connection() const { return m_is_open ? m_client.ptr() : nullptr; }
     Web::PageId routed_page_id() const { return m_id; }
 
     CanonicalTraversable& traversable() const;
@@ -135,6 +135,7 @@ public:
     Optional<PresentedBackingStores> take_presented_backing_stores();
     void release_presented_bitmap(i32 bitmap_id);
     void fail_renderer_owned_downloads();
+    void reset_session_history_for_testing();
 
 private:
     Optional<CanonicalNavigable&> population_worker_navigable(Web::HTML::CrossProcessId navigable_id) const;

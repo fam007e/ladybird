@@ -31,6 +31,7 @@
 #include <LibWebView/ViewImplementation.h>
 #include <LibWebView/WebContentClient.h>
 #include <LibWebView/WebContentPage.h>
+#include <LibWebView/WebContentTestClient.h>
 #include <LibWebView/WebUI.h>
 #include <LibWebView/WorkerProcessManager.h>
 
@@ -455,6 +456,8 @@ void WebContentPage::discard()
 
 Web::CompositorContextId WebContentPage::compositor_context_id()
 {
+    if (!m_is_open)
+        return Web::compositor_context_id_for_page(m_id);
     return client().compositor_context_id_for_page(m_id);
 }
 
@@ -580,7 +583,7 @@ Optional<WebContentPage::PresentedBackingStores> WebContentPage::take_presented_
 void WebContentPage::release_presented_bitmap(i32 bitmap_id)
 {
     auto context_id = Web::compositor_context_id_for_page(m_id);
-    if (client().page_id_for_compositor_context_id(context_id) != m_id)
+    if (!m_is_open || client().page_id_for_compositor_context_id(context_id) != m_id)
         return;
 
     Application::the().notify_compositor_presented_bitmap_ready_to_paint(context_id, bitmap_id);
@@ -2311,19 +2314,17 @@ Messages::WebContentClient::DidRequestNewWebViewResponse WebContentPage::did_req
     traversable.active_browsing_context().set_popup_sandboxing_flag_set(popup_sandboxing_flag_set);
 
     auto new_page_id = Application::the().allocate_page_id();
-    auto& new_page = client().open_page_for_new_top_level_traversable(new_page_id, traversable);
+    client().open_page_for_new_top_level_traversable(new_page_id, traversable);
 
     String window_handle;
     if (view().on_new_web_view)
-        window_handle = view().on_new_web_view(activate_tab, hints, client(), new_page_id);
+        window_handle = view().on_new_web_view(activate_tab, hints, traversable);
 
     if (!traversable.view().has_value()) {
         client().discard_page_of_undisplayed_top_level_traversable(new_page_id);
         CanonicalTraversable::remove_from_user_agent_top_level_traversable_set(traversable);
         return { {}, {}, {}, {}, {}, Web::HTML::VisibilityState::Hidden, move(window_handle) };
     }
-    new_page.view().update_navigation_action_state();
-
     traversable.represent_group_everywhere();
 
     auto environment_id = traversable.active_document().relevant_global_object().relevant_settings_object().id();
@@ -2333,13 +2334,13 @@ Messages::WebContentClient::DidRequestNewWebViewResponse WebContentPage::did_req
 
 void WebContentPage::did_close_browsing_context()
 {
-    auto displays_tab = this->displays_tab();
     traversable().remove_page(*this);
     // NB: Before unregistering, so an acknowledged embedded discard closes an otherwise-unused server immediately.
     m_detached_close_pending = false;
+    close();
     client().unregister_embedded_page(m_id);
 
-    if (displays_tab) {
+    if (displays_tab()) {
         auto& view = this->view();
         view.did_close_browsing_context({});
         if (view.on_close)
@@ -2503,6 +2504,15 @@ void WebContentPage::did_request_traverse_history_by_delta_for_testing(i32 delta
 {
     if (displays_tab())
         view().traverse_the_history_by_delta(delta);
+}
+
+void WebContentPage::reset_session_history_for_testing()
+{
+    auto* client = routed_connection();
+    if (!client || !client->test_connection())
+        return;
+    client->transport().flush();
+    client->test_connection()->async_reset_session_history_for_testing(m_id);
 }
 
 void WebContentPage::did_reset_session_history_for_testing(Web::HTML::SessionHistoryEntryDescriptor active_entry)
