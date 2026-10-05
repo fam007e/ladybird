@@ -124,6 +124,10 @@ impl RootFontInputs {
 }
 
 impl RetainedState {
+    pub(super) fn pseudo_element_style_is_deferred(&self, kind: tree::PseudoElementKind) -> bool {
+        u32::from(kind.0) < u64::BITS && self.deferred_pseudo_elements & (1 << kind.0) != 0
+    }
+
     /// The record a highlight pseudo-element inherits from: the same pseudo-element's record on its
     /// nearest flat-tree ancestor holding one, as the engine has it assigned.
     pub(crate) fn retained_highlight_inheritance_parent_style_record(
@@ -3865,6 +3869,12 @@ impl RetainedState {
         self.computed_group_sets.style_record_dependency_flags(style_record)
     }
 
+    /// Whether `style_record` holds an image a box loads. A record that is gone holds none.
+    pub(crate) fn style_record_holds_image_values(&self, style_record: u64) -> bool {
+        self.style_record_dependency_flags(style_record)
+            .is_some_and(|flags| flags & computed::HOLDS_IMAGE_VALUES != 0)
+    }
+
     pub(crate) fn recording_computed_group_identities(&self, style_record: u64) -> Option<Vec<u32>> {
         #[cfg(feature = "style-recording")]
         return self.computed_group_sets.recording_group_identities(style_record);
@@ -4452,6 +4462,9 @@ impl RetainedState {
         counters: &mut Counters,
     ) -> Option<computed::FinalStyleRecordID> {
         let target = computed::ComputedStyleTarget::new(node, pseudo_kind);
+        // A record the engine derived for the pseudo-element goes with it, uninstalled: the host removed the
+        // pseudo-element instead, as where its element left the top layer beside the transaction that derived it.
+        self.forget_engine_computed_record(target);
         if let Some(state) = self.computed_group_sets.take_pending_cascade_state(target) {
             self.computed_group_sets
                 .observe_absent_pseudo_cascade_state(target, state);
@@ -5042,7 +5055,7 @@ pub(crate) struct DemandedEngineRecord {
     pub(crate) owes_an_animation_plan: bool,
     pub(crate) owes_a_transition_step: bool,
     pub(crate) composed_by_the_host: bool,
-    pub(crate) pseudo_records_present: u8,
+    pub(crate) pseudo_records_present: u16,
     pub(crate) pseudo_records: [u64; bridge::PSEUDO_RECORD_SLOTS],
 }
 
@@ -5066,7 +5079,8 @@ pub(super) struct PseudoCohortKey {
     /// What the monospace font-size recascade gives the pseudo-element, as for an element's cohort.
     monospace_recascaded_font_size: i32,
     parent_record: u64,
-    /// For a ::selection, the record of its nearest ancestor's ::selection it inherits from.
+    /// For a highlight pseudo-element, the record of the same pseudo-element of its nearest
+    /// ancestor it inherits from.
     highlight_parent_record: u64,
     inherited_groups: u32,
     parent_display: u32,
@@ -5091,9 +5105,10 @@ pub(super) mod pseudo_kind {
     pub(in crate::css::style) const FIRST_LETTER: u8 = 3;
     pub(in crate::css::style) const FIRST_LINE: u8 = 4;
     pub(in crate::css::style) const MARKER: u8 = 5;
-    pub(in crate::css::style) const SELECTION: u8 = 6;
-    pub(in crate::css::style) const VIEW_TRANSITION: u8 = 7;
-    pub(in crate::css::style) const SYNTHETIC_COUNT: usize = 8;
+    pub(in crate::css::style) const SEARCH_TEXT: u8 = 6;
+    pub(in crate::css::style) const SELECTION: u8 = 7;
+    pub(in crate::css::style) const VIEW_TRANSITION: u8 = 8;
+    pub(in crate::css::style) const SYNTHETIC_COUNT: usize = 9;
     /// Every kind, in the order a settlement goes through them: first the ones a style update
     /// settles, then the ones only a read asks for.
     pub(in crate::css::style) const SETTLEMENT_ORDER: [u8; SYNTHETIC_COUNT] = [
@@ -5101,6 +5116,7 @@ pub(super) mod pseudo_kind {
         AFTER,
         FIRST_LETTER,
         SELECTION,
+        SEARCH_TEXT,
         BACKDROP,
         MARKER,
         FIRST_LINE,
@@ -5110,6 +5126,11 @@ pub(super) mod pseudo_kind {
     pub(in crate::css::style) const ELEMENT_REFERENCE_KINDS: u64 =
         ((1 << (super::bridge::LAST_ELEMENT_REFERENCE_PSEUDO_ELEMENT_KIND + 1)) - 1)
             & !((1 << super::bridge::FIRST_ELEMENT_REFERENCE_PSEUDO_ELEMENT_KIND) - 1);
+
+    /// https://drafts.csswg.org/css-pseudo-4/#highlight-pseudos
+    pub(in crate::css::style) const fn is_highlight(kind: u8) -> bool {
+        matches!(kind, SEARCH_TEXT | SELECTION)
+    }
 }
 
 /// The element facts a pseudo-element's computation reads: the C++ adjustments for what the

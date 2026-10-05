@@ -11,13 +11,13 @@ use crate::layout::node_data::{NodeFlag, NodeKind, NodeSlotId};
 use crate::layout::node_facts;
 use crate::painting::paint_read::PaintRead;
 
-#[repr(C)]
-pub struct FfiLayoutTreeUpdateClassification {
-    pub marks_partial_relayout_boundary_self_only: bool,
-    /// Whether the rebuild escalates past anonymous parents, and the node it escalates to, named the
-    /// way a commit message names it.
-    pub escalates_past_anonymous_parents: bool,
-    pub escalation_target_style_node: u32,
+crate::render_state::held_node_entries!();
+
+pub(crate) struct LayoutTreeUpdateClassification {
+    pub(crate) marks_partial_relayout_boundary_self_only: bool,
+    /// The node a rebuild escalates to past anonymous parents, if it does, named the way a commit
+    /// message names it.
+    pub(crate) escalation_target: Option<u32>,
 }
 
 /// A partial relayout boundary the planner found its committed layout stands for, with the containing block that layout
@@ -50,7 +50,7 @@ impl LayoutNodeArena {
         &self,
         node: NodeSlotId,
         reason_is_structural_boundary_self_rebuild: bool,
-    ) -> FfiLayoutTreeUpdateClassification {
+    ) -> LayoutTreeUpdateClassification {
         let data = self.data(node);
         let (kind, parent) = (data.kind.get(), data.parent.get());
 
@@ -84,11 +84,9 @@ impl LayoutNodeArena {
             }
         }
 
-        let escalation_target = self.commit_message_style_node(nearest_non_anonymous_ancestor);
-        FfiLayoutTreeUpdateClassification {
+        LayoutTreeUpdateClassification {
             marks_partial_relayout_boundary_self_only: marks_boundary_self_only,
-            escalates_past_anonymous_parents: escalation_target.is_some(),
-            escalation_target_style_node: escalation_target.unwrap_or(0),
+            escalation_target: self.commit_message_style_node(nearest_non_anonymous_ancestor),
         }
     }
 
@@ -756,7 +754,11 @@ pub unsafe extern "C" fn render_state_node_is_partial_relayout_boundary(
     node: NodeSlotId,
 ) -> bool {
     // SAFETY: Guaranteed by the caller.
-    unsafe { super::shell_reads::read(host, node, |arena, node| arena.node_is_partial_relayout_boundary(node)) }
+    unsafe {
+        super::shell_reads::read_arena(host, node_read(), node, |arena, node| {
+            arena.node_is_partial_relayout_boundary(node)
+        })
+    }
 }
 
 /// The facts the host owns that take an update off the partial relayout path.
@@ -764,27 +766,6 @@ pub unsafe extern "C" fn render_state_node_is_partial_relayout_boundary(
 pub(crate) struct FfiPartialRelayoutHostFacts {
     pub container_query_evaluation_is_pending: bool,
     pub should_collect_devtools_layout_data: bool,
-}
-
-/// # Safety
-///
-/// `host` must be a live document host, on its document's thread, and `node` must name a live row of its document.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_classify_layout_tree_update(
-    host: *const crate::render_state::DocumentHost,
-    node: NodeSlotId,
-    reason_is_structural_boundary_self_rebuild: bool,
-) -> FfiLayoutTreeUpdateClassification {
-    // SAFETY: Guaranteed by the caller.
-    unsafe {
-        super::shell_reads::read(
-            host,
-            (node, reason_is_structural_boundary_self_rebuild),
-            |arena, (node, reason_is_structural_boundary_self_rebuild)| {
-                arena.classify_layout_tree_update(node, reason_is_structural_boundary_self_rebuild)
-            },
-        )
-    }
 }
 
 #[cfg(test)]
@@ -1004,11 +985,10 @@ mod tests {
         let classification = arena.classify_layout_tree_update(child.slot, false);
         assert!(!arena.pending_updates_escape_partial_relayout.get());
         assert!(!classification.marks_partial_relayout_boundary_self_only);
-        assert!(classification.escalates_past_anonymous_parents);
-        assert_eq!(classification.escalation_target_style_node, 7);
+        assert_eq!(classification.escalation_target, Some(7));
 
         let parent_classification = arena.classify_layout_tree_update(anonymous_parent.slot, false);
-        assert!(!parent_classification.escalates_past_anonymous_parents);
+        assert_eq!(parent_classification.escalation_target, None);
 
         arena.classify_layout_tree_update(grandparent.slot, false);
         assert!(arena.pending_updates_escape_partial_relayout.get());

@@ -24,12 +24,15 @@
 //! and asks for a run of `StyleNodeID` values, Rust owns the arena and the relation columns keyed by
 //! them.
 
-use super::engine_calls::{document_host, sheet_writing_host, with_engine};
+use super::engine_calls::{document_host, with_engine};
+use super::rule_writes::RuleWrite;
 use super::{ReplayAtomSweep, StyleEngineHandle};
 use crate::render_state::DocumentHost;
 use std::ffi::c_void;
 
 use crate::abort_on_panic as abort_on_boundary_panic;
+use crate::css::animated_overlay::AnimatedOverlay;
+use crate::css::computed_longhand_table::ComputedLonghandTable;
 use crate::css::custom_properties::{CustomPropertyRegistry, ffi_slice};
 use crate::css::host_shared::{HostShared, SharedPayload};
 use crate::css::selector::CompiledSelector;
@@ -94,8 +97,8 @@ pub enum FfiStyleInvalidationField {
     AffectsHitTesting = 1 << 22,
     /// The word holds the damage the engine computed with its answer.
     EngineComputed = 1 << 23,
-    /// Selection highlights, which text descendants paint, repaint.
-    RepaintSelection = 1 << 24,
+    /// Highlight pseudo-elements, which text descendants paint, repaint.
+    RepaintHighlights = 1 << 24,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -192,7 +195,7 @@ pub struct FfiEngineComputedRecord {
     pub composed_by_the_host: bool,
     /// The synthetic pseudo-element kinds whose records the engine settled beside the
     /// element's, as a bit per kind; a present slot holding zero is a removal.
-    pub pseudo_records_present: u8,
+    pub pseudo_records_present: u16,
     pub pseudo_records: [u64; PSEUDO_RECORD_SLOTS],
 }
 
@@ -212,12 +215,12 @@ pub struct FfiSettledPseudoRecords {
     pub explicitly_inherited_groups: u32,
     /// The kinds whose records the engine settled, as a bit per kind; a present slot holding zero
     /// is a removal, and an absent kind keeps its record.
-    pub pseudo_records_present: u8,
+    pub pseudo_records_present: u16,
     pub pseudo_records: [u64; PSEUDO_RECORD_SLOTS],
 }
 
 /// One record slot per synthetic pseudo-element kind in an engine record answer.
-pub const PSEUDO_RECORD_SLOTS: usize = 8;
+pub const PSEUDO_RECORD_SLOTS: usize = 9;
 
 #[derive(Default)]
 pub(crate) struct FfiStyleTransactionOutput {
@@ -610,7 +613,27 @@ pub struct FfiStyleRecordView {
 }
 
 impl FfiStyleRecordView {
-    fn missing() -> Self {
+    /// The record's table, the base record's where it carries an overlay.
+    ///
+    /// # Safety
+    ///
+    /// The view must name a record of an element, which carries a table, that stays live for as long as the borrow.
+    pub(crate) unsafe fn longhand_table(&self) -> &ComputedLonghandTable {
+        // SAFETY: Guaranteed by the caller.
+        unsafe { &*self.longhand_table.cast::<ComputedLonghandTable>() }
+    }
+
+    /// The record's animation overlay, if it carries one.
+    ///
+    /// # Safety
+    ///
+    /// As for [`Self::longhand_table`].
+    pub(crate) unsafe fn animated_overlay(&self) -> Option<&AnimatedOverlay> {
+        // SAFETY: Guaranteed by the caller.
+        unsafe { self.animated_overlay.cast::<AnimatedOverlay>().as_ref() }
+    }
+
+    pub(crate) fn missing() -> Self {
         Self {
             payloads: std::ptr::null(),
             base_payloads: std::ptr::null(),
@@ -710,9 +733,9 @@ pub struct FfiElementArrival {
 /// The last pseudo-element kind C++ materializes as a synthetic pseudo-element; the kinds up to
 /// it are the bits a style record's pseudo-element mask carries. Mirrors the C++
 /// `last_synthetic_pseudo_element`.
-pub const LAST_SYNTHETIC_PSEUDO_ELEMENT_KIND: u16 = 7;
-pub const FIRST_ELEMENT_REFERENCE_PSEUDO_ELEMENT_KIND: u8 = 8;
-pub const LAST_ELEMENT_REFERENCE_PSEUDO_ELEMENT_KIND: u8 = 13;
+pub const LAST_SYNTHETIC_PSEUDO_ELEMENT_KIND: u16 = 8;
+pub const FIRST_ELEMENT_REFERENCE_PSEUDO_ELEMENT_KIND: u8 = 9;
+pub const LAST_ELEMENT_REFERENCE_PSEUDO_ELEMENT_KIND: u8 = 14;
 
 /// What C++ reports about a style reaction it applied, for the engine to derive the reactions of
 /// the element's children. Mirrors C++ `StyleReactionAppliedFact`.
@@ -1447,8 +1470,10 @@ unsafe impl Sync for FfiAppliedAnimationDefinition {}
 /// the scope's row up; a shadow root's scope is named by the root's pointer identity as well.
 ///
 /// The host publishes a scope whenever its rule cache is built, and keeps a reference to every set
-/// the row names until it replaces or gives the row up. This is not a recorded boundary event: a
-/// keyframe set is a host pointer, which a replayed engine could not be handed.
+/// the row names until it replaces or gives the row up. The row is written as the host's other
+/// writes are, ahead of the next job, which is the first that resolves keyframes from it. This is
+/// not a recorded boundary event: a keyframe set is a host pointer, which a replayed engine could
+/// not be handed.
 ///
 /// # Safety
 /// `host` must be a live document host, on its document's thread, and each buffer must hold the
@@ -1465,19 +1490,20 @@ pub unsafe extern "C" fn style_engine_set_tree_scope_animation_keyframes(
     count: usize,
 ) {
     // SAFETY: Guaranteed by the caller.
-    let host = unsafe { document_host(host) };
-    with_engine(host, |engine| {
-        let name_lengths = unsafe { ffi_slice(name_lengths, count) };
-        let name_units = unsafe { ffi_slice(name_units, name_unit_count) };
-        let keyframe_sets = unsafe { ffi_slice(keyframe_sets, count) };
-        engine.set_tree_scope_animation_keyframes(
-            TreeScopeID(tree_scope),
-            shadow_root_identity,
-            name_lengths,
-            name_units,
-            keyframe_sets,
-        );
-    });
+    let row = unsafe {
+        super::animations::AnimationKeyframes::row(
+            ffi_slice(name_lengths, count),
+            ffi_slice(name_units, name_unit_count),
+            ffi_slice(keyframe_sets, count),
+        )
+    };
+    let write = super::engine_calls::EngineWrite::AnimationKeyframes {
+        tree_scope: TreeScopeID(tree_scope),
+        shadow_root_identity,
+        row,
+    };
+    // SAFETY: Guaranteed by the caller.
+    unsafe { super::engine_calls::queue(host, write) };
 }
 
 /// Creates a replay engine whose atom keys are opaque capture tokens rather than live fly strings.
@@ -1509,12 +1535,18 @@ pub unsafe extern "C" fn style_engine_note_custom_property_environment(
     inheritable: u64,
     inheritable_store: *const c_void,
 ) {
+    use super::custom_property_environments::RetainedCustomPropertyStore;
     // SAFETY: Guaranteed by the caller.
-    let host = unsafe { document_host(host) };
+    let retain =
+        |store: *const c_void| (!store.is_null()).then(|| unsafe { RetainedCustomPropertyStore::from_borrowed(store) });
+    let write = super::engine_calls::EngineWrite::NoteCustomPropertyEnvironment {
+        identity,
+        store: retain(store),
+        inheritable,
+        inheritable_store: retain(inheritable_store),
+    };
     // SAFETY: Guaranteed by the caller.
-    with_engine(host, |engine| unsafe {
-        note_custom_property_environment(engine, identity, store, inheritable, inheritable_store);
-    });
+    unsafe { super::engine_calls::queue(host, write) };
 }
 
 /// [`style_engine_note_custom_property_environment`] on `engine`, which the style replay tool calls
@@ -1549,11 +1581,14 @@ pub unsafe fn note_custom_property_environment(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn style_engine_inheritable_custom_property_environment(
     host: *const DocumentHost,
+    read: &crate::render_state::BegunRead,
     identity: u64,
 ) -> u64 {
     // SAFETY: Guaranteed by the caller.
     let host = unsafe { document_host(host) };
-    with_engine(host, |engine| engine.custom_property_environments.inheritable(identity))
+    with_engine(read, host, |engine| {
+        engine.custom_property_environments.inheritable(identity)
+    })
 }
 
 /// How one animation effect's description travels across the boundary: the ranges of the flat
@@ -1640,7 +1675,8 @@ pub struct FfiAnimationEffectVersion {
 }
 
 /// Describe the effects one of an element's animation lists holds, in composite order, for the
-/// style engine to sample them from.
+/// style engine to sample them from. The host retains every value the effects name and streams
+/// the description to the engine.
 ///
 /// Hand-written rather than a recorded boundary event, because a keyframe declaration carries a
 /// style value the host holds, which a replayed engine could not be handed.
@@ -1668,28 +1704,32 @@ pub unsafe extern "C" fn style_engine_set_element_animation_effect_descriptions(
     base_url_bytes: *const u8,
     base_url_byte_count: usize,
 ) {
+    let Some(node) = StyleNodeID::from_raw(node) else {
+        return;
+    };
+    // SAFETY: Guaranteed by the caller.
+    let effects = unsafe {
+        super::effect_descriptions::PublishedEffectBuffers {
+            effects: ffi_slice(effects, effect_count),
+            keyframes: ffi_slice(keyframes, keyframe_count),
+            declarations: ffi_slice(declarations, declaration_count),
+            custom_declarations: ffi_slice(custom_declarations, custom_declaration_count),
+            linear_points: ffi_slice(linear_points, linear_point_count),
+            base_url_bytes: ffi_slice(base_url_bytes, base_url_byte_count),
+        }
+        .effects()
+    };
     // SAFETY: Guaranteed by the caller.
     let host = unsafe { document_host(host) };
-    with_engine(host, |engine| {
-        let Some(node) = StyleNodeID::from_raw(node) else {
-            return;
-        };
-        let buffers = unsafe {
-            super::effect_descriptions::PublishedEffectBuffers {
-                effects: ffi_slice(effects, effect_count),
-                keyframes: ffi_slice(keyframes, keyframe_count),
-                declarations: ffi_slice(declarations, declaration_count),
-                custom_declarations: ffi_slice(custom_declarations, custom_declaration_count),
-                linear_points: ffi_slice(linear_points, linear_point_count),
-                base_url_bytes: ffi_slice(base_url_bytes, base_url_byte_count),
-            }
-        };
-        unsafe { engine.animation_effect_descriptions.set(node, slot, buffers) };
-    });
+    host.engine_memo().described.borrow_mut().follow(node, slot, &effects);
+    host.queue_change(crate::render_state::ArenaChange::Engine(
+        super::engine_calls::EngineWrite::AnimationEffectDescriptions { node, slot, effects },
+    ));
 }
 
 /// Whether the engine describes one of an element's animation lists as holding exactly these
-/// versions of its effects, in this order, so that the host need not describe them again.
+/// versions of its effects, in this order, so that the host need not describe them again. Only
+/// the host describes them, so it knows without asking.
 ///
 /// # Safety
 /// `host` must be a live document host, on its document's thread, and `versions` must hold `count`
@@ -1704,12 +1744,11 @@ pub unsafe extern "C" fn style_engine_describes_animation_effects(
 ) -> bool {
     // SAFETY: Guaranteed by the caller.
     let host = unsafe { document_host(host) };
-    with_engine(host, |engine| {
-        StyleNodeID::from_raw(node).is_some_and(|node| {
-            engine
-                .animation_effect_descriptions
-                .describe(node, slot, unsafe { ffi_slice(versions, count) })
-        })
+    StyleNodeID::from_raw(node).is_some_and(|node| {
+        host.engine_memo()
+            .described
+            .borrow()
+            .describe(node, slot, unsafe { ffi_slice(versions, count) })
     })
 }
 
@@ -1904,7 +1943,7 @@ pub(crate) fn publish_user_agent_style_rule(
     before_rule: u32,
     rule_identity: u64,
     compiled: &[&CompiledSelector],
-    rules: &crate::css::rule::NativeRuleList,
+    namespaces: Option<&super::rule_writes::NamespaceTexts>,
     bound_scope: &BoundScopeChain,
 ) -> Option<u32> {
     if sheet == 0 || !bound_scope.levels.is_empty() {
@@ -1919,7 +1958,7 @@ pub(crate) fn publish_user_agent_style_rule(
     let before = (before_rule != 0).then(|| RuleID(before_rule - 1));
     Some(
         engine
-            .add_user_agent_style_rule(sheet, before, rule_identity, compiled, rules)
+            .add_user_agent_style_rule(sheet, before, rule_identity, compiled, namespaces)
             .0
             + 1,
     )
@@ -2158,6 +2197,7 @@ unsafe fn write_rule_matches(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn style_engine_match_element(
     host: *const DocumentHost,
+    read: &crate::render_state::BegunRead,
     node: u32,
     out: *mut FfiRuleMatch,
     capacity: usize,
@@ -2166,7 +2206,7 @@ pub unsafe extern "C" fn style_engine_match_element(
     // SAFETY: Guaranteed by the caller.
     let host = unsafe { document_host(host) };
     // SAFETY: Guaranteed by the caller.
-    with_engine(host, |engine| unsafe {
+    with_engine(read, host, |engine| unsafe {
         match_element(engine, node, out, capacity, compact_for_cascade)
     })
 }
@@ -2243,17 +2283,13 @@ fn collect_native_custom_declarations(
         .collect()
 }
 
-fn register_element_declared_properties(
+pub(super) fn register_element_declared_properties(
     engine: &mut StyleEngine,
     node: StyleNodeID,
     kind: FfiElementDeclarationKind,
     declarations: &[crate::css::declaration_block::DeclaredProperty],
     custom_properties: &[crate::css::declaration_block::CustomProperty],
-) -> bool {
-    use crate::css::property_metadata::property_defines_a_css_transition;
-    let has_transitions = declarations
-        .iter()
-        .any(|declaration| property_defines_a_css_transition(declaration.property_id));
+) {
     let declarations = engine.intern_element_declared_properties(declarations);
     let custom_declarations = collect_native_custom_declarations(engine, custom_properties);
     let declaration_kind = decode_element_declaration_kind(kind);
@@ -2270,7 +2306,14 @@ fn register_element_declared_properties(
         write_declared_properties(declared, payload);
         write_custom_declarations(custom_declared, payload);
     });
-    has_transitions
+}
+
+/// Whether `declarations` can define transitions.
+pub(crate) fn declares_transitions(declarations: &[crate::css::declaration_block::DeclaredProperty]) -> bool {
+    use crate::css::property_metadata::property_defines_a_css_transition;
+    declarations
+        .iter()
+        .any(|declaration| property_defines_a_css_transition(declaration.property_id))
 }
 
 /// Registers an element's native inline declaration block, or clears it when null.
@@ -2285,22 +2328,16 @@ pub unsafe extern "C" fn style_engine_set_element_inline_style_properties(
     node: u32,
     block: *const c_void,
 ) -> bool {
+    use crate::css::declaration_block::DeclarationBlock;
+    let Some(node) = StyleNodeID::from_raw(node) else {
+        return false;
+    };
     // SAFETY: Guaranteed by the caller.
-    let host = unsafe { document_host(host) };
-    with_engine(host, |engine| {
-        let Some(node) = StyleNodeID::from_raw(node) else {
-            return false;
-        };
-        let block = unsafe { block.cast::<crate::css::declaration_block::DeclarationBlock>().as_ref() };
-        let data = block.map(|block| block.data());
-        register_element_declared_properties(
-            engine,
-            node,
-            FfiElementDeclarationKind::InlineStyle,
-            data.as_ref().map_or(&[], |data| data.properties.as_slice()),
-            data.as_ref().map_or(&[], |data| data.custom_properties.as_slice()),
-        )
-    })
+    let data = unsafe { block.cast::<DeclarationBlock>().as_ref() }.map(DeclarationBlock::data);
+    let has_transitions = data.as_ref().is_some_and(|data| declares_transitions(&data.properties));
+    // SAFETY: Guaranteed by the caller.
+    unsafe { super::engine_calls::queue(host, super::engine_calls::EngineWrite::InlineStyle { node, data }) };
+    has_transitions
 }
 
 /// Registers borrowed presentation hints and returns whether they can define transitions.
@@ -2316,26 +2353,36 @@ pub unsafe extern "C" fn style_engine_set_element_presentational_hint_properties
     properties: *const c_void,
     count: usize,
 ) -> bool {
+    use crate::css::declaration_block::{DeclarationBlockData, FfiDeclaredProperty, declaration_from_view};
+    let Some(node) = StyleNodeID::from_raw(node) else {
+        return false;
+    };
+    let properties = if count == 0 {
+        &[]
+    } else {
+        // SAFETY: Guaranteed by the caller.
+        unsafe { std::slice::from_raw_parts(properties.cast::<FfiDeclaredProperty>(), count) }
+    };
+    // A hint may name a shorthand. Expanded as any declaration block is, it declares every longhand it decides, and so
+    // do all declarations the engine is given.
+    let mut hints = DeclarationBlockData::default();
+    for property in properties {
+        // SAFETY: Guaranteed by the caller.
+        hints.append_in_specified_order(unsafe { declaration_from_view(property) });
+    }
+    let has_transitions = declares_transitions(&hints.properties);
     // SAFETY: Guaranteed by the caller.
-    let host = unsafe { document_host(host) };
-    with_engine(host, |engine| {
-        use crate::css::declaration_block::{DeclarationBlockData, FfiDeclaredProperty, declaration_from_view};
-        let Some(node) = StyleNodeID::from_raw(node) else {
-            return false;
-        };
-        let properties = if count == 0 {
-            &[]
-        } else {
-            unsafe { std::slice::from_raw_parts(properties.cast::<FfiDeclaredProperty>(), count) }
-        };
-        // A hint may name a shorthand. Expanded as any declaration block is, it declares every
-        // longhand it decides, and so do all declarations the engine is given.
-        let mut hints = DeclarationBlockData::default();
-        for property in properties {
-            hints.append_in_specified_order(unsafe { declaration_from_view(property) });
-        }
-        register_element_declared_properties(engine, node, kind, &hints.properties, &[])
-    })
+    unsafe {
+        super::engine_calls::queue(
+            host,
+            super::engine_calls::EngineWrite::PresentationalHints {
+                node,
+                kind,
+                properties: hints.properties.into_boxed_slice(),
+            },
+        );
+    }
+    has_transitions
 }
 
 #[cfg(feature = "style-recording")]
@@ -2445,6 +2492,7 @@ pub unsafe fn replay_memory_pressure_snapshot(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn style_engine_publish_computed_groups(
     host: *const DocumentHost,
+    read: &crate::render_state::BegunRead,
     node: u32,
     pseudo_kind: u8,
     payloads: *const *const c_void,
@@ -2463,7 +2511,7 @@ pub unsafe extern "C" fn style_engine_publish_computed_groups(
     // SAFETY: Guaranteed by the caller.
     let host = unsafe { document_host(host) };
     // SAFETY: Guaranteed by the caller.
-    with_engine(host, |engine| unsafe {
+    with_engine(read, host, |engine| unsafe {
         publish_computed_groups(
             engine,
             node,
@@ -2706,74 +2754,11 @@ pub(crate) fn publish_computed_groups_from_inputs(
     result
 }
 
-/// Replaces only the animation overlay on an already-published target. Recording falls back to
-/// `style_engine_publish_computed_groups`, which captures the complete base-style input.
+/// The StyleEngine-owned group payload array for a base or live animation-overlay record, which the style replay tool
+/// reads where a recording asked for it.
 ///
 /// # Safety
-/// `host` must be a live document host, on its document's thread. `animated_overlay` must be null
-/// when `animation_overlay_identity` is zero and otherwise point at a live animation overlay.
-/// `payloads` must contain live group payloads for a non-empty overlay.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn style_engine_publish_animation_overlay(
-    host: *const DocumentHost,
-    node: u32,
-    pseudo_kind: u8,
-    animation_overlay_identity: u64,
-    animated_overlay: *const c_void,
-    payloads: *const *const c_void,
-    payload_count: usize,
-) -> FfiStyleRecordDelta {
-    // SAFETY: Guaranteed by the caller.
-    let host = unsafe { document_host(host) };
-    with_engine(host, |engine| {
-        let Some(node) = StyleNodeID::from_raw(node) else {
-            return FfiStyleRecordDelta::default();
-        };
-        if animation_overlay_identity != 0 && animated_overlay.is_null() {
-            return FfiStyleRecordDelta::default();
-        }
-        if payload_count != 0 && payloads.is_null() {
-            return FfiStyleRecordDelta::default();
-        }
-        let payloads = match payload_count {
-            0 => &[],
-            _ => SharedPayload::from_pointer_slice(unsafe { std::slice::from_raw_parts(payloads, payload_count) }),
-        };
-        let Some(publication) = engine.publish_animation_overlay_impl(
-            super::computed::ComputedStyleTarget::new(node, pseudo_kind),
-            animation_overlay_identity,
-            HostShared::new(animated_overlay).cast(),
-            payloads,
-        ) else {
-            return FfiStyleRecordDelta::default();
-        };
-        FfiStyleRecordDelta {
-            old_style_record: publication.previous_style_record.raw(),
-            new_style_record: publication.style_record.raw(),
-        }
-    })
-}
-
-/// Returns the StyleEngine-owned group payload array for a base or live animation-overlay record.
-///
-/// # Safety
-/// `host` must be a live document host, on its document's thread, and its document's style engine
-/// must stay as it is for every read through the returned pointer.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn style_engine_style_record_payloads(
-    host: *const DocumentHost,
-    style_record: u64,
-) -> *const c_void {
-    // SAFETY: Guaranteed by the caller.
-    let host = unsafe { document_host(host) };
-    // SAFETY: Guaranteed by the caller.
-    with_engine(host, |engine| unsafe { style_record_payloads(engine, style_record) })
-}
-
-/// [`style_engine_style_record_payloads`] on `engine`, which the style replay tool calls as well.
-///
-/// # Safety
-/// As for [`style_engine_style_record_payloads`], for the arguments after `engine`.
+/// `engine` must stay as it is for every read through the returned pointer.
 pub unsafe fn style_record_payloads(engine: &mut StyleEngine, style_record: u64) -> *const c_void {
     let payloads = engine.style_record_payloads(style_record);
     let result = payloads.map_or(std::ptr::null(), |payloads| payloads.as_ptr().cast());
@@ -2847,12 +2832,13 @@ pub enum FfiNodeRecordReads {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn style_engine_compare_style_records(
     host: *const DocumentHost,
+    read: &crate::render_state::BegunRead,
     old_style_record: u64,
     new_style_record: u64,
 ) -> u32 {
     // SAFETY: Guaranteed by the caller.
     let host = unsafe { document_host(host) };
-    with_engine(host, |engine| {
+    with_engine(read, host, |engine| {
         engine.compare_style_records(old_style_record, new_style_record, true, false, false)
     })
 }
@@ -2867,13 +2853,14 @@ pub unsafe extern "C" fn style_engine_compare_style_records(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn style_engine_element_record_damage(
     host: *const DocumentHost,
+    read: &crate::render_state::BegunRead,
     node: u32,
     old_style_record: u64,
     new_style_record: u64,
 ) -> u32 {
     // SAFETY: Guaranteed by the caller.
     let host = unsafe { document_host(host) };
-    with_engine(host, |engine| {
+    with_engine(read, host, |engine| {
         let Some(node) = StyleNodeID::from_raw(node) else {
             return super::style_invalidation::unreadable_record_damage();
         };
@@ -2891,6 +2878,7 @@ pub unsafe extern "C" fn style_engine_element_record_damage(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn style_engine_pseudo_element_record_damage(
     host: *const DocumentHost,
+    read: &crate::render_state::BegunRead,
     node: u32,
     pseudo_kind: u8,
     old_style_record: u64,
@@ -2900,7 +2888,7 @@ pub unsafe extern "C" fn style_engine_pseudo_element_record_damage(
 ) -> u32 {
     // SAFETY: Guaranteed by the caller.
     let host = unsafe { document_host(host) };
-    with_engine(host, |engine| {
+    with_engine(read, host, |engine| {
         let Some(node) = StyleNodeID::from_raw(node) else {
             return super::style_invalidation::unreadable_record_damage();
         };
@@ -2915,166 +2903,218 @@ pub unsafe extern "C" fn style_engine_pseudo_element_record_damage(
     })
 }
 
-/// Returns whether a candidate animation overlay changes any effective value in a style record.
+/// Whether a candidate animation overlay changes any effective value of the record `installed` views, in place of the
+/// record's own overlay. The host reads it from the record it installed, as the engine would.
 ///
 /// # Safety
-/// `host` must be a live document host, on its document's thread, `animated_overlay` must be live
-/// for this call, and the style record must remain pinned or assigned.
+/// `installed` must view a record the host holds live, and `animated_overlay` must be null or live, for this call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn style_engine_animation_overlay_changed(
-    host: *const DocumentHost,
-    old_style_record: u64,
+    installed: &FfiStyleRecordView,
     animated_overlay: *const c_void,
 ) -> bool {
     // SAFETY: Guaranteed by the caller.
-    let host = unsafe { document_host(host) };
-    with_engine(host, |engine| {
-        engine.animation_overlay_changed(old_style_record, animated_overlay.cast())
-    })
+    let (table, old_overlay, new_overlay) = unsafe {
+        (
+            installed.longhand_table(),
+            installed.animated_overlay(),
+            animated_overlay.cast::<AnimatedOverlay>().as_ref(),
+        )
+    };
+    super::style_invalidation::animation_overlay_changed(table, old_overlay, new_overlay)
 }
 
-/// What the host hands over to have an element's sampled animation overlay composed into the
-/// payloads of its overlay record.
+/// What the host hands over to have an element's sampled animation overlay composed over the record it installed and
+/// published.
 #[repr(C)]
-pub struct FfiAnimationOverlayPayloadInput {
+pub struct FfiAnimationOverlayPublicationInput {
     pub style_node: u32,
     pub pseudo_kind: u8,
-    /// The record the overlay was sampled on, which it composes over.
+    /// The record the element installed, which the overlay was sampled on and composes over.
     pub style_record: u64,
     /// The longhand table the overlay was sampled over.
     pub longhand_table: *const c_void,
     pub animated_overlay: *const c_void,
+    /// The identity of the overlay, or 0 where it animates nothing, which releases the target's overlay record.
+    pub animation_overlay_identity: u64,
     pub used_color_scheme: u8,
     pub display_before_box_type_transformation_raw: u32,
+    pub is_document_element: bool,
+    /// What a target the engine holds no overlay slot for is published again whole with, beside the installed record's
+    /// base: the number of inherited style groups, and the custom-property environment the target holds, with its
+    /// store.
+    pub inherited_group_count: usize,
+    pub custom_property_environment: u64,
+    pub custom_property_store: *const c_void,
     pub callback_context: *mut c_void,
     /// Writes the animated style's platform font, a `ComputedValuesFFI::FfiFontGroupBuildInputs`;
     /// asked only where the font group is rebuilt.
     pub font_group_inputs: unsafe extern "C" fn(*mut c_void, *mut c_void),
 }
 
-/// Which groups of a composed overlay record were rebuilt over its base record.
+/// What publishing an element's sampled animation overlay answers: what replacing the installed record with it damages,
+/// the record the target held and the one it holds now, with the view of the latter, which is missing where the engine
+/// holds no record the overlay was sampled on.
 #[repr(C)]
-pub struct FfiAnimationOverlayPayloads {
-    /// Whether the engine holds the record to compose over; nothing was written where it does not.
-    pub present: bool,
+pub struct FfiAnimationOverlayPublication {
+    pub invalidation: FfiAnimationInvalidation,
+    pub publication: FfiStyleRecordDelta,
+    pub view: FfiStyleRecordView,
     /// Whether the overlay named a value the groups could not be told from, or nothing at all.
     pub rebuilt_every_group: bool,
-    /// The groups whose payloads the caller owns a reference to, given back with
-    /// `style_engine_release_animation_overlay_payloads`.
-    pub rebuilt_groups: u32,
 }
 
-/// Compose an element's sampled animation overlay into the payloads of its overlay record, one per
-/// style group, written to `payloads`; see `RetainedState::build_animation_overlay_payloads`.
+impl FfiAnimationOverlayPublication {
+    fn missing() -> Self {
+        Self {
+            invalidation: FfiAnimationInvalidation::default(),
+            publication: FfiStyleRecordDelta::default(),
+            view: FfiStyleRecordView::missing(),
+            rebuilt_every_group: false,
+        }
+    }
+}
+
+/// Composes an element's sampled animation overlay over the record it installed, rebuilding only the groups the overlay
+/// writes (see `RetainedState::build_animation_overlay_payloads`), compares it with that record, and publishes it as
+/// the target's record, in one call of the engine. A second call is made only where the overlay rebuilds the font group: resolving the animated font may
+/// read the engine, so the host resolves it between the two. The host keeps the view of the record it answers, which it
+/// installs next.
 ///
 /// # Safety
-/// `host` must be a live document host, on its document's thread, `input` and everything it points
-/// to must be live for the call, `input`'s table must be non-null, and `payloads` must hold
-/// `payload_count` entries, one per style group.
+/// `host` must be a live document host, on its document's thread, and everything `input` points to must be live for
+/// the call, its table non-null.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn style_engine_build_animation_overlay_payloads(
+pub unsafe extern "C" fn style_engine_publish_sampled_animation_overlay(
     host: *const DocumentHost,
-    input: *const FfiAnimationOverlayPayloadInput,
-    payloads: *mut *const c_void,
-    payload_count: usize,
-) -> FfiAnimationOverlayPayloads {
-    use crate::css::table_group_builder::{FfiFontGroupBuildInputs, group_index};
+    read: &crate::render_state::BegunRead,
+    input: &FfiAnimationOverlayPublicationInput,
+) -> FfiAnimationOverlayPublication {
+    use crate::css::table_group_builder::FfiFontGroupBuildInputs;
 
     // SAFETY: Guaranteed by the caller.
     let host = unsafe { document_host(host) };
-    let input = unsafe { &*input };
-    assert_eq!(payload_count, group_index::COUNT, "one payload per style group");
-    let payloads = unsafe { &mut *payloads.cast::<[*const c_void; group_index::COUNT]>() };
-    let table = unsafe {
-        &*input
-            .longhand_table
-            .cast::<crate::css::computed_longhand_table::ComputedLonghandTable>()
-    };
-    let overlay = unsafe {
-        input
-            .animated_overlay
-            .cast::<crate::css::animated_overlay::AnimatedOverlay>()
-            .as_ref()
-    };
-    let mut build = |font: Option<&FfiFontGroupBuildInputs>| {
-        with_engine(host, |engine| {
-            engine.build_animation_overlay_payloads(
-                StyleNodeID::from_raw(input.style_node)?,
-                input.pseudo_kind,
-                input.style_record,
-                table,
-                overlay,
-                input.used_color_scheme,
-                input.display_before_box_type_transformation_raw,
-                font,
-                payloads,
-            )
+    let publish = |font: Option<&FfiFontGroupBuildInputs>| {
+        // SAFETY: Guaranteed by the caller.
+        with_engine(read, host, |engine| unsafe {
+            publish_sampled_animation_overlay(engine, input, font)
         })
     };
-    // Resolving the animated font may read the engine, so a build that rebuilds the font group has the
-    // host resolve it between two calls of the engine.
-    let rebuilt = match build(None) {
-        Some(Err(super::engine_sample::NeedsHostFont)) => {
+    let published = match publish(None) {
+        Err(super::engine_sample::NeedsHostFont) => {
             let mut font = std::mem::MaybeUninit::<FfiFontGroupBuildInputs>::uninit();
             // SAFETY: Guaranteed by the caller. The host writes the whole font.
             let font = unsafe {
                 (input.font_group_inputs)(input.callback_context, font.as_mut_ptr().cast());
                 font.assume_init()
             };
-            build(Some(&font))
+            publish(Some(&font))
         }
-        rebuilt => rebuilt,
+        published => published,
     };
-    match rebuilt {
-        Some(Ok(rebuilt)) => FfiAnimationOverlayPayloads {
-            present: true,
-            rebuilt_every_group: rebuilt.every_group,
-            rebuilt_groups: rebuilt.groups,
-        },
-        _ => FfiAnimationOverlayPayloads {
-            present: false,
-            rebuilt_every_group: false,
-            rebuilt_groups: 0,
-        },
+    let Ok(published) = published else {
+        return FfiAnimationOverlayPublication::missing();
+    };
+    if published.view.present {
+        host.engine_memo()
+            .views
+            .set(published.publication.new_style_record, published.view);
     }
+    published
 }
 
-/// Give back the references to the payloads `style_engine_build_animation_overlay_payloads`
-/// rebuilt.
+/// [`style_engine_publish_sampled_animation_overlay`]'s one call of `engine`, which answers `Err` where it needs the
+/// animated font, `font`, it was not given.
 ///
 /// # Safety
-/// `payloads` must hold `payload_count` entries as that build wrote them, and `rebuilt_groups` be
-/// the groups it rebuilt, not given back before.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn style_engine_release_animation_overlay_payloads(
-    payloads: *const *const c_void,
-    payload_count: usize,
-    rebuilt_groups: u32,
-) {
-    let payloads = unsafe { std::slice::from_raw_parts(payloads, payload_count) };
-    super::engine_sample::release_rebuilt_overlay_payloads(payloads, rebuilt_groups);
-}
+/// As for [`style_engine_publish_sampled_animation_overlay`].
+unsafe fn publish_sampled_animation_overlay(
+    engine: &mut StyleEngine,
+    input: &FfiAnimationOverlayPublicationInput,
+    font: Option<&crate::css::table_group_builder::FfiFontGroupBuildInputs>,
+) -> Result<FfiAnimationOverlayPublication, super::engine_sample::NeedsHostFont> {
+    use crate::css::table_group_builder::group_index;
 
-/// Computes property-dependent damage for the sparse changed values in an animation overlay.
-///
-/// # Safety
-/// `host` must be a live document host, on its document's thread, `animated_overlay` and every
-/// group payload must be live for this call, and the style record must remain pinned or assigned.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn style_engine_compare_animation_overlay(
-    host: *const DocumentHost,
-    old_style_record: u64,
-    animated_overlay: *const c_void,
-    payloads: *const *const c_void,
-    payload_count: usize,
-    is_document_element: bool,
-) -> FfiAnimationInvalidation {
+    let Some(node) = StyleNodeID::from_raw(input.style_node) else {
+        return Ok(FfiAnimationOverlayPublication::missing());
+    };
     // SAFETY: Guaranteed by the caller.
-    let host = unsafe { document_host(host) };
-    with_engine(host, |engine| {
-        let payloads =
-            SharedPayload::from_pointer_slice(unsafe { std::slice::from_raw_parts(payloads, payload_count) });
-        engine.compare_animation_overlay(old_style_record, animated_overlay.cast(), payloads, is_document_element)
+    let (table, overlay) = unsafe {
+        (
+            &*input.longhand_table.cast::<ComputedLonghandTable>(),
+            input.animated_overlay.cast::<AnimatedOverlay>().as_ref(),
+        )
+    };
+    let mut payloads = [std::ptr::null(); group_index::COUNT];
+    let Some(rebuilt) = engine.build_animation_overlay_payloads(
+        node,
+        input.pseudo_kind,
+        input.style_record,
+        table,
+        overlay,
+        input.used_color_scheme,
+        input.display_before_box_type_transformation_raw,
+        font,
+        &mut payloads,
+    ) else {
+        return Ok(FfiAnimationOverlayPublication::missing());
+    };
+    let rebuilt = rebuilt?;
+    // Compared before the publication, which may release the installed record: nothing else keeps a pseudo-element's.
+    let invalidation = engine.compare_animation_overlay(
+        input.style_record,
+        input.animated_overlay.cast(),
+        SharedPayload::from_pointer_slice(&payloads),
+        input.is_document_element,
+    );
+    let (animated_overlay, overlay_payloads) = match input.animation_overlay_identity {
+        0 => (std::ptr::null(), &[][..]),
+        _ => (input.animated_overlay, &payloads[..]),
+    };
+    let publication = match engine.publish_animation_overlay_impl(
+        super::computed::ComputedStyleTarget::new(node, input.pseudo_kind),
+        input.animation_overlay_identity,
+        HostShared::new(animated_overlay).cast(),
+        SharedPayload::from_pointer_slice(overlay_payloads),
+    ) {
+        Some(publication) => FfiStyleRecordDelta {
+            old_style_record: publication.previous_style_record.raw(),
+            new_style_record: publication.style_record.raw(),
+        },
+        // A pseudo-element the engine holds no assignment for owns no overlay slot, and a recording captures the
+        // complete base-style input, so the record is published again whole, with the overlay over the same base.
+        None => {
+            // SAFETY: The base record stays live for the call.
+            let base = unsafe { style_record_view(engine, input.style_record) };
+            // SAFETY: Guaranteed by the caller, and the base's arrays are live.
+            unsafe {
+                publish_computed_groups(
+                    engine,
+                    input.style_node,
+                    input.pseudo_kind,
+                    base.base_payloads,
+                    base.payload_count,
+                    input.inherited_group_count,
+                    input.custom_property_environment,
+                    false,
+                    base.counter_style_environment_identity,
+                    input.animation_overlay_identity,
+                    animated_overlay,
+                    overlay_payloads.as_ptr(),
+                    overlay_payloads.len(),
+                    base.longhand_table,
+                    input.custom_property_store,
+                )
+            }
+        }
+    };
+    super::engine_sample::release_rebuilt_overlay_payloads(&payloads, rebuilt.groups);
+    Ok(FfiAnimationOverlayPublication {
+        invalidation,
+        publication,
+        // SAFETY: The published record is live.
+        view: unsafe { style_record_view(engine, publication.new_style_record) },
+        rebuilt_every_group: rebuilt.every_group,
     })
 }
 
@@ -3086,12 +3126,20 @@ pub unsafe extern "C" fn style_engine_compare_animation_overlay(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn style_engine_style_record_view(
     host: *const DocumentHost,
+    read: &crate::render_state::BegunRead,
     style_record: u64,
 ) -> FfiStyleRecordView {
     // SAFETY: Guaranteed by the caller.
     let host = unsafe { document_host(host) };
+    if let Some(view) = super::engine_calls::known_style_record_view(host, style_record) {
+        return view;
+    }
     // SAFETY: Guaranteed by the caller.
-    with_engine(host, |engine| unsafe { style_record_view(engine, style_record) })
+    let view = with_engine(read, host, |engine| unsafe { style_record_view(engine, style_record) });
+    if view.present {
+        host.engine_memo().views.set(style_record, view);
+    }
+    view
 }
 
 /// [`style_engine_style_record_view`] on `engine`, which the style replay tool calls as well.
@@ -3199,13 +3247,14 @@ pub unsafe fn style_record_view(engine: &mut StyleEngine, style_record: u64) -> 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn style_engine_remove_computed_pseudo(
     host: *const DocumentHost,
+    read: &crate::render_state::BegunRead,
     node: u32,
     pseudo_kind: u8,
 ) -> FfiStyleRecordDelta {
     // SAFETY: Guaranteed by the caller.
     let host = unsafe { document_host(host) };
     // SAFETY: Guaranteed by the caller.
-    with_engine(host, |engine| unsafe {
+    with_engine(read, host, |engine| unsafe {
         remove_computed_pseudo(engine, node, pseudo_kind)
     })
 }
@@ -3286,13 +3335,14 @@ pub(crate) fn publish_rule_declarations(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn style_engine_republish_record_environment(
     host: *const DocumentHost,
+    read: &crate::render_state::BegunRead,
     node: u32,
     environment: u64,
     store: *const c_void,
 ) -> u64 {
     // SAFETY: Guaranteed by the caller.
     let host = unsafe { document_host(host) };
-    with_engine(host, |engine| {
+    with_engine(read, host, |engine| {
         let Some(node) = StyleNodeID::from_raw(node) else {
             return 0;
         };
@@ -3391,12 +3441,13 @@ pub struct FfiEnvironmentMoveActions {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn style_engine_move_custom_property_environment(
     host: *const DocumentHost,
+    read: &crate::render_state::BegunRead,
     origin: u32,
     moved: FfiEnvironmentMove,
 ) -> FfiEnvironmentMoveActions {
     // SAFETY: Guaranteed by the caller.
     let host = unsafe { document_host(host) };
-    with_engine(host, |engine| {
+    let (answer, moved) = with_engine(read, host, |engine| {
         let mut actions = std::mem::take(&mut engine.host.environment_move_actions);
         actions.clear();
         if let Some(origin) = StyleNodeID::from_raw(origin) {
@@ -3418,9 +3469,30 @@ pub unsafe extern "C" fn style_engine_move_custom_property_environment(
             actions: actions.as_ptr(),
             count: actions.len(),
         };
+        // Each element the move left an environment takes the record republished over it.
+        let mut moved = Vec::new();
+        for action in &actions {
+            let Some(node) =
+                StyleNodeID::from_raw(action.node).filter(|_| action.kind == FfiEnvironmentMoveActionKind::Republish)
+            else {
+                continue;
+            };
+            moved.push((
+                node,
+                None,
+                engine.element_custom_property_data(node).expose_provenance(),
+            ));
+            moved.extend(
+                engine
+                    .pseudo_element_custom_property_environments(node)
+                    .map(|(pseudo, data)| (node, Some(pseudo), data.expose_provenance())),
+            );
+        }
         engine.host.environment_move_actions = actions;
-        answer
-    })
+        (answer, moved)
+    });
+    host.engine_memo().held.borrow_mut().follow_moved(&moved);
+    answer
 }
 
 /// Replays a record moved to a refreshed environment.
@@ -3478,18 +3550,19 @@ pub enum FfiDemandedPseudoElement {
     FirstLetter = 3,
     FirstLine = 4,
     Marker = 5,
-    Selection = 6,
-    ViewTransition = 7,
-    DetailsContent = 8,
-    FileSelectorButton = 9,
-    Placeholder = 10,
-    SliderFill = 11,
-    SliderThumb = 12,
-    SliderTrack = 13,
-    ViewTransitionGroup = 16,
-    ViewTransitionImagePair = 17,
-    ViewTransitionNew = 18,
-    ViewTransitionOld = 19,
+    SearchText = 6,
+    Selection = 7,
+    ViewTransition = 8,
+    DetailsContent = 9,
+    FileSelectorButton = 10,
+    Placeholder = 11,
+    SliderFill = 12,
+    SliderThumb = 13,
+    SliderTrack = 14,
+    ViewTransitionGroup = 17,
+    ViewTransitionImagePair = 18,
+    ViewTransitionNew = 19,
+    ViewTransitionOld = 20,
 }
 
 /// The answer to a record demand: the record, or that the pseudo-element read generates no box
@@ -3559,7 +3632,7 @@ pub(crate) fn answer_record_demand(
         payload.write_u64(result.record.style_record);
         payload.write_bool(result.is_absent);
         payload.write_bool(result.record.uses_substitution);
-        payload.write_u8(result.record.pseudo_records_present);
+        payload.write_u16(result.record.pseudo_records_present);
     });
     result
 }
@@ -3613,6 +3686,7 @@ pub unsafe fn style_engine_answer_pseudo_element_record_demand_for_replay(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn style_engine_declared_only_record(
     host: *const DocumentHost,
+    read: &crate::render_state::BegunRead,
     subject: u32,
     facts: u32,
     hint_kind: FfiElementDeclarationKind,
@@ -3622,7 +3696,7 @@ pub unsafe extern "C" fn style_engine_declared_only_record(
 ) -> u64 {
     // SAFETY: Guaranteed by the caller.
     let host = unsafe { document_host(host) };
-    with_engine(host, |engine| {
+    with_engine(read, host, |engine| {
         use crate::css::declaration_block::{DeclarationBlock, FfiDeclaredProperty, declaration_from_view};
         abort_on_panic(|| {
             // A record no row holds is no event a replay could reproduce.
@@ -3669,13 +3743,14 @@ pub unsafe extern "C" fn style_engine_declared_only_record(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn style_engine_settle_pseudo_records_after_host_record(
     host: *const DocumentHost,
+    read: &crate::render_state::BegunRead,
     node: u32,
     old_is_list_item: bool,
 ) -> FfiSettledPseudoRecords {
     // SAFETY: Guaranteed by the caller.
     let host = unsafe { document_host(host) };
     // SAFETY: Guaranteed by the caller.
-    with_engine(host, |engine| unsafe {
+    with_engine(read, host, |engine| unsafe {
         settle_pseudo_records_after_host_record(engine, node, old_is_list_item)
     })
 }
@@ -3702,7 +3777,7 @@ pub unsafe fn settle_pseudo_records_after_host_record(
             payload.write_u32(node);
             payload.write_bool(old_is_list_item);
             payload.write_bool(result.refused);
-            payload.write_u8(result.pseudo_records_present);
+            payload.write_u16(result.pseudo_records_present);
         });
         result
     })
@@ -3716,12 +3791,13 @@ pub unsafe fn settle_pseudo_records_after_host_record(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn style_engine_borrow_engine_custom_property_environment(
     host: *const DocumentHost,
+    read: &crate::render_state::BegunRead,
     identity: u64,
     parent: *mut u64,
 ) -> *const c_void {
     // SAFETY: Guaranteed by the caller.
     let host = unsafe { document_host(host) };
-    with_engine(host, |engine| {
+    with_engine(read, host, |engine| {
         let Some((store, parent_identity)) = engine.custom_property_environments.engine_environment(identity) else {
             return std::ptr::null();
         };
@@ -3733,36 +3809,13 @@ pub unsafe extern "C" fn style_engine_borrow_engine_custom_property_environment(
     })
 }
 
-/// Records what a custom property's name atom spells, and the fly string it is. The fly string is
-/// retained and never recorded: a replay has no strings, and names its entries by atom alone.
-///
-/// # Safety
-/// `host` must be a live document host, on its document's thread, `raw` must be a live
-/// `AK::Utf16FlyString` raw representation, and `text` must name `length` code units.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn style_engine_note_custom_property_name(
-    host: *const DocumentHost,
-    name: u32,
-    raw: usize,
-    text: *const u16,
-    length: usize,
-) {
-    // SAFETY: Guaranteed by the caller.
-    let host = unsafe { document_host(host) };
-    with_engine(host, |engine| {
-        if name == 0 || (length != 0 && text.is_null()) {
-            return;
-        }
-        let text = match length {
-            0 => &[],
-            _ => unsafe { std::slice::from_raw_parts(text, length) },
-        };
-        unsafe { note_native_custom_property_name(engine, StyleAtomID(name), raw, text) };
-    });
-}
-
 // The raw identity must remain a live Utf16FlyString for the native engine to retain it.
-unsafe fn note_native_custom_property_name(engine: &mut StyleEngine, name: StyleAtomID, raw: usize, text: &[u16]) {
+pub(super) unsafe fn note_native_custom_property_name(
+    engine: &mut StyleEngine,
+    name: StyleAtomID,
+    raw: usize,
+    text: &[u16],
+) {
     unsafe { engine.note_custom_property_name(name, raw, text) };
     engine.record_boundary_call(EventKind::NoteCustomPropertyName, |payload| {
         payload.write_u32(name.0);
@@ -3798,12 +3851,11 @@ pub struct FfiNativeRuleTarget {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn style_engine_next_declaration_block_version(host: *const DocumentHost) -> u32 {
     // SAFETY: Guaranteed by the caller.
-    let host = unsafe { document_host(host) };
-    with_engine(host, |engine| engine.next_declaration_block_version())
+    unsafe { document_host(host) }.next_declaration_block_version()
 }
 
-/// Publish a native declaration edit through its owning rule and return whether it declares
-/// transitions. The host is notified before publishing, without an engine or graph borrow.
+/// Queues a native declaration edit for the rule that owns the declarations, where the host published that rule to the
+/// sheet `sheet`, and answers whether they declare transitions. The host is told first, with no engine borrowed.
 ///
 /// # Safety
 /// `host` must be a live document host, on its document's thread, and `rule` live. The callback
@@ -3811,88 +3863,76 @@ pub unsafe extern "C" fn style_engine_next_declaration_block_version(host: *cons
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn style_engine_native_rule_declarations_changed(
     host: *const DocumentHost,
+    sheet: u32,
     rule: *const c_void,
     context: *mut c_void,
-    notify: unsafe extern "C" fn(*mut c_void, u32),
+    notify: unsafe extern "C" fn(*mut c_void),
 ) -> bool {
     // SAFETY: Guaranteed by the caller.
-    let host = unsafe { sheet_writing_host(host) };
+    let host = unsafe { document_host(host) };
     // SAFETY: Guaranteed by the caller.
     let rule = unsafe { &*rule.cast::<crate::css::rule::NativeRule>() };
-    let Some(id) = with_engine(host, |engine| native_rule_declaration_owner(engine, rule)) else {
+    let Some(identity) = rule
+        .declaration_owner_identity()
+        .filter(|&identity| host.published_rules().contains(sheet, identity))
+    else {
         return false;
     };
     // SAFETY: Guaranteed by the caller.
-    unsafe { notify(context, id.0 + 1) };
-    with_engine(host, |engine| publish_native_rule_declarations(engine, rule, id))
-}
-
-/// The engine's id of the rule that owns `rule`'s declarations, if it has one.
-pub(crate) fn native_rule_declaration_owner(
-    engine: &StyleEngine,
-    rule: &crate::css::rule::NativeRule,
-) -> Option<RuleID> {
-    engine.native_rule_id(rule.declaration_owner_identity()?)
-}
-
-/// Publishes the declarations of `rule`, whose owner is the engine's rule `id`, and answers
-/// whether they declare transitions.
-pub(crate) fn publish_native_rule_declarations(
-    engine: &mut StyleEngine,
-    rule: &crate::css::rule::NativeRule,
-    id: RuleID,
-) -> bool {
+    unsafe { notify(context) };
     let declarations = rule.cascade_declarations();
-    engine.native_rules.targets.get_mut(&id).unwrap().declarations = declarations.clone();
-    let version = engine.next_declaration_block_version();
-    operations::record_rule_declarations_changed(engine, id.0 + 1, version);
-    declarations.is_some_and(|declarations| publish_rule_declarations(engine, id.0 + 1, &declarations))
+    let transitions = declarations
+        .as_ref()
+        .is_some_and(|declarations| declares_transitions(&declarations.properties));
+    host.write_rules(RuleWrite::RuleDeclarations { identity, declarations });
+    transitions
 }
 
-/// Find the next compiled rule after an inserted native subtree, without creating CSSOM objects.
+/// The native identity of the first rule after an inserted native subtree that the host published to the sheet
+/// `sheet`, or 0 for none, without creating CSSOM objects.
 ///
 /// # Safety
-/// `host` must be a live document host, on its document's thread, and `sheet` a live native
-/// allocation.
+/// `host` must be a live document host, on its document's thread, and `native` a live native sheet.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn style_engine_native_rule_successor(
     host: *const DocumentHost,
-    sheet: *const c_void,
+    sheet: u32,
+    native: *const c_void,
     identity: u64,
-) -> u32 {
+) -> u64 {
     // SAFETY: Guaranteed by the caller.
-    let host = unsafe { sheet_writing_host(host) };
-    with_engine(host, |engine| {
-        let sheet = unsafe { &*sheet.cast::<crate::css::style_sheet::NativeStyleSheet>() };
-        crate::css::rule::mutation::successor(sheet, identity, |identity| {
-            engine.native_rules.identities.get(&identity).map_or(0, |id| id.0 + 1)
-        })
-    })
+    let host = unsafe { document_host(host) };
+    // SAFETY: Guaranteed by the caller.
+    let native = unsafe { &*native.cast::<crate::css::style_sheet::NativeStyleSheet>() };
+    host.published_rules().successor(sheet, native, identity)
 }
 
-/// Retire a native subtree, with host callbacks only for document and cascade-cache notifications.
+/// Retires a native subtree from the sheet `sheet`, with host callbacks only for document and cascade-cache
+/// notifications, and queues the removal of the rules the host published there.
 ///
 /// # Safety
-/// `host` must be a live document host, on its document's thread, and the sheet, rule, callbacks,
-/// and any non-null detached import must be live. Native rules must belong to Arc allocations. No
-/// graph or engine borrow spans a host callback.
+/// `host` must be a live document host, on its document's thread, and the native sheet, rule, callbacks, and any
+/// non-null detached import must be live. Native rules must belong to Rc allocations. No graph borrow spans a host
+/// callback.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn style_engine_remove_native_rule(
     host: *const DocumentHost,
-    sheet: *const c_void,
+    native: *const c_void,
     rule: *const c_void,
     detached_import: *const c_void,
-    _sheet_id: u32,
+    sheet: u32,
     context: *mut c_void,
     begin: unsafe extern "C" fn(*mut c_void, bool, bool),
-    notify: unsafe extern "C" fn(*mut c_void, u32, bool),
+    notify: unsafe extern "C" fn(*mut c_void, bool),
 ) {
     use crate::css::rule::{NativeRule, NativeRuleType, mutation, read::RuleRef};
     use crate::css::style_sheet::NativeStyleSheet;
+    // SAFETY: Guaranteed by the caller.
+    let host = unsafe { document_host(host) };
     let removed = unsafe {
         mutation::removed_rules(
             &*rule.cast::<NativeRule>(),
-            &*sheet.cast::<NativeStyleSheet>(),
+            &*native.cast::<NativeStyleSheet>(),
             detached_import.cast::<NativeStyleSheet>().as_ref(),
         )
     };
@@ -3902,16 +3942,16 @@ pub unsafe extern "C" fn style_engine_remove_native_rule(
         .iter()
         .any(|rule| RuleRef::Materialized(rule).rule_type() == NativeRuleType::CounterStyle);
     unsafe { begin(context, changes_environment, has_counter_style) };
-    // SAFETY: Guaranteed by the caller.
-    let host = unsafe { sheet_writing_host(host) };
+    let mut published = Vec::new();
     for rule in removed {
-        let declares_layer = mutation::declares_layer(&rule);
+        unsafe { notify(context, mutation::declares_layer(&rule)) };
         let identity = RuleRef::Materialized(&rule).identity();
-        let id = with_engine(host, |engine| engine.native_rule_id(identity));
-        unsafe { notify(context, id.map_or(0, |id| id.0 + 1), declares_layer) };
-        if let Some(id) = id {
-            with_engine(host, |engine| operations::remove_rule(engine, id.0 + 1));
+        if host.published_rules().remove(sheet, identity) {
+            published.push(identity);
         }
+    }
+    if !published.is_empty() {
+        host.write_rules(RuleWrite::RemoveRules(published.into()));
     }
 }
 
@@ -3925,13 +3965,14 @@ pub unsafe extern "C" fn style_engine_remove_native_rule(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn style_engine_native_rule_target(
     host: *const DocumentHost,
+    read: &crate::render_state::BegunRead,
     rule: u32,
     result: &mut FfiNativeRuleTarget,
 ) -> bool {
     // SAFETY: Guaranteed by the caller.
-    let host = unsafe { sheet_writing_host(host) };
+    let host = unsafe { document_host(host) };
     // SAFETY: Guaranteed by the caller.
-    with_engine(host, |engine| unsafe { native_rule_target(engine, rule, result) })
+    with_engine(read, host, |engine| unsafe { native_rule_target(engine, rule, result) })
 }
 
 /// [`style_engine_native_rule_target`] on `engine`, which the style replay tool calls as well.
@@ -4020,6 +4061,7 @@ pub struct FfiContainerEffects {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn style_engine_take_container_effects(
     host: *const DocumentHost,
+    read: &crate::render_state::BegunRead,
     node: u32,
     context: *mut c_void,
     record: unsafe extern "C" fn(*mut c_void, FfiContainerEffect),
@@ -4027,7 +4069,8 @@ pub unsafe extern "C" fn style_engine_take_container_effects(
     // SAFETY: Guaranteed by the caller.
     let host = unsafe { document_host(host) };
     let verdict = StyleNodeID::from_raw(node)
-        .and_then(|node| with_engine(host, |engine| engine.take_container_effects_for_host(node)))
+        .filter(|_| host.container_effects_may_be_held())
+        .and_then(|node| with_engine(read, host, |engine| engine.take_container_effects_for_host(node)))
         .unwrap_or_default();
     for (node, kind) in verdict.effects {
         unsafe { record(context, FfiContainerEffect { node: node.raw(), kind }) };
@@ -4041,25 +4084,11 @@ pub unsafe extern "C" fn style_engine_take_container_effects(
     }
 }
 
-/// Interns one name identity and returns its document-local atom.
-///
-/// The caller passes the one-word identity of an interned string it holds a reference to, so the
-/// identity cannot be reused while the atom is live.
+/// Interns the name whose raw identity is `raw` in `engine`, as it adopts the atom its host interned, and as the style
+/// replay tool does.
 ///
 /// # Safety
-/// `host` must be a live document host, on its document's thread.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn style_engine_intern_atom(host: *const DocumentHost, raw: usize) -> u32 {
-    // SAFETY: Guaranteed by the caller.
-    let host = unsafe { document_host(host) };
-    // SAFETY: Guaranteed by the caller.
-    with_engine(host, |engine| unsafe { intern_atom(engine, raw) })
-}
-
-/// [`style_engine_intern_atom`] on `engine`, which the style replay tool calls as well.
-///
-/// # Safety
-/// As for [`style_engine_intern_atom`], for the arguments after `engine`.
+/// `raw` must be the raw identity of a live `AK::Utf16FlyString`, or a replay token.
 pub unsafe fn intern_atom(engine: &mut StyleEngine, raw: usize) -> u32 {
     let result = engine.intern_atom(raw);
     record_interned_atom(engine, raw, result);
@@ -4184,6 +4213,11 @@ pub(crate) unsafe fn take_style_transaction(
 }
 
 impl FfiStyleTransactionOutput {
+    /// The rows the transaction answered.
+    pub(crate) fn answers(&self) -> &[FfiStyleDelta] {
+        &self.answers
+    }
+
     /// The output as C++ reads it, for as long as the output stays where it is.
     pub(crate) fn view(&self) -> FfiStyleTransactionView {
         FfiStyleTransactionView {
@@ -4228,12 +4262,13 @@ pub unsafe fn style_engine_take_style_transaction_for_replay(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn style_engine_sort_style_deltas_for_direct_application(
     host: *const DocumentHost,
+    read: &crate::render_state::BegunRead,
     deltas: *mut FfiStyleDelta,
     count: usize,
 ) {
     // SAFETY: Guaranteed by the caller.
     let host = unsafe { document_host(host) };
-    with_engine(host, |engine| {
+    with_engine(read, host, |engine| {
         if count == 0 {
             return;
         }
@@ -4331,11 +4366,11 @@ pub unsafe fn style_engine_counter_for_replay(
     name.as_ptr()
 }
 
-/// Records a benchmark phase marker when capture is enabled.
+/// Queues a benchmark phase marker, which the engine records in the order of its calls when capture is enabled.
 ///
 /// # Safety
 /// `host` must be a live document host, on its document's thread, and `name` must point at `length`
-/// readable UTF-16 code units.
+/// readable code units, one byte each where `is_ascii` and UTF-16 otherwise.
 #[cfg(feature = "style-recording")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn style_engine_record_benchmark_marker(
@@ -4344,24 +4379,18 @@ pub unsafe extern "C" fn style_engine_record_benchmark_marker(
     length: usize,
     is_ascii: bool,
 ) {
+    let name = if is_ascii {
+        // SAFETY: Guaranteed by the caller.
+        unsafe { borrow(name.cast::<u8>(), length) }
+            .iter()
+            .map(|&code_unit| u16::from(code_unit))
+            .collect()
+    } else {
+        // SAFETY: Guaranteed by the caller.
+        Box::from(unsafe { borrow(name.cast::<u16>(), length) })
+    };
     // SAFETY: Guaranteed by the caller.
-    let host = unsafe { document_host(host) };
-    with_engine(host, |engine| {
-        if engine.recording_id().is_none() {
-            return;
-        }
-        engine.record_boundary_call(EventKind::BenchmarkMarker, |payload| {
-            if is_ascii {
-                let name = unsafe { borrow(name.cast::<u8>(), length) };
-                payload.write_length(name.len());
-                for &code_unit in name {
-                    payload.write_u16(u16::from(code_unit));
-                }
-            } else {
-                payload.write_u16_slice(unsafe { borrow(name.cast::<u16>(), length) });
-            }
-        });
-    })
+    unsafe { super::engine_calls::queue(host, super::engine_calls::EngineWrite::BenchmarkMarker(name)) };
 }
 
 pub(super) unsafe fn borrow<'a, T>(pointer: *const T, count: usize) -> &'a [T] {
@@ -4373,6 +4402,45 @@ pub(super) unsafe fn borrow<'a, T>(pointer: *const T, count: usize) -> &'a [T] {
 }
 
 include!(concat!(env!("OUT_DIR"), "/style_engine_boundary_generated.rs"));
+
+impl StyleChange {
+    /// Whether the change notes what an attribute name's forms are, or what an `attr()` reads it as: what the name is,
+    /// which no style transaction can answer differently, so it need not wait for the drain of one that flew.
+    pub(crate) fn notes_attribute_name(&self) -> bool {
+        matches!(
+            self,
+            Self::NoteAttributeNameForms { .. } | Self::NoteAttributeSubstitutionName { .. }
+        )
+    }
+
+    /// Whether the change only keeps the engine from reclaiming records: it pins or unpins one, or begins or ends an
+    /// epoch of style record views. It changes nothing the paint properties are prepared from.
+    pub(crate) fn only_keeps_records_alive(&self) -> bool {
+        matches!(
+            self,
+            Self::BeginStyleRecordViewEpoch {}
+                | Self::EndStyleRecordViewEpoch {}
+                | Self::PinStyleRecord { .. }
+                | Self::UnpinStyleRecord { .. }
+        )
+    }
+
+    /// Whether the change may move a fact the host knows of the render state. One that keeps records alive, notes what
+    /// an attribute name is or what a value spells, picks the pseudo-element whose style is deferred, or begins or ends
+    /// a cold matching batch never does: none of them stages a style input or touches a layout box.
+    pub(crate) fn may_move_facts(&self) -> bool {
+        !self.only_keeps_records_alive()
+            && !self.notes_attribute_name()
+            && !matches!(
+                self,
+                Self::SetAttributeValueText { .. }
+                    | Self::SetPseudoElementStyleDeferred { .. }
+                    | Self::BeginColdMatchingBatch { .. }
+                    | Self::BeginAdaptiveColdMatchingBatch { .. }
+                    | Self::EndColdMatchingBatch {}
+            )
+    }
+}
 
 #[cfg(test)]
 mod tests {

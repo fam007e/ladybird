@@ -72,6 +72,7 @@ pub mod engine_calls;
 mod engine_sample;
 mod environment_move;
 pub mod exact_matcher;
+pub(crate) mod flight_style_rows;
 pub(crate) mod style_job;
 pub use crate::fast_hash;
 mod engine_handle;
@@ -83,6 +84,7 @@ pub mod impact;
 pub mod index;
 mod input_routing;
 mod inputs;
+pub(crate) use inputs::next_declaration_block_version;
 pub mod instrumentation;
 mod intern_table;
 pub(crate) mod layout_style;
@@ -102,13 +104,14 @@ mod random_bases;
 pub mod record_replay;
 mod resource_contexts;
 mod routing;
+pub(crate) mod rule_writes;
 mod sorted_merge;
 mod style_invalidation;
 mod transition_baselines;
 mod user_agent_selectors;
 pub(crate) use computed::StyleRecordLease;
 pub(crate) use publication::RecordDemand;
-pub(crate) use transition_baselines::InheritedAnimatedValue;
+pub(crate) use transition_baselines::{InheritedAnimatedValue, TransitionBaselines};
 mod weak_pool;
 #[cfg(not(feature = "style-recording"))]
 pub mod record_replay {
@@ -816,11 +819,12 @@ pub struct RetainedState {
     /// ledger is shared through an interior-mutable handle no worker owns a share of. The refresh
     /// points are `refresh_admission_facts`'s callers.
     admission: AdmissionFacts,
-    deferred_pseudo_element: Option<tree::PseudoElementKind>,
+    deferred_pseudo_elements: u64,
     tree: StyleNodeTree,
     program: StyleSheetProgram,
     native_rules: native_rules::NativeRuleRegistry,
-    declaration_block_version: u32,
+    /// The last declaration block version minted, by the engine or by its document's host, which mints without it.
+    declaration_block_version: Arc<std::sync::atomic::AtomicU32>,
     /// Whether the last transaction taken planned nothing but derived child reactions.
     last_transaction_only_derived_child_reactions: bool,
     /// Sheets whose rules currently have no entry points in the routing registry. A detached
@@ -909,7 +913,7 @@ pub struct RetainedState {
     environment_move_recompute_nodes: HashSet<StyleNodeID>,
     /// What the container conditions of the rows the engine answered read of their containers,
     /// per element, taken when the host installs the element's record.
-    container_effects_for_host: HashMap<StyleNodeID, container_queries::ContainerVerdict>,
+    container_effects_for_host: container_queries::ContainerEffectsForHost,
     /// Each node's gated rules and whether their conditions held for their targets when its
     /// winners were published, `None` where the engine could not decide them: the winners hold a
     /// gated rule's declarations exactly where it held, and an undecided one leaves the node to
@@ -967,11 +971,9 @@ pub struct RetainedState {
     /// The computed style groups each longhand reaches, which the host registers before it creates
     /// the engine.
     style_groups: &'static crate::css::computed_values::StyleGroupMasks,
-    /// https://drafts.csswg.org/css-transitions-2/#defining-before-change-style
-    /// Per transition target, by element and then pseudo-element kind, the before-change style its
-    /// transitions are decided against for the rest of the style stabilization epoch, pinned until
-    /// the epoch commits.
-    transition_baselines: HashMap<StyleNodeID, SmallVec<[(u8, u64); 1]>>,
+    /// The before-change style each transition target's transitions are decided against for the
+    /// rest of the style stabilization epoch, pinned until the epoch commits.
+    transition_baselines: transition_baselines::TransitionBaselines,
     /// Whether the registrations used by this transaction differ from the preceding one. A
     /// previously substituted record must then be recomputed by C++, which implements registered
     /// custom properties, even when its cascade winners did not move.
@@ -1132,6 +1134,8 @@ pub struct HostState {
     flushing_deferred_geometry_journal: bool,
     /// Exact element reactions retained across rootless flushes until a style root can consume them.
     deferred_element_style_inputs: Vec<NormalizedInput>,
+    /// Whether the deferred element style inputs moved since the document's host last took them.
+    deferred_element_style_inputs_moved: bool,
     /// Whether the deferred element style inputs are owed to the next transaction, as opposed to
     /// held back by a flush without a document root.
     deferred_element_style_inputs_are_pending: bool,

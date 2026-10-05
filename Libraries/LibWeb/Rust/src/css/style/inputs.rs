@@ -301,12 +301,19 @@ impl RetainedState {
 
     // A stable declaration owner changes contents without changing its address. Reserve zero for
     // absence and one for the initial block, then issue fresh identities for subsequent edits.
-    pub(crate) fn next_declaration_block_version(&mut self) -> u32 {
-        self.declaration_block_version = self
-            .declaration_block_version
-            .checked_add(1)
-            .expect("declaration revision overflow");
-        self.declaration_block_version
+    pub(crate) fn next_declaration_block_version(&self) -> u32 {
+        next_declaration_block_version(&self.declaration_block_version)
+    }
+
+    /// Mints declaration blocks from `versions`, which the document's host mints from as well, rather than from
+    /// versions of the engine's own. The engine has minted none yet.
+    pub(crate) fn share_declaration_block_versions(&mut self, versions: Arc<std::sync::atomic::AtomicU32>) {
+        debug_assert_eq!(
+            self.declaration_block_version
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        self.declaration_block_version = versions;
     }
 
     pub(super) fn compile_selectors(
@@ -352,8 +359,12 @@ impl RetainedState {
     /// Moves whenever an attribute name comes to require its value text: a selector's here, or an
     /// `attr()`'s anywhere in the process.
     pub fn attribute_value_text_requirements_version(&self) -> u64 {
+        with_attr_names_read(self.selector_attribute_value_text_requirements_version())
+    }
+
+    /// Moves whenever an attribute name comes to require its value text for a selector here.
+    pub fn selector_attribute_value_text_requirements_version(&self) -> u64 {
         self.attribute_value_text_requirements_version
-            .wrapping_add(crate::css::parser::arbitrary_substitution::attr_names_read_generation())
     }
 
     /// Whether the host records what the values of an attribute name spell: for a selector whose
@@ -906,16 +917,36 @@ impl RetainedState {
         self.published_style_record_view(style_record)
     }
 
-    /// The dependency flags of the element's published style record, or of its record for one
-    /// pseudo-element kind. `None` while there is no such record.
+    /// The published style record `raw_style_record` names, as a view. `None` for zero, which
+    /// names no record.
     #[must_use]
-    pub(crate) fn published_style_dependency_flags(&self, node: StyleNodeID, pseudo_kind: Option<u8>) -> Option<u8> {
-        let style_record = match pseudo_kind {
-            Some(pseudo_kind) => self.computed_group_sets.pseudo_style_record(node, pseudo_kind),
-            None => self.computed_group_sets.assigned_style_record(node),
-        }?;
+    pub(crate) fn published_record_view(
+        &self,
+        raw_style_record: u64,
+    ) -> Option<crate::css::computed_value_views::ComputedValuesView<'_>> {
+        self.published_style_record_view(computed::FinalStyleRecordID::from_raw(raw_style_record))
+    }
+
+    /// The dependency flags of the published style record `raw_style_record` names. `None` for
+    /// zero, which names no record.
+    #[must_use]
+    pub(crate) fn published_record_dependency_flags(&self, raw_style_record: u64) -> Option<u8> {
+        let style_record = computed::FinalStyleRecordID::from_raw(raw_style_record)?;
         self.computed_group_sets
             .style_record_dependency_flags(style_record.raw())
+    }
+
+    /// The computed longhand table of the published style record `raw_style_record` names, which
+    /// keeps what the record's values were specified as. `None` for zero, which names no record.
+    #[must_use]
+    pub(crate) fn published_record_longhand_table(
+        &self,
+        raw_style_record: u64,
+    ) -> Option<&crate::css::computed_longhand_table::ComputedLonghandTable> {
+        let style_record = computed::FinalStyleRecordID::from_raw(raw_style_record)?;
+        let view = self.computed_group_sets.style_record_view(style_record.raw())?;
+        // SAFETY: The record is live, and shares its table for as long as it is.
+        unsafe { view.longhand_table.as_ref() }
     }
 
     pub(super) fn published_style_record_view(
@@ -1155,22 +1186,16 @@ impl RetainedState {
         }
     }
 
-    /// The custom-property environment one of an element's synthetic pseudo-elements holds, or null.
-    pub(crate) fn pseudo_element_custom_property_data(&self, node: StyleNodeID, pseudo: u8) -> *const std::ffi::c_void {
+    /// The custom-property environments an element's synthetic pseudo-elements hold, by kind.
+    pub(crate) fn pseudo_element_custom_property_environments(
+        &self,
+        node: StyleNodeID,
+    ) -> impl Iterator<Item = (u8, *const std::ffi::c_void)> + '_ {
         self.pseudo_element_custom_property_data
             .get(&node)
-            .and_then(|environments| environments.iter().find(|(kind, _)| *kind == pseudo))
-            .map_or(std::ptr::null(), |(_, environment)| environment.data.data())
-    }
-
-    /// The kinds of an element's synthetic pseudo-elements that hold a custom-property environment,
-    /// one bit per kind.
-    pub(crate) fn pseudo_elements_with_custom_property_data(&self, node: StyleNodeID) -> u64 {
-        self.pseudo_element_custom_property_data
-            .get(&node)
-            .map_or(0, |environments| {
-                environments.iter().fold(0, |kinds, (kind, _)| kinds | (1 << kind))
-            })
+            .into_iter()
+            .flatten()
+            .map(|(kind, environment)| (*kind, environment.data.data()))
     }
 
     /// Record whether the element's style reads its custom-property environment other than through
@@ -1395,25 +1420,6 @@ impl RetainedState {
         slot: animations::AnimationSlot,
     ) -> &[animations::CssDefinedAnimation] {
         self.css_defined_animations.list(node, slot)
-    }
-
-    /// Replaces the `@keyframes` row of one style scope, as its rule cache resolved them: each name
-    /// with the host's keyframe set for it. An empty row gives the scope's row up.
-    pub fn set_tree_scope_animation_keyframes(
-        &mut self,
-        tree_scope: TreeScopeID,
-        shadow_root_identity: usize,
-        name_lengths: &[u32],
-        name_units: &[u16],
-        keyframe_sets: &[usize],
-    ) {
-        self.animation_keyframes.set(
-            tree_scope,
-            shadow_root_identity,
-            name_lengths,
-            name_units,
-            keyframe_sets,
-        );
     }
 
     /// The `@keyframes` the document's style scopes define.
@@ -1812,11 +1818,11 @@ impl StyleEngineState {
             retained: RetainedState {
                 memory,
                 admission: AdmissionFacts::default(),
-                deferred_pseudo_element: None,
+                deferred_pseudo_elements: 0,
                 tree,
                 program: StyleSheetProgram::new(),
                 native_rules: Default::default(),
-                declaration_block_version: 1,
+                declaration_block_version: Arc::new(std::sync::atomic::AtomicU32::new(1)),
                 last_transaction_only_derived_child_reactions: false,
                 sheets_excluded_from_routing: BitColumn::default(),
                 routing_needs_detachment_sweep: false,
@@ -1855,7 +1861,7 @@ impl StyleEngineState {
                 element_custom_property_data: HashMap::default(),
                 pseudo_element_custom_property_data: HashMap::default(),
                 environment_move_recompute_nodes: HashSet::default(),
-                container_effects_for_host: HashMap::default(),
+                container_effects_for_host: Default::default(),
                 published_container_verdicts: HashMap::default(),
                 container_gates_unheld: HashSet::default(),
                 row_inputs_moved: flush::RowInputsMoved::default(),
@@ -1874,7 +1880,7 @@ impl StyleEngineState {
                 random_base_values: Default::default(),
                 replaced_content_inputs: HashMap::default(),
                 style_groups: crate::css::computed_values::StyleGroupMasks::registered_or_none(),
-                transition_baselines: HashMap::default(),
+                transition_baselines: Default::default(),
                 custom_property_registrations_changed: false,
                 engine_computed_records_pending: HashMap::default(),
                 demand_records: HashMap::default(),
@@ -1943,6 +1949,7 @@ impl StyleEngineState {
                 deferred_geometry_journal: NormalizationJournal::new(),
                 flushing_deferred_geometry_journal: false,
                 deferred_element_style_inputs: Vec::new(),
+                deferred_element_style_inputs_moved: false,
                 deferred_element_style_inputs_are_pending: false,
                 environment_move_changed_names: Default::default(),
                 environment_move_actions: Vec::new(),
@@ -2241,8 +2248,34 @@ impl StyleEngineState {
             return 0;
         }
         self.host.deferred_element_style_inputs.remove(index);
+        self.host.deferred_element_style_inputs_moved = true;
         u32::from(reaction | pending_reaction)
             | (u32::from(inherited_style_groups | pending_inherited_style_groups) << 8)
+    }
+
+    /// The element style inputs the engine defers, by element, where they moved since the last time they were taken.
+    pub(crate) fn take_moved_deferred_element_style_inputs(
+        &mut self,
+    ) -> Option<Vec<crate::css::style::engine_calls::DeferredInput>> {
+        if !std::mem::take(&mut self.host.deferred_element_style_inputs_moved) {
+            return None;
+        }
+        Some(
+            self.host
+                .deferred_element_style_inputs
+                .iter()
+                .filter_map(|input| match (input.key, input.new) {
+                    (
+                        InputKey::ElementStyleInput(node),
+                        InputValue::ElementStyleInput {
+                            reaction,
+                            inherited_style_groups,
+                        },
+                    ) => Some((node, reaction, inherited_style_groups)),
+                    _ => None,
+                })
+                .collect(),
+        )
     }
 
     /// Drop the style input an element owes: C++ computed the element's style, which answers it.
@@ -2253,6 +2286,7 @@ impl StyleEngineState {
             .binary_search_by_key(&InputKey::ElementStyleInput(node), |pending| pending.key)
         {
             self.host.deferred_element_style_inputs.remove(index);
+            self.host.deferred_element_style_inputs_moved = true;
         }
     }
 
@@ -2266,6 +2300,7 @@ impl StyleEngineState {
         else {
             return;
         };
+        self.host.deferred_element_style_inputs_moved = true;
         let InputValue::ElementStyleInput {
             reaction,
             inherited_style_groups,
@@ -3338,7 +3373,7 @@ impl RetainedState {
         let Self {
             memory: _,
             admission: _,
-            deferred_pseudo_element: _,
+            deferred_pseudo_elements: _,
             // Retires the whole batch at once, in `retire_elements`.
             tree: _,
             program: _,
@@ -3479,7 +3514,7 @@ impl RetainedState {
         element_custom_property_data.remove(&node);
         pseudo_element_custom_property_data.remove(&node);
         environment_move_recompute_nodes.remove(&node);
-        container_effects_for_host.remove(&node);
+        container_effects_for_host.set(node, None);
         published_container_verdicts.remove(&node);
         container_gates_unheld.remove(&node);
         row_inputs_moved.forget(node);
@@ -3504,7 +3539,7 @@ impl RetainedState {
         random_base_values.retire(node);
         replaced_content_inputs.remove(&node);
         // A retired identity can name another element before the epoch commits.
-        for (_, style_record) in transition_baselines.remove(&node).into_iter().flatten() {
+        for style_record in transition_baselines.remove(node) {
             computed_group_sets.unpin_style_record(style_record);
         }
     }
@@ -3518,4 +3553,18 @@ impl HostState {
             .binary_search_by_key(&InputKey::ElementStyleInput(node), |pending| pending.key)
             .is_ok()
     }
+}
+
+/// Mints the next declaration block version of `versions`.
+pub(crate) fn next_declaration_block_version(versions: &std::sync::atomic::AtomicU32) -> u32 {
+    versions
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        .checked_add(1)
+        .expect("declaration revision overflow")
+}
+
+/// The attribute value text requirements version of an engine whose selectors' requirements are at `selector_version`:
+/// it moves with every name an `attr()` anywhere in the process can newly read, too.
+pub(crate) fn with_attr_names_read(selector_version: u64) -> u64 {
+    selector_version.wrapping_add(crate::css::parser::arbitrary_substitution::attr_names_read_generation())
 }

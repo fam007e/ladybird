@@ -26,6 +26,8 @@ enum class FfiFlightBlocker : uint8_t;
 
 namespace Web::HTML {
 
+class PresentationQueue;
+
 class WEB_API EventLoop : public JS::Cell {
     GC_CELL(EventLoop, JS::Cell);
     GC_DECLARE_ALLOCATOR(EventLoop);
@@ -147,14 +149,22 @@ public:
     // in between two tasks. A rendering update whose style transaction flies runs its steps from its style and layout
     // on once the transaction is taken in.
     void did_let_recording_fly(LocalNavigable&);
+    // The frames of the navigables this event loop renders, in the order the compositor presents them.
+    PresentationQueue& presentation_queue() { return *m_presentation_queue; }
     // Called before a rendering update submits a recording, on a thread with a Core event loop.
     void ensure_frame_completion_registered();
+    // Whether a frame flies beside the event loop, which has not taken it in yet.
     bool has_frame_in_flight() const;
+    // Whether a rendering update has let its frame fly and has not run its steps from its style and layout on yet.
+    bool has_rendering_update_in_flight() const { return m_rendering_update_in_flight; }
     // Runs the steps of the rendering update whose style transaction flies, which take the transaction in.
     void finish_rendering_update_in_flight();
     // A rendering task that would find a frame still in flight, or a rendering update not yet finished, keeps its place
     // in the queue until the frame has been taken in, rather than wait for it.
     bool holds_rendering_opportunity() const;
+    // Whether the tasks of `document` wait for the rendering update in flight: its steps after its style and layout
+    // deliver to the document's script what comes before any of its tasks. The tasks of other documents run beside it.
+    bool holds_tasks_of(DOM::Document const*) const;
     void hold_next_frame_for_testing() { m_holds_next_frame_for_testing = true; }
     void release_held_frames_for_testing();
 
@@ -168,10 +178,11 @@ private:
 
     void process_input_events() const;
     void update_the_rendering();
-    void update_the_rendering_from_style_and_layout(Vector<GC::Root<DOM::Document>> const& docs, double frame_timestamp, Layout::RustFFI::FfiFlightBlocker recording_blocker);
+    void update_the_rendering_after_style_and_layout(Vector<GC::Root<DOM::Document>> const& docs, double frame_timestamp, double update_start_time, Layout::RustFFI::FfiFlightBlocker recording_blocker);
     void finish_rendering_update(double update_start_time);
-    Layout::RustFFI::FfiFlightBlocker style_flight_blocker(Vector<GC::Root<DOM::Document>> const& docs) const;
+    Layout::RustFFI::FfiFlightBlocker style_flight_blocker(DOM::Document&) const;
     void resume_rendering_update_in_flight();
+    // Goes on with the rendering update in flight where it has landed, and presents the recordings that have landed.
     void take_finished_frames_in();
 
     Type m_type { Type::Window };
@@ -224,8 +235,7 @@ private:
 
     GC::Ptr<GC::Function<void()>> m_rendering_task_function;
 
-    // The navigables whose recordings fly beside the event loop.
-    Vector<GC::Ref<LocalNavigable>> m_navigables_with_recordings_in_flight;
+    NonnullOwnPtr<PresentationQueue> m_presentation_queue;
     bool m_frame_completion_registered { false };
     bool m_holds_next_frame_for_testing { false };
 

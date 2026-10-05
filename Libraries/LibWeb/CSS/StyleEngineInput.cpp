@@ -46,6 +46,7 @@
 #include <LibWeb/HTML/NavigableContainer.h>
 #include <LibWeb/Layout/ImageProvider.h>
 #include <LibWeb/Layout/LayoutRustBridge.h>
+#include <LibWeb/Layout/RenderDocument.h>
 #include <LibWeb/SVG/SVGClipPathElement.h>
 #include <LibWeb/SVG/SVGElement.h>
 #include <LibWeb/SVG/SVGGraphicsElement.h>
@@ -1024,32 +1025,23 @@ static void record_element_initial_features(DOM::Element& element)
     if (!style_engine || element.style_node_id() == no_style_node)
         return;
 
-    publish_element_selector_features(
-        *style_engine,
-        element,
-        element.style_node_id(),
-        [&](auto kind, auto name_atom, auto value_kind, auto value_atom) {
-            style_engine->record_local_feature_delta({
-                .node = element.style_node_id().value(),
-                .feature_kind = kind,
-                .name_atom = name_atom.value(),
-                .old_kind = StyleEngineFFI::FfiFeatureValueKind::Absent,
-                .old_atom = 0,
-                .new_kind = value_kind,
-                .new_atom = value_atom.value(),
-            });
-        },
-        [&](bool has_nonempty_text_child) {
-            style_engine->record_local_feature_delta({
-                .node = element.style_node_id().value(),
-                .feature_kind = StyleEngineFFI::FfiFeatureKind::Emptiness,
-                .name_atom = 0,
-                .old_kind = has_nonempty_text_child ? StyleEngineFFI::FfiFeatureValueKind::Present : StyleEngineFFI::FfiFeatureValueKind::Absent,
-                .old_atom = 0,
-                .new_kind = has_nonempty_text_child ? StyleEngineFFI::FfiFeatureValueKind::Absent : StyleEngineFFI::FfiFeatureValueKind::Present,
-                .new_atom = 0,
-            });
-        });
+    publish_element_selector_features(*style_engine, element, element.style_node_id(), [&](auto kind, auto name_atom, auto value_kind, auto value_atom) { style_engine->record_local_feature_delta({
+                                                                                                                                                              .node = element.style_node_id().value(),
+                                                                                                                                                              .feature_kind = kind,
+                                                                                                                                                              .name_atom = name_atom.value(),
+                                                                                                                                                              .old_kind = StyleEngineFFI::FfiFeatureValueKind::Absent,
+                                                                                                                                                              .old_atom = 0,
+                                                                                                                                                              .new_kind = value_kind,
+                                                                                                                                                              .new_atom = value_atom.value(),
+                                                                                                                                                          }); }, [&](bool has_nonempty_text_child) { style_engine->record_local_feature_delta({
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                               .node = element.style_node_id().value(),
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                               .feature_kind = StyleEngineFFI::FfiFeatureKind::Emptiness,
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                               .name_atom = 0,
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                               .old_kind = has_nonempty_text_child ? StyleEngineFFI::FfiFeatureValueKind::Present : StyleEngineFFI::FfiFeatureValueKind::Absent,
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                               .old_atom = 0,
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                               .new_kind = has_nonempty_text_child ? StyleEngineFFI::FfiFeatureValueKind::Absent : StyleEngineFFI::FfiFeatureValueKind::Present,
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                               .new_atom = 0,
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           }); });
 
     if (auto const& id = element.id(); id.has_value())
         style_engine->set_element_id_name(element.style_node_id(), style_engine->intern_atom(*id));
@@ -1098,6 +1090,8 @@ void record_element_moved(DOM::Element& element, DOM::Node* old_parent, DOM::Ele
         && previous.next_element_sibling == relations.next_element_sibling) {
         return;
     }
+    // A style transaction that flew styled the element where it was, and what inherits from it under where it was.
+    style_engine->note_style_node_arrived_or_retired(element.style_node_id());
 
     // A heading's level counts the heading offset its ancestors declare, so moving under a
     // different ancestor can change it without the element itself changing at all.
@@ -1887,10 +1881,10 @@ static void visit_compilation(StyleSheetState const& sheet, u64 rule_identity, D
 }
 
 struct RuleCompilationContext {
-    RuleCompilationContext(StyleEngine& style_engine, SheetID sheet_handle, StyleEngineRuleID before_rule, DOM::Document const& document, StyleComputer& style_computer)
+    RuleCompilationContext(StyleEngine& style_engine, SheetID sheet_handle, u64 before_rule_identity, DOM::Document const& document, StyleComputer& style_computer)
         : style_engine(style_engine)
         , sheet_handle(sheet_handle)
-        , before_rule(before_rule)
+        , before_rule_identity(before_rule_identity)
         , document(document)
         , style_computer(style_computer)
     {
@@ -1898,7 +1892,8 @@ struct RuleCompilationContext {
 
     StyleEngine& style_engine;
     SheetID sheet_handle;
-    StyleEngineRuleID before_rule;
+    // The native identity of the compiled rule the rules go before, or 0 for the end of the sheet.
+    u64 before_rule_identity;
     GC::Ref<DOM::Document const> document;
     GC::Ref<StyleComputer> style_computer;
 };
@@ -1916,10 +1911,10 @@ static void compile_rules_into(RuleCompilationContext const& context, StyleSheet
     Parser::ValueParserFFI::NativeStylePublication publication {
         .host = context.style_engine.host(),
         .sheet = context.sheet_handle.value(),
-        .before_rule = context.before_rule.value(),
+        .before = context.before_rule_identity,
     };
     CompilationVisitor visit = [&](RustRule::Type rule_type, StyleSheetState const& source, auto const&, auto const& result) {
-        if (purpose == Parser::ValueParserFFI::NativeCompilationPurpose::Selectors && result.rule_id != 0)
+        if (purpose == Parser::ValueParserFFI::NativeCompilationPurpose::Selectors && result.published)
             context.style_computer->document().bump_style_environment_version();
         if (result.declares_transitions)
             context.style_engine.note_css_transitions_may_observe_style_changes();
@@ -1928,7 +1923,7 @@ static void compile_rules_into(RuleCompilationContext const& context, StyleSheet
                 scope.invalidate_counter_style_cache();
             });
         }
-        if (result.rule_id != 0)
+        if (result.published)
             context.style_computer->register_style_engine_sheet_source(source);
         return true;
     };
@@ -2096,7 +2091,7 @@ static void record_style_rule_inserted_in(u64 identity, bool changes_environment
     RuleCompilationContext context {
         style_computer.style_engine(),
         sheet_id,
-        StyleEngineRuleID { StyleEngineFFI::style_engine_native_rule_successor(style_computer.style_engine().host(), sheet.native_sheet().handle(), identity) },
+        StyleEngineFFI::style_engine_native_rule_successor(style_computer.style_engine().host(), sheet_id.value(), sheet.native_sheet().handle(), identity),
         document,
         style_computer
     };
@@ -2146,6 +2141,8 @@ void record_style_rule_removed(StyleSheetState& sheet_it_left, RustRule const& r
 {
     if (stop_sharing_compiled_style_sheet(sheet_it_left))
         return;
+    // An imported sheet's rules were compiled into the sheet that imports it.
+    auto* compiled_sheet = owning_compiled_sheet(&sheet_it_left);
     for_each_document_with_engine_copy(sheet_it_left, [&](DOM::Document& document) {
         document.flush_deferred_style_change_event();
         auto& style_computer = document.style_computer();
@@ -2158,7 +2155,7 @@ void record_style_rule_removed(StyleSheetState& sheet_it_left, RustRule const& r
             sheet_it_left.native_sheet().handle(),
             rule.handle(),
             detached_import ? detached_import->native_sheet().handle() : nullptr,
-            style_computer.style_engine_sheet_id_for(sheet_it_left).value(),
+            compiled_sheet ? style_computer.style_engine_sheet_id_for(*compiled_sheet).value() : 0,
             &context,
             [](void* opaque, bool changes_environment, bool has_counter_style) {
                 auto& context = *static_cast<RemovalContext*>(opaque);
@@ -2172,7 +2169,7 @@ void record_style_rule_removed(StyleSheetState& sheet_it_left, RustRule const& r
                     });
                 }
             },
-            [](void* opaque, u32, bool declares_layer) {
+            [](void* opaque, bool declares_layer) {
                 auto& context = *static_cast<RemovalContext*>(opaque);
                 if (declares_layer)
                     publish_layer_order_for_sheet(context.sheet, context.document);
@@ -2217,10 +2214,11 @@ void record_style_rule_declarations_changed(RustRule const& rule, StyleSheetStat
             GC::Ref<DOM::Document> document;
             bool changes_environment;
         } context { document, rule.type() != RustRule::Type::Keyframe && rule_change_needs_style_environment_bump(rule) };
-        auto& style_engine = document.style_computer().style_engine();
+        auto& style_computer = document.style_computer();
+        auto& style_engine = style_computer.style_engine();
         if (StyleEngineFFI::style_engine_native_rule_declarations_changed(
-                style_engine.host(), rule.handle(), &context,
-                [](void* opaque, u32) {
+                style_engine.host(), style_computer.style_engine_sheet_id_for(*sheet).value(), rule.handle(), &context,
+                [](void* opaque) {
                     auto& context = *static_cast<ChangeContext*>(opaque);
                     if (context.changes_environment)
                         context.document->bump_style_environment_version();

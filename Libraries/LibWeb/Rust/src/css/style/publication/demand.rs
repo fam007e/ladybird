@@ -128,7 +128,7 @@ impl RetainedState {
         self.put_back_engine_computed_records(node, scratch, counters);
         set_contains(&mut self.nodes_with_substituted_records, node, saves.uses_substitution);
         set_entry(&mut self.custom_declaration_reads, node, saves.custom_declaration_reads);
-        set_entry(&mut self.container_effects_for_host, node, saves.container_effects);
+        self.container_effects_for_host.set(node, saves.container_effects);
         set_entry(&mut self.published_container_verdicts, node, saves.container_verdicts);
         set_contains(&mut self.container_gates_unheld, node, saves.container_gate_unheld);
         set_entry(&mut self.nodes_with_tree_counting_records, node, saves.tree_counting);
@@ -465,10 +465,10 @@ impl StyleEngineState {
             .style_record_view(element.raw())
             .and_then(|view| unsafe { view.longhand_table.as_ref() })
             .is_some_and(|table| table.display_is_list_item());
-        // A ::selection without rules of its own inherits its ancestor's.
+        // A highlight pseudo-element without rules of its own inherits its ancestor's.
         let generated = kinds_with_rules & (1 << kind) != 0
             || (kind == pseudo_kind::MARKER && element_is_list_item)
-            || (kind == pseudo_kind::SELECTION
+            || (pseudo_kind::is_highlight(kind)
                 && self
                     .retained
                     .retained_highlight_inheritance_parent_style_record(node, kind)

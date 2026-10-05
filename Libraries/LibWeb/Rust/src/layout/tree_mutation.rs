@@ -74,6 +74,7 @@ impl OwedHostWork {
                             facts: crate::layout::host_tables::ShellFacts { id: row, kind },
                             record: arena.node_style_record(row),
                             payloads: arena.data(row).style.get(),
+                            derived: arena.node_style_record_is_derived(row),
                             attach_resources,
                         }
                     }
@@ -92,11 +93,13 @@ enum DueHostCall {
     },
     Freed(FreedSubtree),
     PaintableRowReset(PaintableRowReset),
-    /// The layout node of the row, if something made one, hears the row's style record and payloads.
+    /// The layout node of the row, if something made one, hears the row's style record and payloads, and whether the
+    /// arena derived the record.
     ShellStyleChanged {
         facts: crate::layout::host_tables::ShellFacts,
         record: u64,
         payloads: crate::layout::node_data::StylePayloadsRef,
+        derived: bool,
         attach_resources: bool,
     },
 }
@@ -126,8 +129,9 @@ impl HostWorkDue {
                     facts,
                     record,
                     payloads,
+                    derived,
                     attach_resources,
-                } => tell_shell_of_style_change(main_thread, facts, record, payloads, attach_resources),
+                } => tell_shell_of_style_change(main_thread, facts, record, payloads, derived, attach_resources),
             }
         }
     }
@@ -139,6 +143,7 @@ fn tell_shell_of_style_change(
     facts: crate::layout::host_tables::ShellFacts,
     record: u64,
     payloads: crate::layout::node_data::StylePayloadsRef,
+    derived: bool,
     attach_resources: bool,
 ) {
     let Some(host_tables) = main_thread.host_tables() else {
@@ -168,6 +173,7 @@ fn tell_shell_of_style_change(
             shell.as_ptr(),
             record,
             payloads.as_ptr().cast(),
+            derived,
             attach_resources,
         );
     };
@@ -242,12 +248,10 @@ fn next_sibling_of(arena: &LayoutNodeArena, node: NodeSlotId) -> NodeSlotId {
 
 impl LayoutNodeArena {
     pub(crate) fn attach_child(&self, parent: NodeSlotId, child: UnplacedLayoutNode, before: NodeSlotId) {
-        self.assert_owner_thread();
         self.insert_child(parent, child.into_slot(), before);
     }
 
     pub(crate) fn detach_child(&self, parent: NodeSlotId, child: NodeSlotId) {
-        self.assert_owner_thread();
         self.remove_child(parent, child);
     }
 
@@ -261,7 +265,6 @@ impl LayoutNodeArena {
     }
 
     pub(crate) fn move_child(&self, child: NodeSlotId, new_parent: NodeSlotId, before: NodeSlotId) {
-        self.assert_owner_thread();
         let old_parent = parent_of(self, child);
         assert!(!old_parent.is_invalid(), "moved layout node has no parent");
         self.remove_child(old_parent, child);

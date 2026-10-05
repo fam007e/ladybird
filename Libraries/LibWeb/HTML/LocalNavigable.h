@@ -312,8 +312,8 @@ public:
         // Where the recording is needed now: waits for it to finish.
         Wait,
     };
-    // Takes the recording in flight in, and presents its frame where it still stands. Answers whether no recording is
-    // in flight any more.
+    // Takes the recording in flight in, and hands the presentation queue its frame where it still stands. Answers
+    // whether no recording is in flight any more.
     bool take_recording_in_flight_in(TakeIn);
     bool has_recording_in_flight() const { return m_recording_in_flight; }
     void hold_recording_in_flight_for_testing();
@@ -400,12 +400,12 @@ public:
     bool perform_a_scroll_step_for_key_input(Layout::Node&, CSSPixelPoint delta, Compositing::SnapSelectionStrategy::Type);
     bool perform_a_snapped_momentum_scroll(Layout::Node&, CSSPixelPoint momentum_delta);
     Layout::Node* layout_node_for_async_scroll_node_stable_id(Web::AsyncScrollNodeStableID);
-    void re_snap_scroll_containers_after_layout_change();
+    void re_snap_scroll_containers_after_layout_change(Layout::BegunRead const& read);
     void abort_in_flight_smooth_scrolls(Web::AsyncScrollNodeStableID, SmoothScrollAbortCause);
     void abort_in_flight_smooth_scrolls_taken_over_by_user_input(Web::AsyncScrollNodeStableID, CSSPixelPoint scroll_offset_at_gesture_start);
     void queue_scrollend_event_after_user_scroll(GC::Ref<DOM::EventTarget>, Optional<Web::AsyncScrollNodeStableID>, Optional<CSSPixelPoint> scroll_offset_before_scroll = {}, SnapPositionSelection = SnapPositionSelection::AtGestureEnd);
     void note_user_scroll_input_intent(Compositing::SnapSelectionStrategy::Type);
-    RefPtr<Painting::Scrollbar> scrollbar_dragged_by_compositor(Web::ScrollbarDraggedByCompositor const&);
+    RefPtr<Painting::Scrollbar> scrollbar_dragged_by_compositor(Layout::BegunRead const& read, Web::ScrollbarDraggedByCompositor const&);
     void note_user_scroll_gesture_phase(Web::ScrollGesturePhase);
     void defer_user_scroll_settlement();
     void snap_user_scroll_gestures_that_awaited_layout();
@@ -428,9 +428,14 @@ protected:
     Variant<Empty, Traversal, Utf16String> m_ongoing_navigation;
 
 private:
+    // A rendering update's recording that flies beside the event loop, with what its frame is finished with.
+    struct RecordingInFlight;
+
     Layout::RustFFI::FfiFlightBlocker recording_flight_blocker(DOM::UpdateLayoutReason);
     Optional<Compositor::CompositorFrame> finish_compositor_frame(DOM::Document&, PaintConfig const&, RefPtr<Compositing::DisplayList>);
+    Optional<Compositor::CompositorFrame> finish_recording_in_flight(RecordingInFlight&, bool landed_standing);
     void submit_painted_frame(Compositor::CompositorFrame);
+    Gfx::IntRect present_viewport_rect() const;
 
     enum class PendingNavigationBehavior {
         Append,
@@ -585,8 +590,6 @@ private:
     bool m_needs_repaint { true };
     bool m_needs_to_record_display_list { true };
 
-    // A rendering update's recording that flies beside the event loop, with what its frame is finished with.
-    struct RecordingInFlight;
     OwnPtr<RecordingInFlight> m_recording_in_flight;
     bool m_last_recording_in_flight_stood { true };
 
