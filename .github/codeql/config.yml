@@ -1,0 +1,4 @@
+name: "Ladybird CodeQL Config"
+
+paths-ignore:
+  - "UI/Android/**"
