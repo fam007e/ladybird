@@ -5,7 +5,6 @@ set(SOURCES
     DisplayList/Canvas2DCommandStream.cpp
     DisplayList/DisplayList.cpp
     DisplayList/DisplayListDamage.cpp
-    DisplayList/DisplayListPlayerSkia.cpp
     DisplayList/DisplayListResourceStorage.cpp
     DisplayList/DisplayListResourceTransaction.cpp
     DisplayList/RustFFIAssertions.cpp
@@ -30,6 +29,8 @@ compile_ipc(${LADYBIRD_SOURCE_DIR}/Services/Compositor/CompositorControlClient.i
 compile_ipc(${LADYBIRD_SOURCE_DIR}/Services/Compositor/CompositorControlServer.ipc ${CMAKE_BINARY_DIR}/Services/Compositor/CompositorControlServerEndpoint.h)
 compile_ipc(${LADYBIRD_SOURCE_DIR}/Services/Compositor/CompositorWebContentClient.ipc ${CMAKE_BINARY_DIR}/Services/Compositor/CompositorWebContentClientEndpoint.h)
 compile_ipc(${LADYBIRD_SOURCE_DIR}/Services/Compositor/CompositorWebContentServer.ipc ${CMAKE_BINARY_DIR}/Services/Compositor/CompositorWebContentServerEndpoint.h)
+compile_ipc(${LADYBIRD_SOURCE_DIR}/Services/Compositor/RenderClockClient.ipc ${CMAKE_BINARY_DIR}/Services/Compositor/RenderClockClientEndpoint.h)
+compile_ipc(${LADYBIRD_SOURCE_DIR}/Services/Compositor/RenderClockServer.ipc ${CMAKE_BINARY_DIR}/Services/Compositor/RenderClockServerEndpoint.h)
 compile_ipc(FontClient.ipc FontClientEndpoint.h)
 compile_ipc(FontServer.ipc FontServerEndpoint.h)
 
@@ -39,6 +40,8 @@ set(GENERATED_SOURCES
     ../../Services/Compositor/CompositorControlServerEndpoint.h
     ../../Services/Compositor/CompositorWebContentClientEndpoint.h
     ../../Services/Compositor/CompositorWebContentServerEndpoint.h
+    ../../Services/Compositor/RenderClockClientEndpoint.h
+    ../../Services/Compositor/RenderClockServerEndpoint.h
     FontClientEndpoint.h
     FontServerEndpoint.h
 )
@@ -57,7 +60,7 @@ test_rust_crate(MANIFEST_PATH Rust/Cargo.toml CRATE_NAME libcompositing_rust)
 
 ladybird_lib(LibCompositing compositing EXPLICIT_SYMBOL_EXPORT)
 target_link_libraries(LibCompositing PUBLIC LibWebCommon)
-target_link_libraries(LibCompositing PRIVATE LibCore LibGfx LibIPC LibMedia LibThreading skia libcompositing_rust)
+target_link_libraries(LibCompositing PRIVATE LibCore LibGfx LibIPC LibMedia LibThreading libcompositing_rust)
 
 # The WebGL command stream headers include ANGLE's GLES headers for the GL constants and types,
 # but the GL entry points live in the Compositor. Hand out only ANGLE's compile interface, to this

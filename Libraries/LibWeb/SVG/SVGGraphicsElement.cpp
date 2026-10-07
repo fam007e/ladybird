@@ -7,7 +7,6 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibGfx/Matrix4x4.h>
 #include <LibWeb/Bindings/SVGGraphicsElement.h>
 #include <LibWeb/CSS/Parser/Parser.h>
 #include <LibWeb/DOM/Document.h>
@@ -32,13 +31,6 @@ namespace Web::SVG {
 SVGGraphicsElement::SVGGraphicsElement(DOM::Document& document, DOM::QualifiedName qualified_name)
     : SVGElement(document, move(qualified_name))
 {
-}
-
-GC::Ptr<DOM::Element> SVGGraphicsElement::paint_server_element(Optional<CSS::SVGPaint> const& paint_value) const
-{
-    if (!paint_value.has_value() || !paint_value->is_url())
-        return {};
-    return resolve_url_to_element(paint_value->as_url());
 }
 
 GC::Ptr<DOM::Element> SVGGraphicsElement::resolve_url_to_element(CSS::URL const& url) const
@@ -114,7 +106,7 @@ WebIDL::ExceptionOr<GC::Ref<Geometry::DOMRect>> SVGGraphicsElement::get_b_box(Bi
     //        SVG coordinate space (before any viewbox or other transformations), so it should be possible to
     //        calculate this from SVG geometry without a full layout tree (at least for simple cases).
     //        See: https://svgwg.org/svg2-draft/coords.html#BoundingBoxes
-    Layout::ForcedReadScope read { document(), true };
+    Layout::ForcedReadScope read { document() };
     document().update_layout_if_needed_for_node(*this, DOM::UpdateLayoutReason::SVGGraphicsElementGetBBox);
     auto const* self_layout_node = layout_node(read);
     if (!self_layout_node)
@@ -141,7 +133,7 @@ WebIDL::ExceptionOr<GC::Ref<Geometry::DOMRect>> SVGGraphicsElement::get_b_box(Bi
             }
             if (!Painting::has_committed_box(*child))
                 continue;
-            auto child_rect = as<Layout::NodeWithStyle>(*child).used_svg_element_transform().map(Painting::absolute_rect(*child).to_type<float>());
+            auto child_rect = Painting::svg_element_transform(*child).map(Painting::absolute_rect(*child).to_type<float>());
             united_rect.unite(child_rect);
         }
         if (united_rect.is_empty())
@@ -189,7 +181,7 @@ GC::Ptr<Geometry::DOMMatrix> SVGGraphicsElement::get_screen_ctm()
     if (!is_connected())
         return {};
 
-    Layout::ForcedReadScope read { document(), true };
+    Layout::ForcedReadScope read { document() };
     document().update_layout_if_needed_for_node(*this, DOM::UpdateLayoutReason::SVGGraphicsElementGetScreenCTM);
 
     // 2. If the current element is a non-rendered element, and the UA is not able to resolve the style of the element,

@@ -183,7 +183,7 @@ void HTMLLinkElement::finished_loading_critical_style_subresources(AnyFailed)
 
 bool HTMLLinkElement::has_loaded_icon() const
 {
-    return m_relationship & Relationship::Icon && m_loaded_icon.has_value();
+    return m_relationship & Relationship::Icon && m_loaded_icon;
 }
 
 bool HTMLLinkElement::has_icon_keyword() const
@@ -610,15 +610,7 @@ void HTMLLinkElement::fetch_and_process_linked_preload_resource()
 
 static bool media_attribute_matches_environment(DOM::Document const& document, Utf16View media)
 {
-    if (media.is_empty())
-        return true;
-
-    auto media_queries = parse_media_query_list(media);
-    for (auto const& media_query : media_queries) {
-        if (media_query->evaluate(document))
-            return true;
-    }
-    return false;
+    return CSS::RustMediaList::parse(media).evaluate(document);
 }
 
 static Optional<Fetch::Infrastructure::Request::Destination> module_preload_destination_from_as_attribute(Utf16View as_attribute)
@@ -995,6 +987,47 @@ void HTMLLinkElement::process_linked_resource(bool success, Fetch::Infrastructur
     }
 }
 
+static NonnullRefPtr<Core::Promise<NonnullRefPtr<Gfx::Bitmap const>>> decode_favicon(ReadonlyBytes favicon_data, URL::URL const& favicon_url, Optional<MimeSniff::MimeType> mime_type, GC::Ref<DOM::Document> document)
+{
+    auto promise = Core::Promise<NonnullRefPtr<Gfx::Bitmap const>>::construct();
+
+    auto is_svg_icon = (mime_type.has_value() && mime_type.value().essence() == "image/svg+xml"sv) || favicon_url.basename().ends_with(".svg"sv);
+
+    if (is_svg_icon) {
+        SVG::SVGDecodedImageData::decode(document->page(), favicon_url, favicon_data)
+            ->when_resolved([promise](auto& image_data) {
+                // FIXME: Calculate size based on device pixel ratio
+                auto decoded_frame = image_data->default_frame({ 32, 32 });
+                if (!decoded_frame.has_value()) {
+                    promise->reject(Error::from_string_view("Failed to get bitmap from SVG favicon"sv));
+                    return;
+                }
+                promise->resolve(decoded_frame->bitmap_ref());
+            })
+            .when_rejected([promise](Error& error) {
+                promise->reject(move(error));
+            });
+        return promise;
+    }
+
+    auto on_failed_decode = [favicon_url, promise]([[maybe_unused]] Error& error) {
+        dbgln_if(IMAGE_DECODER_DEBUG, "Failed to decode favicon {}: {}", favicon_url, error);
+        promise->reject(move(error));
+    };
+
+    auto on_successful_decode = [document = GC::Root(document), promise](Web::Platform::DecodedImage& decoded_image) -> ErrorOr<void> {
+        auto favicon_bitmap = decoded_image.frames[0].bitmap;
+        dbgln_if(IMAGE_DECODER_DEBUG, "Decoded favicon, {}", favicon_bitmap->size());
+
+        promise->resolve(favicon_bitmap.release_nonnull());
+        return {};
+    };
+
+    (void)Platform::ImageCodecPlugin::the().decode_image(favicon_data, move(on_successful_decode), move(on_failed_decode));
+
+    return promise;
+}
+
 // AD-HOC: The spec is underspecified for fetching and processing rel="icon" See:
 //         https://github.com/whatwg/html/issues/1769
 void HTMLLinkElement::process_icon_resource(bool success, Fetch::Infrastructure::Response const& response, ByteBuffer body_bytes)
@@ -1002,8 +1035,22 @@ void HTMLLinkElement::process_icon_resource(bool success, Fetch::Infrastructure:
     if (!success)
         return;
 
-    m_loaded_icon = { response.url().value_or({}), move(body_bytes) };
-    document().check_favicon_after_loading_link_resource();
+    auto generation = m_current_fetch_generation;
+    decode_favicon(body_bytes.span(), response.url().value_or({}), Fetch::Infrastructure::extract_mime_type(response.header_list()), document())
+        ->when_resolved(GC::weak_callback(*this, [generation](HTMLLinkElement& element, NonnullRefPtr<Gfx::Bitmap const>& favicon) {
+            if (element.m_current_fetch_generation != generation || !element.document().is_fully_active())
+                return;
+
+            element.m_loaded_icon = favicon;
+            element.document().check_favicon_after_loading_link_resource();
+        }))
+        .when_rejected(GC::weak_callback(*this, [generation](HTMLLinkElement& element, Error&) {
+            if (element.m_current_fetch_generation != generation || !element.document().is_fully_active())
+                return;
+
+            element.m_loaded_icon = nullptr;
+            element.document().check_favicon_after_loading_link_resource();
+        }));
 }
 
 // https://html.spec.whatwg.org/multipage/links.html#link-type-stylesheet:process-the-linked-resource
@@ -1172,60 +1219,6 @@ void HTMLLinkElement::finish_processing_stylesheet_resource(u64 fetch_generation
     }
 }
 
-static NonnullRefPtr<Core::Promise<NonnullRefPtr<Gfx::Bitmap const>>> decode_favicon(ReadonlyBytes favicon_data, URL::URL const& favicon_url, GC::Ref<DOM::Document> document)
-{
-    auto promise = Core::Promise<NonnullRefPtr<Gfx::Bitmap const>>::construct();
-
-    if (favicon_url.basename().ends_with(".svg"sv)) {
-        auto result = SVG::SVGDecodedImageData::create(document->page(), favicon_url, favicon_data);
-        if (result.is_error()) {
-            promise->reject(Error::from_string_view("Failed to decode SVG favicon"sv));
-            return promise;
-        }
-
-        // FIXME: Calculate size based on device pixel ratio
-        Gfx::IntSize size { 32, 32 };
-        auto decoded_frame = result.release_value()->default_frame(size);
-        if (!decoded_frame.has_value()) {
-            promise->reject(Error::from_string_view("Failed to get bitmap from SVG favicon"sv));
-            return promise;
-        }
-
-        promise->resolve(decoded_frame->bitmap_ref());
-        return promise;
-    }
-
-    auto on_failed_decode = [favicon_url, promise]([[maybe_unused]] Error& error) {
-        dbgln_if(IMAGE_DECODER_DEBUG, "Failed to decode favicon {}: {}", favicon_url, error);
-        promise->reject(move(error));
-    };
-
-    auto on_successful_decode = [document = GC::Root(document), promise](Web::Platform::DecodedImage& decoded_image) -> ErrorOr<void> {
-        auto favicon_bitmap = decoded_image.frames[0].bitmap;
-        dbgln_if(IMAGE_DECODER_DEBUG, "Decoded favicon, {}", favicon_bitmap->size());
-
-        promise->resolve(favicon_bitmap.release_nonnull());
-        return {};
-    };
-
-    (void)Platform::ImageCodecPlugin::the().decode_image(favicon_data, move(on_successful_decode), move(on_failed_decode));
-
-    return promise;
-}
-
-RefPtr<Gfx::Bitmap const> HTMLLinkElement::load_favicon_if_window_is_active()
-{
-    if (!has_loaded_icon())
-        return {};
-
-    // FIXME: Refactor the caller(s) to handle the async nature of image loading
-    auto promise = decode_favicon(m_loaded_icon->icon, m_loaded_icon->url, document());
-
-    if (auto result = promise->await(); !result.is_error())
-        return result.release_value();
-    return {};
-}
-
 // https://html.spec.whatwg.org/multipage/links.html#rel-icon:the-link-element-3
 void HTMLLinkElement::load_fallback_favicon_if_needed(GC::Ref<DOM::Document> document)
 {
@@ -1274,8 +1267,11 @@ void HTMLLinkElement::load_fallback_favicon_if_needed(GC::Ref<DOM::Document> doc
         auto& realm = document->relevant_settings_object().realm();
         auto global = GC::Ref { realm.global_object() };
 
-        auto process_body = GC::create_function(GC::Heap::the(), [document, request](ByteBuffer body) {
-            decode_favicon(body, request->url(), document)
+        auto mime_type = Fetch::Infrastructure::extract_mime_type(response->header_list());
+
+        auto process_body = GC::create_function(GC::Heap::the(), [document, request, mime_type](ByteBuffer body) {
+            // FIXME: We should use the response URL to account for redirects when determining if this is an SVG icon.
+            decode_favicon(body, request->url(), mime_type, document)
                 ->when_resolved(GC::weak_callback(*document, [](DOM::Document& document, NonnullRefPtr<Gfx::Bitmap const>& favicon) {
                     if (auto navigable = document.navigable(); navigable && navigable->is_traversable())
                         navigable->page().client().page_did_change_favicon(*favicon);

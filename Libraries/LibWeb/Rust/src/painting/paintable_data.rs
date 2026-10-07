@@ -102,6 +102,16 @@ pub struct FfiSelectionEntry {
     pub state: u8,
 }
 
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct FfiSearchTextRange {
+    pub first_entry: usize,
+    pub entry_count: usize,
+    pub start_offset: usize,
+    pub end_offset: usize,
+    pub is_current: bool,
+}
+
 pub const SELECTION_STATE_NONE: u8 = 0;
 pub const SELECTION_STATE_START: u8 = 1;
 pub const SELECTION_STATE_END: u8 = 2;
@@ -130,10 +140,6 @@ pub enum BorderEdge {
 
 impl BorderEdge {
     pub const ALL: [BorderEdge; 4] = [BorderEdge::Top, BorderEdge::Right, BorderEdge::Bottom, BorderEdge::Left];
-
-    pub const fn index(self) -> usize {
-        self as usize
-    }
 }
 
 pub const PIECE_EDGE_TOP: u8 = 1 << 0;
@@ -228,6 +234,11 @@ impl CommittedSideData {
 
     pub(crate) fn lines(&self) -> &[crate::layout::inline_content::LineRecord] {
         self.inline_content.as_ref().map_or(&[], |content| &content.lines)
+    }
+    pub(crate) fn lines_after_clamp_point_rect(&self) -> Option<used_values::FfiCssPixelRect> {
+        self.inline_content
+            .as_ref()
+            .and_then(|content| content.lines_after_clamp_point_rect.as_deref().copied())
     }
     pub(crate) fn fragments(&self) -> &[FragmentRecord] {
         self.inline_content.as_ref().map_or(&[], |content| &content.fragments)

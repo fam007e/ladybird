@@ -13,7 +13,7 @@ use super::bridge::{
     FfiCustomFunctionEntry, FfiDocumentStyleComputationInputs, FfiHostHandle, FfiStyleSheetResourceContextEntry,
     FfiStyleTransactionOutput, FfiStyleTransactionView, take_style_transaction,
 };
-use super::engine_calls::{StyleAnswer, StyleQuery, ask_engine};
+use super::engine_calls::with_engine;
 use super::identities::StyleNodeIdAllocator;
 use super::tree::StyleNodeID;
 use crate::css::custom_properties::{CustomPropertyRegistry, retain_custom_property_registry};
@@ -22,10 +22,7 @@ use crate::css::rule::CompiledFunction;
 use crate::css::style_compute::FfiLengthResolutionContext;
 use crate::painting::ffi::FfiFlightBlocker;
 use crate::painting::recording_slot::FlightLicense;
-use crate::render_state::{
-    BegunRead, DocumentHost, ReadRight, RenderJob, RenderMessage, RenderWait, ReplyTo, SpentWait, StyleJobPermit,
-    TaskBoundary, fly, force_read, run_job,
-};
+use crate::render_state::{BegunRead, DocumentHost, TaskBoundary, fly};
 use std::sync::Arc;
 
 /// Takes the pending style transaction under `root`, with the document computation inputs the host sealed for it.
@@ -35,6 +32,10 @@ pub(crate) struct StyleJob {
     /// Whether the transaction flies beside the host, which leaves its atom sweep to a later transaction: the host may
     /// name an atom meanwhile that the sweep would reclaim before the host hears of it.
     flies: bool,
+    /// Where a style update applies the transaction's reactions as the job answers them, they close over the elements
+    /// they inherit through, but for those that inherit from the elements here, which arrived, moved or retired
+    /// beside the transaction the host drains: those are the next transaction's.
+    closes_beside: Option<super::HashSet<StyleNodeID>>,
 }
 
 /// A style transaction's document computation inputs, sealed on the host's thread: the job owns a copy of every buffer
@@ -134,15 +135,7 @@ impl SealedStyleInputs {
                 ..context
             })
         });
-        let custom_functions: Box<[_]> = lent_functions
-            .iter()
-            .map(|entry| FfiCustomFunctionEntry {
-                function: entry.function,
-                caller_scope: entry.caller_scope,
-                definition_scope: entry.definition_scope,
-                tree_scope: entry.tree_scope,
-            })
-            .collect();
+        let custom_functions = Box::<[FfiCustomFunctionEntry]>::from(lent_functions);
         let retained_functions = lent_functions
             .iter()
             .filter(|entry| !entry.function.is_null())
@@ -200,9 +193,21 @@ pub(crate) struct StyleJobAnswer {
     output: FfiStyleTransactionOutput,
     records: NamedRecords,
     /// The synthetic pseudo-elements each element whose row the host composes has rules for, as a C++ record's
-    /// pseudo-style mask, by element, which the host reads as it settles the element's pseudo-elements over the
-    /// composition.
-    composed_pseudo_styles: Box<[(u32, u64)]>,
+    /// pseudo-style mask, and those among them that no settle generates or changes, by element, which the host reads as
+    /// it settles the element's pseudo-elements over the composition.
+    composed_pseudo_styles: Box<[(u32, ComposedPseudoStyles)]>,
+    /// The transition steps the transaction decided beside the rows that owe them, by element, which the host's steps
+    /// read rather than ask.
+    decided_transition_steps: Box<[crate::css::transition::DecidedTransitionStep]>,
+}
+
+/// What a style transaction answers of the pseudo-elements of an element whose row the host composes.
+#[derive(Clone, Copy)]
+pub(crate) struct ComposedPseudoStyles {
+    /// The synthetic pseudo-elements with rules, as a C++ record's pseudo-style mask.
+    pub(crate) mask: u64,
+    /// The pseudo-elements in `mask` that a settle over any composition of the element leaves alone.
+    pub(crate) inert: u64,
 }
 
 /// The view of each record a transaction's rows name and the custom-property environment it was computed in, by record,
@@ -220,6 +225,11 @@ impl StyleJobAnswer {
         self.output.answers()
     }
 
+    /// The atoms the engine reclaimed as it took the transaction.
+    pub(crate) fn reclaimed_style_atoms(&self) -> &[super::atoms::ReclaimedStyleAtom] {
+        self.output.reclaimed_style_atoms()
+    }
+
     /// The view of `record`, one the rows name, and the custom-property environment it was computed in.
     pub(crate) fn record(&self, record: u64) -> Option<(super::bridge::FfiStyleRecordView, Option<u64>)> {
         let records = &self.records.0;
@@ -228,25 +238,18 @@ impl StyleJobAnswer {
         Some((view, environment))
     }
 
-    /// The synthetic pseudo-elements `node` has rules for, where the host composes its row.
-    pub(crate) fn composed_pseudo_style_mask(&self, node: u32) -> Option<u64> {
-        let masks = &self.composed_pseudo_styles;
-        let index = masks.binary_search_by_key(&node, |&(node, _)| node).ok()?;
-        Some(masks[index].1)
+    /// What the transaction answered of the pseudo-elements of `node`, where the host composes its row.
+    pub(crate) fn composed_pseudo_styles(&self, node: u32) -> Option<ComposedPseudoStyles> {
+        let styles = &self.composed_pseudo_styles;
+        let index = styles.binary_search_by_key(&node, |&(node, _)| node).ok()?;
+        Some(styles[index].1)
     }
-}
 
-impl RenderJob for StyleJob {
-    type Answer = StyleJobAnswer;
-    type Permit = StyleJobPermit;
-    const IS_STYLE: bool = true;
-
-    fn message(self, reply: ReplyTo<'_, StyleJobAnswer>, spent: SpentWait) -> RenderMessage<'_> {
-        RenderMessage::Style {
-            job: self,
-            reply,
-            _spent: spent,
-        }
+    /// The transition step the transaction decided beside the row of `node`, if it decided one.
+    pub(crate) fn decided_transition_step(&self, node: u32) -> Option<&crate::css::transition::DecidedTransitionStep> {
+        let steps = &self.decided_transition_steps;
+        let index = steps.binary_search_by_key(&node, |step| step.node()).ok()?;
+        Some(&steps[index])
     }
 }
 
@@ -255,7 +258,14 @@ impl StyleJob {
     pub(crate) fn run(self, engine: &mut StyleEngine) -> StyleJobAnswer {
         engine.defer_atom_sweep(self.flies);
         // SAFETY: The sealed inputs name only what they own, and live until the transaction has taken them in.
-        let output = unsafe { take_style_transaction(engine, self.root, self.computation_inputs.inputs) };
+        let output = unsafe {
+            take_style_transaction(
+                engine,
+                self.root,
+                self.computation_inputs.inputs,
+                self.closes_beside.as_ref(),
+            )
+        };
         engine.defer_atom_sweep(false);
         // The host reads the record each row replaces as well, as it compares a box's old style with its new one. Only a
         // live base record comes along: the host asks about a replaced overlay record itself.
@@ -286,21 +296,35 @@ impl StyleJob {
             })
             .collect();
         // The host settles the pseudo-elements of a row it composes only once it has composed the row, which asks
-        // which of them have rules: the transaction that matched the element answers it beside the row.
-        let mut composed_pseudo_styles: Vec<(u32, u64)> = output
+        // which of them have rules, and which of those the settle leaves alone: the transaction that matched the
+        // element answers it beside the row.
+        let mut composed_pseudo_styles: Vec<_> = output
             .answers()
             .iter()
             .filter(|row| row.composed_by_the_host)
             .filter_map(|row| {
                 let node = StyleNodeID::from_raw(row.style_node)?;
-                Some((row.style_node, engine.published_pseudo_style_mask(node)))
+                let styles = ComposedPseudoStyles {
+                    mask: engine.published_pseudo_style_mask(node),
+                    inert: engine.inert_pseudo_kinds(node),
+                };
+                Some((row.style_node, styles))
             })
             .collect();
         composed_pseudo_styles.sort_unstable_by_key(|&(node, _)| node);
+        // The host's transition step for a row that owes one asks how the row's move starts the element's transitions,
+        // which the transaction answers beside the row where nothing but the engine's records decides it.
+        let mut decided_transition_steps: Vec<_> = output
+            .answers()
+            .iter()
+            .filter_map(|row| crate::css::transition::DecidedTransitionStep::of_row(&mut *engine, row))
+            .collect();
+        decided_transition_steps.sort_unstable_by_key(crate::css::transition::DecidedTransitionStep::node);
         StyleJobAnswer {
             output,
             records: NamedRecords(records),
             composed_pseudo_styles: composed_pseudo_styles.into_boxed_slice(),
+            decided_transition_steps: decided_transition_steps.into_boxed_slice(),
         }
     }
 }
@@ -314,7 +338,7 @@ impl StyleJob {
 /// live for this call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn style_engine_take_style_transaction(
-    host: *mut DocumentHost,
+    host: &DocumentHost,
     read: &BegunRead,
     root: u32,
     computation_inputs: FfiDocumentStyleComputationInputs,
@@ -322,21 +346,14 @@ pub unsafe extern "C" fn style_engine_take_style_transaction(
     let Some(root) = StyleNodeID::from_raw(root) else {
         return FfiStyleTransactionView::default();
     };
-    assert!(!host.is_null(), "document host is null");
-    // SAFETY: Guaranteed by the caller.
-    let host = unsafe { &*host };
     let job = StyleJob {
         root,
         // SAFETY: Guaranteed by the caller.
         computation_inputs: unsafe { SealedStyleInputs::seal(computation_inputs) },
         flies: false,
+        closes_beside: host.engine_memo().closes_taken_transaction_beside(),
     };
-    // The first style transaction of a read the host waits for is the read's first job; any other, a rendering
-    // update's or a later wave's, is a style update's.
-    let answer = match host.take_unstyled_read() {
-        Some(read) => force_read(read, host, job),
-        None => run_job(StyleJobPermit::of_style_update(read), host, job),
-    };
+    let answer = host.run(read, true, move |state| job.run(state.engine_mut()));
     host.keep_style_transaction(answer).output.view()
 }
 
@@ -350,14 +367,11 @@ pub unsafe extern "C" fn style_engine_take_style_transaction(
 /// live for this call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn style_engine_let_style_transaction_fly(
-    host: *mut DocumentHost,
+    host: &DocumentHost,
     root: u32,
     computation_inputs: FfiDocumentStyleComputationInputs,
     blocker: FfiFlightBlocker,
 ) -> bool {
-    assert!(!host.is_null(), "document host is null");
-    // SAFETY: Guaranteed by the caller.
-    let host = unsafe { &*host };
     // The round the host sealed for the frame flies with it, or not at all.
     let round = host.take_sealed_round();
     let (Some(root), Some(license)) = (StyleNodeID::from_raw(root), FlightLicense::for_blocker(blocker)) else {
@@ -371,8 +385,9 @@ pub unsafe extern "C" fn style_engine_let_style_transaction_fly(
         // SAFETY: Guaranteed by the caller.
         computation_inputs: unsafe { SealedStyleInputs::seal(computation_inputs) },
         flies: true,
+        closes_beside: None,
     };
-    fly(host, job, round, &license);
+    fly(host, Some(job), round, &license);
     true
 }
 
@@ -385,17 +400,10 @@ pub unsafe extern "C" fn style_engine_let_style_transaction_fly(
 /// `host` must be a live document host, on its document's thread, that let a style transaction fly.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn style_engine_take_flown_style_transaction(
-    host: *const DocumentHost,
+    host: &DocumentHost,
     read: &BegunRead,
 ) -> FfiStyleTransactionView {
-    assert!(!host.is_null(), "document host is null");
-    // SAFETY: Guaranteed by the caller.
-    let host = unsafe { &*host };
-    // The read spends itself on the transaction where no job took it yet, as on the first job it would have sent,
-    // taking the frame in where it still flies.
-    let read = host
-        .take_unstyled_read()
-        .map_or_else(|| read.into_read_right(), ReadRight::Forced);
+    // The read takes the frame in where it still flies.
     let answer = host.begin_style_drain(read);
     host.keep_style_transaction(answer).output.view()
 }
@@ -407,10 +415,33 @@ pub unsafe extern "C" fn style_engine_take_flown_style_transaction(
 ///
 /// `host` must be a live document host, on its document's thread, that drains a style transaction that flew.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn style_engine_end_flown_style_drain(host: *const DocumentHost) {
-    assert!(!host.is_null(), "document host is null");
-    // SAFETY: Guaranteed by the caller.
-    unsafe { &*host }.end_style_drain();
+pub unsafe extern "C" fn style_engine_end_flown_style_drain(host: &DocumentHost) {
+    host.engine_memo().beside_flown_transaction.borrow_mut().clear();
+    host.end_style_drain();
+}
+
+/// Notes that the element `node` names arrived, moved or retired beside the style transaction of `host`'s document that
+/// flew, which knows nothing of that, until the drain of its reactions ends.
+///
+/// # Safety
+///
+/// `host` must be a live document host, on its document's thread.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn style_engine_note_style_node_beside_flown_transaction(host: &DocumentHost, node: u32) {
+    if let Some(node) = StyleNodeID::from_raw(node) {
+        host.engine_memo().beside_flown_transaction.borrow_mut().insert(node);
+    }
+}
+
+/// Whether the element `node` names arrived, moved or retired beside the style transaction of `host`'s document that
+/// flew.
+///
+/// # Safety
+///
+/// `host` must be a live document host, on its document's thread.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn style_engine_style_node_is_beside_flown_transaction(host: &DocumentHost, node: u32) -> bool {
+    StyleNodeID::from_raw(node).is_some_and(|node| host.engine_memo().beside_flown_transaction.borrow().contains(&node))
 }
 
 /// Whether the frame whose style transaction `host`'s document drains applied the element `style_node` names its record
@@ -422,14 +453,11 @@ pub unsafe extern "C" fn style_engine_end_flown_style_drain(host: *const Documen
 /// `host` must be a live document host, on its document's thread.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn style_engine_frame_marked_relayout(
-    host: *const DocumentHost,
+    host: &DocumentHost,
     style_node: u32,
     style_record: u64,
 ) -> bool {
-    assert!(!host.is_null(), "document host is null");
-    // SAFETY: Guaranteed by the caller.
-    StyleNodeID::from_raw(style_node)
-        .is_some_and(|style_node| unsafe { &*host }.frame_marked_relayout(style_node, style_record))
+    StyleNodeID::from_raw(style_node).is_some_and(|style_node| host.frame_marked_relayout(style_node, style_record))
 }
 
 /// Whether the style transaction of `host`'s document the host let fly still flies; one that has landed is taken in.
@@ -439,11 +467,9 @@ pub unsafe extern "C" fn style_engine_frame_marked_relayout(
 ///
 /// `host` must be a live document host, on its document's thread, and the event loop must call this between two tasks.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn style_engine_style_transaction_flies(host: *const DocumentHost) -> bool {
-    assert!(!host.is_null(), "document host is null");
+pub unsafe extern "C" fn style_engine_style_transaction_flies(host: &DocumentHost) -> bool {
     let boundary = TaskBoundary::at_event_loop_entry(&TAKES_FINISHED_STYLE_IN);
-    // SAFETY: Guaranteed by the caller.
-    unsafe { &*host }.frame_still_flies(&boundary)
+    host.frame_still_flies(&boundary)
 }
 
 /// The entry the event loop calls between two tasks to take a document's style transaction in where it has landed.
@@ -460,19 +486,14 @@ const TAKES_FINISHED_STYLE_IN: TakesFinishedStyleIn = TakesFinishedStyleIn { _pr
 /// `host` must be a live document host, on its document's thread, and `allocator` its document's allocator.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn style_engine_end_style_transaction(
-    host: *mut DocumentHost,
+    host: &DocumentHost,
     read: &crate::render_state::BegunRead,
     allocator: *mut StyleNodeIdAllocator,
 ) {
-    assert!(!host.is_null() && !allocator.is_null());
-    // SAFETY: Guaranteed by the caller.
-    unsafe { &*host }.end_style_transaction();
-    // SAFETY: As above.
-    let StyleAnswer::Nodes(released) = (unsafe { ask_engine(host, read, StyleQuery::EndTransaction) }) else {
-        unreachable!("the end of a transaction is answered with the identities it released");
-    };
-    // SAFETY: As above.
-    let memo = unsafe { &*host }.engine_memo();
+    assert!(!allocator.is_null());
+    host.end_style_transaction();
+    let released = with_engine(read, host, |engine| engine.discard_style_transaction_outputs());
+    let memo = host.engine_memo();
     memo.held.borrow_mut().forget(&released);
     memo.described.borrow_mut().forget(&released);
     memo.baselines.borrow_mut().forget(&released);

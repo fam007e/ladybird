@@ -6,6 +6,8 @@
 
 //! CSS transition decisions.
 
+use crate::css::style_value::StyleValueData;
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[repr(u8)]
 pub enum FfiTransitionActionKind {
@@ -14,36 +16,28 @@ pub enum FfiTransitionActionKind {
     Cancel,
     Start,
     RemoveAndStart,
-    CancelRemoveAndStartReversing,
-    CancelRemoveAndStartInterrupted,
+    CancelRemoveAndStart,
 }
 
-#[derive(Clone, Copy)]
+/// A transition the target holds for a property, running or completed, as of the style change event.
 #[repr(C)]
-pub struct FfiTransitionPropertyInput {
+pub struct FfiExistingTransition {
     pub property_id: u16,
-    pub before_change_value: *const crate::css::style_value::StyleValueData,
-    pub after_change_value: *const crate::css::style_value::StyleValueData,
-    pub current_value: *const crate::css::style_value::StyleValueData,
-    pub existing_end_value: *const crate::css::style_value::StyleValueData,
-    pub reversing_adjusted_start_value: *const crate::css::style_value::StyleValueData,
-    pub has_matching_transition: bool,
-    pub allow_discrete: bool,
-    pub has_running_transition: bool,
-    pub has_completed_transition: bool,
-    pub delay: f64,
-    pub duration: f64,
-    pub old_timing_function_output: f64,
-    pub old_reversing_shortening_factor: f64,
+    /// Whether the transition is running rather than completed.
+    pub running: bool,
+    pub end_value: *const StyleValueData,
+    pub reversing_adjusted_start_value: *const StyleValueData,
+    /// The output of the transition's timing function at the time of the style change event, where it is running.
+    pub timing_function_output: f64,
+    pub reversing_shortening_factor: f64,
 }
 
 #[repr(C)]
 pub struct FfiTransitionInput {
-    /// The context the transitions decide in, but for the transform reference box, which the render owner reads.
-    pub context: crate::css::animation::FfiAnimationContext,
-    pub properties: *mut FfiTransitionPropertyInput,
-    pub property_count: usize,
-    /// The target's style node, or 0 when it has none.
+    /// The transitions the target holds, each for a different property.
+    pub existing_transitions: *const FfiExistingTransition,
+    pub existing_transition_count: usize,
+    /// The target's style node.
     pub target_node: u32,
     /// The target's pseudo-element kind, or `u8::MAX` for an element.
     pub target_pseudo_kind: u8,
@@ -51,6 +45,9 @@ pub struct FfiTransitionInput {
     pub element_box_slot: u32,
 }
 
+/// What a transition step does to one property's transitions. Where it starts a transition, the values and timing
+/// function the transition runs with, which the records the step decided over and the existing transition hold;
+/// null otherwise.
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct FfiTransitionAction {
@@ -59,13 +56,80 @@ pub struct FfiTransitionAction {
     pub delay: f64,
     pub active_duration: f64,
     pub reversing_shortening_factor: f64,
+    pub start_value: *const StyleValueData,
+    pub end_value: *const StyleValueData,
+    pub reversing_adjusted_start_value: *const StyleValueData,
+    pub timing_function: *const StyleValueData,
+}
+
+/// One property a transition step decides over: its matching `transition-property` entry, if any, the transition the
+/// target holds for it, if any, and the values the decision compares.
+#[derive(Clone, Copy)]
+struct TransitionProperty {
+    property_id: u16,
+    before_change_value: *const StyleValueData,
+    after_change_value: *const StyleValueData,
+    current_value: *const StyleValueData,
+    existing_end_value: *const StyleValueData,
+    reversing_adjusted_start_value: *const StyleValueData,
+    timing_function: *const StyleValueData,
+    has_matching_transition: bool,
+    allow_discrete: bool,
+    has_running_transition: bool,
+    has_completed_transition: bool,
+    delay: f64,
+    duration: f64,
+    old_timing_function_output: f64,
+    old_reversing_shortening_factor: f64,
+}
+
+impl TransitionProperty {
+    fn new(property_id: u16, entry: Option<&TransitionEntry>, existing: Option<&FfiExistingTransition>) -> Self {
+        Self {
+            property_id,
+            before_change_value: std::ptr::null(),
+            after_change_value: std::ptr::null(),
+            current_value: std::ptr::null(),
+            existing_end_value: existing.map_or(std::ptr::null(), |existing| existing.end_value),
+            reversing_adjusted_start_value: existing
+                .map_or(std::ptr::null(), |existing| existing.reversing_adjusted_start_value),
+            timing_function: entry.map_or(std::ptr::null(), |entry| entry.timing_function),
+            has_matching_transition: entry.is_some(),
+            allow_discrete: entry
+                .is_some_and(|entry| entry.behavior == crate::css::css_enums::transition_behavior::ALLOW_DISCRETE),
+            has_running_transition: existing.is_some_and(|existing| existing.running),
+            has_completed_transition: existing.is_some_and(|existing| !existing.running),
+            delay: entry.map_or(0.0, |entry| entry.delay),
+            duration: entry.map_or(0.0, |entry| entry.duration),
+            old_timing_function_output: existing.map_or(0.0, |existing| existing.timing_function_output),
+            old_reversing_shortening_factor: existing.map_or(1.0, |existing| existing.reversing_shortening_factor),
+        }
+    }
+}
+
+impl FfiTransitionAction {
+    /// Has the action start a transition of `property` from `start_value` to its after-change value.
+    fn start(
+        mut self,
+        kind: FfiTransitionActionKind,
+        property: &TransitionProperty,
+        start_value: *const StyleValueData,
+        reversing_adjusted_start_value: *const StyleValueData,
+    ) -> Self {
+        self.kind = kind;
+        self.start_value = start_value;
+        self.end_value = property.after_change_value;
+        self.reversing_adjusted_start_value = reversing_adjusted_start_value;
+        self.timing_function = property.timing_function;
+        self
+    }
 }
 
 fn property_values_are_transitionable(
     context: &crate::css::animation::FfiAnimationContext,
     property_id: u16,
-    old_value: *const crate::css::style_value::StyleValueData,
-    new_value: *const crate::css::style_value::StyleValueData,
+    old_value: *const StyleValueData,
+    new_value: *const StyleValueData,
     allow_discrete: bool,
 ) -> bool {
     let animation_type = crate::css::property_metadata::property_animation_type(property_id);
@@ -96,18 +160,18 @@ fn property_values_are_transitionable(
     false
 }
 
+fn values_equal(first: *const StyleValueData, second: *const StyleValueData) -> bool {
+    assert!(!first.is_null());
+    assert!(!second.is_null());
+    let (first, second) = unsafe { (&*first, &*second) };
+    std::ptr::eq(first, second) || first == second
+}
+
 fn decide_transition(
     context: &crate::css::animation::FfiAnimationContext,
-    input: &FfiTransitionPropertyInput,
+    input: &TransitionProperty,
     values_originate_from_current_color: bool,
 ) -> FfiTransitionAction {
-    let values_equal = |first: *const crate::css::style_value::StyleValueData,
-                        second: *const crate::css::style_value::StyleValueData| {
-        assert!(!first.is_null());
-        assert!(!second.is_null());
-        let (first, second) = unsafe { (&*first, &*second) };
-        std::ptr::eq(first, second) || first == second
-    };
     let before_change_value_differs = input.has_matching_transition
         && !values_originate_from_current_color
         && !values_equal(input.before_change_value, input.after_change_value);
@@ -149,6 +213,10 @@ fn decide_transition(
         delay: input.delay,
         active_duration: input.duration,
         reversing_shortening_factor: 1.0,
+        start_value: std::ptr::null(),
+        end_value: std::ptr::null(),
+        reversing_adjusted_start_value: std::ptr::null(),
+        timing_function: std::ptr::null(),
     };
 
     // https://drafts.csswg.org/css-transitions/#starting
@@ -176,12 +244,12 @@ fn decide_transition(
         // - end value is the value of the transitioning property in the after-change style,
         // - reversing-adjusted start value is the same as the start value, and
         // - reversing shortening factor is 1.
-        action.kind = if input.has_completed_transition {
+        let kind = if input.has_completed_transition {
             FfiTransitionActionKind::RemoveAndStart
         } else {
             FfiTransitionActionKind::Start
         };
-        return action;
+        return action.start(kind, input, input.before_change_value, input.before_change_value);
     }
 
     // 2. Otherwise, if the element has a completed transition for the property and the end value of the completed transition is different from the
@@ -233,7 +301,6 @@ fn decide_transition(
             let term_1 = input.old_timing_function_output * input.old_reversing_shortening_factor;
             let term_2 = 1.0 - input.old_reversing_shortening_factor;
             let reversing_shortening_factor = (term_1 + term_2).abs().clamp(0.0, 1.0);
-            action.kind = FfiTransitionActionKind::CancelRemoveAndStartReversing;
             action.reversing_shortening_factor = reversing_shortening_factor;
             action.delay = if input.delay >= 0.0 {
                 input.delay
@@ -247,7 +314,12 @@ fn decide_transition(
             // - start value is the current value of the property in the running transition,
             // - end value is the value of the property in the after-change style,
             action.active_duration = input.duration * reversing_shortening_factor;
-            return action;
+            return action.start(
+                FfiTransitionActionKind::CancelRemoveAndStart,
+                input,
+                input.current_value,
+                input.existing_end_value,
+            );
         }
 
         // 4. Otherwise,
@@ -258,16 +330,21 @@ fn decide_transition(
         // - end value is the value of the property in the after-change style,
         // - reversing-adjusted start value is the same as the start value, and
         // - reversing shortening factor is 1.
-        action.kind = FfiTransitionActionKind::CancelRemoveAndStartInterrupted;
+        return action.start(
+            FfiTransitionActionKind::CancelRemoveAndStart,
+            input,
+            input.current_value,
+            input.current_value,
+        );
     }
 
     action
 }
 
-fn value_is_current_color(value: *const crate::css::style_value::StyleValueData) -> bool {
+fn value_is_current_color(value: *const StyleValueData) -> bool {
     matches!(
         unsafe { value.as_ref() },
-        Some(crate::css::style_value::StyleValueData::Keyword { keyword })
+        Some(StyleValueData::Keyword { keyword })
             if *keyword == crate::css::style_compute::keyword::CURRENTCOLOR
     )
 }
@@ -276,7 +353,7 @@ fn computed_value(
     table: &crate::css::computed_longhand_table::ComputedLonghandTable,
     overlay: Option<&crate::css::animated_overlay::AnimatedOverlay>,
     property_id: u16,
-) -> *const crate::css::style_value::StyleValueData {
+) -> *const StyleValueData {
     if let Some(entry) = overlay.and_then(|overlay| overlay.get(property_id))
         && crate::css::animated_overlay::overlay_wins(entry, table.is_important(property_id))
     {
@@ -309,7 +386,7 @@ fn prepare_transition_values(
     after_table: &crate::css::computed_longhand_table::ComputedLonghandTable,
     after_overlay: Option<&crate::css::animated_overlay::AnimatedOverlay>,
     inherited_animation: Option<crate::css::style::InheritedAnimatedValue<'_>>,
-    property: &mut FfiTransitionPropertyInput,
+    property: &mut TransitionProperty,
 ) -> bool {
     let (before_table, before_overlay) = before_style;
     property.before_change_value = computed_value(before_table, before_overlay, property.property_id);
@@ -347,48 +424,59 @@ fn prepare_transition_values(
         && originates_from_current_color(after_table, property.property_id)
 }
 
-/// A transition step's question to the style engine: what each property the host prepared does to the transitions
-/// of the step's target as its style changes from the record `before` to the record `after`, the record the target
-/// installed. The transitions resolve their lengths against `after`, and their transforms against the transform
-/// reference box of the box of the target's element, where it was laid out.
+/// A transition step's question to the style engine: what the step does to the transitions of its target as its style
+/// changes from the record `before` to the record `after`, the record the target installed. The transitions resolve
+/// their lengths against `after`.
 pub(crate) struct TransitionDecision {
     pub(crate) before: u64,
     pub(crate) after: u64,
-    pub(crate) context: crate::css::animation::FfiAnimationContext,
     /// The target's style node, where the target is an element: only an element's own record inherits from its
     /// inheritance parent.
     pub(crate) element: Option<crate::css::style::tree::StyleNodeID>,
-    pub(crate) element_box: crate::layout::node_data::NodeSlotId,
 }
 
 impl TransitionDecision {
-    /// Runs the CSS Transitions decision algorithm for every property, writing the values it compared into the
-    /// property, and its decision into the action beside it.
+    /// Runs the CSS Transitions decision algorithm for every property the after-change style's `transition-*` values
+    /// name, then for every property of an `existing` transition they do not name, and answers one action per property
+    /// in that order. The transitions resolve their transforms against `reference_box`, the transform reference box of
+    /// the box of the target's element, where it was laid out.
     pub(crate) fn decide(
         self,
         engine: &crate::css::style::StyleEngine,
-        arena: &crate::layout::LayoutNodeArena,
-        properties: &mut [FfiTransitionPropertyInput],
-        actions: &mut [FfiTransitionAction],
-    ) {
-        let Self {
-            before,
-            after,
-            mut context,
-            element,
-            element_box,
-        } = self;
-        if let Some(length) = engine.transition_length_resolution_context(after) {
-            context.has_length_resolution_context = true;
-            context.length_resolution_context = length;
+        reference_box: Option<crate::css::css_pixels::CssPixelRect>,
+        existing: &[FfiExistingTransition],
+    ) -> Vec<FfiTransitionAction> {
+        // SAFETY: A live record's table lives as long as the record.
+        let Some(after_table) = engine
+            .style_record_view(self.after)
+            .and_then(|after| unsafe { after.longhand_table.as_ref() })
+        else {
+            debug_assert!(false, "the records of a transition step carry longhand tables");
+            return Vec::new();
+        };
+        // A declaration whose delay and duration are each the single value 0s starts nothing, so it matters only to a
+        // target holding a transition it could cancel.
+        if existing.is_empty() && crate::css::style_compute::transition_delay_and_duration_are_single_zero(after_table)
+        {
+            return Vec::new();
         }
-        context.set_transform_reference_box(crate::painting::ffi::committed_transform_reference_box(
-            &arena.paintable_rows(),
-            element_box,
-        ));
+        let entries = crate::css::style_compute::transition_entries(after_table);
+        self.decide_entries(engine, reference_box, &entries, existing)
+    }
+
+    /// As `decide`, for the after-change style's `entries`.
+    fn decide_entries(
+        self,
+        engine: &crate::css::style::StyleEngine,
+        reference_box: Option<crate::css::css_pixels::CssPixelRect>,
+        entries: &[TransitionEntry],
+        existing: &[FfiExistingTransition],
+    ) -> Vec<FfiTransitionAction> {
+        let Self { before, after, element } = self;
+        let length_resolution_context = engine.transition_length_resolution_context(after);
         let (Some(before), Some(after)) = (engine.style_record_view(before), engine.style_record_view(after)) else {
             debug_assert!(false, "the records a transition step decides over remain live");
-            return;
+            return Vec::new();
         };
         // SAFETY: A live record's table and overlay live as long as the record.
         let (Some(before_table), before_overlay, Some(after_table), after_overlay) = (unsafe {
@@ -400,90 +488,321 @@ impl TransitionDecision {
             )
         }) else {
             debug_assert!(false, "the records of a transition step carry longhand tables");
-            return;
+            return Vec::new();
         };
-        for (property, action) in properties.iter_mut().zip(actions) {
-            let inherited_animation = element
-                .filter(|_| {
-                    after_overlay
-                        .and_then(|overlay| overlay.get(property.property_id))
-                        .is_none_or(|entry| !entry.inherited)
-                })
-                .and_then(|element| engine.inherited_animated_value(element, after_table, property.property_id));
-            let values_originate_from_current_color = prepare_transition_values(
-                (before_table, before_overlay),
-                after_table,
-                after_overlay,
-                inherited_animation,
-                property,
-            );
-            *action = decide_transition(&context, property, values_originate_from_current_color);
+        let mut context = crate::css::animation::FfiAnimationContext {
+            allow_discrete: false,
+            current_color: after_table
+                .effective_value(after_overlay, crate::css::property_metadata::property_id::COLOR, true)
+                .value
+                .cast(),
+            has_length_resolution_context: length_resolution_context.is_some(),
+            length_resolution_context: length_resolution_context.unwrap_or_default(),
+            has_transform_reference_box: false,
+            transform_reference_box_width: 0.0,
+            transform_reference_box_height: 0.0,
+        };
+        context.set_transform_reference_box(reference_box);
+        let existing_for = |property_id| existing.iter().find(|existing| existing.property_id == property_id);
+        let matched = entries
+            .iter()
+            .map(|entry| (entry.property_id, Some(entry), existing_for(entry.property_id)));
+        let unmatched = existing
+            .iter()
+            .filter(|existing| entries.iter().all(|entry| entry.property_id != existing.property_id))
+            .map(|existing| (existing.property_id, None, Some(existing)));
+        matched
+            .chain(unmatched)
+            .map(|(property_id, entry, existing)| {
+                let mut property = TransitionProperty::new(property_id, entry, existing);
+                let inherited_animation = element
+                    .filter(|_| {
+                        after_overlay
+                            .and_then(|overlay| overlay.get(property_id))
+                            .is_none_or(|entry| !entry.inherited)
+                    })
+                    .and_then(|element| engine.inherited_animated_value(element, after_table, property_id));
+                let values_originate_from_current_color = prepare_transition_values(
+                    (before_table, before_overlay),
+                    after_table,
+                    after_overlay,
+                    inherited_animation,
+                    &mut property,
+                );
+                decide_transition(&context, &property, values_originate_from_current_color)
+            })
+            .collect()
+    }
+}
+
+/// The transition step a style transaction decided beside the row of an element that owes one, which the host's step
+/// reads rather than asking where it decides over the same inputs.
+pub(crate) struct DecidedTransitionStep {
+    node: u32,
+    before: u64,
+    after: u64,
+    actions: Box<[FfiTransitionAction]>,
+    /// The first sample of the transitions the step starts, until a host step that reads the decision takes it.
+    fresh_sample: std::cell::Cell<Option<FreshTransitionSample>>,
+}
+
+// SAFETY: The values a decision points at live in the records it decided over, which the host keeps live across the drain
+// of the transaction that decided it, the only time it reads them.
+unsafe impl Send for DecidedTransitionStep {}
+
+impl DecidedTransitionStep {
+    /// Decides the step `row` owes where the host's step decides over nothing but what the engine holds: the element
+    /// runs no animation and owes no animation plan, so the record the row moves it to is its after-change style; its
+    /// before-change style is the one the epoch keeps for it, or else the record it held; and no property its
+    /// transitions name reads a value it inherits, which an ancestor's animation can move before the host decides, or
+    /// its box, which a frame can lay out first. Each transition is decided as one the element has none of yet, which
+    /// the host checks.
+    pub(crate) fn of_row(
+        engine: &mut crate::css::style::StyleEngine,
+        row: &crate::css::style::bridge::FfiStyleDelta,
+    ) -> Option<Self> {
+        use crate::css::property_metadata::property_id as prop;
+        use crate::css::style::bridge::element_adjustment_fact::HAS_ANIMATIONS;
+
+        if !row.owes_a_transition_step || row.owes_an_animation_plan || row.pseudo_kind != u8::MAX {
+            return None;
         }
+        let node = crate::css::style::tree::StyleNodeID::from_raw(row.style_node)?;
+        if engine.element_adjustment_facts(node) & HAS_ANIMATIONS != 0 {
+            return None;
+        }
+        let before = match engine.transition_baseline(node, u8::MAX) {
+            0 => row.old_style_record,
+            baseline => baseline,
+        };
+        let after = row.new_style_record;
+        let before_view = engine.style_record_view(before)?;
+        let after_view = engine.style_record_view(after)?;
+        // SAFETY: A live record's table lives as long as the record.
+        let after_table = unsafe { after_view.longhand_table.as_ref() }?;
+        if before_view.dependency_flags & crate::css::computed_longhand_table::IN_DISPLAY_NONE_SUBTREE != 0
+            || !after_view.animated_overlay.is_null()
+            || crate::css::style_compute::transition_delay_and_duration_are_single_zero(after_table)
+        {
+            return None;
+        }
+        let entries = crate::css::style_compute::transition_entries(after_table);
+        if entries.is_empty()
+            || entries
+                .iter()
+                .any(|entry| entry.property_id == prop::TRANSFORM || after_table.is_inherited(entry.property_id))
+        {
+            return None;
+        }
+        let actions = TransitionDecision {
+            before,
+            after,
+            element: Some(node),
+        }
+        .decide_entries(engine, None, &entries, &[]);
+        let fresh_sample = FreshTransitionSample::of_step(engine, node, after, &actions);
+        Some(Self {
+            node: row.style_node,
+            before,
+            after,
+            actions: actions.into_boxed_slice(),
+            fresh_sample: std::cell::Cell::new(fresh_sample),
+        })
+    }
+
+    pub(crate) fn node(&self) -> u32 {
+        self.node
+    }
+
+    /// Answers the step `decision` asks from this one, where it asks the same: from the same records, of a target with
+    /// no `existing` transition.
+    pub(crate) fn answer(
+        &self,
+        decision: &TransitionDecision,
+        existing: &[FfiExistingTransition],
+    ) -> Option<&[FfiTransitionAction]> {
+        (decision.before == self.before && decision.after == self.after && existing.is_empty()).then_some(&self.actions)
+    }
+
+    /// The first sample of the transitions the step starts, which only the host step that read its decision samples.
+    pub(crate) fn take_fresh_sample(&self) -> Option<FreshTransitionSample> {
+        self.fresh_sample.take()
     }
 }
 
-/// One `transition-property` entry's attributes, as they apply to one physical longhand.
-#[repr(C)]
-pub struct FfiTransitionEntry {
-    pub property_id: u16,
-    pub delay: f64,
-    pub duration: f64,
-    pub timing_function: *const crate::css::style_value::StyleValueData,
-    pub behavior: u8,
+/// The first sample of the transitions a decided step starts, taken beside the step over the record it moves its
+/// element to, which the host's sample of them reads rather than asks. Each transition has only just started, so it
+/// samples at the key its delay and easing give at its start, whatever the time.
+pub(crate) struct FreshTransitionSample {
+    after: u64,
+    /// The key each transition the step starts samples at, in the order the step starts them.
+    keys: Box<[f64]>,
+    overlay: crate::css::animated_overlay::AnimatedOverlay,
+    result: crate::css::style_compute::FfiHostAnimationSampleResult,
 }
 
-#[repr(C)]
-pub struct FfiTransitionEntries {
-    pub entries: *mut FfiTransitionEntry,
-    pub count: usize,
-}
+impl FreshTransitionSample {
+    /// Samples the transitions `actions` start over `after`, each between the values and with the easing the action
+    /// names, as the host starts them: delayed, filling backwards, and held at their start.
+    fn of_step(
+        engine: &mut crate::css::style::StyleEngine,
+        node: crate::css::style::tree::StyleNodeID,
+        after: u64,
+        actions: &[FfiTransitionAction],
+    ) -> Option<Self> {
+        use crate::css::animation::{FfiAnimationPreparationEffect, FfiSampledAnimationEffect};
+        use crate::css::style::effect_descriptions::PublishedEffect;
+        use crate::css::style_value::{RetainedStyleValueData, retain_style_value};
 
-/// The transitions a computed longhand table declares, per physical longhand they name. What the
-/// timing functions point at is borrowed from the table.
-///
-/// # Safety
-/// `longhand_table` must point to a live computed longhand table. The result must be released with
-/// `rust_transition_entries_release`.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_transition_entries(longhand_table: *const std::ffi::c_void) -> FfiTransitionEntries {
-    let table = unsafe { &*longhand_table.cast::<crate::css::computed_longhand_table::ComputedLonghandTable>() };
-    let entries = Box::into_raw(crate::css::style_compute::transition_entries(table).into_boxed_slice());
-    FfiTransitionEntries {
-        entries: entries.cast(),
-        count: entries.len(),
+        let mut fresh = Vec::new();
+        let mut composed = crate::css::style_compute::SampledEffects::new();
+        for action in actions {
+            match action.kind {
+                FfiTransitionActionKind::None => continue,
+                FfiTransitionActionKind::Start => {}
+                _ => return None,
+            }
+            // SAFETY: The action's timing function lives in the record the step moves to.
+            let easing = crate::css::style::effect_descriptions::easing_from_computed_timing_function(unsafe {
+                &*action.timing_function
+            })?;
+            let timing = crate::css::style::animations::EffectTiming {
+                timing: crate::css::style_compute::FfiEffectTiming {
+                    decidable: true,
+                    has_timeline_time: false,
+                    has_timeline_origin_time: false,
+                    has_timeline_scroller: false,
+                    timeline_scroller_is_vertical: false,
+                    timeline_scroller: 0,
+                    has_start_time: false,
+                    has_hold_time: true,
+                    // `Bindings::FillMode::Backwards` and `Bindings::PlaybackDirection::Normal`.
+                    fill_mode: 2,
+                    playback_direction: 0,
+                    timeline_time: 0.0,
+                    timeline_origin_time: 0.0,
+                    start_time: 0.0,
+                    hold_time: 0.0,
+                    playback_rate: 1.0,
+                    start_delay: action.delay,
+                    end_delay: 0.0,
+                    iteration_duration: action.active_duration,
+                    iteration_count: 1.0,
+                    iteration_start: 0.0,
+                },
+                easing,
+            };
+            let identity = fresh.len() as u64 + 1;
+            composed.push(FfiSampledAnimationEffect {
+                effect: FfiAnimationPreparationEffect {
+                    identity,
+                    generation: 0,
+                },
+                current_key: timing.key(0.0)?,
+            });
+            // SAFETY: The decision compared live values, which the records it decided over hold.
+            let [start, end] = [action.start_value, action.end_value]
+                .map(|value| unsafe { RetainedStyleValueData::from_retained_pointer(retain_style_value(value)) });
+            fresh.push(PublishedEffect::transition(identity, action.property_id, start, end));
+        }
+        if composed.is_empty() {
+            return None;
+        }
+        let keys = composed.iter().map(|effect| effect.current_key).collect();
+        let mut overlay = crate::css::animated_overlay::AnimatedOverlay::default();
+        let result = engine
+            .sample_over_record(node, after, &mut overlay, Some(&fresh), composed, None)
+            .ok()?;
+        // The preparation is keyed by the step's own effects, which the host's are not.
+        overlay.animation_preparation = None;
+        Some(Self {
+            after,
+            keys,
+            overlay,
+            result,
+        })
+    }
+
+    /// Answers the host's sample `input`, where it samples what this one did: the transitions the step started, over
+    /// the record it moved its element to, each at the key this one sampled it at. Writes the overlay into the working
+    /// set and answers what the sample found, with the timing each effect was sampled with, which the engine keeps.
+    ///
+    /// # Safety
+    /// As for `rust_sample_animation_effects`.
+    pub(crate) unsafe fn answer(
+        self,
+        input: &crate::css::style_compute::FfiHostAnimationSample,
+    ) -> Option<(
+        crate::css::style_compute::FfiHostAnimationSampleResult,
+        crate::css::style::animations::SampledEffectTimings,
+    )> {
+        if input.style_record != self.after || !input.animated_overlay.is_null() {
+            return None;
+        }
+        // SAFETY: Guaranteed by the caller.
+        let effects = unsafe { crate::css::custom_properties::ffi_slice(input.effects, input.effect_count) };
+        if effects.len() != self.keys.len() {
+            return None;
+        }
+        let timings: Box<[_]> = effects
+            .iter()
+            .map(|effect| {
+                (
+                    effect.identity,
+                    crate::css::style::animations::EffectTiming {
+                        timing: effect.timing,
+                        // SAFETY: As above.
+                        easing: unsafe { crate::css::easing::Easing::from_descriptor(&effect.easing) },
+                    },
+                )
+            })
+            .collect();
+        let samples_alike = timings
+            .iter()
+            .zip(effects)
+            .zip(&self.keys)
+            .all(|(((_, timing), effect), key)| {
+                timing
+                    .key(effect.current_key)
+                    .is_some_and(|host_key| host_key.to_bits() == key.to_bits())
+            });
+        if !samples_alike {
+            return None;
+        }
+        if self.result.outcome == crate::css::style_compute::FfiHostAnimationSampleOutcome::Evaluated {
+            // SAFETY: As above.
+            let overlay = unsafe { (input.prepare_overlay_for_mutation)(input.callback_context) };
+            // SAFETY: The working set hands over its overlay, uniquely owned for the sample.
+            unsafe { *overlay.cast::<crate::css::animated_overlay::AnimatedOverlay>() = self.overlay };
+        }
+        Some((self.result, timings))
     }
 }
 
-/// # Safety
-/// `entries` must come from `rust_transition_entries` and not have been released before.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_transition_entries_release(entries: FfiTransitionEntries) {
-    drop(unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(entries.entries, entries.count)) });
+/// One `transition-property` entry's attributes, as they apply to one physical longhand. The timing function is
+/// borrowed from the computed longhand table the entry was read from.
+pub(crate) struct TransitionEntry {
+    pub(crate) property_id: u16,
+    pub(crate) delay: f64,
+    pub(crate) duration: f64,
+    pub(crate) timing_function: *const StyleValueData,
+    pub(crate) behavior: u8,
 }
 
-/// Whether `rust_transition_entries` would answer any entry for the table, stopping at the first.
+/// Whether the table's `transition-*` values give any longhand a matching entry, stopping at the first. A declaration
+/// whose delay and duration are each the single value `0s`, which is how nearly every element declares no transition
+/// at all, starts nothing, so it gives none unless the element `has_existing_transitions` it could still cancel.
 ///
 /// # Safety
 /// `longhand_table` must point to a live computed longhand table.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_transition_has_entries(longhand_table: *const std::ffi::c_void) -> bool {
-    crate::css::style_compute::has_transition_entries(unsafe {
-        &*longhand_table.cast::<crate::css::computed_longhand_table::ComputedLonghandTable>()
-    })
-}
-
-/// Whether the table's `transition-delay` and `transition-duration` are each the single value `0s`,
-/// which is how nearly every element declares no transition at all.
-///
-/// # Safety
-/// `longhand_table` must point to a live computed longhand table.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_transition_delay_and_duration_are_single_zero(
+pub unsafe extern "C" fn rust_transition_has_matching_entries(
     longhand_table: *const std::ffi::c_void,
+    has_existing_transitions: bool,
 ) -> bool {
-    crate::css::style_compute::transition_delay_and_duration_are_single_zero(unsafe {
-        &*longhand_table.cast::<crate::css::computed_longhand_table::ComputedLonghandTable>()
-    })
+    let table = unsafe { &*longhand_table.cast::<crate::css::computed_longhand_table::ComputedLonghandTable>() };
+    (has_existing_transitions || !crate::css::style_compute::transition_delay_and_duration_are_single_zero(table))
+        && crate::css::style_compute::has_transition_entries(table)
 }
 
 #[cfg(test)]
@@ -528,17 +847,18 @@ mod tests {
     }
 
     fn input(
-        before_change_value: &crate::css::style_value::StyleValueData,
-        after_change_value: &crate::css::style_value::StyleValueData,
-        current_value: &crate::css::style_value::StyleValueData,
-    ) -> FfiTransitionPropertyInput {
-        FfiTransitionPropertyInput {
+        before_change_value: &StyleValueData,
+        after_change_value: &StyleValueData,
+        current_value: &StyleValueData,
+    ) -> TransitionProperty {
+        TransitionProperty {
             property_id: by_computed_value_property(),
             before_change_value,
             after_change_value,
             current_value,
             existing_end_value: std::ptr::null(),
             reversing_adjusted_start_value: std::ptr::null(),
+            timing_function: std::ptr::null(),
             has_matching_transition: true,
             allow_discrete: false,
             has_running_transition: false,
@@ -552,8 +872,8 @@ mod tests {
 
     #[test]
     fn starts_an_initial_transition() {
-        let before = crate::css::style_value::StyleValueData::Number { value: 0.0 };
-        let after = crate::css::style_value::StyleValueData::Number { value: 1.0 };
+        let before = StyleValueData::Number { value: 0.0 };
+        let after = StyleValueData::Number { value: 1.0 };
         assert_eq!(
             decide_transition(&animation_context(), &input(&before, &after, &before), false).kind,
             FfiTransitionActionKind::Start
@@ -563,11 +883,8 @@ mod tests {
     #[test]
     fn equal_nested_values_do_not_start_a_transition() {
         let nested_value = || {
-            let number =
-                std::sync::Arc::into_raw(std::sync::Arc::new(crate::css::style_value::StyleValueData::Number {
-                    value: 0.5,
-                }));
-            crate::css::style_value::StyleValueData::OpacityValue {
+            let number = std::sync::Arc::into_raw(std::sync::Arc::new(StyleValueData::Number { value: 0.5 }));
+            StyleValueData::OpacityValue {
                 value: unsafe { crate::css::style_value::RetainedStyleValueData::from_retained_pointer(number) },
             }
         };
@@ -581,8 +898,8 @@ mod tests {
 
     #[test]
     fn current_color_origins_are_equivalent() {
-        let before = crate::css::style_value::StyleValueData::Number { value: 0.0 };
-        let after = crate::css::style_value::StyleValueData::Number { value: 1.0 };
+        let before = StyleValueData::Number { value: 0.0 };
+        let after = StyleValueData::Number { value: 1.0 };
         let input = input(&before, &after, &before);
         assert_eq!(
             decide_transition(&animation_context(), &input, true).kind,
@@ -592,12 +909,10 @@ mod tests {
 
     #[test]
     fn nested_current_color_origin_is_recognized() {
-        let current_color = crate::css::style_value::RetainedStyleValueData::from_owned(
-            crate::css::style_value::StyleValueData::Keyword {
-                keyword: crate::css::style_compute::keyword::CURRENTCOLOR,
-            },
-        );
-        let nested = crate::css::style_value::StyleValueData::ValueList {
+        let current_color = crate::css::style_value::RetainedStyleValueData::from_owned(StyleValueData::Keyword {
+            keyword: crate::css::style_compute::keyword::CURRENTCOLOR,
+        });
+        let nested = StyleValueData::ValueList {
             values: crate::css::style_value::RetainedStyleValueDataList::from_retained_values(vec![current_color]),
             separator: 0,
             collapsible: false,
@@ -614,8 +929,8 @@ mod tests {
 
     #[test]
     fn removes_a_completed_transition_before_replacement() {
-        let before = crate::css::style_value::StyleValueData::Number { value: 0.0 };
-        let after = crate::css::style_value::StyleValueData::Number { value: 1.0 };
+        let before = StyleValueData::Number { value: 0.0 };
+        let after = StyleValueData::Number { value: 1.0 };
         let mut input = input(&before, &after, &before);
         input.has_completed_transition = true;
         input.existing_end_value = &raw const before;
@@ -627,9 +942,9 @@ mod tests {
 
     #[test]
     fn adjusts_a_reversing_transition() {
-        let before = crate::css::style_value::StyleValueData::Number { value: 0.0 };
-        let after = crate::css::style_value::StyleValueData::Number { value: 1.0 };
-        let current = crate::css::style_value::StyleValueData::Number { value: 0.5 };
+        let before = StyleValueData::Number { value: 0.0 };
+        let after = StyleValueData::Number { value: 1.0 };
+        let current = StyleValueData::Number { value: 0.5 };
         let mut input = input(&before, &after, &current);
         input.has_running_transition = true;
         input.existing_end_value = &raw const before;
@@ -638,7 +953,7 @@ mod tests {
         input.old_timing_function_output = 0.25;
         input.old_reversing_shortening_factor = 0.5;
         let action = decide_transition(&animation_context(), &input, false);
-        assert_eq!(action.kind, FfiTransitionActionKind::CancelRemoveAndStartReversing);
+        assert_eq!(action.kind, FfiTransitionActionKind::CancelRemoveAndStart);
         assert_eq!(action.reversing_shortening_factor, 0.625);
         assert_eq!(action.delay, -12.5);
         assert_eq!(action.active_duration, 62.5);

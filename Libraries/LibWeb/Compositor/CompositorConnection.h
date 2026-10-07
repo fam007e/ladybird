@@ -34,6 +34,11 @@
 
 namespace Web::Compositor {
 
+class CompositorConnectionFrameSink;
+// What a test of the transport, which has no Paint thread, reaches a connection's frame sink through. Only the test
+// defines it.
+struct TransportTestAccess;
+
 class WEB_API CompositorConnection final
     : public IPC::ConnectionToServer<CompositorWebContentClientEndpoint, CompositorWebContentServerEndpoint>
     , public CompositorWebContentClientEndpoint {
@@ -41,22 +46,25 @@ class WEB_API CompositorConnection final
 
 public:
     explicit CompositorConnection(NonnullOwnPtr<IPC::Transport>);
+    virtual ~CompositorConnection() override;
 
     void set_parent_context(Web::CompositorContextId, Optional<Web::CompositorContextId>);
     void stop_presenting_to_client(Web::CompositorContextId);
     void destroy_context(Web::CompositorContextId);
-    void submit_frame(CompositorFrame&&);
+    // Has the Paint thread present frames through this connection from now on.
+    void hand_frame_sink_to_paint_thread();
     void add_video_sink(Media::VideoSinkHandle);
     void remove_video_sink(Media::VideoSinkHandle);
     void set_video_sink_ticking(Media::VideoSinkHandle, bool should_tick);
     Optional<Compositing::CanvasId> create_canvas_2d_context(Gfx::IntSize, bool alpha);
     void update_canvas_2d_stream(Compositing::Canvas2DCommandStream&);
     void destroy_canvas_context(Compositing::CanvasId);
-    Gfx::ShareableBitmap get_canvas_pixels(Compositing::CanvasId, Gfx::IntRect);
+    Gfx::ShareableBitmap get_canvas_pixels(Compositing::CanvasId, Gfx::IntRect, Gfx::AlphaType = Gfx::AlphaType::Premultiplied);
     Optional<Web::Compositor::PlaceholderCanvasLink> allocate_placeholder_canvas();
     void release_placeholder_canvas(Compositing::CanvasId);
     void commit_placeholder_canvas(Web::Compositor::PlaceholderCanvasLink, Optional<Compositing::CanvasId> source_canvas_id, Gfx::IntSize, bool origin_clean);
     Web::Compositor::PlaceholderCanvasPixels get_placeholder_canvas_pixels(Compositing::CanvasId, Gfx::IntRect);
+    bool rasterize_display_list(Compositing::DisplayList const&, Compositing::AccumulatedVisualContextTree const&, Compositing::DisplayListResourceTransaction, NonnullRefPtr<Gfx::Bitmap> target);
     void invalidate_wheel_event_listener_state(Web::CompositorContextId, u64 generation);
     void invalidate_keyboard_scroll_state(Web::CompositorContextId, u64 generation);
     Compositing::AsyncScrollEnqueueResult async_scroll_by(Web::CompositorContextId, Web::UniqueNodeID document_id, Gfx::FloatPoint position, Gfx::FloatPoint delta, Gfx::IntRect viewport_rect, Web::WheelDeltaPrecision, Web::ScrollGesturePhase, u32 modifiers, Compositing::AsyncScrollOperationTracking);
@@ -66,7 +74,7 @@ public:
     void viewport_size_updated(Web::CompositorContextId, Gfx::IntSize, Compositing::WindowResizingInProgress);
     bool request_rendering_opportunity(Web::CompositorContextId, double maximum_frames_per_second);
     void hurry_rendering_opportunity(Web::CompositorContextId);
-    void request_screenshot(Web::CompositorContextId, NonnullRefPtr<Gfx::PaintingSurface>, Function<void()>&&);
+    void request_screenshot(Web::CompositorContextId, NonnullRefPtr<Gfx::Bitmap>, Function<void()>&&);
 
     Optional<Compositing::CanvasId> create_webgl_context(Compositing::WebGL::WebGLVersion, Gfx::IntSize, bool depth, bool stencil, bool antialias, Vector<String>& out_supported_extensions);
     void set_webgl_command_buffer(Compositing::CanvasId, Core::AnonymousBuffer const&);
@@ -80,13 +88,18 @@ public:
     bool read_webgl_buffer_sub_data(Compositing::CanvasId, Compositing::WebGL::GLenum target, Compositing::WebGL::GLintptr offset, Compositing::WebGL::GLintptr size, Core::AnonymousBuffer const& data);
 
     void ensure_video_presentation_channel();
+    // Offers the Compositor the process's render clock, which it delivers display ticks to from then on.
+    void attach_render_clock();
     Function<void(Web::PageId page_id, Web::MouseEvent)> on_mouse_event;
     Function<void(Web::PageId page_id, Web::KeyEvent)> on_key_event;
     Function<void()> on_compositor_lost;
 
 private:
+    // Only a test of the transport hands a frame straight to the compositor.
+    friend struct TransportTestAccess;
+    void submit_frame_for_testing(CompositorFrame&&);
+
     struct PendingScreenshot {
-        NonnullRefPtr<Gfx::PaintingSurface> target_surface;
         NonnullRefPtr<Gfx::Bitmap> target_bitmap;
 
         Function<void()> callback;
@@ -106,9 +119,9 @@ private:
 
     bool can_send_message_to_compositor() const;
     void merge_async_scroll_updates(Web::CompositorContextId, Compositing::PendingAsyncScrollUpdates);
-    bool post_resource_additions_in_batches(Web::CompositorContextId, Compositing::DisplayListResourceTransaction&);
-    bool post_display_list_update(Web::CompositorContextId, CompositorFrame::DisplayListUpdate&);
     Optional<PendingScreenshot> take_screenshot(Compositing::ScreenshotRequestId);
+
+    NonnullRefPtr<CompositorConnectionFrameSink> m_frame_sink;
 
     HashMap<Compositing::ScreenshotRequestId, PendingScreenshot> m_screenshots;
     // What the compositor process scrolled since the last rendering update adopted it, per context.

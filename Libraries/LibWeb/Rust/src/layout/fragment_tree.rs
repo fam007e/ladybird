@@ -38,6 +38,7 @@ pub(crate) struct Fragment {
     pub(crate) computed_svg_path: Option<std::sync::Arc<libgfx_rust::path::OwnedPath>>,
     pub(crate) has_line_clamp_point: bool,
     pub(crate) is_invisible_for_line_clamp: bool,
+    pub(crate) clamped_content_is_scrollable_overflow: bool,
     pub(crate) children: Vec<FragmentLink>,
 }
 
@@ -108,6 +109,7 @@ impl Fragment {
             && same_allocation(self.computed_svg_path.as_ref(), previous.computed_svg_path.as_ref())
             && self.has_line_clamp_point == previous.has_line_clamp_point
             && self.is_invisible_for_line_clamp == previous.is_invisible_for_line_clamp
+            && self.clamped_content_is_scrollable_overflow == previous.clamped_content_is_scrollable_overflow
     }
 
     pub(crate) fn has_same_child_placements(&self, previous: &Fragment) -> bool {
@@ -165,6 +167,7 @@ impl FragmentLink {
                 computed_svg_path: None,
                 has_line_clamp_point: false,
                 is_invisible_for_line_clamp: false,
+                clamped_content_is_scrollable_overflow: false,
                 children: Vec::new(),
             }),
             committed_offset: Default::default(),
@@ -392,6 +395,7 @@ fn snapshot_fragment(
         computed_svg_path,
         has_line_clamp_point: used.has_line_clamp_point.get(),
         is_invisible_for_line_clamp: used.is_invisible_for_line_clamp.get(),
+        clamped_content_is_scrollable_overflow: used.clamped_content_is_scrollable_overflow.get(),
         children,
     };
     if let Some(previous) = previously_committed_fragment_matching(callbacks, &fragment) {
@@ -514,8 +518,6 @@ pub(crate) struct RunFragmentBuilder {
 #[derive(Default)]
 struct RunFragmentBuilderInner {
     pending_fragments: HashMap<u32, PendingFragment>,
-    #[cfg(debug_assertions)]
-    placed_slots: HashSet<u32>,
     child_roots_awaiting_placement: HashMap<u32, UnplacedRootFragment>,
     pending_abspos_at_root: Vec<abspos_inputs::PendingAbsposChild>,
     anchor_candidates_at_root: Vec<AnchorCandidate>,
@@ -580,11 +582,6 @@ impl RunFragmentBuilder {
         entry: abspos_inputs::PendingAbsposChild,
     ) {
         let mut inner = self.inner.borrow_mut();
-        #[cfg(debug_assertions)]
-        assert!(
-            !inner.placed_slots.contains(&coordinate_space_box.slot_index()),
-            "an abspos registration named an already-placed coordinate-space box"
-        );
         if coordinate_space_box == self.root_node {
             inner.pending_abspos_at_root.push(entry);
             return;
@@ -612,11 +609,6 @@ impl RunFragmentBuilder {
         coordinate_space_box: crate::layout::node_data::NodeSlotId,
     ) {
         let mut inner = self.inner.borrow_mut();
-        #[cfg(debug_assertions)]
-        assert!(
-            !inner.placed_slots.contains(&coordinate_space_box.slot_index()),
-            "an inline containing block rect named an already-placed coordinate-space box"
-        );
         debug_assert!(
             !inner
                 .iter_inline_containing_block_rects()
@@ -876,8 +868,6 @@ impl RunFragmentBuilder {
     ) {
         let mut inner = self.inner.borrow_mut();
         let slot = node.slot_index();
-        #[cfg(debug_assertions)]
-        assert!(inner.placed_slots.insert(slot), "a box was placed twice in one run");
         debug_assert!(
             !inner.child_roots_awaiting_placement.contains_key(&slot),
             "a box was placed without normalizing its held unplaced root (slot {slot})"

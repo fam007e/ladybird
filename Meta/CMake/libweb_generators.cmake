@@ -58,12 +58,11 @@ function (generate_css_implementation)
         arguments -j "${LIBWEB_INPUT_FOLDER}/CSS/PseudoElements.json"
     )
 
-    invoke_py_generator(
-        "TransformFunctions.cpp"
+    invoke_py_header_generator(
+        "TransformFunctions.h"
         "generate_libweb_css_transform_functions.py"
         "${LIBWEB_INPUT_FOLDER}/CSS/TransformFunctions.json"
         "CSS/TransformFunctions.h"
-        "CSS/TransformFunctions.cpp"
         arguments -j "${LIBWEB_INPUT_FOLDER}/CSS/TransformFunctions.json"
     )
 
@@ -302,6 +301,7 @@ function (generate_js_bindings target)
         "${LADYBIRD_SOURCE_DIR}/Meta/Generators/libweb_bindings/default_values.py"
         "${LADYBIRD_SOURCE_DIR}/Meta/Generators/libweb_bindings/extended_attributes.py"
         "${LADYBIRD_SOURCE_DIR}/Meta/Generators/libweb_bindings/global_mixins.py"
+        "${LADYBIRD_SOURCE_DIR}/Meta/Generators/libweb_bindings/glue_headers.py"
         "${LADYBIRD_SOURCE_DIR}/Meta/Generators/libweb_bindings/includes.py"
         "${LADYBIRD_SOURCE_DIR}/Meta/Generators/libweb_bindings/interface_declaration.py"
         "${LADYBIRD_SOURCE_DIR}/Meta/Generators/libweb_bindings/interfaces.py"
@@ -311,9 +311,12 @@ function (generate_js_bindings target)
         "${LADYBIRD_SOURCE_DIR}/Meta/Generators/libweb_bindings/namespaces.py"
         "${LADYBIRD_SOURCE_DIR}/Meta/Generators/libweb_bindings/operations.py"
         "${LADYBIRD_SOURCE_DIR}/Meta/Generators/libweb_bindings/overload_resolution.py"
+        "${LADYBIRD_SOURCE_DIR}/Meta/Generators/libweb_bindings/realms.py"
+        "${LADYBIRD_SOURCE_DIR}/Meta/Generators/libweb_bindings/security_checks.py"
         "${LADYBIRD_SOURCE_DIR}/Meta/Generators/libweb_bindings/structured_serialize.py"
         "${LADYBIRD_SOURCE_DIR}/Meta/Generators/libweb_bindings/to_idl_value.py"
         "${LADYBIRD_SOURCE_DIR}/Meta/Generators/libweb_bindings/to_js_value.py"
+        "${LADYBIRD_SOURCE_DIR}/Meta/Generators/libweb_bindings/wrappers.py"
         "${LADYBIRD_SOURCE_DIR}/Meta/Utils/lexer.py"
         "${LADYBIRD_SOURCE_DIR}/Meta/Utils/utils.py"
         "${LADYBIRD_SOURCE_DIR}/Meta/Utils/webidl_parser.py")

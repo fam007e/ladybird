@@ -6,7 +6,7 @@
 
 //! The before-change styles a style stabilization epoch decides CSS transitions against.
 
-use super::bridge::StyleChange;
+use super::boundary::StyleChange;
 use super::tree::StyleNodeID;
 use super::{HashMap, RetainedState};
 use crate::css::animated_overlay::FfiAnimatedOverlayEntry;
@@ -65,15 +65,13 @@ impl TransitionBaselines {
     pub(crate) fn follow(&mut self, change: &StyleChange) {
         match *change {
             StyleChange::RecordTransitionBaseline {
-                node,
+                node: Some(node),
                 pseudo_kind,
                 style_record,
             } if style_record != 0 => {
-                if let Some(node) = StyleNodeID::from_raw(node) {
-                    self.insert(node, pseudo_kind, style_record);
-                }
+                self.insert(node, pseudo_kind, style_record);
             }
-            StyleChange::ReleaseTransitionBaselines {} => self.baselines.clear(),
+            StyleChange::ReleaseTransitionBaselines => self.baselines.clear(),
             _ => {}
         }
     }
@@ -96,11 +94,6 @@ pub(crate) enum InheritedAnimatedValue<'a> {
 }
 
 impl RetainedState {
-    /// An epoch begins: the one before it committed and released every style it pinned.
-    pub(crate) fn begin_transition_baselines(&self) {
-        debug_assert!(self.transition_baselines.baselines.is_empty());
-    }
-
     /// Style, layout or animation feedback can give a target a transition in any later pass of
     /// the epoch, and that transition starts from the style the target held before the epoch's
     /// first pass. The first record named for a target is that style: it is kept, pinned, until
@@ -109,6 +102,11 @@ impl RetainedState {
         if style_record != 0 && self.transition_baselines.insert(node, pseudo_kind, style_record) {
             self.computed_group_sets.pin_style_record(style_record);
         }
+    }
+
+    /// The baseline of `node`'s element or pseudo-element of kind `pseudo_kind`, or 0 before a pass has recorded one.
+    pub(crate) fn transition_baseline(&self, node: StyleNodeID, pseudo_kind: u8) -> u64 {
+        self.transition_baselines.get(node, pseudo_kind)
     }
 
     /// Where an inherited value of `property` in `table`, a record of `node`'s, comes from when an

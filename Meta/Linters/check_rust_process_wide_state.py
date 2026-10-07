@@ -47,7 +47,6 @@ ENVIRONMENT_SWITCH = "read-once environment switch; every thread sees the same a
 IDENTITY = "process-wide atomic counter handing out unique identities"
 BUILT_ONCE = "built once and read-only after; every thread shares the same table"
 LOCKED = "process-wide and behind a mutex or a lock"
-REPLAY = "style replay capture; replay builds only, or off unless an environment variable turns it on"
 TEST_ONLY = "test only"
 
 
@@ -97,9 +96,6 @@ RENDER_STATE_ALLOWED = {
             "css/style/mod.rs:SELECTOR_TRUTH_DERIVATION",
             "css/style/mod.rs:STYLE_ANSWER_PATCH",
             "css/style/mod.rs:STYLE_PLAN_PROVENANCE",
-            "layout/fc_run_cache.rs:MODE",
-            "layout/update_layout.rs:ENABLED",
-            "painting/record/verify.rs:ENABLED",
         ],
     ),
     **render_state_entries(
@@ -107,7 +103,6 @@ RENDER_STATE_ALLOWED = {
         [
             "css/declaration_block.rs:NEXT_DECLARATION_BLOCK_IDENTITY",
             "css/rule.rs:NEXT_RULE_IDENTITY",
-            "css/selector.rs:NEXT_SELECTOR_ID",
             "css/style/index.rs:NEXT",
             "css/style/prefix.rs:NEXT",
             "css/style_sheet.rs:NEXT_SHEET_IDENTITY",
@@ -122,19 +117,18 @@ RENDER_STATE_ALLOWED = {
     **render_state_entries(
         BUILT_ONCE,
         [
-            "css/computed_values.rs:FIELD_DESCRIPTORS",
-            "css/computed_values.rs:PROPERTY_DEPENDENCY_MASKS",
-            "css/computed_values.rs:REGISTRY",
+            "css/computed_values.rs:DEFAULTS",
+            "css/computed_values.rs:MASKS",
             "css/counter_representation.rs:DECIMAL",
             "css/css_string.rs:EMPTY",
             "css/custom_properties.rs:EMPTY",
             "css/parser/stylesheet_cache.rs:HASHER",
             "css/style/publication.rs:REMAINING",
-            "css/style_compute.rs:INITIAL_VALUE_TABLE",
             "css/style_compute.rs:KINDS",
             "css/style_compute.rs:LONGHANDS",
             "css/style_compute.rs:PHASE_BOUNDARIES",
             "css/style_compute.rs:PX",
+            "css/style_compute.rs:TABLE",
         ],
     ),
     **render_state_entries(
@@ -148,18 +142,8 @@ RENDER_STATE_ALLOWED = {
         ],
     ),
     **render_state_entries(
-        REPLAY,
-        [
-            "css/computed_values.rs:REPLAY_STYLE_GROUPS",
-            "css/computed_values.rs:REPLAY_STYLE_GROUP_SIZES",
-            "css/style/record_replay.rs:CAPTURE",
-            "css/style_value.rs:REPLAY_STYLE_VALUES",
-        ],
-    ),
-    **render_state_entries(
         TEST_ONLY,
         [
-            "css/computed_values.rs:GROUPS",
             "css/declaration_block.rs:DECLARATION_OWNER_ALLOCATIONS",
             "css/descriptor_block.rs:DESCRIPTOR_OWNER_ALLOCATIONS",
             "css/rule.rs:RULE_OWNER_ALLOCATIONS",
@@ -178,7 +162,7 @@ RENDER_STATE_ALLOWED = {
     f"{RENDER_STATE_CRATE}/src/stage_thread.rs:THREAD_SETUP": "set once before the first stage thread starts, which runs it; read-only after",
     f"{RENDER_STATE_CRATE}/src/stage_thread.rs:FLIGHT_FINISHED": "set once before the first job is submitted, which a stage thread calls when one finishes; read-only after",
     f"{RENDER_STATE_CRATE}/src/stage_thread.rs:STYLE_LAYOUT_THREAD": "the process's one StyleLayout thread, which every thread hands its jobs to",
-    f"{RENDER_STATE_CRATE}/src/stage_thread.rs:PAINT_THREAD": "the process's one Paint thread, which every thread hands its jobs to",
+    f"{RENDER_STATE_CRATE}/src/paint_stage.rs:PAINT_THREAD": "the process's one Paint thread, which every thread hands its jobs to, and the stage only its own jobs reach",
     f"{RENDER_STATE_CRATE}/src/stage_thread.rs:THREAD": "test only",
 }
 

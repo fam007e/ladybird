@@ -7,6 +7,7 @@
 #include <AK/Debug.h>
 #include <AK/Math.h>
 #include <Compositor/ConnectionFromWebContent.h>
+#include <Compositor/RasterizeDisplayList.h>
 #include <LibCompositing/WebGL/WebGLSharedCommandBuffer.h>
 #include <LibCore/ElapsedTimer.h>
 #include <LibCore/Environment.h>
@@ -44,6 +45,35 @@ void ConnectionFromWebContent::offer_video_presentation_channel(IPC::TransportHa
 #endif
 
     dbgln_if(VIDEO_PRESENTATION_CHANNEL_DEBUG, "Compositor: established video presentation channel for WebContent (client_id={})", client_id());
+}
+
+void ConnectionFromWebContent::offer_render_clock_channel(IPC::TransportHandle handle)
+{
+    auto transport_or_error = handle.create_transport();
+    if (transport_or_error.is_error()) {
+        did_misbehave("WebContent sent an unusable render clock transport handle");
+        return;
+    }
+    // A new channel replaces the one before it, whose requests were for the contexts the process armed then.
+    m_render_clock_connection = RenderClockConnection::construct(transport_or_error.release_value(), client_id());
+#ifdef AK_OS_WINDOWS
+    m_render_clock_connection->transport().set_peer_pid(transport().peer_pid());
+#endif
+    m_render_clock_connection->on_request_clock_tick = [this](Web::CompositorContextId context_id, double maximum_frames_per_second) {
+        if (!context_is_owned_by_this_connection(context_id))
+            return;
+        if (!isfinite(maximum_frames_per_second) || maximum_frames_per_second <= 0) {
+            did_misbehave("WebContent sent an invalid maximum clock tick rate");
+            return;
+        }
+        m_compositor_state->request_clock_tick(context_id, maximum_frames_per_second);
+    };
+}
+
+void ConnectionFromWebContent::clock_tick(Web::CompositorContextId context_id, i64 frame_time_nanoseconds, double frame_interval_milliseconds, Vector<Web::CompositorScrollOffset> const& scroll_offsets)
+{
+    if (m_render_clock_connection)
+        m_render_clock_connection->async_clock_tick(context_id, frame_time_nanoseconds, frame_interval_milliseconds, scroll_offsets);
 }
 
 void ConnectionFromWebContent::add_video_sink(Media::VideoSinkHandle video_sink_handle)
@@ -236,9 +266,30 @@ void ConnectionFromWebContent::destroy_canvas_context(Compositing::CanvasId canv
     m_canvas_host.destroy_context(canvas_id);
 }
 
-Messages::CompositorWebContentServer::GetCanvasPixelsResponse ConnectionFromWebContent::get_canvas_pixels(Compositing::CanvasId canvas_id, Gfx::IntRect rect)
+Messages::CompositorWebContentServer::GetCanvasPixelsResponse ConnectionFromWebContent::get_canvas_pixels(Compositing::CanvasId canvas_id, Gfx::IntRect rect, Gfx::AlphaType alpha_type)
 {
-    return m_canvas_host.read_back_pixels(canvas_id, rect);
+    if (!Gfx::is_valid_alpha_type(to_underlying(alpha_type))) {
+        did_misbehave("WebContent asked for canvas pixels with an invalid alpha type");
+        return Gfx::ShareableBitmap {};
+    }
+    return m_canvas_host.read_back_pixels(canvas_id, rect, alpha_type);
+}
+
+Messages::CompositorWebContentServer::RasterizeDisplayListResponse ConnectionFromWebContent::rasterize_display_list(Core::AnonymousBuffer display_list_buffer, u64 tape_size, u64 run_count, Compositing::DisplayList::Properties display_list_properties, Compositing::AccumulatedVisualContextTree visual_context_tree, Compositing::DisplayListResourceTransaction resource_transaction, Gfx::ShareableBitmap target_bitmap)
+{
+    auto display_list = Compositing::DisplayList::create_from_shared_buffer(move(display_list_properties), move(display_list_buffer), tape_size, run_count);
+    if (display_list.is_error()) {
+        dbgln("Compositor: Rejecting display list to rasterize from WebContent: {}", display_list.error());
+        did_misbehave("WebContent asked to rasterize a display list its shared buffer does not hold");
+        return false;
+    }
+    if (!target_bitmap.is_valid())
+        return false;
+    if (auto result = Compositor::rasterize_display_list(*display_list.value(), visual_context_tree, move(resource_transaction), *target_bitmap.bitmap()); result.is_error()) {
+        dbgln("Compositor: Not rasterizing display list from WebContent: {}", result.error());
+        return false;
+    }
+    return true;
 }
 
 Messages::CompositorWebContentServer::AllocatePlaceholderCanvasResponse ConnectionFromWebContent::allocate_placeholder_canvas()

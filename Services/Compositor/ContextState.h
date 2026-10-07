@@ -15,6 +15,8 @@
 #include <AK/Span.h>
 #include <AK/Vector.h>
 #include <Compositor/BackingStoreManager.h>
+#include <Compositor/DisplayListRasterCache.h>
+#include <Compositor/Forward.h>
 #include <Compositor/FramePacer.h>
 #include <Compositor/ScrollSnapController.h>
 #include <Compositor/ScrollbarController.h>
@@ -42,12 +44,6 @@
 namespace Gfx {
 
 class SkiaBackendContext;
-
-}
-
-namespace Compositing {
-
-class DisplayListPlayerSkia;
 
 }
 
@@ -194,6 +190,15 @@ public:
     bool rendering_opportunity_is_due(MonotonicTime frame_time, double display_refresh_rate) const;
     void did_deliver_rendering_opportunity(MonotonicTime frame_time);
 
+    bool request_clock_tick(double maximum_frames_per_second);
+    bool clock_tick_requested() const { return m_clock_tick_requested; }
+    double clock_tick_interval(double display_refresh_rate) const { return m_clock_tick_pacer.frame_interval(display_refresh_rate); }
+    bool clock_tick_is_due(MonotonicTime frame_time, double display_refresh_rate) const { return m_clock_tick_pacer.is_due(frame_time, display_refresh_rate); }
+    void did_deliver_clock_tick(MonotonicTime frame_time);
+    // Where the compositor has scrolled each scroll node to.
+    Vector<Web::CompositorScrollOffset> scroll_offsets() const;
+    bool display_tick_requested() const { return m_rendering_opportunity_requested || m_clock_tick_requested; }
+
     void queue_present_frame(PendingFrame);
     Optional<Gfx::IntRect> pending_present_frame_viewport_rect() const;
     void mark_pending_present_frame_scheduled();
@@ -205,11 +210,11 @@ public:
     Optional<Gfx::IntRect> frame_rect_to_repaint() const;
     Optional<Gfx::IntRect> self_present_rect() const;
     bool draws_canvas(Compositing::CanvasId) const;
-    Optional<PreparedFrame> prepare_frame(Compositing::DisplayListPlayerSkia&, PendingFrame, CompositedContextResolver const*);
+    Optional<PreparedFrame> prepare_frame(DisplayListPlayerSkia&, PendingFrame, CompositedContextResolver const*);
     void did_submit_prepared_frame(Gfx::IntRect);
-    bool present_synchronously(Compositing::DisplayListPlayerSkia&, CompositedContextResolver const*);
+    bool present_synchronously(DisplayListPlayerSkia&, CompositedContextResolver const*);
     bool can_paint_screenshot(Gfx::ShareableBitmap&) const;
-    void paint_screenshot(Compositing::DisplayListPlayerSkia&, Gfx::ShareableBitmap&, CompositedContextResolver const*);
+    void paint_screenshot(DisplayListPlayerSkia&, Gfx::ShareableBitmap&, CompositedContextResolver const*);
     bool acknowledge_presented_bitmap(i32 bitmap_id);
     void did_finish_gpu_present(i32 bitmap_id);
 
@@ -294,7 +299,7 @@ private:
         No,
         Yes,
     };
-    void paint_current_display_list(Compositing::DisplayListPlayerSkia&, Gfx::PaintingSurface&, CompositedContextResolver const*, Optional<Gfx::IntRect> damage_rect = {}, PaintUIOverlay = PaintUIOverlay::Yes, bool apply_raster_transform = true);
+    void paint_current_display_list(DisplayListPlayerSkia&, Gfx::PaintingSurface&, CompositedContextResolver const*, Optional<Gfx::IntRect> damage_rect = {}, PaintUIOverlay = PaintUIOverlay::Yes, bool apply_raster_transform = true);
     Gfx::IntSize raster_size() const;
     Gfx::IntRect raster_damage_rect(Gfx::IntRect) const;
     Gfx::IntRect frame_damage_for(PendingFrame const&);
@@ -320,6 +325,7 @@ private:
     bool m_has_active_visual_animations { false };
     Optional<bool> m_animated_content_may_affect_viewport;
     Compositing::DisplayListResourceStorage m_display_list_resource_storage;
+    DisplayListRasterCache m_raster_cache;
     Compositing::ScrollStateSnapshot m_scroll_state_snapshot;
     BackingStoreManager m_backing_store_manager;
     RefPtr<Gfx::PaintingSurface> m_latest_rendered_surface;
@@ -383,6 +389,8 @@ private:
 
     bool m_rendering_opportunity_requested { false };
     FramePacer m_rendering_opportunity_pacer;
+    bool m_clock_tick_requested { false };
+    FramePacer m_clock_tick_pacer;
 
     Optional<PendingFrame> m_pending_present_frame;
     bool m_pending_present_frame_scheduled { false };

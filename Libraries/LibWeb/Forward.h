@@ -48,7 +48,6 @@ namespace Web::Compositor {
 class CompositorConnection;
 class CompositorContextHandle;
 class CompositorHost;
-class CompositorHostBase;
 class NavigablePresenter;
 struct CompositorFrame;
 
@@ -92,8 +91,6 @@ namespace Web::Bindings {
 
 class Intrinsics;
 enum class NamedPropertyDeletionResult : u8;
-class OptionConstructor;
-class PlatformObject;
 class Wrappable;
 class WrapperWorld;
 
@@ -232,18 +229,14 @@ enum class ElementBoxKind : u8;
 
 class AbstractImageStyleValue;
 class AbstractOrHypotheticalElement;
-class AnchorStyleValue;
 class Angle;
 class AnglePercentage;
 class AngleStyleValue;
 class BackgroundSizeStyleValue;
 class BlurFilterStyleValue;
 class BorderImageSliceStyleValue;
-class BorderRadiusRectStyleValue;
-class BorderRadiusStyleValue;
 class CalculatedStyleValue;
 class CustomPropertyData;
-class Clip;
 class ColorFilterStyleValue;
 class ColorFunctionStyleValue;
 class ColorSchemeStyleValue;
@@ -251,14 +244,10 @@ class ColorStyleValue;
 class ComputedStyleWorkingSet;
 class ComputedValues;
 class ComputedStyleRecordView;
-class ConicGradientStyleValue;
 class ContainerQuery;
 class ContentStyleValue;
 class CounterDefinitionsStyleValue;
-class CounterStyle;
 class CounterStyleStyleValue;
-class CounterStyleSystemStyleValue;
-class CounterStyleValue;
 class CSSAnimation;
 class CSSConditionRule;
 class CSSContainerRule;
@@ -349,9 +338,7 @@ class LengthOrAuto;
 class LengthPercentage;
 class LengthPercentageOrAuto;
 class LengthStyleValue;
-class LinearGradientStyleValue;
 class MediaList;
-class MediaQuery;
 class MediaQueryList;
 class MediaQueryListEvent;
 class Number;
@@ -359,19 +346,13 @@ class NumberStyleValue;
 class NumericType;
 class OpacityValueStyleValue;
 class OpenTypeTaggedStyleValue;
-class OverflowClipMarginStyleValue;
-class ParsedFontFace;
 class PendingSubstitutionStyleValue;
 class Percentage;
 class PercentageStyleValue;
 class PositionStyleValue;
 class PropertyNameAndID;
-class RadialGradientStyleValue;
-class RadialSizeStyleValue;
-class RandomValueSharingStyleValue;
 class Ratio;
 class RatioStyleValue;
-class RectStyleValue;
 class RepeatStyleStyleValue;
 class Resolution;
 class ResolutionStyleValue;
@@ -381,7 +362,6 @@ class Selector;
 class ShadowStyleValue;
 class ShorthandStyleValue;
 class Size;
-class ScrollbarColorStyleValue;
 class StringStyleValue;
 class StyleComputer;
 class StylePropertyMap;
@@ -392,15 +372,10 @@ class StyleSheetImport;
 class StyleSheetList;
 class StyleValue;
 class StyleValueList;
-class SuperellipseStyleValue;
-class SVGPaint;
-class TextIndentStyleValue;
 class Time;
 class TimePercentage;
 class TimeStyleValue;
 class TransformationStyleValue;
-class TreeCountingFunctionStyleValue;
-class TupleStyleValue;
 class UnicodeRangeStyleValue;
 class UnresolvedStyleValue;
 class URL;
@@ -468,7 +443,6 @@ enum class TextUnderlinePositionVertical : u8;
 enum class TransitionBehavior : u8;
 enum class WritingMode : u8;
 
-struct BackgroundLayerData;
 struct CalculationContext;
 struct CalculationResolutionContext;
 struct ColorResolutionContext;
@@ -482,7 +456,6 @@ struct RequiredInvalidationAfterStyleChange;
 using CSSNumberish = Variant<double, GC::Ref<CSSNumericValue>>;
 using PaintOrderList = Array<PaintOrder, 3>;
 using StyleValueVector = Vector<ValueComparingNonnullRefPtr<StyleValue const>>;
-using StyleValueTuple = Vector<ValueComparingRefPtr<StyleValue const>>;
 
 }
 
@@ -532,7 +505,6 @@ class EventHandler;
 class EventTarget;
 class HTMLCollection;
 class IDLEventListener;
-class InvalidationJournal;
 class LiveNodeList;
 class MutationObserver;
 class MutationRecord;
@@ -1259,7 +1231,6 @@ class Instance;
 class Memory;
 class Module;
 class Table;
-class WebAssemblyModule;
 
 namespace Detail {
 
