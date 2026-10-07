@@ -27,6 +27,7 @@ target_sources(ladybird PRIVATE
     BookmarksBar.cpp
     BrowserWindow.cpp
     ChromeStyle.cpp
+    CrashReportNotifier.cpp
     CrashReportReviewWidget.cpp
     DevToolsBanner.cpp
     EventLoopImplementationQt.cpp
@@ -41,6 +42,7 @@ target_sources(ladybird PRIVATE
     NativeWindowContainer.cpp
     ProcessManagerWindow.cpp
     PerformanceMonitorWidget.cpp
+    Popover.cpp
     SelectDropdown.cpp
     Settings.cpp
     StringUtils.cpp
