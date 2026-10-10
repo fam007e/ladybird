@@ -2226,7 +2226,6 @@ fn expose_shared_abi_types_as_cpp_types(config: &mut cbindgen::Config) {
             "ClipNodeIndex",
             "EffectNodeIndex",
             "ContextRef",
-            "DisplayListCommandRun",
             "ReplayClip",
             "ReplayLayer",
             "ReplayMask",
@@ -2268,7 +2267,6 @@ fn expose_shared_abi_types_as_cpp_types(config: &mut cbindgen::Config) {
         ("ClipNodeIndex", "Compositing::ClipNodeIndex"),
         ("EffectNodeIndex", "Compositing::EffectNodeIndex"),
         ("ContextRef", "Compositing::ContextRef"),
-        ("DisplayListCommandRun", "Compositing::DisplayListCommandRun"),
         ("ReplayClip", "Compositing::ReplayClip"),
         ("ReplayLayer", "Compositing::ReplayLayer"),
         ("ReplayMask", "Compositing::ReplayMask"),
@@ -2318,7 +2316,6 @@ fn expose_compositing_types_as_cpp_types(config: &mut cbindgen::Config) {
         "FfiVisualAnimationSummary",
         "FfiAnimatedContentViewportEffect",
         "FfiTestStickyConstraints",
-        "FfiRecordedDisplayList",
         "FfiDisplayListReplayCallbacks",
         "FfiEasingDescriptor",
         "FfiEasingKind",
@@ -2461,13 +2458,16 @@ fn main() -> Result<(), Box<dyn Error>> {
     // an FFI call.
     let mut style_value_config = base_config.clone();
     style_value_config.namespaces = Some(vec!["Web".to_string(), "CSS".to_string(), "StyleValueFFI".to_string()]);
-    // A transition step's inputs and decisions cross through the style engine's header, which names them here.
+    // A transition step's inputs and decisions cross through the style engine's header, which names them here, and
+    // the style a color resolves against crosses the layout header behind an opaque pointer.
     style_value_config.export.include = [
         "StyleValueData",
         "RetainedGridTrackEntry",
         "FfiTransitionInput",
         "FfiExistingTransition",
         "FfiTransitionAction",
+        "FfiColorResolutionStyle",
+        "FfiLaneTransition",
     ]
     .map(String::from)
     .to_vec();
@@ -2582,14 +2582,14 @@ fn main() -> Result<(), Box<dyn Error>> {
         "Web::CSS::StyleValueFFI::FfiCompositeOperation".to_string(),
     );
     // A transition step's decision is asked of the engine in the style value header's terms.
-    for name in ["FfiTransitionInput", "FfiTransitionAction"] {
+    for name in ["FfiTransitionInput", "FfiTransitionAction", "FfiLaneTransition"] {
         style_engine_config
             .export
             .rename
             .insert(name.to_string(), format!("Web::CSS::StyleValueFFI::{name}"));
     }
     style_engine_config.after_includes = Some(
-        "namespace Web::CSS::StyleValueFFI { enum class FfiCompositeOperation : uint8_t; enum class FfiTransitionActionKind : uint8_t; struct FfiTransitionInput; struct FfiTransitionAction; }"
+        "namespace Web::CSS::StyleValueFFI { enum class FfiCompositeOperation : uint8_t; enum class FfiTransitionActionKind : uint8_t; struct FfiTransitionInput; struct FfiTransitionAction; struct FfiLaneTransition; }"
             .to_string(),
     );
     // The host queues the engine's changes on the document host, which the layout header declares.
@@ -2633,6 +2633,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             manifest_dir.join("src/css/style/rule_writes.rs"),
             manifest_dir.join("src/css/style/style_job.rs"),
             manifest_dir.join("src/css/ffi_support.rs"),
+            manifest_dir.join("src/css/style/hover_lane.rs"),
             out_dir.join("ffi_state_fact_generated.rs"),
         ],
         &out_dir,
@@ -2858,6 +2859,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             manifest_dir.join("src/painting/layout_tree_dump.rs"),
             manifest_dir.join("src/painting/ffi.rs"),
             manifest_dir.join("src/render_state/clock.rs"),
+            manifest_dir.join("src/render_state/clock/hover.rs"),
             manifest_dir.join("src/layout/script_entries.rs"),
             manifest_dir.join("src/painting/paint_changes.rs"),
             manifest_dir.join("src/painting/ffi/main_thread_entries.rs"),

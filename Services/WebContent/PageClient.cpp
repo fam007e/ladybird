@@ -142,6 +142,12 @@ PageClient::PageClient(PageHost& owner, Web::PageId id, Optional<Web::HTML::Cros
 {
     setup_palette();
 
+    // A hover of the render clock asks for its cursor on the StyleLayout thread, as the main thread does on its own: both
+    // over the one connection, under the page cursor's lock.
+    m_page->cursor().set_send([&client = client(), id = m_id](Gfx::Cursor const& cursor) {
+        client.async_did_request_cursor_change(id, cursor);
+    });
+
     m_frame_timer = Core::Timer::create_single_shot(0, [this] { frame_timer_fired(); });
 }
 
@@ -827,11 +833,6 @@ void PageClient::set_maximum_frames_per_second(double maximum_frames_per_second)
         return;
     m_maximum_frames_per_second = maximum_frames_per_second;
     m_last_rendering_opportunity_frame_interval = 1000.0 / maximum_frames_per_second;
-}
-
-void PageClient::page_did_request_cursor_change(Gfx::Cursor const& cursor)
-{
-    client().async_did_request_cursor_change(m_id, cursor);
 }
 
 void PageClient::page_did_change_title(Utf16String const& title)
@@ -2078,34 +2079,21 @@ void PageClient::page_did_receive_network_response_body(u64 request_id, Readonly
     client().async_did_receive_network_response_body(m_id, request_id, data);
 }
 
-void PageClient::did_connect_devtools_client()
+void PageClient::set_has_devtools_client(bool has_devtools_client)
 {
-    auto was_first_devtools_client = !has_devtools_client();
-    ++m_devtools_client_count;
-
-    if (!was_first_devtools_client)
+    if (m_has_devtools_client == has_devtools_client)
         return;
+    m_has_devtools_client = has_devtools_client;
 
     for (auto& navigable : Web::HTML::all_local_navigables()) {
         if (&navigable->page() != &page())
             continue;
-        if (auto active_document = navigable->active_document())
+        auto active_document = navigable->active_document();
+        if (!active_document)
+            continue;
+        if (has_devtools_client)
             active_document->update_layout(Web::DOM::UpdateLayoutReason::InspectDevToolsLayoutData);
-    }
-}
-
-void PageClient::did_disconnect_devtools_client()
-{
-    VERIFY(m_devtools_client_count > 0);
-    --m_devtools_client_count;
-
-    if (has_devtools_client())
-        return;
-
-    for (auto& navigable : Web::HTML::all_local_navigables()) {
-        if (&navigable->page() != &page())
-            continue;
-        if (auto active_document = navigable->active_document())
+        else
             active_document->clear_devtools_layout_inspection_data();
     }
 }

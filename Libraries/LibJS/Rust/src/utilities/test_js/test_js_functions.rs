@@ -22,7 +22,7 @@ use crate::layout::object::Object;
 use crate::layout::realm::Realm;
 use crate::layout::value::Value;
 use crate::layout_forward::RawNativeFunctionPointer;
-use crate::runtime::abstract_operations::can_be_held_weakly;
+use crate::runtime::abstract_operations::{call, can_be_held_weakly};
 use crate::runtime::array_buffer::{ArrayBuffer, Order, detach_array_buffer};
 use crate::runtime::completion::ThrowCompletionOr;
 use crate::runtime::date::clear_system_time_zone_cache;
@@ -43,7 +43,12 @@ use crate::utf16::Utf16View;
 /// functions TESTJS_GLOBAL_FUNCTION defines, each has a length of 1.
 pub const EXPOSED_GLOBAL_FUNCTIONS: &[(&str, RawNativeFunctionPointer)] = &[
     ("canParseSource", raw_native!(can_parse_source)),
+    ("haveSameShape", raw_native!(have_same_shape)),
     ("gc", raw_native!(collect_garbage)),
+    (
+        "collectGarbageOnEveryAllocation",
+        raw_native!(collect_garbage_on_every_allocation),
+    ),
     ("addEnginePrivateProperty", raw_native!(add_engine_private_property)),
     ("evaluateSource", raw_native!(evaluate_source)),
     ("evaluateModule", raw_native!(evaluate_module)),
@@ -78,6 +83,16 @@ fn as_if<T: GcCell + Extends<Object>>(value: Value) -> Option<Gc<T>> {
     value.as_object().downcast::<T>()
 }
 
+fn have_same_shape(vm: &Vm) -> ThrowCompletionOr<Value> {
+    let (lhs, rhs) = (vm.argument(0), vm.argument(1));
+    for argument in [lhs, rhs] {
+        if !argument.is_object() {
+            return vm.throw_completion(ErrorKind::TypeError, ErrorType::NotAnObject, &[&argument]);
+        }
+    }
+    Ok(Value::from_bool(lhs.as_object().shape() == rhs.as_object().shape()))
+}
+
 fn can_parse_source(vm: &Vm) -> ThrowCompletionOr<Value> {
     let realm = vm.current_realm().expect("canParseSource runs in a realm");
     let source = vm.argument(0).to_utf16_string(vm)?;
@@ -89,6 +104,15 @@ fn can_parse_source(vm: &Vm) -> ThrowCompletionOr<Value> {
 fn collect_garbage(vm: &Vm) -> ThrowCompletionOr<Value> {
     vm.heap().collect_garbage();
     Ok(Value::UNDEFINED)
+}
+
+fn collect_garbage_on_every_allocation(vm: &Vm) -> ThrowCompletionOr<Value> {
+    let heap = vm.heap();
+    let previous = heap.should_collect_on_every_allocation();
+    heap.set_should_collect_on_every_allocation(true);
+    let result = call(vm, vm.argument(0), Value::UNDEFINED, &[]);
+    heap.set_should_collect_on_every_allocation(previous);
+    result
 }
 
 fn add_engine_private_property(vm: &Vm) -> ThrowCompletionOr<Value> {

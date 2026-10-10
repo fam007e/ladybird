@@ -1311,6 +1311,10 @@ pub struct FfiPublishedAnimationEffect {
     pub keyframe_count: u32,
     pub base_url_offset: u32,
     pub base_url_length: u32,
+    /// A transition's reversing-adjusted start value, or null for any other effect.
+    pub reversing_adjusted_start_value: *const c_void,
+    /// A transition's reversing shortening factor.
+    pub reversing_shortening_factor: f64,
 }
 
 /// The easing function a published keyframe spells out.
@@ -1898,6 +1902,48 @@ pub unsafe fn publish_computed_groups(
     )
 }
 
+/// Builds every style group of the document's own style from its longhand table, against the used color-scheme and
+/// `color` the table computed, and interns the record no element holds. Answers the record.
+///
+/// # Safety
+/// `font` must borrow platform font resources that stay live across the call.
+pub(crate) unsafe fn intern_document_style(
+    engine: &mut StyleEngine,
+    table: &ComputedLonghandTable,
+    font: &crate::css::table_group_builder::FfiFontGroupBuildInputs,
+    length: &crate::css::style_compute::FfiLengthResolutionContext,
+) -> u64 {
+    use crate::css::table_group_builder::{assemble_group_from_table, assembly_color_inputs, group_index};
+    let color_inputs = assembly_color_inputs(table, length);
+    let payloads: [*const c_void; group_index::COUNT] = std::array::from_fn(|group| unsafe {
+        assemble_group_from_table(table, group, Some(font), std::ptr::null(), color_inputs, length)
+    });
+    let delta = unsafe {
+        publish_computed_groups(
+            engine,
+            0,
+            crate::css::cascaded_properties::NO_PSEUDO_ELEMENT,
+            payloads.as_ptr(),
+            payloads.len(),
+            super::computed::ENGINE_INHERITED_GROUP_COUNT,
+            0,
+            false,
+            0,
+            0,
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+            std::ptr::from_ref(table).cast(),
+            std::ptr::null(),
+        )
+    };
+    // Interning a record no element holds retains its groups, so the references the builders handed over go back.
+    for (group, payload) in payloads.into_iter().enumerate() {
+        crate::css::computed_values::release_group_payload(group, payload);
+    }
+    delta.new_style_record
+}
+
 // Shared by host publication and native layout-style derivation.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn publish_computed_groups_from_inputs(
@@ -2205,6 +2251,9 @@ unsafe fn publish_sampled_animation_overlay(
     let Some(node) = StyleNodeID::from_raw(input.style_node) else {
         return Ok(FfiAnimationOverlayPublication::missing());
     };
+    let Some(installed_style_record) = super::computed::FinalStyleRecordID::from_raw(input.style_record) else {
+        return Ok(FfiAnimationOverlayPublication::missing());
+    };
     // SAFETY: Guaranteed by the caller.
     let (table, overlay) = unsafe {
         (
@@ -2240,6 +2289,7 @@ unsafe fn publish_sampled_animation_overlay(
     };
     let publication = match engine.publish_animation_overlay_impl(
         super::computed::ComputedStyleTarget::new(node, input.pseudo_kind),
+        installed_style_record,
         input.animation_overlay_identity,
         HostShared::new(animated_overlay).cast(),
         SharedPayload::from_pointer_slice(overlay_payloads),

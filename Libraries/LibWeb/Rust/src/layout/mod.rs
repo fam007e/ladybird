@@ -68,7 +68,9 @@ use crate::layout::layout_node_arena::IntrinsicInlineSizeMeasurement;
 use crate::layout::layout_node_arena::IntrinsicSizeCacheKey;
 use crate::layout::layout_node_arena::IntrinsicSizeCacheKind;
 pub(crate) use crate::layout::layout_node_arena::MainThreadFfiEntry as ArenaMainThreadFfiEntry;
-pub(crate) use crate::layout::layout_node_arena::{HostStyle, LayoutNodeArena, LiveRow, RowsVersion, SLOTS_PER_CHUNK};
+pub(crate) use crate::layout::layout_node_arena::{
+    HostStyle, LayoutNodeArena, LiveRow, RowsVersion, SLOTS_PER_CHUNK, SampleKind,
+};
 use crate::layout::layout_node_arena::{TableCellMeasurement, TableCellMeasurementKey};
 use crate::layout::node_data::AncestorFact;
 pub use crate::layout::node_data::FfiReplacedContentFacts;
@@ -103,5 +105,5 @@ use std::ffi::c_void;
 pub(crate) use style_values::StyleValues;
 pub(crate) use tree_builder::build_keeps_box;
 pub(crate) use update_layout::MainThreadFfiEntry as UpdateMainThreadFfiEntry;
-pub(crate) use update_layout::{ClockRound, ClockRoundDeclined, FlownRound, LayoutRoundAnswer, SealedRound};
+pub(crate) use update_layout::{ClockRound, ClockRoundDeclined, FlownRound, SealedRound};
 pub(crate) use used_values::{FfiCssPixelPoint, FfiCssPixelRect, FfiCssPixelSize, SizeConstraint, UsedValues};

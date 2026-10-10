@@ -2247,19 +2247,10 @@ void ConnectionFromClient::set_listen_for_dom_mutations(Web::PageId page_id, boo
         page->clear_pending_dom_mutations();
 }
 
-void ConnectionFromClient::did_connect_devtools_client(Web::PageId page_id)
+void ConnectionFromClient::set_has_devtools_client(Web::PageId page_id, bool has_devtools_client)
 {
     if (auto page = this->page(page_id); page.has_value())
-        page->did_connect_devtools_client();
-}
-
-void ConnectionFromClient::did_disconnect_devtools_client(Web::PageId page_id)
-{
-    auto page = this->page(page_id);
-    if (!page.has_value())
-        return;
-
-    page->did_disconnect_devtools_client();
+        page->set_has_devtools_client(has_devtools_client);
 }
 
 void ConnectionFromClient::get_dom_node_inner_html(Web::PageId page_id, Web::UniqueNodeID node_id)
@@ -3544,14 +3535,24 @@ void ConnectionFromClient::request_close(Web::PageId page_id)
 {
     // Browser user agents should offer users the ability to arbitrarily close any top-level traversable in their top-level traversable set.
     // For example, by clicking a "close tab" button.
-    if (auto page = this->page(page_id); page.has_value())
-        as<Web::HTML::LocalTraversableNavigable>(*page->page().top_level_traversable()).close_top_level_traversable();
+    if (auto page = this->page(page_id); page.has_value()) {
+        // NB: A close queued before a process switch can arrive after this page has stopped hosting the traversable.
+        if (auto* traversable = as_if<Web::HTML::LocalTraversableNavigable>(page->page().top_level_traversable().ptr()))
+            traversable->close_top_level_traversable();
+        else
+            discard_embedded_page(page_id);
+    }
 }
 
 void ConnectionFromClient::force_close(Web::PageId page_id)
 {
-    if (auto page = this->page(page_id); page.has_value())
-        as<Web::HTML::LocalTraversableNavigable>(*page->page().top_level_traversable()).close_top_level_traversable(Web::HTML::LocalTraversableNavigable::PromptToUnload::No);
+    if (auto page = this->page(page_id); page.has_value()) {
+        // NB: A close queued before a process switch can arrive after this page has stopped hosting the traversable.
+        if (auto* traversable = as_if<Web::HTML::LocalTraversableNavigable>(page->page().top_level_traversable().ptr()))
+            traversable->close_top_level_traversable(Web::HTML::LocalTraversableNavigable::PromptToUnload::No);
+        else
+            discard_embedded_page(page_id);
+    }
 }
 
 void ConnectionFromClient::exit_fullscreen(Web::PageId page_id)

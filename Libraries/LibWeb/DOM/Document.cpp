@@ -25,7 +25,6 @@
 #include <AK/Utf8View.h>
 #include <LibCompositing/DisplayList/AccumulatedVisualContext.h>
 #include <LibCompositing/DisplayList/DisplayList.h>
-#include <LibCompositing/DisplayList/DisplayListCommand.h>
 #include <LibCore/Timer.h>
 #include <LibGC/ConservativeVector.h>
 #include <LibGC/Heap.h>
@@ -668,7 +667,21 @@ void Document::mark_style_attribute_dirty(Element& element)
 
 void Document::synchronize_dirty_style_attributes()
 {
+    // OPTIMIZATION: A style update synchronizes the style attribute of an element whose declarations script changed
+    //               only for the selectors and attr()s of the style engine. Where none reads the attribute, it is
+    //               synchronized as the DOM reads it, which tells the engine then, and the elements left out are
+    //               synchronized at the first style update that something of the engine reads it at.
+    auto& style_engine = style_computer().style_engine();
+    if (style_engine.attribute_is_known_unread(style_engine.intern_attribute_name(HTML::AttributeNames::style, {}))) {
+        for (auto& element : m_elements_with_dirty_style_attributes)
+            m_elements_with_unreported_style_attributes.set(element);
+        m_elements_with_dirty_style_attributes.clear();
+        return;
+    }
     auto elements = move(m_elements_with_dirty_style_attributes);
+    for (auto& element : m_elements_with_unreported_style_attributes)
+        elements.set(element);
+    m_elements_with_unreported_style_attributes.clear();
     for (auto& element : elements) {
         if (element.is_connected() && &element.document() == this)
             element.synchronize_all_attributes();
@@ -2294,9 +2307,9 @@ bool Document::layout_is_up_to_date() const
         return true;
     if (m_reads_layout_as_it_flew)
         return true;
-    // A frame in flight, or a round that flew or a clock lease ran and is not paid yet, brings layout the host waits
-    // for, which the host knows without reading the render state. So does style that flew, which is pending until a read
-    // of the document drains it: a read of a document it embeds asks here, and lays the document out to drain it.
+    // A frame in flight, or a round that flew and is not paid yet, brings layout the host waits for, which the host
+    // knows without reading the render state. So does style that flew, which is pending until a read of the document
+    // drains it: a read of a document it embeds asks here, and lays the document out to drain it.
     if (has_flown_style_transaction() || (m_layout_node_arena && m_layout_node_arena->render_document().waits_for_frame()))
         return false;
     // Without an arena there is no layout root either, so there is a tree to build.
@@ -2801,8 +2814,13 @@ void Document::obtain_supported_color_schemes()
     set_supported_color_schemes(move(supported_color_schemes), supported_color_schemes_are_only);
 }
 
-// https://html.spec.whatwg.org/multipage/semantics.html#meta-theme-color
 void Document::obtain_theme_color(Layout::BegunRead const& read)
+{
+    page().client().page_did_change_theme_color(theme_color(read));
+}
+
+// https://html.spec.whatwg.org/multipage/semantics.html#meta-theme-color
+Color Document::theme_color(Layout::BegunRead const& read)
 {
     Color theme_color = Color::Transparent;
 
@@ -2831,13 +2849,12 @@ void Document::obtain_theme_color(Layout::BegunRead const& read)
 
             // 4. If color is not failure, then return color.
             if (!css_value.is_null() && css_value->has_color()) {
-                CSS::ColorResolutionContext color_resolution_context {};
-                // NB: Called during theme color computation, layout may be stale.
-                if (html_element() && html_element()->unsafe_layout_node(read)) {
-                    color_resolution_context = CSS::ColorResolutionContext::for_layout_node_with_style(*html_element()->unsafe_layout_node(read));
-                }
-
-                theme_color = css_value->to_color(color_resolution_context).value();
+                // The parsed value is no computed one, so it resolves against the root element's style the way that
+                // style computes its own values, lengths included.
+                auto root_element_style_record = html_element() ? html_element()->style_record_identity() : CSS::StyleRecordID {};
+                auto resolved = CSS::StyleValueFFI::rust_style_value_to_color_against_style_record(style_computer().style_engine().host(), &read, root_element_style_record.value(), css_value->rust_style_value_data());
+                VERIFY(resolved.resolved);
+                theme_color = Color(resolved.rgba[0], resolved.rgba[1], resolved.rgba[2], resolved.rgba[3]);
                 return TraversalDecision::Break;
             }
         }
@@ -2846,7 +2863,7 @@ void Document::obtain_theme_color(Layout::BegunRead const& read)
     });
 
     // 3. Return nothing(the page has no theme color).
-    document().page().client().page_did_change_theme_color(theme_color);
+    return theme_color;
 }
 
 Layout::Viewport const* Document::layout_node(Layout::BegunRead const& read) const
@@ -3081,6 +3098,9 @@ static void mark_mouse_transition_event_as_trusted_if_needed(Event& event, Optio
 void Document::set_hovered_node(GC::Ptr<Node> node, Optional<HoverEventData> hover_event_data)
 {
     Layout::ForcedReadScope read { *this };
+    // The style's hover follows the node the events hover. A hover beside the host may have moved it already, while
+    // the hovered node of the events stayed.
+    CSS::move_style_hover(*this, node);
     if (m_hovered_node == node)
         return;
 
@@ -3127,8 +3147,6 @@ void Document::set_hovered_node(GC::Ptr<Node> node, Optional<HoverEventData> hov
         for (auto target = node; target && target.ptr() != common_ancestor; target = target->parent_or_shadow_host())
             entered_ancestors.append(make_hover_event_target(*target));
     }
-
-    CSS::Invalidation::invalidate_style_after_pseudo_class_state_change(CSS::PseudoClass::Hover, old_hovered_node, node);
 
     m_hovered_node = node;
 
@@ -10303,13 +10321,20 @@ RefPtr<Compositing::DisplayList> Document::record_display_list(Layout::BegunRead
 {
     // The host reads this recording right after it, so a recording in flight is taken in first: it has the recorder
     // state.
+    // The navigable's resource storage is the Paint thread's while the document's clock lane presents: a recording
+    // that adds to it holds the lane meanwhile.
+    auto* host = layout_node_arena().host();
+    bool holds_clock_lane = false;
     if (auto navigable = this->navigable()) {
         navigable->take_recording_in_flight_in(HTML::LocalNavigable::TakeIn::Wait);
-        // What a clock lease's ticks published, a recording that publishes copies from, which the document takes in with
-        // the presenter.
-        if (cache_mode == Painting::PaintCommandCacheMode::ReadWrite)
-            (void)navigable->presenter();
+        holds_clock_lane = &resource_storage == &navigable->display_list_resource_storage();
     }
+    if (holds_clock_lane)
+        Layout::RustFFI::document_host_hold_clock_lane(host);
+    ScopeGuard release_clock_lane = [&] {
+        if (holds_clock_lane)
+            Layout::RustFFI::document_host_release_clock_lane(host);
+    };
     auto recording = start_display_list_recording(read, config, cache_mode);
     if (!recording.has_value())
         return nullptr;
@@ -10338,13 +10363,13 @@ Optional<Painting::DisplayListRecording> Document::start_recording(Layout::Begun
     auto& document_paint_state = paint_state();
     auto visual_context_tree = document_paint_state.visual_context_tree(*this);
 
-    auto placeholder_display_list = Compositing::DisplayList::create(visual_context_tree);
+    Optional<Gfx::Color> surface_clear_color;
 
     // https://drafts.csswg.org/css-color-adjust-1/#color-scheme-effect
     // On the root element, the used color scheme additionally must affect the surface color of the canvas, and the viewport’s scrollbars.
     if (navigable()->is_top_level_traversable()) {
         auto canvas_background_color = this->canvas_background_color(read);
-        placeholder_display_list->set_surface_clear_color(canvas_background_color);
+        surface_clear_color = canvas_background_color;
         page().client().page_did_change_background_color(canvas_background_color);
     }
 
@@ -10366,7 +10391,7 @@ Optional<Painting::DisplayListRecording> Document::start_recording(Layout::Begun
     if (config.should_show_caret_hit_test_debug_overlay)
         overlay_inputs.caret_debug_rect = m_caret_hit_test_debug_rect;
 
-    return Painting::start_rust_display_list_recording(read, *this, move(visual_context_tree), move(placeholder_display_list), cache_mode, config, overlay_inputs, move(committed));
+    return Painting::start_rust_display_list_recording(read, *this, move(visual_context_tree), surface_clear_color, cache_mode, config, overlay_inputs, move(committed));
 }
 
 RefPtr<Compositing::DisplayList> Document::finish_display_list_recording(Layout::BegunRead const& read, Painting::DisplayListRecording const& recording, Compositing::DisplayListResourceStorage& resource_storage, Painting::HitTestListStands hit_test_list_stands)
@@ -10374,11 +10399,11 @@ RefPtr<Compositing::DisplayList> Document::finish_display_list_recording(Layout:
     auto display_list = Painting::finish_rust_display_list_recording(read, *this, recording, resource_storage);
     if (!display_list)
         return nullptr;
-    adopt_published_recording(hit_test_list_read(read, hit_test_list_stands), recording, *display_list, resource_storage);
+    adopt_published_recording(hit_test_list_read(read, hit_test_list_stands), recording, *display_list, [&] { return resource_storage.collect_referenced_resources(*display_list); });
     return display_list;
 }
 
-void Document::adopt_published_recording(Optional<Layout::BegunRead const&> hit_test_list_read, Painting::DisplayListRecording const& recording, NonnullRefPtr<Compositing::DisplayList> display_list, Compositing::DisplayListResourceStorage& resource_storage)
+void Document::adopt_published_recording(Optional<Layout::BegunRead const&> hit_test_list_read, Painting::DisplayListRecording const& recording, NonnullRefPtr<Compositing::DisplayList> display_list, Function<Compositing::DisplayListResourceSet()> const& referenced_resources)
 {
     auto& document_paint_state = paint_state();
     bool const recording_returned_the_paint_command_cache_source = display_list == document_paint_state.display_list_used_as_paint_command_cache_source();
@@ -10388,7 +10413,7 @@ void Document::adopt_published_recording(Optional<Layout::BegunRead const&> hit_
         m_hit_test_display_list = Painting::HitTestDisplayList::create_from_rust_recording(*hit_test_list_read, recording.visual_context_tree.structural_epoch(), layout_node_arena(), *m_chrome_widget_registry);
 
     if (recording.cache_mode == Painting::PaintCommandCacheMode::ReadWrite && !recording_returned_the_paint_command_cache_source)
-        document_paint_state.set_display_list_used_as_paint_command_cache_source(display_list, resource_storage.collect_referenced_resources(*display_list));
+        document_paint_state.set_display_list_used_as_paint_command_cache_source(display_list, referenced_resources());
 }
 
 void Document::set_caret_hit_test_debug_rect(Optional<CSSPixelRect> rect)
@@ -10887,6 +10912,11 @@ Utf16String Document::dump_display_list()
     if (paint_state().has_visual_context_tree(read))
         schedule_full_accumulated_visual_context_rebuild(Layout::RustFFI::VisualContextUpdateScope::FreshTree);
 
+    // The dump reads the navigable's resource storage after the recording adds to it, which the Paint thread owns while
+    // the document's clock lane presents: the dump holds the lane until it is done.
+    auto* host = layout_node_arena().host();
+    Layout::RustFFI::document_host_hold_clock_lane(host);
+    ScopeGuard release_clock_lane = [&] { Layout::RustFFI::document_host_release_clock_lane(host); };
     auto& resource_storage = navigable()->display_list_resource_storage();
     auto display_list = record_display_list(read, HTML::PaintConfig {}, resource_storage, Painting::PaintCommandCacheMode::ReadOnly);
     if (!display_list)

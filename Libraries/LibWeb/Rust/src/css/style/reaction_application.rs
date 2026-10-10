@@ -52,6 +52,20 @@ impl HostElementPtr {
     }
 }
 
+/// The custom-property environment an engine-computed record was published with, as it stands to the one the element
+/// inherits now.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+#[expect(dead_code, reason = "C++ constructs the variants")]
+pub enum FfiRecordEnvironment {
+    /// The engine resolved no environment for the record over the one the element inherits.
+    Uninstallable = 0,
+    /// The environment the element inherits.
+    Inherited = 1,
+    /// An environment the engine resolved over the one the element inherits.
+    ResolvedOverInherited = 2,
+}
+
 /// The element a style node names, as the host holds it while it applies a reaction to it.
 #[derive(Clone, Copy)]
 #[repr(C)]
@@ -199,11 +213,11 @@ unsafe extern "C" {
     fn web_css_begin_style_update_pass(application: *mut HostStyleReactionApplication, first: bool);
     fn web_css_style_reaction_element(application: *mut HostStyleReactionApplication, node: u32) -> FfiReactionElement;
     fn web_css_parent_style_has_animated_values(element: *mut HostElement) -> bool;
-    fn web_css_engine_record_environment_is_installable(
+    fn web_css_engine_record_environment(
         application: *mut HostStyleReactionApplication,
         element: *mut HostElement,
         style_record: u64,
-    ) -> bool;
+    ) -> FfiRecordEnvironment;
     fn web_css_record_derived_element_style_input(
         application: *mut HostStyleReactionApplication,
         node: u32,
@@ -232,10 +246,24 @@ impl Application<'_> {
         unsafe { web_css_style_reaction_element(self.host_application, node) }
     }
 
-    fn record_environment_is_installable(self, element: &FfiReactionElement, style_record: u64) -> bool {
+    fn record_environment_is_installable(
+        self,
+        element: &FfiReactionElement,
+        node: StyleNodeID,
+        style_record: u64,
+    ) -> bool {
         // SAFETY: As above, and the element is live while its reaction is applied.
-        unsafe {
-            web_css_engine_record_environment_is_installable(self.host_application, element.element.0, style_record)
+        let environment =
+            unsafe { web_css_engine_record_environment(self.host_application, element.element.0, style_record) };
+        match environment {
+            FfiRecordEnvironment::Uninstallable => false,
+            FfiRecordEnvironment::Inherited => true,
+            // Only an element whose cascade declares custom properties holds an environment the engine resolved over
+            // the one it inherits. An element declaring none holds exactly what it inherits: its record was resolved
+            // over the parent's environment before an earlier reaction of the batch moved it.
+            FfiRecordEnvironment::ResolvedOverInherited => with_engine(self.read, self.host, |engine| {
+                engine.node_declares_custom_properties(node)
+            }),
         }
     }
 
@@ -256,7 +284,7 @@ impl Application<'_> {
         if answer.style_record == 0 {
             return None;
         }
-        if !self.record_environment_is_installable(element, answer.style_record) {
+        if !self.record_environment_is_installable(element, node, answer.style_record) {
             self.host
                 .queue_change(ArenaChange::Style(StyleChange::AbandonDemandedRecords {
                     node: Some(node),
@@ -524,7 +552,7 @@ fn apply_style_reactions(
                         .for_each(|pseudo_delta| installation.add_pseudo_element_delta(pseudo_delta));
                     installation
                 });
-                if application.record_environment_is_installable(&element, delta.new_style_record) {
+                if application.record_environment_is_installable(&element, node, delta.new_style_record) {
                     Some(installation)
                 } else {
                     // The engine resolved the record's environment over the parent's own, which an earlier reaction of

@@ -469,7 +469,7 @@ impl FlownRound {
     }
 }
 
-/// The layout round each tick of a clock lease runs once it has shown the samples of the document's animations: the
+/// The layout round each tick of a clock lane runs once it has shown the samples of the document's animations: the
 /// document's facts, and a container length query that answers nothing, sealed where the clock's plan was, at the end of
 /// a rendering update that left the layout up to date.
 pub(crate) struct ClockRound {
@@ -486,15 +486,8 @@ impl ClockRound {
         state: &mut ArenaHandle,
         owed: &'a mut Vec<LayoutRoundAnswer>,
     ) -> Result<Option<&'a LayoutRoundAnswer>, ClockRoundDeclined> {
-        let arena = state.arena();
-        if arena.layout_root().is_invalid() || arena.needs_full_layout_tree_update() {
-            return Err(ClockRoundDeclined);
-        }
-        let build = arena
-            .document_style_node()
-            .filter(|&document| arena.layout_tree_update_marks().borrow().child_needs(document))
-            .map(|document| TreeBuildJob::new(document, None));
-        if build.is_none() && arena.layout_is_up_to_date(false) {
+        let build = Self::marked_build(state.arena())?;
+        if build.is_none() && state.arena().layout_is_up_to_date(false) {
             return Ok(None);
         }
         let answer = LayoutRoundJob {
@@ -507,23 +500,100 @@ impl ClockRound {
         .run(state);
         // A box the build gave an image has none until the host attaches it.
         let arena = state.arena();
-        let declined = matches!(
-            answer.end,
-            LayoutRoundEnd::Built { .. } | LayoutRoundEnd::NeedsDocumentStyle
-        ) || answer.owed_images.iter().any(|image| image.is_shown(arena));
+        let declined = if matches!(answer.end, LayoutRoundEnd::Built { .. }) {
+            Some("a build that asks for another pass")
+        } else if matches!(answer.end, LayoutRoundEnd::NeedsDocumentStyle) {
+            Some("a build that needs the document's style")
+        } else if answer.owed_images.iter().any(|image| image.is_shown(arena)) {
+            Some("a box the build owes an image")
+        } else {
+            None
+        };
         owed.push(answer);
-        match state.arena().mark_unresolved_container_lengths_for_layout() || declined {
-            true => Err(ClockRoundDeclined),
-            false => Ok(owed.last()),
+        if state.arena().mark_unresolved_container_lengths_for_layout() {
+            return Err(ClockRoundDeclined("a length only the host resolves"));
+        }
+        match declined {
+            Some(reason) => Err(ClockRoundDeclined(reason)),
+            None => Ok(owed.last()),
+        }
+    }
+}
+
+impl ClockRound {
+    /// The build of what the clock frame marked, where it marked anything. A tree that needs the host's update declines.
+    fn marked_build(arena: &LayoutNodeArena) -> Result<Option<TreeBuildJob>, ClockRoundDeclined> {
+        if arena.layout_root().is_invalid() || arena.needs_full_layout_tree_update() {
+            return Err(ClockRoundDeclined("the layout tree needs the host's update"));
+        }
+        Ok(arena
+            .document_style_node()
+            .filter(|&document| arena.layout_tree_update_marks().borrow().child_needs(document))
+            .map(|document| TreeBuildJob::new(document, None)))
+    }
+
+    /// Builds again what the clock frame marked, and lays out nothing: the next round lays out what the build moved,
+    /// over whatever a tick shows in the boxes it built meanwhile. Pushes what the build owes the host to `owed`, and
+    /// answers whether it built anything. A build that needs the host declines, as in [`Self::run`].
+    pub(crate) fn build(
+        &self,
+        state: &mut ArenaHandle,
+        owed: &mut Vec<LayoutRoundAnswer>,
+    ) -> Result<bool, ClockRoundDeclined> {
+        let Some(build) = Self::marked_build(state.arena())? else {
+            return Ok(false);
+        };
+        let arena = state.arena();
+        if build.lacks_document_style(arena) {
+            return Err(ClockRoundDeclined("a build that needs the document's style"));
+        }
+        // The round cannot call the host, which hears of the boxes nodes gain and lose once it is over.
+        arena.queue_box_presence();
+        let mut answer = LayoutRoundAnswer {
+            build: None,
+            work: HostWorkDue::default(),
+            commits: Vec::new(),
+            end: LayoutRoundEnd::Built {
+                needs_another_build_pass: false,
+                layout: RoundLayout::PartialIfPlanned,
+            },
+            rebuilt_roots: Vec::new(),
+            owed_images: Vec::new(),
+            clamped_scroll_offsets: Vec::new(),
+        };
+        let work = OwedHostWork::default();
+        let end = LayoutRoundJob::build(
+            state,
+            build,
+            &work,
+            &mut answer,
+            self.facts.has_stale_list_item_counters,
+        );
+        let arena = state.arena();
+        answer.work = work.resolve(arena);
+        answer.owed_images = OwedImage::take_from(arena);
+        // A box the build gave an image has none until the host attaches it.
+        let declined = match end {
+            BuildEnd::AnotherPass => Some("a build that asks for another pass"),
+            BuildEnd::ReconcileCounters => Some("a build that reconciles list item counters"),
+            BuildEnd::LayOut if answer.owed_images.iter().any(|image| image.is_shown(arena)) => {
+                Some("a box the build owes an image")
+            }
+            BuildEnd::LayOut => None,
+        };
+        owed.push(answer);
+        match declined {
+            Some(reason) => Err(ClockRoundDeclined(reason)),
+            None => Ok(true),
         }
     }
 }
 
 /// A clock round whose tree build or layout needs the host: a build that asks for another pass, reconciles list item
 /// counters or owes the host image resources, or a length only the host resolves.
-pub(crate) struct ClockRoundDeclined;
+pub(crate) struct ClockRoundDeclined(pub(crate) &'static str);
 
-/// Seals the round the ticks of a clock lease of `document_host`'s document run, where its layout is up to date in
+/// Seals the round the ticks of a clock lane of `document_host`'s document run, where its layout is up to date in
 /// `read`.
 fn seal_clock_round(main_thread: &MainThread, document_host: &DocumentHost, read: &BegunRead) -> Option<ClockRound> {
     let host = document_host.host_tables().layout_update_host.get()?;
@@ -591,7 +661,7 @@ impl LayoutRoundJob {
         if self.layout == RoundLayout::PartialIfPlanned
             && arena.partial_relayout_may_be_attempted(
                 arena.layout_root(),
-                &arena.partial_relayout_boundary_roots.borrow(),
+                arena.partial_relayout_boundary_roots.borrow().roots(),
                 partial_relayout_facts,
             )
         {
@@ -894,8 +964,6 @@ unsafe fn fly_first_round(
 unsafe fn take_flown_layout_in(main_thread: &MainThread, document_host: &DocumentHost, read: &BegunRead) -> bool {
     let host = layout_update_host(document_host);
     document_host.take_frame_in_with(read);
-    // SAFETY (for every pay below): Guaranteed by the caller.
-    document_host.pay_clock_rounds(|mut answer| unsafe { answer.pay(main_thread, document_host, read) });
     let Some(FlownRound {
         mut answer,
         rebuilds_tree,
@@ -903,6 +971,7 @@ unsafe fn take_flown_layout_in(main_thread: &MainThread, document_host: &Documen
     else {
         return false;
     };
+    // SAFETY (for every pay below): Guaranteed by the caller.
     unsafe { answer.pay(main_thread, document_host, read) };
     if rebuilds_tree && host.reconcile_stale_list_item_counters_after_tree_build(main_thread, &answer.rebuilt_roots) {
         return false;
@@ -943,6 +1012,12 @@ unsafe fn update_layout(
     // Recompute it after each pass because an initial style update can enroll the elements of a
     // freshly parsed document after the layout update has already started. The bound is at least
     // the ordinary limit, so the passes within it do not ask for the count.
+    // A DevTools client that attaches to a document that has already laid out gets one catch-up layout, which collects
+    // the inspection data: the first round the update builds itself, since a round that flew in before the update has
+    // no inspection data to collect. The passes after it settle as ordinary ones do: forcing each of them would never
+    // settle a document whose full layout always leaves style to update, as one does where a container-relative unit
+    // resolves against a container with no box.
+    let mut inspection_round_pending = inputs.reason_is_inspect_devtools_layout_data;
     let mut layout_pass: u64 = 0;
     while layout_pass <= ORDINARY_STABILIZATION_ROUND_LIMIT
         || layout_pass
@@ -951,8 +1026,6 @@ unsafe fn update_layout(
         layout_pass += 1;
 
         host.update_style(main_thread, read);
-        // What the ticks of a clock lease the update ended laid out, the host pays before anything else of the update.
-        document_host.pay_clock_rounds(|mut answer| unsafe { answer.pay(main_thread, document_host, read) });
         // A round that flew in the frame the update took in is the update's first, which the host pays before
         // anything else of the update reads the layout.
         document_host.take_frame_in_with(read);
@@ -964,7 +1037,8 @@ unsafe fn update_layout(
 
                 let facts = host.document_facts(main_thread, read);
                 let force_devtools_layout_data_collection =
-                    facts.should_collect_devtools_layout_data && inputs.reason_is_inspect_devtools_layout_data;
+                    inspection_round_pending && facts.should_collect_devtools_layout_data;
+                inspection_round_pending = false;
                 if host_layout_is_up_to_date(document_host, read, &facts) && !force_devtools_layout_data_collection {
                     host.prepare_for_rendering(main_thread, read);
                     return;
@@ -1026,7 +1100,8 @@ unsafe fn update_layout(
             Some(LayoutRoundEnd::PartialLayout) => {
                 // A round that built the tree changed it, whichever of its jobs ran the build.
                 host.after_layout_commit(main_thread, read, rebuilds_tree);
-                if host.needs_style_update_after_layout(main_thread, read)
+                if inspection_round_pending
+                    || host.needs_style_update_after_layout(main_thread, read)
                     || !host_layout_is_up_to_date(document_host, read, &host.document_facts(main_thread, read))
                 {
                     continue;
@@ -1052,7 +1127,7 @@ unsafe fn update_layout(
         }
 
         // Layout-only invalidations still need to be flushed before we can exit.
-        if host_layout_is_up_to_date(document_host, read, &facts) {
+        if host_layout_is_up_to_date(document_host, read, &facts) && !inspection_round_pending {
             break;
         }
     }

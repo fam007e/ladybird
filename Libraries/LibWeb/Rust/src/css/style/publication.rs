@@ -2044,17 +2044,56 @@ impl RetainedState {
     }
 
     /// Whether moving an element from the `old` record to the `new` one moves the `animation-*`
-    /// longhands declaring its CSS animations. Every such longhand is in the animation group; a
-    /// group that moved with only transitions in it decides a plan that changes nothing.
+    /// longhands declaring its CSS animations, or the timelines they name. Every such longhand is
+    /// in the animation group, beside the `transition-*` ones: a group that moved with only
+    /// transitions in it decides a plan that changes nothing.
     fn animation_declarations_moved(&self, old: u64, new: u64) -> bool {
+        use crate::css::computed_value_types::{AnimationValues, ComputedStyleValueHandle};
         use crate::css::table_group_builder::group_index::ANIMATION;
+        if old == new {
+            return false;
+        }
         let animation_group = |record| {
             self.computed_group_sets
                 .style_record_payloads(record)
                 .and_then(|payloads| payloads.get(ANIMATION))
                 .map(|payload| payload.as_ptr())
         };
-        old != new && animation_group(old) != animation_group(new)
+        let (old_group, new_group) = (animation_group(old), animation_group(new));
+        if old_group == new_group {
+            return false;
+        }
+        let (Some(old_group), Some(new_group)) = (old_group, new_group) else {
+            return true;
+        };
+        // SAFETY: A live record's animation group payload is an `AnimationValues`.
+        let (old_values, new_values) = unsafe {
+            (
+                &*old_group.cast::<AnimationValues>(),
+                &*new_group.cast::<AnimationValues>(),
+            )
+        };
+        fn declarations(values: &AnimationValues) -> [&ComputedStyleValueHandle; 16] {
+            [
+                &values.animation_name,
+                &values.animation_composition,
+                &values.animation_delay,
+                &values.animation_direction,
+                &values.animation_duration,
+                &values.animation_fill_mode,
+                &values.animation_iteration_count,
+                &values.animation_play_state,
+                &values.animation_timeline,
+                &values.animation_timing_function,
+                &values.scroll_timeline_name,
+                &values.scroll_timeline_axis,
+                &values.timeline_scope,
+                &values.view_timeline_name,
+                &values.view_timeline_axis,
+                &values.view_timeline_inset,
+            ]
+        }
+        declarations(old_values) != declarations(new_values)
     }
 
     /// Whether the host composes animations over a record, which the engine cannot drive from: a
@@ -3120,18 +3159,31 @@ impl RetainedState {
         else {
             return Some(SiblingPosition { count: 1, index: 1 });
         };
-        let mut position = SiblingPosition::default();
-        for child in self
+        // OPTIMIZATION: Each element of a run of many siblings asks for its place as a style pass reaches it, which
+        //               counting the run every time would make quadratic: the places of a long run are kept until
+        //               the tree's DOM order changes.
+        let mut cache = self
+            .sibling_positions
+            .lock()
+            .expect("the sibling position memo is never held across a panic");
+        cache.forget_unless_at(self.tree.dom_order_version());
+        if let Some(position) = cache.position_of(parent, node) {
+            return Some(position);
+        }
+        let children: Vec<StyleNodeID> = self
             .tree
             .dom_children(parent)
             .filter(|child| child.text_index().is_none())
-        {
-            position.count += 1;
-            if child == node {
-                position.index = position.count;
-            }
+            .collect();
+        let count = u32::try_from(children.len()).expect("sibling count space exhausted");
+        if children.len() >= SiblingPositionCache::MIN_CHILDREN {
+            cache.insert(parent, &children);
         }
-        Some(position)
+        let index = children
+            .iter()
+            .position(|&child| child == node)
+            .map_or(0, |index| index as u32 + 1);
+        Some(SiblingPosition { count, index })
     }
 
     /// Whether any of a state's winners is written with a tree-counting function.
@@ -4051,6 +4103,7 @@ impl StyleEngine {
     pub(super) fn publish_animation_overlay_impl(
         &mut self,
         target: computed::ComputedStyleTarget,
+        installed_style_record: computed::FinalStyleRecordID,
         source_identity: u64,
         animated_overlay: HostShared<crate::css::animated_overlay::AnimatedOverlay>,
         payloads: &[SharedPayload],
@@ -4069,13 +4122,24 @@ impl StyleEngine {
                     .style_record_dependency_flags(record.raw())
             })
             .is_some_and(|flags| flags & computed::IN_DISPLAY_NONE_SUBTREE != 0);
-        let publication = self.retained.computed_group_sets.publish_animation_overlay(
-            target,
-            source_identity,
-            animated_overlay,
-            payloads,
-            parent_in_display_none_subtree,
-        )?;
+        let publication = self
+            .publish_animation_overlay_beneath_derivation(
+                target,
+                installed_style_record,
+                source_identity,
+                animated_overlay,
+                payloads,
+                parent_in_display_none_subtree,
+            )
+            .or_else(|| {
+                self.retained.computed_group_sets.publish_animation_overlay(
+                    target,
+                    source_identity,
+                    animated_overlay,
+                    payloads,
+                    parent_in_display_none_subtree,
+                )
+            })?;
         self.settle_computed_memory();
         if publication.slot_allocated {
             self.retained.counters.bump(Counter::AnimationOverlaySlotsAllocated);
@@ -4089,6 +4153,55 @@ impl StyleEngine {
         self.retained
             .counters
             .set(Counter::LiveAnimationOverlayRecords, publication.live_records as u64);
+        Some(publication)
+    }
+
+    fn publish_animation_overlay_beneath_derivation(
+        &mut self,
+        target: computed::ComputedStyleTarget,
+        installed_style_record: computed::FinalStyleRecordID,
+        source_identity: u64,
+        animated_overlay: HostShared<crate::css::animated_overlay::AnimatedOverlay>,
+        payloads: &[SharedPayload],
+        parent_in_display_none_subtree: bool,
+    ) -> Option<computed::AnimationOverlayUpdate> {
+        let computed_group_sets = &self.retained.computed_group_sets;
+        if computed_group_sets.assigned_final_style_record(target)? == installed_style_record {
+            return None;
+        }
+        let assigned = computed_group_sets.assigned_underlying_style_record(target)?;
+        let derivation = self
+            .retained
+            .engine_computed_records_pending
+            .get_mut(&target.node())
+            .and_then(|pending| {
+                pending.iter_mut().find(|pending| {
+                    pending.pseudo_kind == target.pseudo_kind()
+                        && computed_group_sets.underlying_style_record(pending.new_style_record) == Some(assigned)
+                })
+            });
+        debug_assert!(
+            derivation.is_some()
+                || computed_group_sets
+                    .underlying_style_record(installed_style_record)
+                    .is_none_or(|installed| installed == assigned),
+            "only a pending derivation moves an assignment off the base of the record the host installed"
+        );
+        let derivation = derivation?;
+        let (publication, composition) = self.retained.computed_group_sets.compose_detached_animation_overlay(
+            installed_style_record,
+            source_identity,
+            animated_overlay,
+            payloads,
+            parent_in_display_none_subtree,
+        )?;
+        if publication.style_record != installed_style_record {
+            derivation.old_style_record = publication.style_record;
+            let replaced = std::mem::replace(&mut derivation.detached_composition, composition);
+            if let Some(replaced) = replaced {
+                self.retained.computed_group_sets.release_detached_composition(replaced);
+            }
+        }
         Some(publication)
     }
 }
@@ -4125,6 +4238,46 @@ fn cold_record_facts(facts: u32) -> u32 {
 /// The bit a node's own record holds among what its records read of its place among its siblings,
 /// above one bit per synthetic pseudo-element kind.
 const ELEMENT_READS_SIBLING_POSITION: u16 = 1 << pseudo_kind::SYNTHETIC_COUNT;
+
+/// The places of the element children of parents with many of them, as
+/// [`RetainedState::sibling_position`] counts them, at one version of the tree's DOM order.
+#[derive(Default)]
+pub(super) struct SiblingPositionCache {
+    dom_order_version: u64,
+    /// How many element children each parent counted has.
+    counts: super::fast_hash::FastMap<StyleNodeID, u32>,
+    /// The place of each counted child among its parent's element children, counted from one.
+    indices: super::fast_hash::FastMap<StyleNodeID, u32>,
+}
+
+impl SiblingPositionCache {
+    /// How many element children a parent has before their places are kept: fewer are counted again
+    /// as quickly as they are looked up.
+    const MIN_CHILDREN: usize = 32;
+
+    /// Forgets the places counted at a version of the DOM order other than `dom_order_version`.
+    fn forget_unless_at(&mut self, dom_order_version: u64) {
+        if self.dom_order_version != dom_order_version {
+            self.counts.clear();
+            self.indices.clear();
+            self.dom_order_version = dom_order_version;
+        }
+    }
+
+    fn position_of(&self, parent: StyleNodeID, node: StyleNodeID) -> Option<SiblingPosition> {
+        Some(SiblingPosition {
+            count: *self.counts.get(&parent)?,
+            index: *self.indices.get(&node)?,
+        })
+    }
+
+    fn insert(&mut self, parent: StyleNodeID, children: &[StyleNodeID]) {
+        self.counts.insert(parent, children.len() as u32);
+        for (index, &child) in children.iter().enumerate() {
+            self.indices.insert(child, index as u32 + 1);
+        }
+    }
+}
 
 /// Where an element stands among its element siblings, counted from one: what `sibling-count()`
 /// and `sibling-index()` read.
@@ -4241,6 +4394,7 @@ const MAXIMUM_COLD_RECORD_DONORS_PER_KEY: usize = 4;
 const COLD_RECORD_CACHE_LIMIT: usize = 4096;
 
 /// A record the engine derived for a published reaction, awaiting C++'s installation.
+#[derive(Clone)]
 pub(super) struct PendingEngineComputedRecord {
     node: StyleNodeID,
     /// The pseudo-element the record is for, or `u8::MAX` for the element's own.
@@ -4328,7 +4482,7 @@ impl WrittenValueChecks {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(super) struct EngineComputabilityScratch {
     /// What a record computed from the state reads beside its winners, or `None` when the engine
     /// computes none from it.
@@ -4354,7 +4508,7 @@ impl EngineComputabilityScratch {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(super) struct EngineComputedRecordScratch {
     pub(super) font_drive: drive::FontDriveScratch,
     /// Whether this flush carries a document environment change. A record's winners stand
@@ -4534,6 +4688,12 @@ impl FromIterator<Option<u16>> for FlippedRules {
 }
 
 impl EngineComputedRecordScratch {
+    /// Takes `node` as an element whose composition its children need not wait for: what the host composes over its
+    /// record moves nothing they inherit.
+    pub(super) fn forget_composed_by_the_host(&mut self, node: StyleNodeID) {
+        self.nodes_composed_by_the_host.remove(&node);
+    }
+
     pub(super) fn capacity_bytes(&self) -> u64 {
         capacity::capacity_bytes! {
             shallow [self.computability.states, self.cohorts, self.derived_child_inputs, self.cold_cohorts, self.stores,
@@ -5373,6 +5533,165 @@ mod tests {
                 .pseudo_style_record(node, pseudo_kind::BEFORE),
             Some(composition)
         );
+    }
+
+    #[test]
+    fn an_animation_sampled_beneath_a_pending_derivation_composes_over_the_installed_record() {
+        let mut engine = StyleEngine::new();
+        let mut raw_node = [0];
+        engine.allocate_style_nodes(&mut raw_node);
+        let node = StyleNodeID::from_raw(raw_node[0]).unwrap();
+        let target = computed::ComputedStyleTarget::new(node, u8::MAX);
+        let animated_overlay = crate::css::animated_overlay::AnimatedOverlay::default();
+        let overlay = HostShared::new(std::ptr::from_ref(&animated_overlay));
+        let metadata =
+            |counter_style_environment_identity, animated_overlay: HostShared<_>| computed::ComputedMetadataInput {
+                pseudo_element_styles: 0,
+                dependency_flags: 0,
+                counter_style_environment_identity,
+                animation_overlay_identity: u64::from(!animated_overlay.is_null()),
+                animated_overlay,
+                animation_overlay_payloads: &[],
+                longhand_table: HostShared::null(),
+            };
+        let installed = engine
+            .publish_computed_groups(target, &[], 0, 0, metadata(1, overlay))
+            .style_record_identity;
+        let installed_base = engine.computed_group_sets.underlying_style_record(installed).unwrap();
+        let derive = |engine: &mut StyleEngine, old_style_record| {
+            let detached_composition = engine.computed_group_sets.detach_composition(node);
+            let replaced = engine.computed_group_sets.replaced_columns(node);
+            let derived = engine
+                .publish_computed_groups(target, &[], 0, 0, metadata(2, HostShared::null()))
+                .style_record_identity;
+            engine
+                .engine_computed_records_pending
+                .entry(node)
+                .or_default()
+                .push(PendingEngineComputedRecord {
+                    node,
+                    pseudo_kind: u8::MAX,
+                    old_style_record,
+                    new_style_record: derived,
+                    replaced: Some(replaced),
+                    cascade_state: None,
+                    longhand_evaluations: 0,
+                    owes_a_transition_step: false,
+                    detached_composition,
+                });
+            derived
+        };
+        let derived = derive(&mut engine, installed);
+
+        let sampled = engine
+            .publish_animation_overlay_impl(target, installed, 2, overlay, &[])
+            .unwrap()
+            .style_record;
+        assert_eq!(
+            engine.computed_group_sets.underlying_style_record(sampled),
+            Some(installed_base)
+        );
+        assert_eq!(engine.computed_group_sets.assigned_style_record(node), Some(derived));
+
+        engine.discard_engine_computed_records();
+        assert_eq!(engine.computed_group_sets.assigned_style_record(node), Some(sampled));
+
+        let derived = derive(&mut engine, sampled);
+        let cancelled = engine
+            .publish_animation_overlay_impl(target, sampled, 0, HostShared::null(), &[])
+            .unwrap()
+            .style_record;
+        assert_eq!(cancelled, installed_base);
+        assert_eq!(engine.computed_group_sets.assigned_style_record(node), Some(derived));
+        assert!(engine.computed_group_sets.underlying_style_record(sampled).is_none());
+    }
+
+    #[test]
+    fn animations_sampled_beneath_a_derivation_of_the_installed_base_survive_its_discard() {
+        let animated_overlay = crate::css::animated_overlay::AnimatedOverlay::default();
+        let overlay = HostShared::new(std::ptr::from_ref(&animated_overlay));
+        let metadata = |animated_overlay: HostShared<_>| computed::ComputedMetadataInput {
+            pseudo_element_styles: 0,
+            dependency_flags: 0,
+            counter_style_environment_identity: 0,
+            animation_overlay_identity: u64::from(!animated_overlay.is_null()),
+            animated_overlay,
+            animation_overlay_payloads: &[],
+            longhand_table: HostShared::null(),
+        };
+        let derive_installed_base = |source_identities: &[u64]| {
+            let mut engine = StyleEngine::new();
+            let mut raw_node = [0];
+            engine.allocate_style_nodes(&mut raw_node);
+            let node = StyleNodeID::from_raw(raw_node[0]).unwrap();
+            let target = computed::ComputedStyleTarget::new(node, u8::MAX);
+            let installed = engine
+                .publish_computed_groups(target, &[], 0, 0, metadata(overlay))
+                .style_record_identity;
+            let detached_composition = engine.computed_group_sets.detach_composition(node);
+            let replaced = engine.computed_group_sets.replaced_columns(node);
+            let derived = engine
+                .publish_computed_groups(target, &[], 0, 0, metadata(HostShared::null()))
+                .style_record_identity;
+            assert_eq!(
+                engine.computed_group_sets.underlying_style_record(installed),
+                Some(derived)
+            );
+            engine
+                .engine_computed_records_pending
+                .entry(node)
+                .or_default()
+                .push(PendingEngineComputedRecord {
+                    node,
+                    pseudo_kind: u8::MAX,
+                    old_style_record: installed,
+                    new_style_record: derived,
+                    replaced: Some(replaced),
+                    cascade_state: None,
+                    longhand_evaluations: 0,
+                    owes_a_transition_step: false,
+                    detached_composition,
+                });
+            let mut sampled = installed;
+            for &source_identity in source_identities {
+                let animated_overlay = if source_identity == 0 {
+                    HostShared::null()
+                } else {
+                    overlay
+                };
+                sampled = engine
+                    .publish_animation_overlay_impl(target, sampled, source_identity, animated_overlay, &[])
+                    .unwrap()
+                    .style_record;
+            }
+            (engine, node, derived, sampled)
+        };
+
+        for source_identities in [&[2][..], &[1], &[0], &[0, 2], &[2, 0, 3]] {
+            let (mut engine, node, _, sampled) = derive_installed_base(source_identities);
+            engine.discard_engine_computed_records();
+            assert_eq!(engine.computed_group_sets.assigned_style_record(node), Some(sampled));
+            assert_eq!(
+                engine.computed_group_sets.live_animation_overlay_records(),
+                usize::from(source_identities.last() != Some(&0))
+            );
+            engine.computed_group_sets.remove(node);
+            assert_eq!(engine.computed_group_sets.live_animation_overlay_records(), 0);
+        }
+
+        let (mut engine, node, derived, _) = derive_installed_base(&[0, 2]);
+        engine.acknowledge_engine_computed_record(node);
+        let target = computed::ComputedStyleTarget::new(node, u8::MAX);
+        let sampled = engine
+            .publish_animation_overlay_impl(target, derived, 3, overlay, &[])
+            .unwrap()
+            .style_record;
+        assert_eq!(
+            engine.computed_group_sets.underlying_style_record(sampled),
+            Some(derived)
+        );
+        assert_eq!(engine.computed_group_sets.assigned_style_record(node), Some(sampled));
+        assert_eq!(engine.computed_group_sets.live_animation_overlay_records(), 1);
     }
 }
 

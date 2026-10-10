@@ -10,6 +10,11 @@
 #include <LibWeb/Animations/DocumentTimeline.h>
 #include <LibWeb/Animations/KeyframeEffect.h>
 #include <LibWeb/Animations/ScrollTimeline.h>
+#include <LibWeb/CSS/CSSTransition.h>
+#include <LibWeb/CSS/StyleComputer.h>
+#include <LibWeb/CSS/StyleEngineBridge.h>
+#include <LibWeb/CSS/StyleEngineEffectTiming.h>
+#include <LibWeb/Compositor/RenderClock.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/Element.h>
 #include <LibWeb/HTML/EventLoop/ClockPlan.h>
@@ -19,6 +24,7 @@
 #include <LibWeb/Layout/Node.h>
 #include <LibWeb/Layout/RenderDocument.h>
 #include <LibWeb/Namespace.h>
+#include <LibWeb/Page/Page.h>
 #include <LibWeb/Painting/BoxViews.h>
 
 namespace Web::HTML {
@@ -152,18 +158,31 @@ static bool runs_on_compositor(Animations::KeyframeEffect const& effect)
     return effect.is_compositor_driven() || effect.is_compositor_replaced();
 }
 
-bool runs_animations_for_clock_plan(DOM::Document const& document)
+// Whether the render clock may hover what is under the pointer while a task runs. LIBWEB_HOVER_LANE=0 turns it off.
+bool hover_lane_is_enabled()
 {
-    return any_of(document.associated_animation_timelines(), [](auto const& timeline) {
-        bool const on_scroll_timeline = is<Animations::ScrollTimeline>(*timeline);
-        return any_of(timeline->associated_animations(), [&](auto const& animation) {
-            auto const* effect = as_if<Animations::KeyframeEffect>(animation.effect().ptr());
-            return runs_for_clock_plan(animation, on_scroll_timeline) && effect && !runs_on_compositor(*effect);
-        });
-    });
+    static bool const enabled = [] {
+        auto value = getenv("LIBWEB_HOVER_LANE");
+        return !value || StringView { value, strlen(value) } != "0"sv;
+    }();
+    return enabled;
 }
 
-bool seal_clock_plan(DOM::Document& document, bool may_plan)
+// The page's cursor, as a hover of the render clock asks it to show the cursor of what it hovers, on the StyleLayout
+// thread.
+static Layout::RustFFI::FfiPageCursor ffi_page_cursor(PageCursor& cursor)
+{
+    return {
+        .cursor = &cursor,
+        .retain = [](void const* cursor) { static_cast<PageCursor const*>(cursor)->ref(); },
+        .release = [](void const* cursor) { static_cast<PageCursor const*>(cursor)->unref(); },
+        .request = [](void const* cursor, u8 css_cursor) {
+            auto& page_cursor = const_cast<PageCursor&>(*static_cast<PageCursor const*>(cursor));
+            page_cursor.request(css_to_gfx_cursor(static_cast<CSS::CursorPredefined>(css_cursor))); },
+    };
+}
+
+bool seal_clock_plan(DOM::Document& document, bool may_plan, bool may_animate, u64 update_serial)
 {
     auto* arena = document.layout_node_arena_if_created();
     if (!arena)
@@ -189,14 +208,14 @@ bool seal_clock_plan(DOM::Document& document, bool may_plan)
                 return false;
             auto plan_animation = [&](Animations::Animation const& animation, Animations::ScrollTimeline const* scroll_timeline, Animations::KeyframeEffect const& effect, DOM::Element const& target) {
                 // A tick moves the document's timeline, at the rate it runs, and the scroll timelines, to where the
-                // compositor has scrolled.
-                if (animation.pending() || !(animation.playback_rate() > 0))
+                // compositor has scrolled. What the compositor runs already runs there while its play is pending.
+                if ((animation.pending() && !runs_on_compositor(effect)) || !(animation.playback_rate() > 0))
                     return false;
                 // A scroll timeline with nothing to scroll holds still, and so do its animations.
                 if (scroll_timeline && !scroll_timeline->followed_scroller().has_value())
                     return false;
                 // What the compositor runs, or what the main thread does not sample per frame either, a tick does not
-                // sample: the lease only stops at its events.
+                // sample: the lane only stops at its events.
                 bool const tick_samples = !runs_on_compositor(effect) && !effect.can_skip_per_frame_style_update();
                 if (tick_samples && !tick_can_sample(document, effect, target, read))
                     return false;
@@ -245,13 +264,62 @@ bool seal_clock_plan(DOM::Document& document, bool may_plan)
                 return false;
             return !elements.is_empty() && deadline > timeline_time->value;
         };
-        if (plan()) {
+        bool const animates = may_animate && plan();
+        if (!animates) {
+            elements.clear();
+            deadline = AK::Infinity<double>;
+            last_end = -AK::Infinity<double>;
+        }
+        // The lane's ticks may also follow the pointer, and hover what is under it while a task runs.
+        Optional<Layout::RustFFI::FfiHoverPlanInputs> hover;
+        Span<Gfx::FloatPoint const> scroll_offsets;
+        Vector<u32> effect_timing_nodes;
+        Vector<u64> effect_timing_identities;
+        Vector<CSS::ComputedValuesFFI::FfiEffectTiming> effect_timings;
+        if (hover_lane_is_enabled() && document.is_fully_active() && !document.hidden() && document.window()) {
+            // A hover decides over the transitions the host runs as they run, where the host runs them without
+            // sampling them, which leaves the timing the engine holds of them behind.
+            for (auto const& associated_timeline : document.associated_animation_timelines()) {
+                for (auto& animation : associated_timeline->associated_animations()) {
+                    auto const* effect = as_if<Animations::KeyframeEffect>(animation.effect().ptr());
+                    auto target = effect ? effect->target() : nullptr;
+                    if (!effect || !target || effect->pseudo_element_type().has_value() || !target->style_node_id()
+                        || !effect->can_skip_per_frame_style_update())
+                        continue;
+                    auto timing = CSS::style_engine_effect_timing(*effect, animation);
+                    // The compositor runs a transition whose play is still pending from the time of the style change
+                    // event that started it.
+                    if (auto const* transition = as_if<CSS::CSSTransition>(animation); transition && animation.pending()
+                        && !animation.start_time().has_value() && effect->is_compositor_driven()) {
+                        timing.has_start_time = true;
+                        timing.start_time = transition->transition_start_time() - effect->start_delay().value;
+                        timing.has_hold_time = false;
+                    }
+                    effect_timing_nodes.append(target->style_node_id().value());
+                    effect_timing_identities.append(effect->animation_preparation_identity());
+                    effect_timings.append(timing);
+                }
+            }
+            scroll_offsets = document.scroll_state_snapshot().device_offsets();
+            hover = Layout::RustFFI::FfiHoverPlanInputs {
+                .device_pixels_per_css_pixel = document.page().client().device_pixels_per_css_pixel(),
+                .scroll_offsets = scroll_offsets.data(),
+                .scroll_offset_count = scroll_offsets.size(),
+                .chrome_metrics = document.page().chrome_metrics(),
+                .page_cursor = ffi_page_cursor(document.page().cursor()),
+                .effect_timing_nodes = effect_timing_nodes.data(),
+                .effect_timing_identities = effect_timing_identities.data(),
+                .effect_timings = effect_timings.data(),
+                .effect_timing_count = effect_timings.size(),
+            };
+        }
+        if (animates || hover.has_value()) {
             auto time_origin = document.relevant_settings_object().time_origin();
-            Layout::RustFFI::render_state_seal_clock_plan(arena->host(), read, elements.data(), elements.size(), time_origin, deadline, last_end, scroll_timelines.data(), scroll_timelines.size());
+            Layout::RustFFI::render_state_seal_clock_plan(arena->host(), read, elements.data(), elements.size(), time_origin, deadline, last_end, scroll_timelines.data(), scroll_timelines.size(), hover.has_value() ? &*hover : nullptr, update_serial);
             return true;
         }
     }
-    Layout::RustFFI::document_host_drop_clock_plan(arena->host());
+    Layout::RustFFI::document_host_drop_clock_plan(arena->host(), update_serial);
     return false;
 }
 

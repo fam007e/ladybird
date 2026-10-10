@@ -23,7 +23,9 @@ mod owner;
 mod wait;
 
 pub use clock::FfiPlannedScrollTimeline;
-pub(crate) use clock::{ClockPlan, CommittedContent, CommittedFrame, SampledFrame};
+pub use clock::hover::FfiHoverPlanInputs;
+pub(crate) use clock::hover::HoverPlan;
+pub(crate) use clock::{ClockPlan, CommittedContent, CommittedFrame, LaneDelivery, SampledFrame};
 pub use document_host::DocumentHost;
 pub(crate) use document_host::OwedWorkPayment;
 #[cfg(test)]
@@ -101,6 +103,22 @@ impl RenderState {
         self.streamed_marks = Some(self.arena.arena().layout_tree_update_marks().take());
     }
 
+    /// A fork of the state, as it is now: a copy of it that the render clock may write and present from while the host
+    /// goes on writing the state, which neither sees the other's writes. See [`crate::fork`].
+    pub(crate) fn fork(&self) -> RenderFork {
+        let mut engine = Box::new(self.engine_ref().clone());
+        engine.detach_host_flags_for_fork();
+        let engine = StyleEngineHandle::create(engine);
+        let arena = Box::new(self.arena.fork(engine));
+        RenderFork(std::mem::ManuallyDrop::new(Self {
+            arena,
+            engine,
+            owed: Vec::new(),
+            streamed_marks: None,
+            sample_clock: self.sample_clock.clone(),
+        }))
+    }
+
     /// Drops the state, which must hold no layout node any more.
     fn retire(self) {
         let Self {
@@ -155,16 +173,18 @@ impl RenderState {
                 .selector_attribute_value_text_requirements_version(),
         };
         let selector_value_text_names = std::sync::Arc::clone(engine.selector_attribute_value_text_names());
+        let selector_tested_attribute_names = std::sync::Arc::clone(engine.selector_tested_attribute_names());
         Owed {
             work: std::mem::take(&mut self.owed),
             deferred_inputs: self.engine_mut().take_moved_deferred_element_style_inputs(),
             facts,
             selector_value_text_names,
+            selector_tested_attribute_names,
         }
     }
 
     /// The style engine, to read.
-    fn engine_ref(&self) -> &crate::css::style::StyleEngine {
+    pub(crate) fn engine_ref(&self) -> &crate::css::style::StyleEngine {
         // SAFETY: The engine lives as long as the state, and is borrowed mutably only through a mutable borrow of it.
         unsafe { self.engine.get() }
     }
@@ -250,7 +270,9 @@ pub(crate) struct Owed {
     deferred_inputs: Option<Vec<crate::css::style::engine_calls::DeferredInput>>,
     facts: StateFacts,
     /// The attribute names whose value text the engine's selectors read, as of `facts`.
-    selector_value_text_names: crate::css::style::SelectorValueTextNames,
+    selector_value_text_names: crate::css::style::SelectorAttributeNames,
+    /// The attribute names the engine's selectors test in any way, as the job left them.
+    selector_tested_attribute_names: crate::css::style::SelectorAttributeNames,
 }
 
 /// What a document's render state answers of itself as a job or a frame leaves it, which the host reads in place for as
@@ -318,6 +340,18 @@ pub(crate) enum ArenaChange {
 }
 
 impl ArenaChange {
+    /// Whether the change leaves the render state showing what the frame sampled last showed: it takes in the recording
+    /// of that frame, which a lane's fork takes in too, or only keeps the engine from reclaiming records.
+    pub(crate) fn keeps_the_presented_frame(&self) -> bool {
+        match self {
+            Self::Paint(crate::painting::paint_changes::PaintChange::TakeInRecording { .. }) => true,
+            Self::Style(change) => change.only_keeps_records_alive(),
+            _ => false,
+        }
+    }
+}
+
+impl ArenaChange {
     /// # Safety
     ///
     /// `engine` must name the live style engine `arena` links, which nothing else borrows meanwhile.
@@ -328,7 +362,12 @@ impl ArenaChange {
         owed: &mut Vec<crate::layout::tree_mutation::HostWorkDue>,
     ) {
         match self {
-            Self::Layout(change) => change.apply(arena),
+            Self::Layout(change) => {
+                let host_work = change.apply_owing(arena);
+                if !host_work.is_empty() {
+                    owed.push(host_work);
+                }
+            }
             Self::DetachForRemoval(nodes) => owed.push(
                 crate::layout::layout_changes::LayoutWrite::DetachRemainingRowsForRemoval(&nodes)
                     .apply(arena)
@@ -598,13 +637,6 @@ impl ChangeQueue {
         queued.push(change);
     }
 
-    /// Queues `change` ahead of every write queued before it.
-    fn push_front(&self, change: ArenaChange) {
-        self.note(&change);
-        self.replaced_paint_facts_positions.borrow_mut().clear();
-        self.queued.borrow_mut().insert(0, change);
-    }
-
     /// Whether the writes queued may write the style record of the row `id`, which `rows`, published before them, has.
     fn may_write_style_of(
         &self,
@@ -739,6 +771,7 @@ pub(crate) fn fly(
     host.let_frame_fly(|document, seed, marks| {
         // A host that waits for the frame says the stop word, and the frame comes back with its style alone.
         let run = move |stop: &crate::stage_thread::StopWord| {
+            clock::note_host_write(document);
             owner::with_state(document, seed, |state| {
                 let ((style, applied, round), marks) = state.with_marks(marks, |state| {
                     state.apply(changes.drain(..));
@@ -840,7 +873,6 @@ mod tests {
     #[test]
     fn replaced_paint_facts_replace_the_facts_queued_for_their_box() {
         use crate::css::style::tree::StyleNodeID;
-        use crate::layout::layout_changes::LayoutChange;
         use crate::layout::node_data::NodeSlotId;
         use crate::layout::tree_update_marks::MarkedBox;
         use crate::painting::host::FfiCanvasPaintFacts;
@@ -892,13 +924,6 @@ mod tests {
             queued_facts(),
             [canvas(4), canvas(5)],
             "a write that may rebind the box keeps the facts before it"
-        );
-        queue.push_front(ArenaChange::Layout(LayoutChange::RecordPartialRelayoutEscape));
-        push(element, canvas(6));
-        assert_eq!(
-            queued_facts(),
-            [canvas(4), canvas(5), canvas(6)],
-            "a write queued ahead of the facts keeps them"
         );
     }
 
@@ -1100,5 +1125,33 @@ mod tests {
         );
         // SAFETY: The host is destroyed once, and nothing reaches it after.
         unsafe { document_host::document_host_destroy(pointer) };
+    }
+}
+
+/// A fork of a document's render state. See [`RenderState::fork`]. Nothing the host holds names it, so it drops whatever
+/// it holds.
+pub(crate) struct RenderFork(std::mem::ManuallyDrop<RenderState>);
+
+impl std::ops::Deref for RenderFork {
+    type Target = RenderState;
+
+    fn deref(&self) -> &RenderState {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for RenderFork {
+    fn deref_mut(&mut self) -> &mut RenderState {
+        &mut self.0
+    }
+}
+
+impl Drop for RenderFork {
+    fn drop(&mut self) {
+        // SAFETY: The fork is not used again.
+        let RenderState { arena, engine, .. } = unsafe { std::mem::ManuallyDrop::take(&mut self.0) };
+        drop(arena);
+        // SAFETY: The fork made the handle, and the arena that linked it is gone.
+        drop(unsafe { engine.destroy() });
     }
 }

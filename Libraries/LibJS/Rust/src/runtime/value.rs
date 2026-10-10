@@ -13,7 +13,9 @@ use num_traits::Zero;
 
 use crate::build_configuration::HEAP_REGION_OFFSET_MASK;
 use crate::bytecode::executable::{PropertyLookupCache, StaticPropertyLookupCacheSite};
-use crate::bytecode::property_access::{CachePropertyAbsence, GetByIdMode, get_by_id};
+use crate::bytecode::property_access::{
+    CachePropertyAbsence, GetByIdMode, get_by_id, get_own_property_without_side_effects,
+};
 use crate::gc::capi::js_heap_region_base;
 use crate::gc::class_id::ClassId;
 use crate::interpreter::vm::Vm;
@@ -35,6 +37,7 @@ use crate::runtime::error::ErrorKind;
 use crate::runtime::error_types::ErrorType;
 use crate::runtime::number_object::NumberObject;
 use crate::runtime::object::PropertyLookupPhase;
+use crate::runtime::object_prototype::{ObjectPrototype, builtin_tag};
 use crate::runtime::property_key::PropertyKey;
 use crate::runtime::proxy_object::ProxyObject;
 use crate::runtime::string_object::StringObject;
@@ -45,13 +48,101 @@ use crate::utf16::{Utf16Display, Utf16StringBuilder, Utf16View};
 use libjs_abi::Builtin;
 use libjs_abi::value as nan_box;
 
-/// Makes the whole encoded value live up to this point. The conservative stack scan recognizes a cell by its tagged
-/// value or by its address, but not by its bare heap offset, which the compiler could otherwise keep instead of the
-/// value while the value is held across an allocation.
+/// Makes the whole encoded value live up to this point, and the decoded address from this point on. The conservative
+/// stack scan recognizes a cell by its tagged value or by its address, but not by its bare heap offset, which the
+/// compiler could otherwise keep instead of the value or the address while either is held across an allocation.
 #[inline(always)]
-fn keep_encoded_value_alive(encoded: u64) {
-    // SAFETY: The assembly is empty: it only has the compiler put `encoded` in a register here.
-    unsafe { core::arch::asm!("/* {0} */", in(reg) encoded, options(nomem, nostack, preserves_flags)) };
+fn decode_cell_address(encoded: u64) -> usize {
+    // SAFETY: Cell values are offsets into the heap region, whose base LibGC fixed before any cell existed.
+    let base = unsafe { js_heap_region_base } as u64;
+    let mut address = base + (encoded & HEAP_REGION_OFFSET_MASK);
+    // SAFETY: The assembly is empty: it only has the compiler put `encoded` and `address` in registers here.
+    unsafe {
+        core::arch::asm!(
+            "/* {encoded} {address} */",
+            encoded = in(reg) encoded,
+            address = inout(reg) address,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    address as usize
+}
+
+/// The most objects on a prototype chain to_primitive_of_object_with_default_conversions() looks through.
+const MAX_DEFAULT_CONVERSION_PROTOTYPE_CHAIN_LENGTH: usize = 4;
+
+/// OPTIMIZATION: ToPrimitive of an object that inherits toString and valueOf from %Object.prototype%, without any
+///               @@toPrimitive or @@toStringTag on its prototype chain, is "[object Object]" for every preferred type:
+///               there is no exotic @@toPrimitive, valueOf returns the object itself, and toString is
+///               %Object.prototype.toString%. Returns nothing if the object is not such an object, or if its builtinTag
+///               is not "Object".
+fn to_primitive_of_object_with_default_conversions(vm: &Vm, object: &Object) -> Option<Gc<PrimitiveString>> {
+    // NB: Only objects whose builtinTag is "Object" convert to the cached string, so the others, such as arrays, are left
+    //     to the generic path first. Proxies have no ordinary property lookup, so IsArray is whether the object is an
+    //     Array.
+    if builtin_tag(object, object.is_array_exotic_object()) != "Object" {
+        return None;
+    }
+
+    let realm = vm.current_realm()?;
+    let object_prototype = realm.object_prototype();
+
+    let to_primitive_key = PropertyKey::from(vm.well_known_symbols().to_primitive);
+    let to_string_tag_key = PropertyKey::from(vm.well_known_symbols().to_string_tag);
+
+    // Every object on the chain below %Object.prototype% looks these properties up in its own storage, and has none.
+    let mut current = object.as_gc();
+    let mut chain_length = 0;
+    while current != object_prototype {
+        chain_length += 1;
+        if chain_length > MAX_DEFAULT_CONVERSION_PROTOTYPE_CHAIN_LENGTH || !current.has_ordinary_named_property_lookup()
+        {
+            return None;
+        }
+        let shape = current.shape();
+        if shape.has_conversion_properties(vm) {
+            return None;
+        }
+        current = shape.prototype()?;
+    }
+
+    // %Object.prototype% still has its own toString and valueOf, and no @@toPrimitive or @@toStringTag.
+    let cache = |site| vm.static_property_lookup_cache(site);
+    let to_string = get_own_property_without_side_effects(
+        &object_prototype,
+        &vm.names.toString,
+        cache(StaticPropertyLookupCacheSite::ValueDefaultConversionsToString),
+    );
+    if !to_string.is_object()
+        || to_string.as_object() != realm.intrinsics().object_prototype_to_string_function().upcast()
+    {
+        return None;
+    }
+    let value_of = get_own_property_without_side_effects(
+        &object_prototype,
+        &vm.names.valueOf,
+        cache(StaticPropertyLookupCacheSite::ValueDefaultConversionsValueOf),
+    );
+    if !value_of.is_function() || !ObjectPrototype::is_value_of_function(vm, value_of.as_function()) {
+        return None;
+    }
+    if !get_own_property_without_side_effects(
+        &object_prototype,
+        &to_primitive_key,
+        cache(StaticPropertyLookupCacheSite::ValueDefaultConversionsToPrimitive),
+    )
+    .is_empty()
+        || !get_own_property_without_side_effects(
+            &object_prototype,
+            &to_string_tag_key,
+            cache(StaticPropertyLookupCacheSite::ValueDefaultConversionsToStringTag),
+        )
+        .is_empty()
+    {
+        return None;
+    }
+
+    Some(vm.cached_strings().object_Object)
 }
 
 impl Value {
@@ -182,10 +273,7 @@ impl Value {
     /// The value must hold a cell of type T.
     pub(crate) unsafe fn cell<T>(self) -> Gc<T> {
         debug_assert!(self.is_cell());
-        keep_encoded_value_alive(self.0);
-        // SAFETY: Cell values are offsets into the heap region, whose base LibGC fixed before any cell existed.
-        let base = unsafe { js_heap_region_base } as u64;
-        let address = (base + (self.0 & HEAP_REGION_OFFSET_MASK)) as usize;
+        let address = decode_cell_address(self.0);
         // SAFETY: The caller guarantees the value holds a live cell of type T.
         unsafe { Gc::from_non_null(NonNull::new_unchecked(core::ptr::without_provenance_mut::<T>(address))) }
     }
@@ -247,7 +335,7 @@ impl Value {
     }
 
     pub fn is_nan(self) -> bool {
-        self.is_number() && self.as_f64().is_nan()
+        self.0 == nan_box::CANON_NAN_BITS
     }
 
     pub fn is_infinity(self) -> bool {
@@ -404,6 +492,10 @@ impl Value {
     fn to_primitive_slow_case(self, vm: &Vm, mut preferred_type: PreferredType) -> ThrowCompletionOr<Value> {
         // 1. If input is an Object, then
         if self.is_object() {
+            if let Some(string) = to_primitive_of_object_with_default_conversions(vm, &self.as_object()) {
+                return Ok(Value::from_string(string));
+            }
+
             // a. Let exoticToPrim be ? GetMethod(input, @@toPrimitive).
             let exotic_to_primitive = self.get_method_with_cache(
                 vm,
@@ -2336,6 +2428,13 @@ pub fn append_number_to_string(builder: &mut impl NumberStringBuilder, value: f6
     // 4. If x is +∞𝔽, return "Infinity".
     if value.is_infinite() {
         builder.append_ascii(if value > 0.0 { b"Infinity" } else { b"-Infinity" });
+        return;
+    }
+
+    // OPTIMIZATION: For an integer of a magnitude below 2^53, the steps below produce its decimal digits, preceded by
+    //               "-" if it is negative.
+    if value.trunc() == value && value.abs() < 9_007_199_254_740_992.0 {
+        builder.append_ascii(DecimalDigits::new_signed(value as i64).as_bytes());
         return;
     }
 

@@ -79,6 +79,7 @@ impl FfiAppliedAnimationDefinition {
 
 /// One of the CSS animations the host holds: its name, and the definition the last plan applied
 /// to it.
+#[derive(Clone)]
 pub(crate) struct CssDefinedAnimation {
     pub(crate) name: CssString,
     applied_definition: FfiAppliedAnimationDefinition,
@@ -89,7 +90,7 @@ type CssDefinedAnimationList = (AnimationSlot, Box<[CssDefinedAnimation]>);
 
 /// Per element, the CSS animations the host holds for it and each of its pseudo-elements, in the
 /// order the host holds them.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct CssDefinedAnimations {
     /// Owning a CSS animation is rare, so only the elements that do have a row, and a row holds
     /// only the lists that are not empty.
@@ -235,7 +236,7 @@ pub(crate) type KeyframesRow = HashMap<Box<[u16]>, usize>;
 /// refcounted object, borrowed: the scope keeps a reference to every set its row names until it
 /// publishes the row again or gives it up, which the engine takes in ahead of anything that
 /// resolves keyframes.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct AnimationKeyframes {
     scopes: HashMap<TreeScopeID, KeyframesRow>,
     /// Which scope a shadow root's pointer identity names. The cascade attributes the winning
@@ -410,6 +411,24 @@ impl EffectTiming {
     pub(crate) fn key(&self, host_key: f64) -> Option<f64> {
         self.key_at(AnimationTimelineSamples::default())
             .unwrap_or(Some(host_key))
+    }
+
+    /// The local time of the effect with its timeline at `samples`, or none where it is unresolved or the engine cannot
+    /// decide the timing.
+    /// https://www.w3.org/TR/web-animations-1/#local-time
+    #[must_use]
+    pub(crate) fn local_time_at(&self, samples: AnimationTimelineSamples) -> Option<f64> {
+        let timing = &self.timing;
+        if !timing.decidable {
+            return None;
+        }
+        match (timing.has_hold_time, samples.timeline_time(timing)?) {
+            (true, _) => Some(timing.hold_time),
+            (false, Some(timeline_time)) if timing.has_start_time => {
+                Some((timeline_time - timing.start_time) * timing.playback_rate)
+            }
+            (false, _) => None,
+        }
     }
 
     /// The key the effect's keyframes are sampled at with its timeline at `samples`, which is

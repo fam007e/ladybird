@@ -69,7 +69,12 @@ pub struct EcmascriptFunctionObjectStorage {
 
 pub static ECMASCRIPT_FUNCTION_OBJECT_METHODS: ObjectMethods = ObjectMethods {
     internal_get_own_property: EcmascriptFunctionObject::internal_get_own_property,
-    is_cacheable_for_property_absence: |_| false,
+    // NB: Functions answer for "prototype" before instantiating it lazily, and for "caller" and "arguments" if they
+    //     support the legacy properties, whatever their shape holds. They answer for other names like ordinary
+    //     objects.
+    is_cacheable_for_absence_of: |_, vm, property_key| {
+        *property_key != vm.names.prototype && *property_key != vm.names.caller && *property_key != vm.names.arguments
+    },
     internal_own_property_keys: EcmascriptFunctionObject::internal_own_property_keys,
     internal_call: Some(EcmascriptFunctionObject::internal_call),
     internal_construct: Some(EcmascriptFunctionObject::internal_construct),
@@ -752,9 +757,9 @@ impl EcmascriptFunctionObject {
         self.shared_data().formal_parameter_count()
     }
 
-    /// A copy of the parameter names, since the arguments object they are for is allocated while they are in use.
-    pub fn parameter_names_for_mapped_arguments(&self) -> Vec<Utf16FlyString> {
-        self.shared_data().parameter_names_for_mapped_arguments().to_vec()
+    /// Shares the cached parameter map with an arguments object.
+    pub fn mapped_argument_names(&self) -> Rc<[Utf16FlyString]> {
+        self.shared_data().mapped_argument_names()
     }
 
     pub fn set_is_class_constructor(&self) {

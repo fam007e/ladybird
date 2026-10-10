@@ -1015,6 +1015,8 @@ pub fn try_inline_call(vm: &Vm, pc: u32, instruction: &op::Call, values: &op::Ca
         return false;
     }
 
+    // NB: Stack traces show the caller at its program counter.
+    vm.running_execution_context_ref().program_counter.set(pc);
     vm.push_inline_frame(
         callee_function,
         callee_function.inline_call_executable(),
@@ -1111,7 +1113,7 @@ pub fn create_arguments(
         create_mapped_arguments_object(
             vm,
             function,
-            &ecmascript_function.parameter_names_for_mapped_arguments(),
+            ecmascript_function.mapped_argument_names(),
             passed_arguments,
             environment,
         )

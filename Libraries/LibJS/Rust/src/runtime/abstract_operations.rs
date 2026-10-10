@@ -8,6 +8,7 @@
 
 use core::cell::Cell;
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
 use ak::{ScopeGuard, Utf16FlyString, Utf16String};
 use num_bigint::Sign;
@@ -54,7 +55,7 @@ use crate::runtime::object_environment::{IsWithEnvironment, ObjectEnvironment};
 use crate::runtime::primitive_string::PrimitiveString;
 use crate::runtime::private_environment::PrivateEnvironment;
 use crate::runtime::promise_capability::{new_promise_capability, try_or_reject};
-use crate::runtime::property_attributes::{DEFAULT_ATTRIBUTES, PropertyAttributes};
+use crate::runtime::property_attributes::PropertyAttributes;
 use crate::runtime::property_descriptor::PropertyDescriptor;
 use crate::runtime::property_key::PropertyKey;
 use crate::runtime::proxy_object::ProxyObject;
@@ -1692,19 +1693,10 @@ pub fn create_unmapped_arguments_object(vm: &Vm, arguments: &[Cell<Value>]) -> G
 
     // 5. Let index be 0.
     // 6. Repeat, while index < len,
-    for (index, argument) in arguments.iter().enumerate() {
-        // a. Let val be argumentsList[index].
-        let value = argument.get();
-
-        // b. Perform ! CreateDataPropertyOrThrow(obj, ! ToString(𝔽(index)), val).
-        object.indexed_put(
-            u32::try_from(index).expect("the argument index fits in u32"),
-            value,
-            DEFAULT_ATTRIBUTES,
-        );
-
-        // c. Set index to index + 1.
-    }
+    //    a. Let val be argumentsList[index].
+    //    b. Perform ! CreateDataPropertyOrThrow(obj, ! ToString(𝔽(index)), val).
+    //    c. Set index to index + 1.
+    set_arguments_as_indexed_elements(&object, arguments);
 
     // 7. Perform ! DefinePropertyOrThrow(obj, @@iterator, PropertyDescriptor { [[Value]]: %Array.prototype.values%, [[Writable]]: true, [[Enumerable]]: false, [[Configurable]]: true }).
     let array_prototype_values = realm.array_prototype_values_function();
@@ -1723,11 +1715,24 @@ pub fn create_unmapped_arguments_object(vm: &Vm, arguments: &[Cell<Value>]) -> G
     object
 }
 
-// 10.4.4.7 CreateMappedArgumentsObject ( func, formals, argumentsList, env ), https://tc39.es/ecma262/#sec-createmappedargumentsobject
+/// OPTIMIZATION: The arguments become default data properties of an object without indexed properties, which is
+///               packed indexed storage made in one step.
+fn set_arguments_as_indexed_elements(object: &Object, arguments: &[Cell<Value>]) {
+    let length = u32::try_from(arguments.len()).expect("the argument count fits in u32");
+    if length == 0 {
+        return;
+    }
+    object.set_indexed_property_elements_to_undefined(length);
+    for (index, argument) in arguments.iter().enumerate() {
+        object.set_packed_indexed_element(index as u32, argument.get());
+    }
+}
+
+// 10.4.4.7 CreateMappedArgumentsObject ( func, formals, argList, envRecord ), https://tc39.es/ecma262/#sec-createmappedargumentsobject
 pub fn create_mapped_arguments_object(
     vm: &Vm,
     function: Gc<FunctionObject>,
-    parameter_names: &[Utf16FlyString],
+    mapped_names: Rc<[Utf16FlyString]>,
     arguments: &[Cell<Value>],
     environment: Gc<Environment>,
 ) -> Gc<Object> {
@@ -1735,7 +1740,7 @@ pub fn create_mapped_arguments_object(
 
     // 1. Assert: formals does not contain a rest parameter, any binding patterns, or any initializers. It may contain duplicate identifiers.
 
-    // 2. Let len be the number of elements in argumentsList.
+    // 2. Let length be the number of elements in argList.
     let length = i32::try_from(arguments.len()).expect("the argument count fits in i32");
 
     // 3. Let obj be MakeBasicObject(« [[Prototype]], [[Extensible]], [[ParameterMap]] »).
@@ -1745,25 +1750,22 @@ pub fn create_mapped_arguments_object(
     // 7. Set obj.[[Set]] as specified in 10.4.4.4.
     // 8. Set obj.[[Delete]] as specified in 10.4.4.5.
     // 9. Set obj.[[Prototype]] to %Object.prototype%.
-    let object = ArgumentsObject::create(vm, realm, environment, parameter_names.is_empty());
+    let object = ArgumentsObject::create(vm, realm, environment, mapped_names.is_empty());
+
+    // 10. Let map be OrdinaryObjectCreate(null).
+    // 11. Set obj.[[ParameterMap]] to map.
+    // 12. Let paramNames be the BoundNames of formals.
+    // 13. Let paramCount be the number of elements in paramNames.
+    // OPTIMIZATION: ArgumentsObject implements the parameter map internally. The function supplies the cached mapping.
 
     // 14. Let index be 0.
-    // 15. Repeat, while index < len,
-    for (index, argument) in arguments.iter().enumerate() {
-        // a. Let val be argumentsList[index].
-        let value = argument.get();
+    // 15. Repeat, while index < length,
+    //     a. Let value be argList[index].
+    //     b. Perform ! CreateDataPropertyOrThrow(obj, ! ToString(𝔽(index)), value).
+    //     c. Set index to index + 1.
+    set_arguments_as_indexed_elements(&object, arguments);
 
-        // b. Perform ! CreateDataPropertyOrThrow(obj, ! ToString(𝔽(index)), val).
-        object.indexed_put(
-            u32::try_from(index).expect("the argument index fits in u32"),
-            value,
-            DEFAULT_ATTRIBUTES,
-        );
-
-        // c. Set index to index + 1.
-    }
-
-    // 16. Perform ! DefinePropertyOrThrow(obj, "length", PropertyDescriptor { [[Value]]: 𝔽(len), [[Writable]]: true, [[Enumerable]]: false, [[Configurable]]: true }).
+    // 16. Perform ! DefinePropertyOrThrow(obj, "length", PropertyDescriptor { [[Value]]: 𝔽(length), [[Writable]]: true, [[Enumerable]]: false, [[Configurable]]: true }).
     object.put_direct(realm.mapped_arguments_object_length_offset(), Value::from_i32(length));
 
     // OPTIMIZATION: We take a different route here than what the spec suggests.
@@ -1775,40 +1777,22 @@ pub fn create_mapped_arguments_object(
     //               and getter/setter behavior itself without extra GC allocations.
 
     // 17. Let mappedNames be a new empty List.
-    let mut seen_names: HashSet<Utf16FlyString> = HashSet::new();
-    let mut mapped_names: Vec<Utf16FlyString> = Vec::new();
-
-    // 18. Set index to numberOfParameters - 1.
+    // 18. Set index to paramCount - 1.
     // 19. Repeat, while index ≥ 0,
-    let parameter_count = i32::try_from(parameter_names.len()).expect("the parameter count fits in i32");
-    for index in (0..parameter_count).rev() {
-        // a. Let name be parameterNames[index].
-        let name = &parameter_names[index as usize];
+    //     a. Let name be paramNames[index].
+    //     b. If mappedNames does not contain name, then
+    //         i. Append name to mappedNames.
+    //         ii. If index < length, then
+    //             1. Let getter be MakeArgGetter(name, envRecord).
+    //             2. Let setter be MakeArgSetter(name, envRecord).
+    //             3. Perform ! map.[[DefineOwnProperty]](! ToString(𝔽(index)), PropertyDescriptor { [[Setter]]: setter, [[Getter]]: getter, [[Enumerable]]: false, [[Configurable]]: true }).
+    //     c. Set index to index - 1.
+    // OPTIMIZATION: Share the precomputed names and limit mapping to indices below the argument count. The arguments
+    //               object's internal methods implement the binding access without creating getters and setters.
+    let mapped_count = mapped_names.len().min(arguments.len());
+    object.set_parameter_map(mapped_names, mapped_count);
 
-        // b. If name is not an element of mappedNames, then
-        if seen_names.contains(name) {
-            continue;
-        }
-
-        // i. Add name as an element of the list mappedNames.
-        seen_names.insert(name.clone());
-
-        // ii. If index < len, then
-        if index < length {
-            // 1. Let g be MakeArgGetter(name, env).
-            // 2. Let p be MakeArgSetter(name, env).
-            // 3. Perform ! map.[[DefineOwnProperty]](! ToString(𝔽(index)), PropertyDescriptor { [[Set]]: p, [[Get]]: g, [[Enumerable]]: false, [[Configurable]]: true }).
-            if index as usize >= mapped_names.len() {
-                mapped_names.resize(index as usize + 1, Utf16FlyString::default());
-            }
-
-            mapped_names[index as usize] = name.clone();
-        }
-    }
-
-    object.set_mapped_names(mapped_names);
-
-    // 20. Perform ! DefinePropertyOrThrow(obj, @@iterator, PropertyDescriptor { [[Value]]: %Array.prototype.values%, [[Writable]]: true, [[Enumerable]]: false, [[Configurable]]: true }).
+    // 20. Perform ! DefinePropertyOrThrow(obj, %Symbol.iterator%, PropertyDescriptor { [[Value]]: %Array.prototype.values%, [[Writable]]: true, [[Enumerable]]: false, [[Configurable]]: true }).
     let array_prototype_values = realm.array_prototype_values_function();
     object.put_direct(
         realm.mapped_arguments_object_well_known_symbol_iterator_offset(),

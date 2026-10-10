@@ -7,35 +7,42 @@
 //! What the host keeps of a document's render state, which the render owner holds: its name, the frame that may fly
 //! beside the host, and what the host reads between the jobs it hands the owner.
 
-use super::clock::{
-    ClockLease, ClockPlan, ClockRecorder, ClockTicks, CommittedFrame, LeaseLanding, TickPresented, TickRecording,
-};
+use super::clock::{ClockPlan, ClockTicks, CommittedFrame};
 use super::owner::{self, DocumentId, SharedWithHost, StateSeed};
-use super::wait::{BegunRead, NodeRead, TaskStart};
+use super::wait::{BegunRead, NodeRead};
 use super::{
     ArenaChange, ArenaFacts, ChangeQueue, EngineFacts, ForcedRead, Landing, Moves, NoFrameInFlight, Owed, RenderState,
     RenderWait, RowWrite, StateFacts, on_render_side, post_to_render_side,
 };
-use crate::css::css_pixels::CssPixelRect;
 use crate::css::style::flight_style_rows::FlightStyleRow;
 use crate::css::style::rule_writes::{PublishedRules, RuleWrite};
-use crate::css::style::style_job::StyleJobAnswer;
+use crate::css::style::style_job::{SealedStyleInputs, StyleJobAnswer};
 use crate::css::style::tree::StyleNodeID;
+use crate::css::transition::HoverTransitions;
 use crate::layout::node_data::NodeSlotId;
 use crate::layout::row_reads::{RowIdentities, RowSnapshot, RowStyles};
 use crate::layout::tree_update_marks::{LayoutTreeUpdateMarkWrite, LayoutTreeUpdateMarks};
-use crate::layout::{FlownRound, HostTables, LayoutRoundAnswer, RowsVersion, SealedRound};
+use crate::layout::{FlownRound, HostTables, RowsVersion, SealedRound};
 use crate::painting::paint_read::PaintSource;
-use crate::painting::presentation::Presentation;
 use crate::painting::record::recorder_state::AbsoluteRectMemo;
 use crate::painting::recording_slot::{RecordingAnswer, RecordingSlot};
 use crate::painting::visual_animation::VisualAnimation;
 use crate::render_state::TaskBoundary;
 use crate::stage_thread::InFlight;
+use libgfx_rust::FloatPoint;
 use std::cell::{Cell, RefCell, RefMut};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+
+/// The boundary events a hover a rendering update kept owes: where the pointer was, in the context's device pixels, or
+/// none where it left the context, and the element the lane's hover put the hover on there, or nothing, where the lane
+/// took that move.
+#[derive(Clone, Copy)]
+pub(super) struct HoverOwed {
+    pub(super) pointer: Option<FloatPoint>,
+    pub(super) target: Option<Option<StyleNodeID>>,
+}
 
 /// The host's side of one document's render state: the name the render owner holds the state by, the frame that may
 /// fly beside the host, the host tables the host answers layout through, and what the document keeps of its display
@@ -49,12 +56,10 @@ pub struct DocumentHost {
     document: DocumentId,
     /// What the owner makes the state from, until the host's first job hands it over.
     seed: Cell<Option<StateSeed>>,
-    /// The frame that flies beside the host, until the host takes it in, or the render clock's lease of the render state
-    /// while a task runs, until any job of the host ends it.
-    away: RefCell<Option<Away>>,
-    /// Whether the host waits for the frame: it flies, or a layout round that flew with it or that the ticks of a clock
-    /// lease ran is not paid yet. The host's scopes of a read and its document's layout read it where it is (see
-    /// [`document_host_read_scope_view`]).
+    /// The frame that flies beside the host, until the host takes it in.
+    away: RefCell<Option<InFlight<Landing>>>,
+    /// Whether the host waits for the frame: it flies, or a layout round that flew with it is not paid yet. The host's
+    /// scopes of a read and its document's layout read it where it is (see [`document_host_read_scope_view`]).
     waits_for_frame: Cell<bool>,
     host_tables: HostTables,
     recording: RefCell<RecordingSlot>,
@@ -98,33 +103,40 @@ pub struct DocumentHost {
     published_rules: PublishedRules,
     /// What the host learned of its document's style engine.
     engine_memo: crate::css::style::engine_calls::EngineMemo,
-    /// The facts of the render state as the host's last job or frame left it, which a frame in flight and a clock lease
-    /// forget.
+    /// The facts of the render state as the host's last job or frame left it, which a frame in flight forgets.
     facts: Cell<Option<StateFacts>>,
     /// The attribute names whose value text the engine's selectors read, as the host's last job or frame left them.
-    selector_value_text_names: RefCell<crate::css::style::SelectorValueTextNames>,
-    /// What the clock leases the tasks after the last rendering update tick, until one takes it.
-    clock_plan: RefCell<Option<ClockPlan>>,
-    /// What the rounds of the ticks of the clock lease that landed last owe, until the host's next layout update pays it.
-    clock_rounds: RefCell<Vec<LayoutRoundAnswer>>,
-    /// The presentation of the document's navigable a clock lease brought back, until the navigable takes it again.
-    presentation: RefCell<Option<Presentation>>,
-    /// The recording of the frame the last tick of a lease that ended presented, which brings back the recorder state
-    /// and presentation once the host needs them.
-    tick_recording: RefCell<Option<TickRecording>>,
-    /// The border boxes of the elements a clock lease sampled in the last frame one of its ticks presented.
-    presented_border_boxes: RefCell<Vec<(StyleNodeID, CssPixelRect)>>,
-    /// Whether the render state was leased to the render clock since the last rendering update.
-    leased_since_rendering_update: Cell<bool>,
+    selector_value_text_names: RefCell<crate::css::style::SelectorAttributeNames>,
+    /// The attribute names the engine's selectors test in any way, as its last job left them.
+    selector_tested_attribute_names: RefCell<crate::css::style::SelectorAttributeNames>,
+    /// The ticks the render clock hands the lanes of the document's presented frames.
+    ticks: Arc<ClockTicks>,
+    /// The steps the hover of the lanes decided that the last rendering update took in, which the host runs as the lanes
+    /// do from then.
+    lane_transitions: RefCell<Vec<Arc<HoverTransitions>>>,
     /// Whether the frame in flight waits for a test to release it.
     frame_held_for_testing: Cell<bool>,
-}
-
-/// What runs on the render owner beside the host, which the host takes back before it hands the owner a job: the frame
-/// that flies, or a clock lease, never both.
-enum Away {
-    Flying(InFlight<Landing>),
-    Leased(ClockLease),
+    /// The root and the sealed document computation inputs of the last style transaction the host took or let fly,
+    /// which the hover of a lane takes its own transactions with.
+    style_inputs: RefCell<Option<(StyleNodeID, Arc<SealedStyleInputs>)>>,
+    /// The element the host asked the engine's hover to move to last: the one the events of the last mouse move it
+    /// handled hovered, as the engine's hover follows it through tree changes.
+    hover_target: Cell<Option<StyleNodeID>>,
+    /// Where the compositor said the pointer went last as a rendering update took the lanes in, and the element a lane's
+    /// hover put the hover on there, if one did: the boundary events of the move the host fires where it handles no
+    /// mouse move first.
+    hover_events_owed: Cell<Option<HoverOwed>>,
+    /// The input event id of the newest pointer move the host knows of: the newest mouse event it handled, or the
+    /// newest move the compositor told the render clock of as the host took in what the lanes did.
+    newest_pointer_input_event: Cell<u64>,
+    /// The last pointer move a tick of the lanes took that the last rendering update took in, which the mouse event of
+    /// that move goes by: the host drops older moves' events.
+    lane_move: Cell<Option<super::clock::LaneMove>>,
+    /// The serial number of the last rendering update that took the lanes in, until it, or an update after it, seals its
+    /// plan.
+    lanes_taken_in: Cell<Option<u64>>,
+    /// Whether the last plan the host sealed was one, which the lanes may still follow: with none, they do nothing.
+    lanes_planned: Cell<bool>,
 }
 
 /// Pays what the writes a job applied owe the host, which only [`DocumentHost::pay`] makes.
@@ -158,8 +170,9 @@ enum FlownStyle {
 impl DocumentHost {
     fn new() -> Self {
         let shared = SharedWithHost::new();
+        let document = DocumentId::mint();
         Self {
-            document: DocumentId::mint(),
+            document,
             seed: Cell::new(Some(StateSeed { shared: shared.clone() })),
             shared,
             away: RefCell::default(),
@@ -188,13 +201,17 @@ impl DocumentHost {
             engine_memo: Default::default(),
             facts: Cell::new(None),
             selector_value_text_names: RefCell::default(),
-            clock_plan: RefCell::default(),
-            clock_rounds: RefCell::default(),
-            presentation: RefCell::default(),
-            tick_recording: RefCell::default(),
-            presented_border_boxes: RefCell::default(),
-            leased_since_rendering_update: Cell::default(),
+            selector_tested_attribute_names: RefCell::default(),
+            ticks: ClockTicks::new(document),
+            lane_transitions: RefCell::default(),
             frame_held_for_testing: Cell::default(),
+            style_inputs: RefCell::default(),
+            hover_target: Cell::default(),
+            hover_events_owed: Cell::default(),
+            newest_pointer_input_event: Cell::default(),
+            lane_move: Cell::default(),
+            lanes_taken_in: Cell::default(),
+            lanes_planned: Cell::default(),
         }
     }
 
@@ -259,7 +276,10 @@ impl DocumentHost {
         let changes = self.changes.take_for_stream();
         self.streamed.set(true);
         let document = self.document;
-        post_to_render_side(move || owner::with_state(document, None, |state| state.apply_streamed(changes)));
+        post_to_render_side(move || {
+            super::clock::note_host_write(document);
+            owner::with_state(document, None, |state| state.apply_streamed(changes));
+        });
     }
 
     /// Commits the rendering update's frame to the render owner, spending `read`, and goes on: the owner applies the
@@ -284,18 +304,22 @@ impl DocumentHost {
             self.streamed.set(true);
         }
         let document = self.document;
+        let ticks = Arc::clone(&self.ticks);
         crate::stage_thread::style_layout_thread().submit_relayed(move |relay| {
+            if !changes.is_empty() {
+                super::clock::note_host_write(document);
+            }
             owner::with_state(document, None, |state| {
                 if !changes.is_empty() {
                     state.apply_streamed(changes);
                 }
-                commit.sample(state, relay);
+                commit.sample(state, relay, &ticks);
             });
         })
     }
 
     /// Whether the render state may apply the writes the host queued now: a job made it, none runs, as a host callback
-    /// of one does, no frame flies, is leased or waits to be taken in, and the host reads the state as of its writes.
+    /// of one does, no frame flies or waits to be taken in, and the host reads the state as of its writes.
     fn may_stream_writes(&self) -> bool {
         if self.in_job.get()
             || self.away.borrow().is_some()
@@ -325,8 +349,6 @@ impl DocumentHost {
     /// Takes the writes the host queued, for a frame that flies with them to the render owner. The style writes queued
     /// beside a frame that flies with a style transaction wait for its drain.
     pub(super) fn take_queued_changes_for_flight(&self, with_style: bool) -> Vec<ArenaChange> {
-        // A clock lease ends before the frame flies, and the styles it gives back go first.
-        self.end_clock_lease();
         debug_assert!(!self.has_flown_style(), "one frame of a document flies at a time");
         self.changes.take_for_flight(with_style)
     }
@@ -339,20 +361,20 @@ impl DocumentHost {
             deferred_inputs,
             facts,
             selector_value_text_names,
+            selector_tested_attribute_names,
         }: Owed,
     ) {
         self.facts.set(Some(facts));
         *self.selector_value_text_names.borrow_mut() = selector_value_text_names;
+        *self.selector_tested_attribute_names.borrow_mut() = selector_tested_attribute_names;
         self.engine_memo
             .deferred
             .borrow_mut()
             .follow_job(deferred_inputs, !self.changes.is_empty());
-        if work.is_empty() {
-            return;
-        }
         // SAFETY: The host has its job or frame back, on its document's thread, or on the render owner in a host
         // callback of a job the host waits for, as every host callback runs.
         let main_thread = unsafe { crate::stage::from_ffi_entry(&OWED_WORK_PAYMENT, self) };
+        crate::css::style::give_up_custom_property_data_let_go_beside_the_host(&main_thread);
         for work in work {
             work.pay(&main_thread);
         }
@@ -368,154 +390,100 @@ impl DocumentHost {
         self.streamed.set(false);
         let (flight, held_for_testing) = flight(self.document, self.seed.take(), self.lend_marks());
         self.frame_held_for_testing.set(held_for_testing);
-        let previous = self.away.borrow_mut().replace(Away::Flying(flight));
+        let previous = self.away.borrow_mut().replace(flight);
         assert!(previous.is_none(), "one frame of a document flies at a time");
         self.note_frame_wait();
     }
 
     /// Takes the frame in flight in, where one flies, waiting for it to land, spending `read`: only a read waits for a
-    /// frame. A lease ends, which waits for at most one tick and spends no read.
+    /// frame.
     #[inline]
     fn take_frame_in(&self, read: impl RenderWait) {
         if self.away.borrow().is_some() {
-            self.take_frame_back(read);
-        }
-    }
-
-    /// Takes back what runs beside the host: lands the frame in flight, or ends the lease.
-    #[cold]
-    fn take_frame_back(&self, read: impl RenderWait) {
-        if self.frame_flies() {
             self.land(read.into_forced_read());
         }
-        self.end_clock_lease();
     }
 
-    /// Ends the document's clock lease, where one runs: the boxes take back the styles the host installed before
-    /// anything reads them, the boxes the clock built are marked for the host's next layout tree build to build again,
-    /// the host's next layout update pays what the ticks laid out, and the recorder state and presentation come back.
-    fn end_clock_lease(&self) {
-        match self.away.take() {
-            Some(Away::Leased(lease)) => self.lease_landed(lease.end()),
-            other => *self.away.borrow_mut() = other,
-        }
+    /// Takes the transitions the hover of the lane leaves elements running that the host has yet to run as the lane does,
+    /// which it runs from now on.
+    pub(crate) fn take_lane_transitions(&self) -> Vec<Arc<HoverTransitions>> {
+        std::mem::take(&mut *self.lane_transitions.borrow_mut())
     }
 
-    fn lease_landed(
-        &self,
-        LeaseLanding {
-            recording,
-            ticked,
-            built,
-            owed,
-            presented_border_boxes,
-            ..
-        }: LeaseLanding,
-    ) {
-        use crate::layout::layout_changes::LayoutChange;
-        if !presented_border_boxes.is_empty() {
-            *self.presented_border_boxes.borrow_mut() = presented_border_boxes;
-        }
-        if !built.shown.is_empty() {
-            for write in built.mark_writes {
-                self.write_marks(write);
-            }
-            self.changes
-                .push_front(ArenaChange::Layout(LayoutChange::LetGoOfTickShownRecords(built.shown)));
-            for (node, mark) in built.box_marks {
-                self.changes
-                    .push_front(ArenaChange::Layout(LayoutChange::ApplyLayoutTreeUpdateMark {
-                        node: Some(node),
-                        mark,
-                    }));
-            }
-        }
-        if !ticked.is_empty() {
-            self.changes
-                .push_front(ArenaChange::Layout(LayoutChange::RestoreHostStyles(ticked)));
-        }
-        self.clock_rounds.borrow_mut().extend(owed);
-        self.note_frame_wait();
-        let previous = self.tick_recording.replace(Some(recording));
-        debug_assert!(previous.is_none(), "a lease begins with the recorder state here");
+    /// Keeps the root and the sealed inputs of a style transaction the host takes or lets fly, for the hover of a lane
+    /// to take its own with.
+    pub(crate) fn keep_style_inputs(&self, root: StyleNodeID, inputs: Arc<SealedStyleInputs>) {
+        *self.style_inputs.borrow_mut() = Some((root, inputs));
     }
 
-    /// Takes in the recording of the frame the last tick of a lease presented, waiting for it where it still runs: the
-    /// recorder state and presentation come back, and the document takes the frame in as its last recording.
-    fn take_tick_recording_in(&self) {
-        let Some(recording) = self.tick_recording.take() else {
-            return;
-        };
-        let ClockRecorder {
-            recorder,
-            presentation,
-            presented,
-        } = recording.land();
-        if let TickPresented::Frame {
-            output,
-            hit_test_list_changed,
-        } = presented
-        {
-            self.queue_change(ArenaChange::Paint(
-                crate::painting::paint_changes::PaintChange::TakeInRecording {
-                    output,
-                    hit_test_list_changed,
-                    publishes_recording: true,
-                },
-            ));
+    /// The root and the sealed inputs of the last style transaction the host took or let fly.
+    pub(crate) fn style_inputs(&self) -> Option<(StyleNodeID, Arc<SealedStyleInputs>)> {
+        self.style_inputs.borrow().clone()
+    }
+
+    /// Takes `target` as the element the hover targets, as the events of a mouse move hover it. Answers whether the
+    /// host's next input transaction moves the engine's hover to it.
+    pub(crate) fn request_hover(&self, target: Option<StyleNodeID>) -> bool {
+        self.hover_events_owed.set(None);
+        let moves = self.hover_target.get() != target;
+        self.hover_target.set(target);
+        moves
+    }
+
+    /// The element the lanes' hover put the hover on at the pointer move with the input event id `input_event_id`, or
+    /// nothing, where a tick of theirs took that move and hovered it, as the last rendering update took them in.
+    pub(super) fn lane_hover_target_for(&self, input_event_id: u64) -> Option<Option<StyleNodeID>> {
+        self.lane_move
+            .get()
+            .filter(|hover_move| input_event_id != 0 && hover_move.input_event_id == input_event_id)
+            .and_then(|hover_move| hover_move.target)
+    }
+
+    /// Whether the lanes may hover or run transitions beside the tasks: the last plan the host sealed was one.
+    pub(super) fn may_have_lanes(&self) -> bool {
+        self.lanes_planned.get()
+    }
+
+    /// Whether a rendering update took the lanes in and has yet to seal its plan, until which they present nothing.
+    pub(super) fn lanes_wait_for_the_update(&self) -> bool {
+        self.lanes_taken_in.get().is_some()
+    }
+
+    /// Hands `plan` to the lane of the frame the host presented last, or none, for the tasks after the rendering update
+    /// with the serial number `update`. The plan of an update that sealed after a later one took the lanes in leaves them
+    /// waiting for that one's.
+    pub(crate) fn seal_clock_plan(&self, plan: Option<ClockPlan>, update: u64) {
+        if super::clock::hover::logs_hover() {
+            eprintln!(
+                "{} hover lane: host frame of the update hovers {:?}",
+                super::clock::hover::log_time(),
+                self.hover_target.get().map(StyleNodeID::raw)
+            );
         }
-        self.recording.borrow_mut().give_back_recorder(recorder);
-        *self.presentation.borrow_mut() = Some(presentation);
+        self.ticks
+            .note_plan_animates(plan.as_ref().is_some_and(ClockPlan::animates));
+        self.ticks.note_input_handled(self.newest_pointer_input_event.get());
+        self.lanes_planned.set(plan.is_some());
+        let plan = plan.map(|mut plan| {
+            plan.animation_changes = self.ticks.animation_changes();
+            plan
+        });
+        let document = self.document;
+        self.lanes_taken_in
+            .set(self.lanes_taken_in.get().filter(|taken_in| *taken_in > update));
+        post_to_render_side(move || super::clock::seal_plan(document, plan, update));
     }
 
-    /// Keeps `plan` for the clock lease of the tasks after a rendering update, in place of the last one, or none.
-    pub(crate) fn seal_clock_plan(&self, plan: Option<ClockPlan>) {
-        *self.clock_plan.borrow_mut() = plan;
+    /// Notes whether the event loop begins a task or goes idle: beside an idle event loop the lanes sample no animations.
+    /// Answers whether a task begins whose lanes sample the animations of the last plan the host sealed.
+    pub(super) fn note_event_loop_task(&self, runs_task: bool) -> bool {
+        self.ticks.hold_animations(!runs_task);
+        runs_task && self.ticks.plan_animates()
     }
 
-    /// Leases the render state, with the recorder state and `presentation`, to the render clock as `start` begins a
-    /// task, where the host has a plan, no frame flies and the recorder state is here. The render state stays with the
-    /// render owner, whose ticks reach it by the document's name. Answers the ticks the render clock hands the lease, or
-    /// gives `presentation` back.
-    pub(super) fn lease_clock(
-        &self,
-        start: &TaskStart,
-        presentation: Presentation,
-    ) -> Result<Arc<ClockTicks>, Presentation> {
-        if self.away.borrow().is_some() {
-            return Err(presentation);
-        }
-        let Some(plan) = self.clock_plan.take() else {
-            return Err(presentation);
-        };
-        let Some(recorder) = self.recording().take_recorder_for_clock() else {
-            *self.clock_plan.borrow_mut() = Some(plan);
-            return Err(presentation);
-        };
-        // The ticks write the rows, what the paint properties are prepared from and the facts of the state, so the
-        // host's next read asks the owner, and ends the lease first.
-        self.facts.set(None);
-        self.note_render_state_write();
-        let (lease, ticks) = ClockLease::begin(start, self.document, recorder, presentation, plan);
-        *self.away.borrow_mut() = Some(Away::Leased(lease));
-        self.leased_since_rendering_update.set(true);
-        Ok(ticks)
-    }
-
-    /// Hands `pay` what each round the ticks of the clock lease that landed last ran owes, for the layout update that
-    /// pays it. The host waits for the frame while any is owed, so a layout update that owes none pays a load.
-    #[inline]
-    pub(crate) fn pay_clock_rounds(&self, pay: impl FnMut(LayoutRoundAnswer)) {
-        if self.waits_for_frame.get() {
-            self.pay_owed_clock_rounds(pay);
-        }
-    }
-
-    #[cold]
-    fn pay_owed_clock_rounds(&self, pay: impl FnMut(LayoutRoundAnswer)) {
-        let rounds = self.clock_rounds.take();
-        self.note_frame_wait();
-        rounds.into_iter().for_each(pay);
+    /// The ticks the render clock hands the lanes of the document's presented frames.
+    pub(super) fn clock_ticks(&self) -> &Arc<ClockTicks> {
+        &self.ticks
     }
 
     /// Takes the frame in flight in, where one flies, spending `read`.
@@ -530,15 +498,12 @@ impl DocumentHost {
     /// Lands the frame in flight, waiting for it, spending `read`: the style transaction that flew with it waits to be
     /// drained.
     fn land(&self, read: ForcedRead) {
-        match self.away.take() {
-            Some(Away::Flying(flight)) => {
-                // A frame a test holds goes on as soon as the host waits for it.
-                if self.frame_held_for_testing.take() {
-                    crate::painting::recording_slot::release_held_recording_for_testing();
-                }
-                self.landed(flight.join(read));
+        if let Some(flight) = self.away.take() {
+            // A frame a test holds goes on as soon as the host waits for it.
+            if self.frame_held_for_testing.take() {
+                crate::painting::recording_slot::release_held_recording_for_testing();
             }
-            other => *self.away.borrow_mut() = other,
+            self.landed(flight.join(read));
         }
     }
 
@@ -653,8 +618,8 @@ impl DocumentHost {
     }
 
     /// Proof that no frame flies, where the document's layout waits for none: neither a frame that flies nor a round
-    /// that flew or a clock lease ran and is not paid yet. A read of the layout in place then takes no frame in, and
-    /// needs no read the host began.
+    /// that flew and is not paid yet. A read of the layout in place then takes no frame in, and needs no read the host
+    /// began.
     pub(crate) fn layout_waits_for_no_frame(&self) -> Option<NoFrameInFlight> {
         (!self.waits_for_frame.get()).then_some(NoFrameInFlight(()))
     }
@@ -718,6 +683,17 @@ impl DocumentHost {
         Some(keys.iter().any(|key| names.contains(key)))
     }
 
+    /// Whether the engine's selectors test an attribute that answers to any of `keys`, where the host knows: as it knows
+    /// where their requirements are.
+    pub(crate) fn known_selectors_test_attribute(
+        &self,
+        keys: &[crate::css::style::index::StyleAtomID],
+    ) -> Option<bool> {
+        self.known_selector_attribute_value_text_requirements_version()?;
+        let names = self.selector_tested_attribute_names.borrow();
+        Some(keys.iter().any(|key| names.contains(key)))
+    }
+
     /// Whether the host knows what its engine holds as of the writes it queued: no job of the engine runs, as a host
     /// callback of one does, and no frame flies.
     pub(crate) fn knows_engine_between_jobs(&self) -> bool {
@@ -725,71 +701,120 @@ impl DocumentHost {
     }
 
     fn frame_flies(&self) -> bool {
-        matches!(*self.away.borrow(), Some(Away::Flying(_)))
+        self.away.borrow().is_some()
     }
 
     fn note_frame_wait(&self) {
         self.waits_for_frame
-            .set(self.frame_flies() || self.flown_round.borrow().is_some() || !self.clock_rounds.borrow().is_empty());
+            .set(self.frame_flies() || self.flown_round.borrow().is_some());
     }
 
-    /// Ends the document's clock lease, where one runs, spending `_wait`.
-    pub(crate) fn end_clock_lease_waiting(&self, _wait: impl RenderWait) {
-        self.end_clock_lease();
-    }
-
-    /// Ends the clock lease, where one runs, as a rendering update begins, and answers whether the render state was
-    /// leased since the last rendering update.
-    pub(super) fn end_clock_lease_for_rendering_update(&self) -> bool {
-        self.end_clock_lease();
-        self.leased_since_rendering_update.take()
-    }
-
-    /// Whether the last rendering update left a plan for a clock lease no task has taken yet.
-    pub(super) fn has_clock_plan(&self) -> bool {
-        self.clock_plan.borrow().is_some()
-    }
-
-    /// Ends the clock lease, where one runs, and takes the presentation a lease brought back, if any.
-    pub(super) fn take_back_presentation(&self) -> Option<Presentation> {
-        self.end_clock_lease();
-        self.take_tick_recording_in();
-        self.presentation.take()
-    }
-
-    /// Ends the clock lease, where one runs, and drops the plan for the next one, which no longer stands.
-    pub(super) fn end_clock_lease_and_plan(&self) {
-        self.end_clock_lease();
-        self.clock_plan.take();
-    }
-
-    /// Ends the clock lease, where one runs, and answers the border box of `element` in the last frame a tick of a clock
-    /// lease presented, if it presented one.
-    pub(super) fn presented_border_box(&self, element: StyleNodeID) -> Option<CssPixelRect> {
-        self.end_clock_lease();
-        self.presented_border_boxes
-            .borrow()
-            .iter()
-            .find_map(|&(presented, rect)| (presented == element).then_some(rect))
-    }
-
-    /// The ticks of the document's clock lease, where one runs.
-    pub(super) fn clock_ticks(&self) -> Option<Arc<ClockTicks>> {
-        match &*self.away.borrow() {
-            Some(Away::Leased(lease)) => Some(Arc::clone(lease.ticks())),
-            Some(Away::Flying(_)) | None => None,
+    /// Takes in what the lanes did, as a rendering update begins, and answers whether a tick of a lane presented a frame
+    /// since the host last took in what they did, which the screen shows in place of the host's. The update keeps what
+    /// the screen shows: it hovers where the compositor said the pointer went last, as the lanes did, which owes the
+    /// boundary events of the move until the host handles a mouse move.
+    pub(super) fn take_clock_lanes_in(&self, update: u64, outer_input_event: u64) -> bool {
+        // The lanes present nothing from now until the update's frame: a pointer move that waits for a tick is the
+        // update's to hover, as the newest the compositor told of. The owner takes them in between ticks, so no tick
+        // presents a frame the report leaves out.
+        let ticks = Arc::clone(&self.ticks);
+        let report = match self.lanes_taken_in.replace(Some(update)) {
+            // An earlier update took the lanes in and has yet to seal its plan: they did nothing since, and wait for
+            // this update's plan from now on, which the owner hears of behind what it runs for the earlier update.
+            Some(_) => {
+                post_to_render_side(move || {
+                    let _ = super::clock::take_lanes_in(&ticks, update);
+                });
+                None
+            }
+            None => Some(on_render_side(move || super::clock::take_lanes_in(&ticks, update))),
+        };
+        // A same-process iframe's lanes hear of the pointer from the lanes of the document around it, which handed them
+        // nothing of a newer move the compositor told that document of: the pointer may have gone elsewhere, and the
+        // host hovers nothing of the older move, nor does the next lane. It hovers where the pointer went as it handles
+        // the newer move. The transitions that hover started ran on screen all the same, which the host runs on from
+        // where they are, and decides over as it hovers.
+        let stale = self.ticks.forget_pointer_older_than(outer_input_event);
+        let mut presented = false;
+        if let Some(report) = report {
+            presented = report.presented;
+            self.lane_move.set(report.last_move.filter(|_| !stale));
+            *self.lane_transitions.borrow_mut() = report.transitions;
+        } else if stale {
+            self.lane_move.set(None);
         }
+        if super::clock::hover::logs_hover() {
+            eprintln!(
+                "{} hover lane: update takes the lanes in: moved {}, presented {presented}, {} steps to adopt, newest pointer {:?}",
+                super::clock::hover::log_time(),
+                self.lane_move.get().is_some(),
+                self.lane_transitions.borrow().len(),
+                self.ticks
+                    .newest_pointer()
+                    .map(|pointer| (pointer.position, pointer.input_event_id))
+            );
+        }
+        // The host hovers where the compositor said the pointer went last, which is newer than the mouse events the host
+        // queued before it, and than the moves the lanes' hover took, if any: the hover never moves back to where an
+        // older event says the pointer was, and the newest move's own event follows.
+        // Where a tick took that move last, the host hovers the element the lane hovered, which is what the screen
+        // shows: a hit test of its own, in a layout that has not moved with the lane's hover, could find another.
+        // A move older than a mouse event the host handled owes nothing, nor does one the lanes handed to a same-process
+        // iframe, whose lanes hovered it: the host hands the iframe the move's mouse event as it handles it, and the
+        // hover of this document stays where it is.
+        let lane_move = self.lane_move.get();
+        let handled = self.newest_pointer_input_event.get();
+        let (newest, waits) = self.ticks.newest_pointer_and_waits();
+        if let Some(newest) = newest
+            && (newest.input_event_id == 0 || newest.input_event_id >= handled)
+            && (newest.input_event_id > handled || waits || lane_move.is_some())
+            && !lane_move.is_some_and(|last| last.handed && last.input_event_id == newest.input_event_id && !waits)
+        {
+            self.newest_pointer_input_event.set(handled.max(newest.input_event_id));
+            self.hover_events_owed.set(Some(HoverOwed {
+                pointer: newest.position,
+                target: lane_move
+                    .filter(|last| last.input_event_id == newest.input_event_id && !waits)
+                    .and_then(|last| last.target),
+            }));
+        }
+        presented
+    }
+
+    /// The input event id of the newest pointer move the host knows of, or the compositor told the render clock of.
+    pub(super) fn newest_pointer_input_event(&self) -> u64 {
+        self.ticks
+            .newest_pointer()
+            .map_or(0, |pointer| pointer.input_event_id)
+            .max(self.newest_pointer_input_event.get())
+    }
+
+    /// Whether the mouse event with the input event id `input_event_id` is older than the newest pointer move the host
+    /// knows of, and notes the id of one that is not, which the host handles: the hover and the pointer never move back
+    /// to where an older event says the pointer was. An event with id 0 matches no UI event, and is never outdated.
+    pub(super) fn mouse_event_is_outdated(&self, input_event_id: u64) -> bool {
+        if input_event_id == 0 {
+            return false;
+        }
+        if input_event_id < self.newest_pointer_input_event.get() {
+            return true;
+        }
+        self.newest_pointer_input_event.set(input_event_id);
+        false
+    }
+
+    /// Takes the boundary events a hover a rendering update kept owes, where the host handled no mouse move since: where
+    /// the pointer was, in the context's device pixels, or none where it left the context, and the element a lane's hover
+    /// put the hover on there, if one did.
+    pub(super) fn take_hover_events_owed(&self) -> Option<HoverOwed> {
+        self.hover_events_owed.take()
     }
 
     /// Whether the document's frame still flies, where it has not landed: one that has is taken in. The event loop asks
     /// between two tasks, so this never waits.
     pub(crate) fn frame_still_flies(&self, boundary: &TaskBoundary) -> bool {
-        let flight = match self.away.take() {
-            Some(Away::Flying(flight)) => flight,
-            other => {
-                *self.away.borrow_mut() = other;
-                return false;
-            }
+        let Some(flight) = self.away.take() else {
+            return false;
         };
         match flight.try_take(boundary) {
             Ok(landing) => {
@@ -797,7 +822,7 @@ impl DocumentHost {
                 false
             }
             Err(flight) => {
-                *self.away.borrow_mut() = Some(Away::Flying(flight));
+                *self.away.borrow_mut() = Some(flight);
                 true
             }
         }
@@ -876,8 +901,8 @@ impl DocumentHost {
     }
 
     /// Whether the document's style engine may keep a row's container effects for the host to take, where the host
-    /// knows it without asking: neither a frame flies nor a clock lease runs, whose style may note some beside the host.
-    /// What a frame or a lease noted has reached the host once it is back.
+    /// knows it without asking: no frame flies, whose style may note some beside the host. What a frame noted has
+    /// reached the host once it is back.
     pub(crate) fn container_effects_may_be_held(&self) -> bool {
         self.away.borrow().is_some() || self.shared.container_effects_held.load(Ordering::Relaxed)
     }
@@ -928,7 +953,16 @@ impl DocumentHost {
         let (answer, marks) = self.changes.drain(|changes| {
             let (document, seed, marks) = (self.document, self.seed.take(), self.lend_marks());
             let in_job = self.in_job.replace(true);
+            // A job that writes the state moves it on from the frame the host presented last, which a lane no longer forks.
+            let moves_state = writes
+                || changes
+                    .as_slice()
+                    .iter()
+                    .any(|change| !change.keeps_the_presented_frame());
             let answer = on_render_side(move || {
+                if moves_state {
+                    super::clock::note_host_write(document);
+                }
                 owner::with_state(document, seed, |state| {
                     state.with_marks(marks, |state| {
                         state.apply(changes);
@@ -1236,7 +1270,6 @@ impl DocumentHost {
 
     /// What the document keeps of its recordings.
     pub(crate) fn recording(&self) -> RefMut<'_, RecordingSlot> {
-        self.take_tick_recording_in();
         self.recording.borrow_mut()
     }
 }
@@ -1390,7 +1423,6 @@ pub unsafe extern "C" fn document_host_destroy(host: *mut DocumentHost) {
     if host.streamed.get() {
         host.ask(ForcedRead::of_teardown(), |_| ());
     }
-    host.take_tick_recording_in();
     let DocumentHost {
         document,
         seed,
@@ -1464,6 +1496,22 @@ mod tests {
         host.ask(ScriptForcedRead::for_test(), |state| {
             state.engine_mut().has_deferred_element_style_input(node)
         })
+    }
+
+    #[test]
+    fn the_plan_of_an_earlier_update_leaves_a_later_take_in_standing() {
+        let host = TestHost::new();
+        let host = host.host();
+        host.take_clock_lanes_in(1, 0);
+        // The update before ends as the next one runs, after the next one took the lanes in.
+        host.take_clock_lanes_in(2, 0);
+        host.seal_clock_plan(None, 1);
+        assert!(
+            host.lanes_wait_for_the_update(),
+            "the lanes wait for the plan of the update that took them in last"
+        );
+        host.seal_clock_plan(None, 2);
+        assert!(!host.lanes_wait_for_the_update());
     }
 
     #[test]

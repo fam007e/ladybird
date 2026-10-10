@@ -23,26 +23,6 @@
 
 namespace Compositor {
 
-template<typename Callback>
-static void for_each_drawn_canvas(Compositing::DisplayList const& display_list, Callback callback)
-{
-    display_list.for_each_command_header([&](Compositing::ContextRef context, Compositing::DisplayListCommandHeader const& header, ReadonlyBytes payload) {
-        if (header.command_type != Compositing::DisplayListCommandType::DrawCanvas)
-            return;
-        callback(context, header, Compositing::read_display_list_object<Compositing::DrawCanvas>(payload));
-    });
-}
-
-template<typename Callback>
-static void for_each_caret(Compositing::DisplayList const& display_list, Callback callback)
-{
-    display_list.for_each_command_header([&](Compositing::ContextRef context, Compositing::DisplayListCommandHeader const& header, ReadonlyBytes payload) {
-        if (header.command_type != Compositing::DisplayListCommandType::PaintCaret)
-            return;
-        callback(context, header, Compositing::read_display_list_object<Compositing::PaintCaret>(payload));
-    });
-}
-
 static void set_or_append_pending_scroll_offset(
     Vector<Compositing::AsyncScrollOffset>& pending_scroll_offsets,
     Compositing::AsyncScrollOffset const& scroll_offset)
@@ -71,6 +51,12 @@ static bool visual_viewport_transforms_match(Compositing::TransformWithOrigin co
 
     return AK::fabs(a.origin.x() - b.origin.x()) <= translation_epsilon
         && AK::fabs(a.origin.y() - b.origin.y()) <= translation_epsilon;
+}
+
+// Pinch zoom scales the visual viewport, which a page whose viewport cannot be scrolled has too.
+static bool admits_async_pinch(Compositing::WheelRoutingAdmission wheel_routing_admission)
+{
+    return first_is_one_of(wheel_routing_admission, Compositing::WheelRoutingAdmission::Accepted, Compositing::WheelRoutingAdmission::NoScrollNode);
 }
 
 static void update_visual_animation_sampling_state(Compositing::AccumulatedVisualContextTree const& visual_context_tree, Optional<i64>& sample_time_ns, bool& has_active_animations)
@@ -144,10 +130,23 @@ void ContextState::request_rendering_update()
     m_web_content_client.request_rendering_update();
 }
 
-void ContextState::dispatch_mouse_event_to_web_content(Web::MouseEvent const& event)
+void ContextState::dispatch_mouse_event_to_web_content(Web::MouseEvent const& event, bool nested_context_scrolled_since_last_frame)
 {
     VERIFY(m_page_id.has_value());
     m_web_content_client.dispatch_mouse_event_to_web_content(*m_page_id, event);
+
+    // The render clock hears where the pointer went too, without waiting for WebContent's main thread, so that hover
+    // can follow the pointer while that thread runs a task. The lanes hit test it in the frames on screen, which a
+    // scroll since, here or in a nested context, has moved.
+    if (event.type == Web::MouseEvent::Type::MouseMove)
+        m_web_content_client.pointer_moved(m_context_id, event.position, to_underlying(event.buttons), scrolled_since_last_frame() || nested_context_scrolled_since_last_frame, event.id);
+    else if (event.type == Web::MouseEvent::Type::MouseLeave)
+        m_web_content_client.pointer_left(m_context_id, event.id);
+}
+
+bool ContextState::scrolled_since_last_frame() const
+{
+    return has_pending_async_scroll_updates() || !m_unreconciled_async_scroll_offsets.is_empty() || has_active_smooth_scroll_animations() || has_active_scroll_fling();
 }
 
 void ContextState::dispatch_key_event_to_web_content(Web::KeyEvent const& event)
@@ -210,7 +209,7 @@ void ContextState::install_display_list_update(
     m_wheel_routing_admission = wheel_routing_admission;
     m_can_accept_async_wheel_events = wheel_routing_admission == Compositing::WheelRoutingAdmission::Accepted;
     m_has_blocking_wheel_event_listeners = async_scrolling_state.has_blocking_wheel_event_listeners;
-    if (m_async_visual_viewport_transform.has_value() && (!m_can_accept_async_wheel_events || m_has_blocking_wheel_event_listeners)) {
+    if (m_async_visual_viewport_transform.has_value() && (!admits_async_pinch(wheel_routing_admission) || m_has_blocking_wheel_event_listeners)) {
         invalidate_visual_context_tree_for_compositing();
         m_async_visual_viewport_transform.clear();
     }
@@ -232,7 +231,7 @@ void ContextState::install_display_list_update(
 void ContextState::update_caret_blink_timer()
 {
     Optional<i64> blink_cycle_start_time_ns;
-    for_each_caret(*m_display_list, [&](auto const&, auto const&, auto const& caret) {
+    m_display_list->for_each_caret([&](auto, auto, auto const& caret) {
         if (caret.should_blink)
             blink_cycle_start_time_ns = caret.blink_cycle_start_time_ns;
     });
@@ -278,10 +277,10 @@ Gfx::IntRect ContextState::caret_damage_rect()
 
     auto const& visual_context_tree = visual_context_tree_for_compositing();
     Gfx::IntRect damage_rect;
-    for_each_caret(*m_display_list, [&](auto context, auto const& header, auto const& caret) {
+    m_display_list->for_each_caret([&](auto context, auto bounding_rect, auto const& caret) {
         if (!caret.should_blink)
             return;
-        auto rect = visual_context_tree.transform_rect_to_viewport(context.spatial, header.bounding_rect.template to_type<float>(), m_scroll_state_snapshot);
+        auto rect = visual_context_tree.transform_rect_to_viewport(context.spatial, bounding_rect.template to_type<float>(), m_scroll_state_snapshot);
         if (!isfinite(rect.x()) || !isfinite(rect.y()) || !isfinite(rect.width()) || !isfinite(rect.height())) {
             damage_rect = { {}, m_viewport_size };
             return;
@@ -616,7 +615,7 @@ ContextState::ContextUpdateResult ContextState::handle_pinch_event(Web::PinchEve
 {
     if (!presents_to_client())
         return {};
-    if (!m_can_accept_async_wheel_events)
+    if (!admits_async_pinch(m_wheel_routing_admission))
         return {};
     if (m_has_blocking_wheel_event_listeners)
         return {};
@@ -1084,7 +1083,10 @@ ContextState::ContextUpdateResult ContextState::async_scroll_by(Gfx::FloatPoint 
 {
     if (!presents_to_client())
         return {};
-    if (!m_can_accept_async_wheel_events)
+    // A page without scroll nodes still has a visual viewport to pan once it is zoomed in.
+    auto can_pan_zoomed_visual_viewport = m_wheel_routing_admission == Compositing::WheelRoutingAdmission::NoScrollNode
+        && visual_viewport_scale_for_compositing().value_or(1.0f) > 1.0f;
+    if (!m_can_accept_async_wheel_events && !can_pan_zoomed_visual_viewport)
         return {};
 
     auto now = now_for_testing.value_or(MonotonicTime::now());
@@ -1675,13 +1677,21 @@ Optional<ContextState::VisualViewportScrollDelta> ContextState::apply_visual_vie
     if (!m_visual_context_tree.has_value())
         return {};
 
-    auto viewport_node_id = m_async_scroll_tree.viewport_scroll_node_id();
-    if (!viewport_node_id.has_value())
+    // A page whose viewport cannot be scrolled records no viewport scroll node, and its viewport stays where it is.
+    Web::AsyncScrollNodeStableID viewport_stable_id;
+    Gfx::FloatPoint viewport_scroll_offset;
+    if (auto viewport_node_id = m_async_scroll_tree.viewport_scroll_node_id(); viewport_node_id.has_value()) {
+        auto scroll_offset = m_async_scroll_tree.scroll_offset_for_node(*viewport_node_id, m_scroll_state_snapshot);
+        if (!scroll_offset.has_value())
+            return {};
+        viewport_stable_id = viewport_stable_id_from(*viewport_node_id);
+        viewport_scroll_offset = *scroll_offset;
+    } else if (auto document_id = m_async_scroll_tree.document_id(); document_id.has_value()) {
+        viewport_stable_id = { .node_id = *document_id, .kind = Web::AsyncScrollNodeKind::Viewport };
+        viewport_scroll_offset = m_async_scrolling_viewport_rect.location().to_type<float>();
+    } else {
         return {};
-
-    auto viewport_scroll_offset = m_async_scroll_tree.scroll_offset_for_node(*viewport_node_id, m_scroll_state_snapshot);
-    if (!viewport_scroll_offset.has_value())
-        return {};
+    }
 
     auto transform = m_async_visual_viewport_transform.value_or(m_visual_context_tree->visual_viewport_transform());
     auto scale = transform.matrix[0, 0];
@@ -1707,8 +1717,8 @@ Optional<ContextState::VisualViewportScrollDelta> ContextState::apply_visual_vie
 
     return VisualViewportScrollDelta {
         .scroll_offset = {
-            .stable_node_id = viewport_stable_id_from(*viewport_node_id),
-            .compositor_scroll_offset = *viewport_scroll_offset,
+            .stable_node_id = viewport_stable_id,
+            .compositor_scroll_offset = viewport_scroll_offset,
             .unadopted_scroll_delta = consumed_delta.scaled(1.0f / scale),
             .last_relative_scroll_delta = {},
         },
@@ -1973,15 +1983,11 @@ Gfx::IntRect ContextState::damage_since_last_raster(Gfx::IntSize viewport_size)
             continue;
         damage_rect.unite(scrollbar.gutter_rect.united(scrollbar.expanded_gutter_rect));
     }
-    for_each_drawn_canvas(*m_display_list, [&](auto context, auto const& header, auto const& draw_canvas) {
+    m_display_list->for_each_drawn_canvas([&](auto context, auto bounding_rect, auto const& draw_canvas) {
         auto last_content_generation = last_frame.canvas_content_generations.get(draw_canvas.canvas_id);
         if (last_content_generation.has_value() && *last_content_generation == m_canvas_surface_registry.canvas_content_generation(draw_canvas.canvas_id))
             return;
-        if (!header.has_bounding_rect) {
-            damage_rect = viewport_rect;
-            return;
-        }
-        auto canvas_rect = visual_context_tree.transform_rect_to_viewport(context.spatial, header.bounding_rect.template to_type<float>(), m_scroll_state_snapshot);
+        auto canvas_rect = visual_context_tree.transform_rect_to_viewport(context.spatial, bounding_rect.template to_type<float>(), m_scroll_state_snapshot);
         if (!isfinite(canvas_rect.x()) || !isfinite(canvas_rect.y()) || !isfinite(canvas_rect.width()) || !isfinite(canvas_rect.height())) {
             damage_rect = viewport_rect;
             return;
@@ -1998,7 +2004,7 @@ Gfx::IntRect ContextState::damage_since_last_raster(Gfx::IntSize viewport_size)
 void ContextState::remember_rasterized_frame(Gfx::IntSize viewport_size)
 {
     HashMap<Compositing::CanvasId, u64> canvas_content_generations;
-    for_each_drawn_canvas(*m_display_list, [&](auto const&, auto const&, auto const& draw_canvas) {
+    m_display_list->for_each_drawn_canvas([&](auto, auto, auto const& draw_canvas) {
         canvas_content_generations.set(draw_canvas.canvas_id, m_canvas_surface_registry.canvas_content_generation(draw_canvas.canvas_id));
     });
     m_last_rasterized_frame = RasterizedFrame {

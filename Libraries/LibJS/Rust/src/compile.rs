@@ -1445,7 +1445,7 @@ fn take_parser_errors(parser: &mut Parser) -> Result<(), Vec<ParseError>> {
 }
 
 impl ParsedDynamicFunction {
-    /// Describes the function the source defines, which always gets an arguments object.
+    /// Describes the function the source defines.
     pub fn into_description(mut self) -> Result<SharedFunctionDescription, Vec<ParseError>> {
         // The program is a single ExpressionStatement wrapping a FunctionExpression.
         let function_id = if let StatementKind::Program(ref data) = self.program.inner {
@@ -1471,8 +1471,7 @@ impl ParsedDynamicFunction {
             }]);
         };
 
-        let mut function_data = self.function_table.take(function_id);
-        function_data.parsing_insights.might_need_arguments_object = true;
+        let function_data = self.function_table.take(function_id);
 
         let is_strict = function_data.is_strict_mode;
         let subtable = self
@@ -2166,7 +2165,13 @@ fn compute_sfd_metadata(
     let mut lex_environment_bindings_count: usize = 0;
 
     // §10.2.11 step 19: route parameter bindings.
-    let env_is_function_env = strict || !has_parameter_expressions;
+    // NB: The bytecode gives parameters an environment of their own whenever there are parameter expressions and
+    //     parameters in the environment, also in strict mode, where nothing can tell. The arguments binding and the
+    //     lexical declarations of strict code without var declarations in the environment then go there as well, and
+    //     to the function environment without one. Environments get exactly as many bindings as they are created
+    //     with room for, so that their shapes get final.
+    let has_parameter_environment = has_parameter_expressions && parameters_in_environment > 0;
+    let env_is_function_env = !has_parameter_environment;
     if env_is_function_env {
         function_environment_bindings_count += parameters_in_environment;
     }
@@ -2174,6 +2179,15 @@ fn compute_sfd_metadata(
     // §10.2.11 step 22: arguments binding.
     if arguments_object_needs_binding && env_is_function_env {
         function_environment_bindings_count += 1;
+    }
+
+    if let Some(body_scope) = body_scope
+        && has_parameter_expressions
+        && strict
+        && bsi.non_local_var_count_for_parameter_expressions == 0
+        && env_is_function_env
+    {
+        function_environment_bindings_count += count_non_local_lex_declarations(body_scope, arena);
     }
 
     if let Some(body_scope) = body_scope {
@@ -2228,6 +2242,7 @@ fn compute_sfd_metadata(
 
     let this_value_needs_environment_resolution = bsi.uses_this_from_env;
     let function_environment_needed = arguments_object_needs_binding
+        || (strict && has_parameter_environment)
         || function_environment_bindings_count > 0
         || var_environment_bindings_count > 0
         || lex_environment_bindings_count > 0

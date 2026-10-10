@@ -44,14 +44,15 @@ async function twoFrames() {
     await nextFrame();
 }
 
-// Leases the document's render state to the render clock for a task.
+// Has the clock lane of the document's presented frame sample its animations beside a task.
 //
-// whileClockLeased(animate, during) injects rendering opportunities until the animation `animate` starts is running and
-// a rendering update has left the document a plan for a clock lease, then runs `during` in the first task after the
-// update's frame has landed, which the lease begins with. `during` gets the frame time of the last rendering update,
-// from which it injects the clock's ticks, and the animation's start time, read before the lease: a read of a CSS
-// animation's timing reads its style, which ends the lease. Rendering opportunities stay manual until `during` is done.
-async function whileClockLeased(animate, during) {
+// whileLaneAnimates(animate, during) injects rendering opportunities until the animation `animate` starts is running and
+// a rendering update has left the document a plan for the lane of its frame, then runs `during` in the first task after
+// the update's frame has landed and its lane, not that of an earlier frame, has come together from it, beside which the
+// lane ticks. A tick a test injects before then reaches the earlier lane. `during` gets the frame time of the last
+// rendering update, from which it injects the clock's ticks, and the animation's start time, read before the task.
+// Rendering opportunities stay manual until `during` is done.
+async function whileLaneAnimates(animate, during) {
     if (document.readyState !== "complete")
         await new Promise(resolve => window.addEventListener("load", resolve, { once: true }));
     internals.setManualRenderingOpportunities(true);
@@ -70,8 +71,43 @@ async function whileClockLeased(animate, during) {
         frameTime += 16;
         internals.injectRenderingOpportunity(frameTime);
         do await nextTask();
-        while (internals.frameSchedulerState() !== "idle");
+        while (internals.frameSchedulerState() !== "idle" || internals.clockLaneIsComing(document));
         return await during(frameTime, animation, startTime);
+    } finally {
+        internals.setManualRenderingOpportunities(false);
+    }
+}
+
+// Resolves once the srcdoc document of `iframe` has loaded, which it may have before the page's DOMContentLoaded, as the
+// test begins.
+function srcdocLoaded(iframe) {
+    const document = iframe.contentDocument;
+    if (document && document.URL === "about:srcdoc" && document.readyState === "complete") return Promise.resolve();
+    return new Promise(resolve => iframe.addEventListener("load", resolve, { once: true }));
+}
+
+// Has the clock lane of the document's presented frame follow the pointer beside a task.
+//
+// whileLaneHovers(during) injects rendering opportunities until a rendering update has left the document a plan for the
+// lane of its frame, then runs `during` in the first task after the update's frame has landed and its lane, not that of
+// an earlier frame, has come together from it, beside which the lane hovers. A pointer move a test injects before the
+// lane follows the pointer reaches no lane, and nothing else hands it to the host. Rendering opportunities stay manual
+// until `during` is done. `documents` are those whose lanes `during` needs: a same-process iframe's document is laid
+// out after the document around it, and its frame lands on its own.
+async function whileLaneHovers(during, documents = [document]) {
+    if (document.readyState !== "complete")
+        await new Promise(resolve => window.addEventListener("load", resolve, { once: true }));
+    internals.setManualRenderingOpportunities(true);
+    try {
+        await nextTask();
+        let frameTime = performance.now();
+        internals.injectRenderingOpportunity(frameTime);
+        do await nextTask();
+        while (
+            internals.frameSchedulerState() !== "idle" ||
+            documents.some(doc => internals.clockLaneState(doc) === "none" || internals.clockLaneIsComing(doc))
+        );
+        return await during(frameTime);
     } finally {
         internals.setManualRenderingOpportunities(false);
     }

@@ -96,6 +96,7 @@ RENDER_STATE_ALLOWED = {
             "css/style/mod.rs:SELECTOR_TRUTH_DERIVATION",
             "css/style/mod.rs:STYLE_ANSWER_PATCH",
             "css/style/mod.rs:STYLE_PLAN_PROVENANCE",
+            "render_state/clock/hover.rs:LOGS",
         ],
     ),
     **render_state_entries(
@@ -138,6 +139,7 @@ RENDER_STATE_ALLOWED = {
             "css/parser/arbitrary_substitution.rs:ATTR_NAMES_READ_GENERATION",
             "css/parser/stylesheet_cache.rs:CACHE",
             "css/style/atoms.rs:GLOBAL_ATOMS",
+            "css/style/inputs.rs:CUSTOM_PROPERTY_DATA_LET_GO_BESIDE_THE_HOST",
             "css/style/user_agent_selectors.rs:PROGRAMS",
         ],
     ),

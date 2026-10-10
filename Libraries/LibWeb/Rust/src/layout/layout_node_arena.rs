@@ -20,7 +20,7 @@ use crate::cow_column::{ColumnSnapshot, CowColumn};
 use crate::css::css_pixels::{CssPixelPoint, FfiCssPixelPoint};
 use crate::css::style::bridge::ElementBoxKind;
 use crate::css::style::fast_hash::{FastMap as HashMap, FastSet as HashSet};
-use crate::css::style::flight_style_rows::{Decline, FlightStyleRow};
+use crate::css::style::flight_style_rows::{Decline, FlightStyleRow, REBUILD_LEVEL, RELAYOUT_LEVEL};
 use crate::css::style::tree::{StyleNodeID, TableSpans};
 use crate::css::style::{
     PublishedBoxFacts, PublishedTextSource, StyleEngine, TextStyleParentFacts,
@@ -495,18 +495,36 @@ struct DefaultScrollShiftAnchorSlot {
     anchor: NodeSlotId,
 }
 
-#[derive(Default)]
+#[derive(Clone, Copy)]
 struct TextNodeSlot {
     generation: u8,
-    state: Option<Box<TextNodeState>>,
+    /// Where the slot's state is in [`TextSlots::states`], or [`TextNodeSlot::NO_STATE`].
+    state: u32,
+}
+
+impl TextNodeSlot {
+    const NO_STATE: u32 = u32::MAX;
+}
+
+impl Default for TextNodeSlot {
+    fn default() -> Self {
+        Self {
+            generation: 0,
+            state: Self::NO_STATE,
+        }
+    }
 }
 
 /// Each text row's state, and what it publishes for the paint side. A slot is written only through
 /// a [`TextStateMut`], which republishes the slot when it drops, or by [`TextSlots::reset`], so
-/// the published column cannot fall behind the slots.
-#[derive(Default)]
+/// the published column cannot fall behind the slots. The states live side by side rather than
+/// each in an allocation of its own, which keeps a copy of the slots to one allocation.
+#[derive(Clone, Default)]
 struct TextSlots {
     slots: Vec<TextNodeSlot>,
+    states: Vec<TextNodeState>,
+    /// The places in `states` no slot uses.
+    vacant_states: Vec<u32>,
     published: CowColumn<PublishedTextSlot, SLOTS_PER_CHUNK>,
 }
 
@@ -514,8 +532,8 @@ impl TextSlots {
     fn state(&self, id: NodeSlotId) -> Option<&TextNodeState> {
         self.slots
             .get(id.slot_index() as usize)
-            .filter(|slot| slot.generation == id.generation())
-            .and_then(|slot| slot.state.as_deref())
+            .filter(|slot| slot.generation == id.generation() && slot.state != TextNodeSlot::NO_STATE)
+            .map(|slot| &self.states[slot.state as usize])
     }
 
     /// The state of `id`'s slot, for writing. A slot last used by another generation starts over.
@@ -524,22 +542,37 @@ impl TextSlots {
         if self.slots.len() <= index {
             self.slots.resize_with(index + 1, TextNodeSlot::default);
         }
-        let slot = &mut self.slots[index];
-        if slot.generation != id.generation() {
-            *slot = TextNodeSlot {
-                generation: id.generation(),
-                ..TextNodeSlot::default()
+        if self.slots[index].generation != id.generation() {
+            self.release_state(index);
+            self.slots[index].generation = id.generation();
+        }
+        if self.slots[index].state == TextNodeSlot::NO_STATE {
+            self.slots[index].state = match self.vacant_states.pop() {
+                Some(state) => state,
+                None => {
+                    self.states.push(TextNodeState::default());
+                    u32::try_from(self.states.len() - 1).expect("text states fit in u32")
+                }
             };
         }
-        slot.state.get_or_insert_with(Default::default);
         TextStateMut { slots: self, index }
     }
 
     /// Empties the slot at `index`, if there is one.
     fn reset(&mut self, index: usize) {
-        if let Some(slot) = self.slots.get_mut(index) {
-            *slot = TextNodeSlot::default();
+        if index < self.slots.len() {
+            self.release_state(index);
+            self.slots[index] = TextNodeSlot::default();
             self.republish(index);
+        }
+    }
+
+    /// Lets go of the state of the slot at `index`, if it has one.
+    fn release_state(&mut self, index: usize) {
+        let state = std::mem::replace(&mut self.slots[index].state, TextNodeSlot::NO_STATE);
+        if state != TextNodeSlot::NO_STATE {
+            self.states[state as usize] = TextNodeState::default();
+            self.vacant_states.push(state);
         }
     }
 
@@ -548,13 +581,14 @@ impl TextSlots {
         let published = self
             .slots
             .get(index)
-            .and_then(|slot| {
-                let state = slot.state.as_deref()?;
-                Some(PublishedTextSlot {
+            .filter(|slot| slot.state != TextNodeSlot::NO_STATE)
+            .map(|slot| {
+                let state = &self.states[slot.state as usize];
+                PublishedTextSlot {
                     generation: slot.generation,
                     first_letter: state.first_letter,
                     rendered: state.content.as_ref().map(|content| content.rendered().clone()),
-                })
+                }
             })
             .unwrap_or_default();
         if self.published.get(index).is_none() {
@@ -577,19 +611,13 @@ impl Deref for TextStateMut<'_> {
     type Target = TextNodeState;
 
     fn deref(&self) -> &TextNodeState {
-        self.slots.slots[self.index]
-            .state
-            .as_deref()
-            .expect("a written slot has state")
+        &self.slots.states[self.slots.slots[self.index].state as usize]
     }
 }
 
 impl DerefMut for TextStateMut<'_> {
     fn deref_mut(&mut self) -> &mut TextNodeState {
-        self.slots.slots[self.index]
-            .state
-            .as_deref_mut()
-            .expect("a written slot has state")
+        &mut self.slots.states[self.slots.slots[self.index].state as usize]
     }
 }
 
@@ -599,7 +627,7 @@ impl Drop for TextStateMut<'_> {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct TextNodeState {
     source_range: Option<FfiTextSourceRange>,
     first_letter: NodeSlotId,
@@ -649,7 +677,7 @@ impl RowsVersion {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct ReplacedContentFactsSlot {
     generation: u8,
     facts: Option<FfiReplacedContentFacts>,
@@ -694,6 +722,10 @@ pub(crate) struct DueBoxPresence {
 }
 
 impl DueBoxPresence {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.nodes.is_empty()
+    }
+
     /// Tells the host, if it listens.
     pub(crate) fn tell(self, _: &MainThread) {
         let Some(BoxPresenceHost(context, callback)) = self.host else {
@@ -876,7 +908,7 @@ const BOUND_ROWS_PER_CHUNK: usize = 64;
 /// The row each node is bound to, kept so that the host reads it from published rows: by the dense
 /// index of an element or text identity, by generator and kind for a pseudo-element, and the
 /// viewport row for the document.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct BoundRows {
     elements: CowColumn<NodeSlotId, BOUND_ROWS_PER_CHUNK>,
     texts: CowColumn<NodeSlotId, BOUND_ROWS_PER_CHUNK>,
@@ -988,7 +1020,7 @@ impl PublishedBoundRows {
 
 /// One row for each StyleNodeID, indexed by the identity's dense index within its kind, so element
 /// and text identities each cost one entry per node of their own kind.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct RowsByStyleNode {
     elements: Vec<NodeSlotId>,
     texts: Vec<NodeSlotId>,
@@ -1031,7 +1063,7 @@ const PUBLISHED_REFERENCE_ATOM_COUNT: usize = 5;
 /// What the arena keeps under a style node identity, besides the rows carrying it. Identities are
 /// reissued, so every table here must let go of a retired one: `LayoutNodeArena::forget_style_node`
 /// names each field, and a table added here does not compile until it says how it forgets.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct StyleNodeTables {
     /// The CSS counters set of every element and pseudo-element the tree build resolved one for.
     counters_sets: RefCell<super::counters::CountersSets>,
@@ -1099,6 +1131,15 @@ enum ArenaStylePin {
     Sampled,
 }
 
+/// What a sample a clock tick shows in a box samples: the animations the host runs on the box's element, or transitions
+/// a hover beside the host started on it, which leave a record the host pinned for its own readers theirs until the
+/// host starts the transitions in its turn.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SampleKind {
+    Animation,
+    Transition,
+}
+
 /// The style a clock tick took from a box to show a sample of its element's animations in its place:
 /// the record the host installed for the box, and the pin the arena held it by. Only
 /// [`LayoutNodeArena::restore_host_style`] gives it back, so the host never reads a sample.
@@ -1115,6 +1156,7 @@ impl HostStyle {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct LayoutNodeArena {
     chunks: Vec<Box<Chunk>>,
     tree_shape: TreeShape,
@@ -1208,7 +1250,7 @@ pub(crate) struct LayoutNodeArena {
     // Hit testing can measure overflow and invalidate painting state while querying this list.
     // Reuse workspace allocations without making recording scratch part of the committed paint state.
     pub(crate) scrollable_overflow: crate::painting::scrollable_overflow::ScrollableOverflowState,
-    pub(crate) partial_relayout_boundary_roots: RefCell<Vec<NodeSlotId>>,
+    pub(crate) partial_relayout_boundary_roots: RefCell<super::partial_relayout::PartialRelayoutBoundaryRoots>,
     nodes_with_layout_update_flags: RefCell<Vec<NodeSlotId>>,
     layout_update_flag_node_indices: RefCell<HashMap<NodeSlotId, usize>>,
     pub(super) pending_attached_subtree_roots: RefCell<Vec<NodeSlotId>>,
@@ -1319,7 +1361,7 @@ impl LayoutNodeArena {
             paintable_rows: crate::painting::paintable_rows::PaintableRowStore::default(),
             paint_state: RefCell::new(crate::painting::paint_state::PaintState::default()),
             scrollable_overflow: Default::default(),
-            partial_relayout_boundary_roots: RefCell::new(Vec::new()),
+            partial_relayout_boundary_roots: RefCell::default(),
             nodes_with_layout_update_flags: RefCell::new(Vec::new()),
             layout_update_flag_node_indices: RefCell::new(HashMap::default()),
             pending_attached_subtree_roots: RefCell::new(Vec::new()),
@@ -1634,6 +1676,7 @@ impl LayoutNodeArena {
         self.inline_boxes_lifted_out_of.get_mut().remove(&id);
         self.out_of_flow_positioning_contained.get_mut().remove(&id);
         self.pre_order_labels[index as usize].set(0);
+        self.partial_relayout_boundary_roots.get_mut().note_freed(id);
         self.metadata_mut(index).occupied = false;
         self.forget_row_sharing_dom_node(id);
         self.unbind_row(id);
@@ -2306,31 +2349,261 @@ impl LayoutNodeArena {
         Ok(applied)
     }
 
-    /// Shows `sample`, a sample of the animations of the element whose box `row` is, in the box in place of the record the
-    /// host installed, with the relayout the move asks for. Answers the host's style where the box held it, or nothing
-    /// where it held a sample already, which `sample` replaces. A box the host styles in a way of its own shows no sample,
-    /// and neither does one whose sample moves the style of an anonymous box: its layout node would have to hear of a
-    /// style no host reads.
-    pub(crate) fn install_animation_sample(
+    /// The box of the element or pseudo-element `row` of a hover's style transaction styles, `generated_for` naming the
+    /// pseudo-element, or 0 for the element.
+    fn hover_row_box(&self, row: &crate::css::style::bridge::FfiStyleDelta, generated_for: u8) -> NodeSlotId {
+        let Some(node) = StyleNodeID::from_raw(row.style_node) else {
+            return NodeSlotId::INVALID;
+        };
+        match generated_for {
+            0 => self.bound_row(node),
+            generated_for => self.bound_pseudo_element_row(node, generated_for),
+        }
+    }
+
+    /// Whether the box of the element or pseudo-element `row` of a hover's style transaction moves takes the row's
+    /// record as the host's install of it would, without the host: the move rebuilds no box, and a box it styles is a
+    /// plain one that shows the record the row moves from. List items, images and SVG boxes, which take facts from their
+    /// element as the host styles them, take a move that only repaints them.
+    /// Whether the move of `row` builds boxes again, which the box takes only from a build.
+    pub(crate) fn hover_row_builds_boxes_again(&self, row: &crate::css::style::bridge::FfiStyleDelta) -> bool {
+        row.record_damage & crate::css::style::bridge::FfiStyleInvalidationField::LevelMask as u32 >= REBUILD_LEVEL
+    }
+
+    pub(crate) fn takes_hover_row(&self, row: &crate::css::style::bridge::FfiStyleDelta, generated_for: u8) -> bool {
+        self.hover_row_box_refusal(row, generated_for).is_none()
+    }
+
+    /// Why the box of the element or pseudo-element `row` of a hover's style transaction moves cannot take the row's
+    /// record without the host, or none where it can (see [`Self::takes_hover_row`]).
+    pub(crate) fn hover_row_box_refusal(
+        &self,
+        row: &crate::css::style::bridge::FfiStyleDelta,
+        generated_for: u8,
+    ) -> Option<String> {
+        use crate::css::style::bridge::FfiStyleInvalidationField;
+        let level = row.record_damage & FfiStyleInvalidationField::LevelMask as u32;
+        if level >= REBUILD_LEVEL {
+            return Some("a move that builds boxes again".into());
+        }
+        let slot = self.hover_row_box(row, generated_for);
+        // A row without a new record moves only what its element's children inherit.
+        if slot.is_invalid() || row.old_style_record == row.new_style_record || row.new_style_record == 0 {
+            return None;
+        }
+        let kind = self.data(slot).kind.get();
+        let repaints_only = level < RELAYOUT_LEVEL;
+        let plain = matches!(kind, NodeKind::Box | NodeKind::BlockContainer | NodeKind::InlineNode)
+            || (repaints_only
+                && matches!(
+                    kind,
+                    NodeKind::ListItemBox
+                        | NodeKind::ListItemMarkerBox
+                        | NodeKind::ImageBox
+                        | NodeKind::VideoBox
+                        | NodeKind::SVGSVGBox
+                        | NodeKind::SVGGeometryBox
+                        | NodeKind::SVGGraphicsBox
+                        | NodeKind::SVGTextBox
+                ));
+        if !plain {
+            return Some(format!("a {kind:?} box at damage level {level}"));
+        }
+        // A record the host pinned for its own readers stays theirs until the host installs the row, beside the one
+        // the box shows.
+        if self.style_records[slot.slot_index() as usize].get() != row.old_style_record {
+            return Some("a box that shows another record".into());
+        }
+        if self.style_record_pins[slot.slot_index() as usize].get() == ArenaStylePin::Sampled {
+            return Some("a box that shows an animation sample".into());
+        }
+        if self.node_style_record_is_derived(slot) {
+            return Some("a box whose record the arena derived".into());
+        }
+        let parent = self.data(slot).parent.get();
+        (!parent.is_invalid() && self.data(parent).kind.get() == NodeKind::TableWrapper).then(|| "a table box".into())
+    }
+
+    /// Whether the box of the element or pseudo-element `row` of a hover's style transaction styles shows the record the
+    /// row moves to already, or there is no box.
+    pub(crate) fn hover_row_box_shows_its_record(
+        &self,
+        row: &crate::css::style::bridge::FfiStyleDelta,
+        generated_for: u8,
+    ) -> bool {
+        let slot = self.hover_row_box(row, generated_for);
+        slot.is_invalid() || self.style_records[slot.slot_index() as usize].get() == row.new_style_record
+    }
+
+    /// Installs the record `row` of a hover's style transaction moves to in the box of its element or pseudo-element,
+    /// which [`Self::takes_hover_row`] took, as the host's install of the row does: the style, the styles the box's
+    /// anonymous descendants inherit, and the relayout, the visual contexts and the repaint the move asks for.
+    pub(crate) fn install_hover_row(
+        &self,
+        host_calls: HostCalls<'_>,
+        row: &crate::css::style::bridge::FfiStyleDelta,
+        generated_for: u8,
+    ) {
+        use crate::css::style::bridge::FfiStyleInvalidationField;
+        let slot = self.hover_row_box(row, generated_for);
+        if slot.is_invalid() || row.old_style_record == row.new_style_record || row.new_style_record == 0 {
+            return;
+        }
+        let previous_payloads = self.data(slot).style.get();
+        let payloads = self.with_style_engine(|engine| {
+            engine
+                .style_record_payloads(row.new_style_record)
+                .map_or(std::ptr::null(), <[_]>::as_ptr)
+        });
+        let payloads = StylePayloadsRef::new(payloads.cast());
+        if self.set_node_style(slot, row.new_style_record, payloads) {
+            self.refresh_style_flags(slot);
+        }
+        self.publish_new_size_container_geometry(slot);
+        self.enroll_node_for_svg_paint_resources_sync(slot);
+        if !style_payloads_equal_in_layout_affecting_groups(previous_payloads, payloads) {
+            self.bump_fragment_cache_epoch_of_self_and_ancestors(slot);
+            self.reset_cached_intrinsic_sizes_of_self_and_ancestors(slot);
+        }
+        self.reinherit_anonymous_descendants(HostCalls(host_calls.0), slot);
+        let level = row.record_damage & FfiStyleInvalidationField::LevelMask as u32;
+        if level >= RELAYOUT_LEVEL
+            && let Some(style_node) = self.node_style_node(slot)
+        {
+            self.mark_row_for_relayout_after_style_change(style_node, slot);
+        }
+        self.note_style_visual_context_moves(slot, row.record_damage);
+        self.push_paint_damage_for_repaint(slot, crate::painting::record::damage::PaintDamage::ALL_PRODUCERS);
+    }
+
+    /// Notes the visual contexts a style move with `damage`, an `FfiStyleInvalidationField` word, moves for `slot`'s
+    /// box, which the next recording builds again.
+    pub(crate) fn note_style_visual_context_moves(&self, slot: NodeSlotId, damage: u32) {
+        use crate::css::style::bridge::FfiStyleInvalidationField;
+        use crate::painting::visual_context::dirty::VisualContextBoxDirtyKind;
+        let visual_contexts = (damage >> FfiStyleInvalidationField::VisualContextShift as u32)
+            & FfiStyleInvalidationField::LevelMask as u32;
+        if visual_contexts == 0 || !crate::painting::paint_read::GeometryRead::paintable_row_is_populated(self, slot) {
+            return;
+        }
+        let kind = match visual_contexts {
+            1 => VisualContextBoxDirtyKind::StyleValueChange,
+            _ => VisualContextBoxDirtyKind::StyleStructuralChange,
+        };
+        self.note_visual_context_box_dirty(slot, kind);
+    }
+
+    /// Whether the box `row` shows `sample`, a sample of `kind` of the effects of its element, where
+    /// [`Self::install_sample`] would. A box the host styles in a way of its own shows no sample, and neither does one
+    /// whose sample moves the style of an anonymous box: its layout node would have to hear of a style no host reads.
+    pub(crate) fn takes_sample(&self, row: NodeSlotId, sample: &DerivedStyleRecord, kind: SampleKind) -> bool {
+        self.takes_sample_beside_anonymous_boxes(row, kind)
+            && !self.sample_moves_anonymous_box_style(row, sample.payloads)
+    }
+
+    /// Whether the box `row` shows a sample of `kind` of the effects of its element where the anonymous boxes below it
+    /// show what they inherit of the sample beside it (see [`Self::anonymous_child_samples`]). A table box shows none,
+    /// as its table wrapper takes properties of its own from it.
+    pub(crate) fn takes_sample_beside_anonymous_boxes(&self, row: NodeSlotId, kind: SampleKind) -> bool {
+        let parent = self.data(row).parent.get();
+        matches!(
+            self.data(row).kind.get(),
+            NodeKind::Box | NodeKind::BlockContainer | NodeKind::InlineNode
+        ) && self.style_record_pins[row.slot_index() as usize].get() != ArenaStylePin::Derived
+            && (kind == SampleKind::Transition || self.node_style_record_pinned_by_host(row) == 0)
+            && self.node_style_node(row).is_some()
+            && (parent.is_invalid() || self.data(parent).kind.get() != NodeKind::TableWrapper)
+    }
+
+    /// The anonymous boxes below the box `row` that inherit what they show from it, as the host reinherits them (see
+    /// [`Self::reinherit_anonymous_descendants`]): the anonymous wrappers among its children, and theirs.
+    pub(crate) fn anonymous_descendants(&self, row: NodeSlotId) -> smallvec::SmallVec<[NodeSlotId; 2]> {
+        let mut descendants = smallvec::SmallVec::new();
+        let mut parents: smallvec::SmallVec<[NodeSlotId; 2]> = smallvec::smallvec![row];
+        while let Some(parent) = parents.pop() {
+            let mut child = self.data(parent).first_child.get();
+            while !child.is_invalid() {
+                let flags = self.data(child).flags.get();
+                if flags & NodeFlag::Anonymous as u32 != 0 && flags & NodeFlag::HasStyle as u32 != 0 {
+                    descendants.push(child);
+                    parents.push(child);
+                }
+                child = self.data(child).next_sibling.get();
+            }
+        }
+        descendants
+    }
+
+    /// What the anonymous boxes below the box `row` show where it shows `sample`: each inherits what it inherits of
+    /// its parent's again over `host_record` of it, the record the host installed in it. Answers none where one of
+    /// them follows a pseudo-element or styles a table wrapper, which only the host restyles.
+    pub(crate) fn anonymous_child_samples(
+        &self,
+        row: NodeSlotId,
+        sample: &DerivedStyleRecord,
+        host_record: impl Fn(NodeSlotId) -> u64,
+    ) -> Option<smallvec::SmallVec<[(NodeSlotId, DerivedStyleRecord); 2]>> {
+        let mut samples: smallvec::SmallVec<[(NodeSlotId, DerivedStyleRecord); 2]> = smallvec::SmallVec::new();
+        let mut parents: smallvec::SmallVec<[(NodeSlotId, u64); 2]> = smallvec::smallvec![(row, sample.record)];
+        while let Some((parent, parent_record)) = parents.pop() {
+            let mut child = self.data(parent).first_child.get();
+            while !child.is_invalid() {
+                let data = self.data(child);
+                let flags = data.flags.get();
+                if flags & NodeFlag::Anonymous as u32 != 0 && flags & NodeFlag::HasStyle as u32 != 0 {
+                    let wraps = matches!(data.kind.get(), NodeKind::BlockContainer | NodeKind::InlineNode)
+                        && flags & NodeFlag::IsPseudoElementPrincipalBox as u32 == 0
+                        && data.generated_for.get() == 0
+                        && matches!(
+                            self.style_record_pins[child.slot_index() as usize].get(),
+                            ArenaStylePin::Derived | ArenaStylePin::Sampled
+                        );
+                    if !wraps {
+                        self.with_style_engine(|engine| {
+                            for (_, sample) in &samples {
+                                engine.unpin_layout_style_record(sample.record);
+                            }
+                        });
+                        return None;
+                    }
+                    let derived = self.reinherit_anonymous_style_record(host_record(child), parent_record);
+                    parents.push((child, derived.record));
+                    samples.push((child, derived));
+                }
+                child = self.data(child).next_sibling.get();
+            }
+        }
+        Some(samples)
+    }
+
+    /// Shows `sample`, a sample of `kind` of the effects of the element whose box `row` is, in the box in place of the
+    /// record the host installed, with the relayout the move asks for, where the box takes it (see
+    /// [`Self::takes_sample`]). Answers the host's style where the box held it, or nothing where it held a sample
+    /// already, which `sample` replaces.
+    pub(crate) fn install_sample(
         &self,
         row: NodeSlotId,
         sample: DerivedStyleRecord,
+        kind: SampleKind,
     ) -> Result<Option<HostStyle>, NeedsHost> {
-        let index = row.slot_index() as usize;
-        let pin = self.style_record_pins[index].get();
-        let style_node = self.node_style_node(row);
-        if !matches!(
-            self.data(row).kind.get(),
-            NodeKind::Box | NodeKind::BlockContainer | NodeKind::InlineNode
-        ) || pin == ArenaStylePin::Derived
-            || self.node_style_record_pinned_by_host(row) != 0
-            || style_node.is_none()
-            || self.sample_moves_anonymous_box_style(row, sample.payloads)
-        {
+        if !self.takes_sample(row, &sample, kind) {
             self.with_style_engine(|engine| engine.unpin_layout_style_record(sample.record));
             return Err(NeedsHost);
         }
-        let host_style = match pin {
+        Ok(self.install_sample_beside_anonymous_boxes(row, sample))
+    }
+
+    /// Shows `sample` in the box `row`, which [`Self::takes_sample_beside_anonymous_boxes`] answers for, or in one of
+    /// the anonymous boxes below such a box, which shows what it inherits of the sample (see
+    /// [`Self::anonymous_child_samples`]), in place of the record the host installed. Answers the host's style where
+    /// the box held it, or nothing where it held a sample already, which `sample` replaces.
+    pub(crate) fn install_sample_beside_anonymous_boxes(
+        &self,
+        row: NodeSlotId,
+        sample: DerivedStyleRecord,
+    ) -> Option<HostStyle> {
+        let index = row.slot_index() as usize;
+        let host_style = match self.style_record_pins[index].get() {
             ArenaStylePin::Sampled => {
                 let previous = self.style_records[index].get();
                 self.with_style_engine(|engine| engine.unpin_layout_style_record(previous));
@@ -2342,8 +2615,8 @@ impl LayoutNodeArena {
             }),
         };
         self.style_record_pins[index].set(ArenaStylePin::Sampled);
-        self.show_style(row, style_node, sample);
-        Ok(host_style)
+        self.show_style(row, self.node_style_node(row), sample);
+        host_style
     }
 
     /// Whether showing a style with `payloads` in `row` moves the style of an anonymous box: the table wrapper's, which
@@ -2362,6 +2635,19 @@ impl LayoutNodeArena {
             child = self.data(child).next_sibling.get();
         }
         false
+    }
+
+    /// Whether the style the box `row` shows differs from the record `host_record`, which the host installed for it, in
+    /// what its children inherit.
+    pub(crate) fn shows_other_inherited_style_than(&self, row: NodeSlotId, host_record: u64) -> bool {
+        let Some(host_payloads) = self.with_style_engine(|engine| {
+            engine
+                .style_record_payloads(host_record)
+                .map(|payloads| StylePayloadsRef::new(payloads.as_ptr().cast()))
+        }) else {
+            return true;
+        };
+        !style_payloads_equal_in_inherited_groups(self.data(row).style.get(), host_payloads)
     }
 
     /// Gives `row` back the style the host installed for it, which a clock tick took to show a sample in its place.
@@ -2466,6 +2752,25 @@ impl LayoutNodeArena {
 
     pub(crate) fn svg_paint_resources(&self) -> &crate::painting::svg_paint_resources::SvgPaintResources {
         &self.svg_paint_resources
+    }
+
+    /// A fork of the arena, linked to `engine`, the fork of its style engine: its chunks have addresses of their own,
+    /// and the flags the arena shares with the host are its own. See [`crate::fork`].
+    pub(crate) fn fork(&self, engine: crate::css::style::StyleEngineHandle) -> Self {
+        let mut fork = self.clone();
+        fork.chunks_by_address = fork
+            .chunks
+            .iter()
+            .enumerate()
+            .map(|(chunk_index, chunk)| ChunkAddress {
+                start: chunk.slots_address(),
+                chunk_index,
+            })
+            .collect();
+        fork.chunks_by_address.sort_unstable_by_key(|address| address.start);
+        fork.style_engine.set(engine);
+        fork.svg_paint_resources.detach_enrolled_flag_for_fork();
+        fork
     }
 
     /// See [`crate::painting::svg_paint_resources::SvgPaintResources::share_enrolled_flag`].
@@ -4795,6 +5100,11 @@ impl LayoutNodeArena {
         self.may_have_auto_content_visibility.get()
     }
 
+    /// Whether a row has ever been given a style with a scroll snap type, short of which no scroll container snaps.
+    pub(crate) fn may_have_scroll_snap_areas(&self) -> bool {
+        self.may_have_scroll_snap_areas.get()
+    }
+
     pub(crate) fn style_payloads(&self, id: NodeSlotId) -> Option<&FfiStylePayloads> {
         Self::row_style_payloads(self.data(id))
     }
@@ -5007,6 +5317,14 @@ impl LayoutNodeArena {
             .get(&node)
             .copied()
             .filter(|&inline_box| self.slot_is_live(inline_box))
+    }
+
+    /// The live node in the slot at `index`, if there is one.
+    pub(crate) fn live_slot_at(&self, index: u32) -> Option<NodeSlotId> {
+        self.slot_metadata
+            .get(index as usize)
+            .filter(|metadata| metadata.occupied)
+            .map(|metadata| NodeSlotId::new(index, metadata.generation))
     }
 
     pub(crate) fn slot_is_live(&self, id: NodeSlotId) -> bool {
@@ -5777,6 +6095,44 @@ mod tests {
                 (element, 0),
             ]
         );
+    }
+
+    #[test]
+    fn a_change_that_forgets_a_style_node_owes_the_host_its_box_presence() {
+        use crate::css::style::tree::StyleNodeID;
+        use crate::layout::layout_changes::LayoutChange;
+        unsafe extern "C" fn record(context: *mut c_void, style_node: u32, bits: u8) {
+            // SAFETY: The test registers a live Vec as the context, and reads it only after unregistering.
+            unsafe { &mut *context.cast::<Vec<(u32, u8)>>() }.push((style_node, bits));
+        }
+        let mut reports: Vec<(u32, u8)> = Vec::new();
+        let mut arena = LayoutNodeArena::new();
+        let element = StyleNodeID::element(3);
+        let row = arena.allocate(NodeConstructionFacts {
+            style_node: element.raw(),
+            ..test_construction_facts()
+        });
+        arena.bind_row(row);
+        arena.set_box_presence_host(Some(super::BoxPresenceHost(
+            std::ptr::from_mut(&mut reports).cast::<c_void>(),
+            record,
+        )));
+
+        let owed = LayoutChange::StyleNodeChanged {
+            old: Some(element),
+            new: None,
+            generated_for: Default::default(),
+        }
+        .apply_owing(&mut arena);
+        assert!(reports.is_empty(), "the change tells the host nothing while it applies");
+        assert!(!owed.is_empty());
+        owed.pay(&crate::stage::MainThread::for_test());
+        arena.set_box_presence_host(None);
+        assert_eq!(reports, [(element.raw(), 0)]);
+
+        arena
+            .free_subtree(row)
+            .destroy_shells_and_invoke_callbacks(&crate::stage::MainThread::for_test());
     }
 
     #[test]

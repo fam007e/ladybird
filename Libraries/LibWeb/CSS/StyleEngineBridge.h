@@ -272,6 +272,12 @@ public:
     {
         return StyleAtomID { StyleEngineFFI::document_host_intern_attribute_value(host(), name.value(), Utf16FlyString { value }.raw_identity()) };
     }
+    // Whether the document host knows that no selector and no attr() reads the attribute name `name`.
+    bool attribute_is_known_unread(StyleAtomID name) const
+    {
+        return StyleEngineFFI::document_host_attribute_is_known_unread(host(), name.value());
+    }
+
     // Demand expansion already has every value identity. Check the name before interning the text
     // so attributes nothing reads as text do not pay another string hash.
     void backfill_attribute_value_text_if_required(StyleAtomID name, Utf16String const& value);
@@ -282,6 +288,9 @@ public:
     void record_element_arrival(StyleEngineFFI::FfiElementArrival const&, ReadonlySpan<StyleAtomID> custom_states);
     void record_local_feature_delta(StyleEngineFFI::FfiLocalFeatureDelta const&);
     void record_state_delta(StyleEngineFFI::FfiStateDelta const&);
+    // The hover moves to `target`, or off the document for none, as the events of a mouse move hover it, once the rest
+    // of the recorded input is in place.
+    void record_hover(Optional<StyleNodeID> target);
     void record_element_declaration_delta(StyleEngineFFI::FfiElementDeclarationDelta const&);
     enum StyleReaction : u8 {
         PublishedStyle = 1 << 0,

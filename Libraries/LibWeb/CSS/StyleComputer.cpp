@@ -55,6 +55,7 @@
 #include <LibWeb/CSS/SelectorMatching.h>
 #include <LibWeb/CSS/StyleComputeFFI.h>
 #include <LibWeb/CSS/StyleComputer.h>
+#include <LibWeb/CSS/StyleEngineEffectTiming.h>
 #include <LibWeb/CSS/StyleEngineInput.h>
 #include <LibWeb/CSS/StyleProperty.h>
 #include <LibWeb/CSS/StyleScope.h>
@@ -292,9 +293,22 @@ void StyleComputer::unregister_style_node(StyleNodeID style_node_id)
     }
     if (index < m_element_style_nodes.size()) {
         m_element_style_nodes[index] = nullptr;
+        m_style_nodes_retired_beside_lanes.set(style_node_id);
         StyleEngineFFI::style_engine_consume_element_style_input(m_style_engine.host(), style_node_id);
         m_style_engine.note_style_node_arrived_or_retired(style_node_id);
     }
+}
+
+GC::Ptr<DOM::Node> StyleComputer::node_for_lane_style_node(StyleNodeID style_node_id) const
+{
+    if (m_style_nodes_retired_beside_lanes.contains(style_node_id))
+        return nullptr;
+    return node_for_style_node(style_node_id);
+}
+
+GC::Ptr<DOM::Element> StyleComputer::element_for_lane_style_node(StyleNodeID style_node_id) const
+{
+    return as_if<DOM::Element>(node_for_lane_style_node(style_node_id).ptr());
 }
 
 GC::Ptr<DOM::Element> StyleComputer::element_for_style_node(StyleNodeID style_node_id) const
@@ -611,10 +625,9 @@ void StyleComputer::finish_animation_refresh(Layout::BegunRead const& read, DOM:
     }
 }
 
-// The timing the style engine computes the key an effect samples its keyframes at from: what its animation contributes,
-// the effect's own timing, and its timeline's current time. The engine decides it only where every time is in one unit:
-// a duration, or a percentage of a scroll timeline's progress.
-static ComputedValuesFFI::FfiEffectTiming style_engine_effect_timing(Animations::KeyframeEffect const& effect, Animations::Animation const& animation)
+// The engine decides the timing only where every time is in one unit: a duration, or a percentage of a scroll
+// timeline's progress.
+ComputedValuesFFI::FfiEffectTiming style_engine_effect_timing(Animations::KeyframeEffect const& effect, Animations::Animation const& animation)
 {
     ComputedValuesFFI::FfiEffectTiming timing {};
     Optional<Animations::TimeValue::Type> unit;
@@ -648,6 +661,7 @@ static ComputedValuesFFI::FfiEffectTiming style_engine_effect_timing(Animations:
     }
     optional_duration(animation.start_time(), timing.has_start_time, timing.start_time);
     optional_duration(animation.hold_time(), timing.has_hold_time, timing.hold_time);
+    timing.paused = animation.play_state() == Bindings::AnimationPlayState::Paused;
     timing.playback_rate = animation.playback_rate();
     timing.start_delay = duration(effect.start_delay());
     timing.end_delay = duration(effect.end_delay());
@@ -1993,7 +2007,7 @@ void StyleComputer::finalize_animated_box_type(Layout::BegunRead const& read, Co
     style.finish_animated_overlay_rust_mutation(Badge<StyleComputer> {});
 }
 
-NonnullRefPtr<ComputedValues const> StyleComputer::create_document_style() const
+StyleRecordID StyleComputer::intern_document_style(Layout::BegunRead const& read) const
 {
     Vector<u8> document_supported_color_scheme_codes;
     auto document_supported_color_schemes = document().supported_color_schemes();
@@ -2019,14 +2033,9 @@ NonnullRefPtr<ComputedValues const> StyleComputer::create_document_style() const
         .viewport_height = viewport_rect.height().to_double(),
     };
     auto computed_properties = CSS::ComputedStyleWorkingSet::create_with_longhand_table(ComputedValuesFFI::rust_create_document_longhand_table(&input));
-    CSS::ColorResolutionContext color_resolution_context {
-        .color_scheme = document().page().preferred_color_scheme(),
-        .current_color = CSS::InitialValues::color(),
-        .current_color_style_value = &computed_properties->property(PropertyID::Color),
-        .calculation_resolution_context = { .length_resolution_context = CSS::Length::ResolutionContext::for_document(document()) },
-    };
-    auto computed_values = CSS::ComputedValues::create(*computed_properties, document(), document().style_scope(), move(color_resolution_context));
-    return computed_values;
+    // The font group inputs borrow the font list the working set resolves, so it outlives the call.
+    auto font_group_inputs = computed_properties->font_group_build_inputs(document(), document().style_scope().style_engine_tree_scope());
+    return StyleRecordID { ComputedValuesFFI::rust_intern_document_style(m_style_engine.host(), &read, computed_properties->computed_longhand_table(), &font_group_inputs, &input.length_resolution_context) };
 }
 
 void StyleComputer::publish_sampled_animation_overlays(Layout::BegunRead const& read, ReadonlySpan<SampledAnimationOverlay> overlays, Span<StyleEngineFFI::FfiAnimationOverlayPublication> publications) const

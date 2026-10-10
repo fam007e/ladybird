@@ -91,8 +91,10 @@ public:
     bool is_owned_by(CompositorStateWebContentClient const&) const;
     CompositorStateWebContentClient& web_content_client() const { return m_web_content_client; }
     void request_rendering_update();
-    void dispatch_mouse_event_to_web_content(Web::MouseEvent const&);
+    void dispatch_mouse_event_to_web_content(Web::MouseEvent const&, bool nested_context_scrolled_since_last_frame = false);
     void dispatch_key_event_to_web_content(Web::KeyEvent const&);
+    // Whether the scroll offsets here moved past those of the last frame WebContent presented.
+    bool scrolled_since_last_frame() const;
     bool can_dispatch_input_to_web_content() const { return m_page_id.has_value(); }
 
     bool presents_to_client() const { return m_presents_to_client; }

@@ -26,6 +26,14 @@ enum class FfiFlightBlocker : uint8_t;
 
 namespace Web::HTML {
 
+// What the render clock's lanes do with a document's running animations.
+enum class ClockAnimations : u8 {
+    // Leaves them alone: the event loop is idle, and its rendering updates run them.
+    Hold,
+    // Samples them: a task begins, beside which only the render clock runs them.
+    Run,
+};
+
 // Whether a committed frame records the document, rather than keep the display list the compositor has.
 enum class CommittedFrameRecords : bool {
     No,
@@ -157,8 +165,6 @@ public:
     // Waits for every frame the navigables committed to be presented, and takes it in.
     void take_committed_frames_in();
     // A test that injects its rendering opportunities injects its render clock's ticks as well.
-    void set_render_clock_is_manual_for_testing(bool manual) { m_render_clock_is_manual_for_testing = manual; }
-    bool render_clock_is_manual_for_testing() const { return m_render_clock_is_manual_for_testing; }
     // Called before a rendering update submits a recording, on a thread with a Core event loop.
     void ensure_frame_completion_registered();
     // Whether a frame flies beside the event loop, which has not taken it in yet.
@@ -176,13 +182,17 @@ public:
     // deliver to the document's script what comes before any of its tasks. A task of no document waits whenever the
     // tasks of any document do, and an update with intersection observations to update holds every task.
     bool holds_tasks_of(DOM::Document const*) const;
+    // Whether the rendering update in flight holds back the tasks of `document`, as it does where no test holds it.
+    bool rendering_update_in_flight_holds_tasks_of_for_testing(DOM::Document const&) const;
     void hold_next_frame_for_testing() { m_holds_next_frame_for_testing = true; }
+    void hold_next_layout_for_testing() { m_holds_next_layout_for_testing = true; }
     void release_held_frames_for_testing();
 
     RenderingSchedulerCounters const& rendering_scheduler_counters() const { return m_rendering_scheduler_counters; }
     void reset_rendering_scheduler_counters();
 
 private:
+    bool rendering_update_in_flight_holds_tasks_of(DOM::Document const*) const;
     explicit EventLoop(Type);
 
     virtual void visit_edges(Visitor&) override;
@@ -195,7 +205,7 @@ private:
         UpToDate,
         AsItFlew,
     };
-    void update_the_rendering_after_style_and_layout(Vector<GC::Root<DOM::Document>> const& docs, double frame_timestamp, TakenLayout = TakenLayout::UpToDate);
+    void update_the_rendering_after_style_and_layout(Vector<GC::Root<DOM::Document>> const& docs, double frame_timestamp, u64 update_serial, TakenLayout = TakenLayout::UpToDate);
     void finish_rendering_update(double update_start_time);
     Layout::RustFFI::FfiFlightBlocker style_flight_blocker(DOM::Document&) const;
     void resume_rendering_update_in_flight();
@@ -204,7 +214,7 @@ private:
     // Goes on with the rendering update in flight where it has landed, and presents the recordings that have landed.
     void take_finished_frames_in();
     bool let_layout_of_rendering_update_fly();
-    void lease_clocks_for_task();
+    void note_clock_lanes(ClockAnimations);
 
     Type m_type { Type::Window };
 
@@ -258,14 +268,18 @@ private:
 
     // The navigables whose committed frame flies beside the event loop, which has not taken it in yet.
     Vector<GC::Ref<LocalNavigable>> m_navigables_with_frames_in_flight;
-    // The navigables whose active document the last rendering update left a plan for a clock lease, which a task takes.
-    Vector<GC::Ref<LocalNavigable>> m_navigables_with_clock_plans;
-    bool m_render_clock_is_manual_for_testing { false };
+    // The navigables whose active document a rendering update left a plan for the lane of its frame, which the event
+    // loop tells whether it runs a task.
+    Vector<GC::Ref<LocalNavigable>> m_navigables_with_clock_lanes;
     bool m_frame_completion_registered { false };
     bool m_holds_next_frame_for_testing { false };
+    bool m_holds_next_layout_for_testing { false };
 
     struct RenderingUpdateInFlight;
     OwnPtr<RenderingUpdateInFlight> m_rendering_update_in_flight;
+    // The serial number of the last rendering update that began: the lanes an update takes in wait for its own plan,
+    // not for that of an update before it.
+    u64 m_rendering_update_serial { 0 };
     // How deep the event loop is spun inside a task.
     size_t m_spin_depth { 0 };
 };

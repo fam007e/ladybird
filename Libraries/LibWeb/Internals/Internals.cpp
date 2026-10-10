@@ -49,6 +49,7 @@
 #include <LibWeb/CSS/StyleSheetState.h>
 #include <LibWeb/Compositor/CompositorFrame.h>
 #include <LibWeb/Compositor/CompositorHost.h>
+#include <LibWeb/Compositor/RenderClock.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/Event.h>
 #include <LibWeb/DOM/EventTarget.h>
@@ -83,6 +84,7 @@
 #include <LibWeb/HTML/SharedResourceRequest.h>
 #include <LibWeb/HTML/Window.h>
 #include <LibWeb/HTML/WindowProxy.h>
+#include <LibWeb/HighResolutionTime/TimeOrigin.h>
 #include <LibWeb/Internals/InternalGamepad.h>
 #include <LibWeb/Internals/Internals.h>
 #include <LibWeb/Layout/NodeArena.h>
@@ -267,6 +269,20 @@ GC::Ref<JS::Object> Internals::visual_context_node_indices(DOM::Element& element
     object->define_direct_property("effects"_utf16_fly_string, owned_indices_as_array(Layout::RustFFI::FfiVisualContextBoxNodeList::EffectNodes), JS::default_attributes);
     object->define_direct_property("needsCompositorEffectsLayer"_utf16_fly_string, JS::Value(layout_node && layout_node->needs_compositor_effects_layer()), JS::default_attributes);
     object->define_direct_property("needsCompositorBackgroundColorFrame"_utf16_fly_string, JS::Value(layout_node && layout_node->needs_compositor_background_color_frame()), JS::default_attributes);
+    Vector<Gfx::Color> background_color_animation_keyframe_colors;
+    if (layout_node) {
+        Layout::BegunRead const& begun_read = read;
+        for (auto effect_node_index : Painting::rust_owned_visual_context_node_indices(*layout_node, Layout::RustFFI::FfiVisualContextBoxNodeList::EffectNodes)) {
+            Layout::RustFFI::render_state_background_color_animation_keyframe_colors(document.layout_node_arena().host(), &begun_read, effect_node_index, &background_color_animation_keyframe_colors, [](void* colors, Gfx::Color color) {
+                static_cast<Vector<Gfx::Color>*>(colors)->append(color);
+            });
+        }
+    }
+    object->define_direct_property("backgroundColorAnimationKeyframes"_utf16_fly_string,
+        JS::Array::create_from<Gfx::Color>(realm, background_color_animation_keyframe_colors.span(), [&](Gfx::Color const& color) {
+            return JS::PrimitiveString::create(realm.vm(), Utf16String::from_utf8(color.to_string()));
+        }),
+        JS::default_attributes);
     return object;
 }
 
@@ -589,6 +605,19 @@ void Internals::click_through_ui_process(double x, double y)
     }
 }
 
+// A mouse move the UI process routes, as it would a user's, through the compositor, which tells the render clock of it
+// too.
+void Internals::mouse_move_through_ui_process(double x, double y)
+{
+    auto& page = this->page();
+    auto position = page.css_to_device_point(window().navigable()->to_page_position({ x, y }));
+    Web::MouseEvent event;
+    event.type = Web::MouseEvent::Type::MouseMove;
+    event.position = position;
+    event.screen_position = position;
+    page.client().page_did_request_webdriver_mouse_event(window().navigable()->local_root()->id(), move(event), GC::create_function(heap(), [] { }));
+}
+
 void Internals::wheel_through_ui_process(double x, double y, double delta_x, double delta_y)
 {
     auto& page = this->page();
@@ -751,6 +780,22 @@ Utf16String Internals::current_cursor()
         [](Gfx::ImageCursor const&) {
             return "Image"_utf16;
         });
+}
+
+Optional<Utf16String> Internals::current_cursor_pixel(i32 x, i32 y)
+{
+    auto cursor = page().current_cursor();
+    auto const* image_cursor = cursor.get_pointer<Gfx::ImageCursor>();
+    if (!image_cursor || !image_cursor->bitmap.is_valid())
+        return {};
+    return Utf16String::from_utf8(image_cursor->bitmap.bitmap()->get_pixel(x, y).to_string());
+}
+
+Utf16String Internals::theme_color()
+{
+    auto& document = window().associated_document();
+    Layout::ForcedReadScope read { document };
+    return Utf16String::from_utf8(document.theme_color(read).to_string());
 }
 
 Utf16String Internals::selected_text_for_clipboard()
@@ -1563,6 +1608,12 @@ void Internals::set_geolocation_emulated_position(double latitude, double longit
     });
 }
 
+bool Internals::html_parser_body_is_exhausted(DOM::Document& document)
+{
+    auto parser = document.parser();
+    return parser && parser->streaming_body_is_exhausted();
+}
+
 u64 Internals::parser_non_append_insertions()
 {
     return HTML::parser_non_append_insertions();
@@ -1663,17 +1714,56 @@ void Internals::inject_clock_tick(double frame_time_ms, Optional<double> viewpor
     Layout::RustFFI::document_host_inject_clock_tick(document.layout_node_arena().host(), static_cast<i64>(frame_time * 1'000'000.0), scroll_offset.has_value() ? &*scroll_offset : nullptr);
 }
 
-Utf16String Internals::clock_lease_state(DOM::Document& document)
+void Internals::inject_hover_pointer(double x, double y, Optional<double> frame_time_ms, Optional<u64> input_event_id)
 {
-    switch (Layout::RustFFI::document_host_clock_lease_state(document.layout_node_arena().host())) {
-    case Layout::RustFFI::FfiClockLeaseState::None:
+    auto& document = window().associated_document();
+    auto device_pixels_per_css_pixel = page().client().device_pixels_per_css_pixel();
+    auto frame_time = frame_time_ms.has_value() ? document.relevant_settings_object().time_origin() + *frame_time_ms : HighResolutionTime::unsafe_shared_current_time();
+    Layout::RustFFI::document_host_inject_pointer(document.layout_node_arena().host(), static_cast<float>(x * device_pixels_per_css_pixel), static_cast<float>(y * device_pixels_per_css_pixel), static_cast<i64>(frame_time * 1'000'000.0), input_event_id.value_or(0));
+}
+
+u64 Internals::queue_mouse_move(double x, double y, u32 buttons)
+{
+    // NB: Above every id a UI process hands out in a test.
+    static u64 next_input_event_id = 1ull << 40;
+    auto& page = this->page();
+    auto position = page.css_to_device_point(window().navigable()->to_page_position({ x, y }));
+    Web::MouseEvent event;
+    event.type = Web::MouseEvent::Type::MouseMove;
+    event.position = position;
+    event.screen_position = position;
+    event.buttons = static_cast<UIEvents::MouseButton>(buttons);
+    event.id = next_input_event_id++;
+    auto id = event.id;
+    page.client().input_event_queue().enqueue({ page.client().id(), move(event), {}, {} });
+    return id;
+}
+
+void Internals::move_hover_pointer(double x, double y, Optional<u64> input_event_id)
+{
+    auto& document = window().associated_document();
+    auto device_pixels_per_css_pixel = page().client().device_pixels_per_css_pixel();
+    Layout::RustFFI::document_host_move_pointer(document.layout_node_arena().host(), static_cast<float>(x * device_pixels_per_css_pixel), static_cast<float>(y * device_pixels_per_css_pixel), input_event_id.value_or(0));
+}
+
+Utf16String Internals::clock_lane_state(DOM::Document& document)
+{
+    switch (Layout::RustFFI::document_host_clock_lane_state(document.layout_node_arena().host())) {
+    case Layout::RustFFI::FfiClockLaneState::None:
         return "none"_utf16;
-    case Layout::RustFFI::FfiClockLeaseState::Ticking:
+    case Layout::RustFFI::FfiClockLaneState::Ticking:
         return "ticking"_utf16;
-    case Layout::RustFFI::FfiClockLeaseState::Parked:
+    case Layout::RustFFI::FfiClockLaneState::Parked:
         return "parked"_utf16;
+    case Layout::RustFFI::FfiClockLaneState::Hovering:
+        return "hovering"_utf16;
     }
     VERIFY_NOT_REACHED();
+}
+
+bool Internals::clock_lane_is_coming(DOM::Document& document)
+{
+    return Layout::RustFFI::document_host_clock_lane_is_coming(document.layout_node_arena().host());
 }
 
 GC::Ptr<Geometry::DOMRect> Internals::presented_border_box(DOM::Element& element)
@@ -1684,12 +1774,38 @@ GC::Ptr<Geometry::DOMRect> Internals::presented_border_box(DOM::Element& element
     return Geometry::DOMRect::create(rect.x().to_double(), rect.y().to_double(), rect.width().to_double(), rect.height().to_double());
 }
 
+Optional<u32> Internals::presented_compositor_animation_count(DOM::Element& element)
+{
+    u32 count = 0;
+    if (!element.style_node_id() || !Layout::RustFFI::document_host_presented_compositor_animation_count(element.document().layout_node_arena().host(), element.style_node_id().value(), &count))
+        return {};
+    return count;
+}
+
+Optional<double> Internals::presented_opacity(DOM::Element& element)
+{
+    float opacity = 0;
+    if (!element.style_node_id() || !Layout::RustFFI::document_host_presented_opacity(element.document().layout_node_arena().host(), element.style_node_id().value(), &opacity))
+        return {};
+    return opacity;
+}
+
+Optional<String> Internals::presented_color(DOM::Element& element)
+{
+    u32 argb = 0;
+    if (!element.style_node_id() || !Layout::RustFFI::document_host_presented_color(element.document().layout_node_arena().host(), element.style_node_id().value(), &argb))
+        return {};
+    return Color::from_bgra(argb).serialize_a_srgb_value();
+}
+
 void Internals::set_manual_rendering_opportunities(bool enabled)
 {
-    // A test that injects its rendering opportunities injects its clock ticks too: the clock lease that runs now ends,
-    // and no later one ticks with the display.
-    HTML::main_thread_event_loop().set_render_clock_is_manual_for_testing(enabled);
+    // A test that injects its rendering opportunities injects its clock ticks too: the clock lanes tick with the display
+    // no more, and the frame in flight reaches the compositor first.
+    Compositor::RenderClock::the().set_manual_for_testing(enabled);
     if (enabled) {
+        // A lane armed before ticks with the display until it declines a tick, at the compositor's own scroll offsets.
+        Compositor::RenderClock::the().disarm_all_for_testing();
         if (auto* navigable = as_if<HTML::LocalNavigable>(window().associated_document().navigable().ptr()))
             (void)navigable->presenter();
     }
@@ -1717,8 +1833,10 @@ Utf16String Internals::frame_scheduler_state() const
 void Internals::hold_next_frame(Utf16String const& hold)
 {
     Layout::RustFFI::render_state_hold_next_recording_for_testing();
-    if (hold == "layout"sv)
+    if (hold == "layout"sv) {
+        HTML::main_thread_event_loop().hold_next_layout_for_testing();
         return;
+    }
     HTML::main_thread_event_loop().hold_next_frame_for_testing();
 }
 
@@ -1751,6 +1869,11 @@ void Internals::release_held_frame()
 {
     Layout::RustFFI::render_state_release_held_recording_for_testing();
     HTML::main_thread_event_loop().release_held_frames_for_testing();
+}
+
+bool Internals::rendering_update_holds_tasks_of(DOM::Document& document)
+{
+    return HTML::main_thread_event_loop().rendering_update_in_flight_holds_tasks_of_for_testing(document);
 }
 
 void Internals::update_compositor_animations()

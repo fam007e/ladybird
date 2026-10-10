@@ -29,6 +29,17 @@ const REBUILD_ROOT_BOX_PRESENCE_CHANGE: u8 = 3;
 const REBUILD_ROOT_PARENT: u8 = 4;
 const ALL_INHERITED_STYLE_GROUPS: u8 = (1 << 7) - 1;
 
+/// What a sample may change beside the box of its element: the visual contexts the box takes part in, which the render
+/// owner builds again for the frames it records, and where no scroll container of the document snaps, which
+/// `scroll_snaps` says, the scrollable overflow of its scroll container. The values the element's children inherit
+/// follow, as the caller composes them over the children itself, and the text decorations its subtree draws where
+/// `subtree_follows` says the caller repaints every element in it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SampleBounds {
+    pub scroll_snaps: bool,
+    pub subtree_follows: bool,
+}
+
 #[derive(Clone, Copy, Default)]
 struct StyleInvalidation {
     level: u8,
@@ -98,10 +109,14 @@ impl StyleInvalidation {
     /// Whether the damage stays in the box of its element: no layout tree, stacking context, visual context, scroll
     /// snap or text decoration of descendants.
     fn stays_in_its_box(self) -> bool {
+        self.stays_in_its_box_and_visual_contexts(true) && self.visual_context == 0 && !self.rebuild_stacking_context
+    }
+
+    /// Whether the move changes only what the box paints and lays out, and the visual contexts it takes part in, and
+    /// where `scroll_snaps` says a scroll container of the document may snap, nothing it snaps to.
+    fn stays_in_its_box_and_visual_contexts(self, scroll_snaps: bool) -> bool {
         self.level < INVALIDATION_REBUILD_LAYOUT_TREE
-            && self.visual_context == 0
-            && !self.rebuild_stacking_context
-            && !self.resnap_scroll_container
+            && !(scroll_snaps && self.resnap_scroll_container)
             && !self.repaint_text_decorations
     }
 
@@ -804,14 +819,25 @@ impl RetainedState {
         old_style_record: u64,
         animated_overlay: &AnimatedOverlay,
         payloads: &[SharedPayload],
+        bounds: SampleBounds,
     ) -> bool {
         let is_document_element =
             self.computed_group_sets.adjustment_facts(node) & element_adjustment_fact::IS_DOCUMENT_ELEMENT != 0;
-        StyleInvalidation::unpack(
+        let invalidation = StyleInvalidation::unpack(
             self.compare_animation_overlay(old_style_record, animated_overlay, payloads, is_document_element)
                 .invalidation,
-        )
-        .stays_in_its_box()
+        );
+        let SampleBounds {
+            scroll_snaps,
+            subtree_follows,
+        } = bounds;
+        invalidation.stays_in_its_box_and_visual_contexts(scroll_snaps)
+            || (subtree_follows
+                && StyleInvalidation {
+                    repaint_text_decorations: false,
+                    ..invalidation
+                }
+                .stays_in_its_box_and_visual_contexts(scroll_snaps))
     }
 
     /// Whether moving `node` from `old_style_record`, the record the host installed for the element, to
@@ -829,6 +855,33 @@ impl RetainedState {
             && !invalidation.recompute_descendants
             && ((invalidation.inherited_groups == 0 && !invalidation.non_inherited_inheritance_source)
                 || self.tree.first_element_child(node).is_none())
+    }
+
+    /// What moving a box from the record `old_style_record` to `new_style_record` damages, of `properties` alone, read
+    /// from the records' payloads: a sample of animations over a record keeps the record's longhand table, and holds
+    /// the values it animates only in its payloads.
+    pub(crate) fn sampled_properties_damage(
+        &self,
+        old_style_record: u64,
+        new_style_record: u64,
+        properties: &[u16],
+    ) -> u32 {
+        if properties.is_empty() || old_style_record == new_style_record {
+            return 0;
+        }
+        let (Some(old_record), Some(new_record)) = (
+            self.computed_group_sets.style_record_view(old_style_record),
+            self.computed_group_sets.style_record_view(new_style_record),
+        ) else {
+            return unreadable_record_damage();
+        };
+        let old_values = ComputedValuesView::new(SharedPayload::as_pointer_slice(old_record.payloads));
+        let new_values = ComputedValuesView::new(SharedPayload::as_pointer_slice(new_record.payloads));
+        let mut result = StyleInvalidation::default();
+        for &property in properties {
+            result.merge(property_invalidation(property, old_values, new_values));
+        }
+        result.pack()
     }
 
     pub(crate) fn compare_style_records(

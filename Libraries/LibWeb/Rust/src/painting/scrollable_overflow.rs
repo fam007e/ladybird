@@ -416,10 +416,13 @@ fn measure_scrollable_overflow_impl(
 
         {
             let child_data = layout_arena.committed_side_data(child_node);
+            // NB: A line before a line clamp point can be cut short of the atomic inlines on it, so it does not
+            //     contribute their boxes.
             if child_position == positioning::STATIC
                 && child_display.is_inline_outside()
                 && !child_is_floating
                 && !child_has_css_transform
+                && !style_queries::has_line_clamp_point(layout_arena, box_node)
                 && layout_arena
                     .committed_side_data(child_node)
                     .overflow_valid_across_recommits
@@ -622,7 +625,7 @@ fn measure_scrollable_overflow_impl(
 
 /// Geometry caches and their pending effects belong to the arena, independently of the
 /// visual-context state temporarily borrowed or taken by painting traversals.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct ScrollableOverflowState {
     pub(crate) viewport: Cell<Option<NodeSlotId>>,
     pub(crate) full_layout_commit: Cell<bool>,
@@ -882,6 +885,17 @@ impl OverflowStyle {
             && old.transform_origin_x == new.transform_origin_x
             && old.transform_origin_y == new.transform_origin_y
             && old.transform_origin_z == new.transform_origin_z
+    }
+}
+
+/// A fork's snapshot holds its own reference to the group.
+impl Clone for OverflowStyle {
+    fn clone(&self) -> Self {
+        crate::css::computed_values::retain_group_payload(
+            crate::css::computed_value_types::STYLE_GROUP_INDEX_TRANSFORM,
+            self.0.as_ptr().cast(),
+        );
+        Self(self.0)
     }
 }
 

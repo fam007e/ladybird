@@ -35,7 +35,7 @@ const CHILD_NEEDS: u8 = 1 << 3;
 
 /// One byte of marks per identity, in the element and the text index spaces apart. The low bits
 /// are the reuse reasons, so no reason ever needs translating.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct LayoutTreeUpdateMarks {
     elements: Vec<u8>,
     text: Vec<u8>,
@@ -391,20 +391,6 @@ impl LayoutNodeArena {
         }
 
         self.apply_layout_tree_update_mark(node, mark);
-    }
-
-    /// The writes that mark `node`, which is in no top layer, for the next layout tree build in marks the arena does
-    /// not hold, as [`Self::mark_layout_tree_update`] marks it in its own: the host's, which the render clock leaves
-    /// the host to make in its own once it has them back.
-    pub(crate) fn layout_tree_update_mark_writes(
-        &self,
-        node: StyleNodeID,
-        reuse_reason: u8,
-    ) -> impl Iterator<Item = LayoutTreeUpdateMarkWrite> + '_ {
-        let ancestors = std::iter::successors(self.flat_tree_parent(node), |&ancestor| self.flat_tree_parent(ancestor))
-            .chain(self.document_style_node());
-        std::iter::once(LayoutTreeUpdateMarkWrite::Merge(node, true, reuse_reason))
-            .chain(ancestors.map(|ancestor| LayoutTreeUpdateMarkWrite::SetChildNeeds(ancestor, true)))
     }
 
     /// Invalidates the box of the node `node` names, or the document's for `None`, as a layout tree update mark on it

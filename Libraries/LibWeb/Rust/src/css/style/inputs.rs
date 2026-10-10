@@ -120,7 +120,8 @@ pub(crate) struct CustomPropertyDataObject {
 }
 
 // SAFETY: The data is immutable once built and counts its references atomically, so a shared
-// reference to it may be read, taken and given up on any thread.
+// reference to it may be read and taken on any thread. The StyleLayout thread leaves giving one up
+// to the host (see `RetainedCustomPropertyData`'s `Drop`).
 unsafe impl Sync for CustomPropertyDataObject {}
 
 /// The custom-property environment one element holds, a `Web::CSS::CustomPropertyData` the engine
@@ -146,6 +147,7 @@ impl RetainedCustomPropertyData {
 
 /// The custom-property environment an element or one of its synthetic pseudo-elements holds, with
 /// what a move of the environment it inherits reads of it.
+#[derive(Clone)]
 pub(crate) struct HeldCustomPropertyEnvironment {
     /// The identity the host's object names the environment by.
     pub(crate) identity: u64,
@@ -158,10 +160,45 @@ pub(crate) struct HeldCustomPropertyEnvironment {
     pub(crate) data: RetainedCustomPropertyData,
 }
 
+/// A fork's environment holds its own reference.
+impl Clone for RetainedCustomPropertyData {
+    fn clone(&self) -> Self {
+        // SAFETY: The row holds a reference, so the data is live.
+        unsafe { Self::retain(self.data()) }
+    }
+}
+
 impl Drop for RetainedCustomPropertyData {
     fn drop(&mut self) {
+        // The last reference destroys the data, which gives up its references to its values, counted without atomics
+        // on the host's thread. The StyleLayout thread, which lets go of an environment beside the host's task as a
+        // fork or a streamed write does, leaves it to the host.
+        if crate::stage_thread::is_on_style_layout_thread() {
+            CUSTOM_PROPERTY_DATA_LET_GO_BESIDE_THE_HOST
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(self.data() as usize);
+            return;
+        }
         // SAFETY: The row owns exactly one reference, taken in `retain`.
         unsafe { web_css_custom_property_data_unreference(self.data()) };
+    }
+}
+
+/// The references to custom-property environments the StyleLayout thread let go of, which the host gives up.
+static CUSTOM_PROPERTY_DATA_LET_GO_BESIDE_THE_HOST: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+
+/// Gives up the references to custom-property environments the StyleLayout thread let go of. On the host's thread, or
+/// in a job the host waits for.
+pub(crate) fn give_up_custom_property_data_let_go_beside_the_host(_: &crate::stage::MainThread) {
+    let let_go = std::mem::take(
+        &mut *CUSTOM_PROPERTY_DATA_LET_GO_BESIDE_THE_HOST
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    );
+    for data in let_go {
+        // SAFETY: Each entry is a reference a dropped environment owned.
+        unsafe { web_css_custom_property_data_unreference(data as *const std::ffi::c_void) };
     }
 }
 
@@ -260,7 +297,7 @@ impl RetainedState {
         {
             return;
         }
-        let routing = Arc::get_mut(&mut self.routing).expect("routing program is shared outside a planning epoch");
+        let routing = Arc::make_mut(&mut self.routing);
         routing.add_rule(rule, program, &self.programs);
     }
 
@@ -325,7 +362,7 @@ impl RetainedState {
             scope,
             &self.counters,
         );
-        self.note_attribute_value_text_names(&compiled);
+        self.note_selector_attribute_names(&compiled);
         if let Some(reusable) = reusable
             && self.programs.get(reusable) == &compiled
         {
@@ -337,8 +374,14 @@ impl RetainedState {
         program
     }
 
-    /// Record the attribute names whose values `program` reads as text.
-    pub(super) fn note_attribute_value_text_names(&mut self, program: &SelectorProgram) {
+    /// Record the attribute names `program` tests, and those whose values it reads as text.
+    pub(super) fn note_selector_attribute_names(&mut self, program: &SelectorProgram) {
+        if !program
+            .tested_attribute_names()
+            .all(|name| self.tested_attribute_names.contains(&name))
+        {
+            Arc::make_mut(&mut self.tested_attribute_names).extend(program.tested_attribute_names());
+        }
         if program
             .attribute_value_text_names()
             .all(|name| self.attribute_value_text_names.contains(&name))
@@ -361,8 +404,13 @@ impl RetainedState {
     }
 
     /// The attribute names whose value text a selector here reads.
-    pub(crate) fn selector_attribute_value_text_names(&self) -> &SelectorValueTextNames {
+    pub(crate) fn selector_attribute_value_text_names(&self) -> &SelectorAttributeNames {
         &self.attribute_value_text_names
+    }
+
+    /// The attribute names a selector here tests in any way.
+    pub(crate) fn selector_tested_attribute_names(&self) -> &SelectorAttributeNames {
+        &self.tested_attribute_names
     }
 
     /// Whether the host records what the values of an attribute name spell: for a selector whose
@@ -1098,7 +1146,7 @@ impl RetainedState {
             .filter(|&rule| self.program.rule_is_live(rule))
             .filter_map(|rule| Some((rule, self.program.rule_version(rule).selector_program?)));
         let programs = &self.programs;
-        let routing = Arc::get_mut(&mut self.routing).expect("routing program is shared outside a planning epoch");
+        let routing = Arc::make_mut(&mut self.routing);
         for (rule, program) in rules {
             routing.add_rule(rule, program, programs);
         }
@@ -1434,6 +1482,18 @@ impl RetainedState {
         slot: animations::AnimationSlot,
     ) -> &[super::effect_descriptions::PublishedEffect] {
         self.animation_effect_descriptions.effects(node, slot)
+    }
+
+    /// Has one of an element's described effects take `timing`, the one the host runs it on without sampling it (see
+    /// [`super::effect_descriptions::AnimationEffectDescriptions::refresh_timing`]).
+    pub(crate) fn refresh_element_animation_effect_timing(
+        &mut self,
+        node: StyleNodeID,
+        identity: u64,
+        timing: &crate::css::style_compute::FfiEffectTiming,
+    ) {
+        self.animation_effect_descriptions
+            .refresh_timing(node, identity, timing);
     }
 
     /// Keeps the timing the host samples one of an element's described effects with, and answers the
@@ -1808,8 +1868,8 @@ impl StyleEngine {
                 memory,
                 admission: AdmissionFacts::default(),
                 deferred_pseudo_elements: 0,
-                tree,
-                program: StyleSheetProgram::new(),
+                tree: crate::fork::ForkShared::new(tree),
+                program: crate::fork::ForkShared::new(StyleSheetProgram::new()),
                 native_rules: Default::default(),
                 declaration_block_version: Arc::new(std::sync::atomic::AtomicU32::new(1)),
                 last_transaction_only_derived_child_reactions: false,
@@ -1838,17 +1898,17 @@ impl StyleEngine {
                 font_resolution: None,
                 layer_topology_version: 0,
                 sheet_order_version: 0,
-                specified_values: SpecifiedValues::new(),
-                winner_groups: WinnerGroups::new(),
-                computed_group_sets: ComputedGroupSets::default(),
+                specified_values: crate::fork::ForkShared::new(SpecifiedValues::new()),
+                winner_groups: crate::fork::ForkShared::new(WinnerGroups::new()),
+                computed_group_sets: Default::default(),
                 custom_property_environments: Default::default(),
                 nodes_with_substituted_records: HashSet::default(),
                 custom_declaration_reads: HashMap::default(),
                 nodes_with_tree_counting_records: HashMap::default(),
                 nodes_with_rolled_back_records: HashMap::default(),
                 nodes_with_element_relative_substitutions: HashMap::default(),
-                element_custom_property_data: HashMap::default(),
-                pseudo_element_custom_property_data: HashMap::default(),
+                element_custom_property_data: Default::default(),
+                pseudo_element_custom_property_data: Default::default(),
                 environment_move_recompute_nodes: HashSet::default(),
                 container_effects_for_host: Default::default(),
                 published_container_verdicts: HashMap::default(),
@@ -1858,13 +1918,14 @@ impl StyleEngine {
                 layout_style_snapshots: HashMap::default(),
                 size_container_queries: Default::default(),
                 counter_style_environment_identities: HashMap::default(),
-                held_style_records: HashMap::default(),
+                held_style_records: Default::default(),
                 tick_shown: Default::default(),
                 backing_elements: HashMap::default(),
                 children_explicitly_inherit_marks: HashSet::default(),
                 css_defined_animations: Default::default(),
                 animation_keyframes: Default::default(),
                 animation_effect_descriptions: Default::default(),
+                hover: Default::default(),
                 held_root_font_inputs: None,
                 random_base_values: Default::default(),
                 replaced_content_inputs: HashMap::default(),
@@ -1877,8 +1938,8 @@ impl StyleEngine {
                 batch_answers_complete_but_for_custom_properties: HashMap::default(),
                 batch_custom_property_matches: HashMap::default(),
                 batch_backing_pseudo_matches: HashMap::default(),
-                engine_cold_record_cache: HashMap::default(),
-                engine_cold_record_donors: HashMap::default(),
+                engine_cold_record_cache: Default::default(),
+                engine_cold_record_donors: Default::default(),
                 computed_group_set_memory: MemoryLease::new(MemoryCategory::ComputedGroupSet),
                 custom_property_environment_memory: MemoryLease::new(MemoryCategory::CustomPropertyEnvironment),
                 computed_fixed_metadata_memory: MemoryLease::new(MemoryCategory::ComputedFixedMetadata),
@@ -1888,23 +1949,25 @@ impl StyleEngine {
                 computed_pseudo_assignment_memory: MemoryLease::new(MemoryCategory::ComputedPseudoAssignment),
                 style_invalidation_cache: HashMap::default(),
                 html_element_namespace: StyleAtomID::NONE,
-                match_answers: MatchAnswerCatalog::default(),
+                match_answers: Default::default(),
                 selector_truth_sets: SelectorTruthSetCatalog::default(),
-                retained_match_answers: RetainedMatchAnswers::default(),
+                retained_match_answers: Default::default(),
                 retained_selector_incidences: RetainedSelectorIncidences::default(),
                 selector_incidence_is_current: false,
                 batch_matching_traversal: None,
                 completion_exactness: CompletionExactness::Exact,
-                route_pruning_states: Mutex::new(RoutePruningStateCache::default()),
+                route_pruning_states: crate::fork::ForkReset::new(Mutex::new(RoutePruningStateCache::default())),
+                sibling_positions: crate::fork::ForkReset::default(),
                 prefix_caches: std::sync::Arc::default(),
                 #[cfg(test)]
                 force_bounded_prefix_completion: false,
                 prepared_batch_matching_traversal: None,
                 published_match_answers: PublishedMatchAnswers::default(),
                 transaction_fact_view: None,
-                facts: ElementFactStore::new(),
+                facts: crate::fork::ForkShared::new(ElementFactStore::new()),
                 programs: SelectorPrograms::for_live_engine(),
                 attribute_value_text_names: Arc::default(),
+                tested_attribute_names: Arc::default(),
                 attribute_value_text_requirements_version: 0,
                 selector_programs_need_sweep: false,
                 routing: Arc::new(RoutingRegistry::new()),
@@ -1916,14 +1979,14 @@ impl StyleEngine {
                 witness_effect_scratch: MemoryLease::new(MemoryCategory::BatchScratch),
                 relational_witness_residency: MemoryLease::new(MemoryCategory::RetainedWitness),
                 scope_roots: Column::default(),
-                scope_by_root: SegmentedNodeColumn::default(),
+                scope_by_root: Default::default(),
                 scope_programs: intern_table::InternTable::default(),
                 vacant_scope_programs: Vec::new(),
                 scope_dispatch_templates: HashMap::default(),
                 scope_cascade_templates: HashMap::default(),
-                ancestor_dispatch_templates: HashMap::default(),
+                ancestor_dispatch_templates: Default::default(),
                 scope_program_by_scope: Column::default(),
-                atoms: DocumentAtoms::for_live_engine(),
+                atoms: crate::fork::ForkShared::new(DocumentAtoms::for_live_engine()),
                 fold_id_and_class_name_case: false,
                 #[cfg(test)]
                 diagnostic_plan_capture: None,
@@ -2139,6 +2202,19 @@ impl StyleEngine {
     /// what it already carries and a descendant recompute. The folded input is consumed; one not
     /// covered stays owed to the next transaction. Returns the merged reaction in the low byte and
     /// the merged inherited style groups in the next, or zero when nothing was folded.
+    /// The reaction the element `node` owes as an element style input the engine defers, if it owes one.
+    pub(crate) fn deferred_element_style_reaction(&self, node: StyleNodeID) -> Option<u8> {
+        let index = self
+            .host
+            .deferred_element_style_inputs
+            .binary_search_by_key(&InputKey::ElementStyleInput(node), |pending| pending.key)
+            .ok()?;
+        match self.host.deferred_element_style_inputs[index].new {
+            InputValue::ElementStyleInput { reaction, .. } => Some(reaction),
+            _ => None,
+        }
+    }
+
     pub fn absorb_element_style_input(
         &mut self,
         node: StyleNodeID,
@@ -3172,6 +3248,7 @@ impl RetainedState {
             deferred_pseudo_elements: _,
             // Retires the whole batch at once, in `retire_elements`.
             tree: _,
+            hover,
             program: _,
             native_rules: _,
             declaration_block_version: _,
@@ -3259,6 +3336,8 @@ impl RetainedState {
             // Scratch of one traversal.
             batch_matching_traversal: _,
             route_pruning_states: _,
+            // Keyed by the tree's DOM order version.
+            sibling_positions: _,
             completion_exactness: _,
             // Dropped in `forget_departed_elements` when a relation holds a departed element.
             prefix_caches: _,
@@ -3272,6 +3351,7 @@ impl RetainedState {
             facts: _,
             programs: _,
             attribute_value_text_names: _,
+            tested_attribute_names: _,
             attribute_value_text_requirements_version: _,
             selector_programs_need_sweep: _,
             routing: _,
@@ -3300,6 +3380,7 @@ impl RetainedState {
             #[cfg(test)]
                 diagnostic_plan_capture: _,
         } = self;
+        hover.retire(node);
         winner_groups.remove(node);
         computed_group_sets.remove(node);
         nodes_with_substituted_records.remove(&node);

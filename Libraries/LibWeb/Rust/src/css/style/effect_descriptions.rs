@@ -30,6 +30,7 @@ use std::ops::Range;
 use std::sync::Arc;
 
 /// What a published keyframe declares for a property.
+#[derive(Clone)]
 pub(crate) enum PublishedValue {
     /// The element's own value, held by a keyframe the host synthesized, and not known until the
     /// element is sampled.
@@ -132,6 +133,8 @@ pub(crate) fn easing_from_computed_timing_function(value: &StyleValueData) -> Op
     }
 }
 
+#[derive(Clone)]
+
 pub(crate) struct PublishedDeclaration {
     pub(crate) property_id: u16,
     pub(crate) value: PublishedValue,
@@ -140,10 +143,13 @@ pub(crate) struct PublishedDeclaration {
 /// A custom property a keyframe declares. The name is retained: a description outlives the call
 /// that published it, and a fly string's raw representation is only an identity while the string
 /// is alive.
+#[derive(Clone)]
 pub(crate) struct PublishedCustomDeclaration {
     pub(crate) name: RetainedUtf16FlyString,
     pub(crate) value: PublishedValue,
 }
+
+#[derive(Clone)]
 
 pub(crate) struct PublishedKeyframe {
     pub(crate) key: i64,
@@ -158,6 +164,7 @@ pub(crate) struct PublishedKeyframe {
 }
 
 /// The style sheet an effect's keyframes come from, which their URLs resolve against.
+#[derive(Clone)]
 pub(crate) struct PublishedResourceContext {
     /// Shared with every resolution of the effect's declarations that points into it.
     pub(crate) base_url: Arc<[u8]>,
@@ -165,6 +172,7 @@ pub(crate) struct PublishedResourceContext {
 }
 
 /// One of an element's animation effects, described for the style engine.
+#[derive(Clone)]
 pub(crate) struct PublishedEffect {
     pub(crate) identity: u64,
     pub(crate) generation: u64,
@@ -176,6 +184,16 @@ pub(crate) struct PublishedEffect {
     custom_declarations: Box<[PublishedCustomDeclaration]>,
     /// The timing the host last sampled the effect with, which moves without the description.
     pub(crate) timing: Option<EffectTiming>,
+    /// What a transition reverses to, and how much shorter a reversing transition runs, where the effect is one.
+    pub(crate) reversing: Option<TransitionReversing>,
+}
+
+/// What a transition that reverses the one an effect belongs to starts from.
+/// https://drafts.csswg.org/css-transitions/#reversing-adjusted-start-value
+#[derive(Clone)]
+pub(crate) struct TransitionReversing {
+    pub(crate) adjusted_start_value: RetainedStyleValueData,
+    pub(crate) shortening_factor: f64,
 }
 
 impl PublishedEffect {
@@ -208,6 +226,7 @@ impl PublishedEffect {
             })),
             custom_declarations: Box::new([]),
             timing: None,
+            reversing: None,
         }
     }
 
@@ -293,6 +312,10 @@ impl PublishedEffectBuffers<'_> {
                     declarations: declarations.into(),
                     custom_declarations: custom_declarations.into(),
                     timing: None,
+                    reversing: (!effect.reversing_adjusted_start_value.is_null()).then(|| TransitionReversing {
+                        adjusted_start_value: unsafe { retained(effect.reversing_adjusted_start_value) },
+                        shortening_factor: effect.reversing_shortening_factor,
+                    }),
                 }
             })
             .collect()
@@ -328,7 +351,7 @@ type AnimationEffectList = (AnimationSlot, Box<[PublishedEffect]>);
 
 /// Per element, the animation effects the host holds for it and each of its pseudo-elements,
 /// described for the style engine.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct AnimationEffectDescriptions {
     /// Holding an animation is rare, so only the elements that do have a row, and a row holds only
     /// the lists that are not empty.
@@ -427,6 +450,20 @@ impl AnimationEffectDescriptions {
             .and_then(|(_, effects)| effects.iter_mut().find(|effect| effect.identity == identity))
         {
             effect.timing = Some(timing);
+        }
+    }
+
+    /// Has one of an element's described effects that the host sampled before take `timing`, keeping its easing: the
+    /// timing the host runs it on since, where it runs it without sampling it.
+    pub(crate) fn refresh_timing(&mut self, node: StyleNodeID, identity: u64, timing: &FfiEffectTiming) {
+        if let Some(kept) = self
+            .rows
+            .get_mut(&node)
+            .and_then(|lists| lists.iter_mut().find(|(list_slot, _)| *list_slot == 0))
+            .and_then(|(_, effects)| effects.iter_mut().find(|effect| effect.identity == identity))
+            .and_then(|effect| effect.timing.as_mut())
+        {
+            kept.timing = *timing;
         }
     }
 
@@ -541,6 +578,8 @@ mod tests {
             keyframe_count: 0,
             base_url_offset: 0,
             base_url_length: 0,
+            reversing_adjusted_start_value: std::ptr::null(),
+            reversing_shortening_factor: 1.0,
         }
     }
 

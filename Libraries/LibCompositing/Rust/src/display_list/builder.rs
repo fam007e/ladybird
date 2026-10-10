@@ -487,7 +487,6 @@ fn push_or_merge_run(runs: &mut Vec<DisplayListCommandRun>, run: DisplayListComm
         debug_assert_eq!(last.offset + last.size, run.offset);
         last.size += run.size;
         last.has_compositor_metadata |= run.has_compositor_metadata;
-        last.has_unbounded_draw |= run.has_unbounded_draw;
         last.ink_bounds = last.ink_bounds.united(run.ink_bounds);
         return;
     }
@@ -515,10 +514,9 @@ pub(crate) fn note_command(
     run.size += record_size;
     if header.command_type.is_compositor_metadata() {
         run.has_compositor_metadata = true;
-    } else if header.has_bounding_rect {
-        run.ink_bounds = run.ink_bounds.united(header.bounding_rect);
     } else {
-        run.has_unbounded_draw = true;
+        debug_assert!(header.has_bounding_rect, "a draw command must report its bounding rect");
+        run.ink_bounds = run.ink_bounds.united(header.bounding_rect);
     }
 }
 
@@ -540,9 +538,10 @@ pub fn for_each_command<'a>(bytes: &'a [u8], mut f: impl FnMut(&DisplayListComma
 
 pub fn read_command<C: Copy>(payload: &[u8]) -> C {
     assert!(payload.len() >= std::mem::size_of::<C>());
-    // SAFETY: Display-list records are native-layout copies of these `Copy` command structs. The
-    // byte stream is validated at the C++ boundary, and `read_unaligned` does not require the
-    // payload pointer to have `C`'s alignment.
+    // SAFETY: Display-list records are native-layout copies of these `Copy` command structs. A
+    // tape is either recorded by this crate or checked by `validate::validate_tape` when it
+    // arrives from another process, so every enum and bool byte holds a valid value.
+    // `read_unaligned` does not require the payload pointer to have `C`'s alignment.
     unsafe { std::ptr::read_unaligned(payload.as_ptr().cast::<C>()) }
 }
 
@@ -556,6 +555,20 @@ pub fn inline_transform_entry_offset(header: &DisplayListCommandHeader, payload:
 pub fn inline_transform_of(header: &DisplayListCommandHeader, payload: &[u8]) -> Option<AffineTransform> {
     inline_transform_entry_offset(header, payload)
         .map(|offset| read_command::<DisplayListInlineTransform>(&payload[offset..]).transform)
+}
+
+/// The inline clip entries at the end of a record's payload, in the order the player pushes them.
+pub fn inline_clips_of<'a>(
+    header: &DisplayListCommandHeader,
+    payload: &'a [u8],
+) -> impl Iterator<Item = DisplayListInlineClip> + use<'a> {
+    let count = usize::from(header.inline_clip_count);
+    let entries = &payload[payload.len() - count * INLINE_CLIP_ENTRY_SIZE..];
+    entries
+        .as_chunks::<INLINE_CLIP_ENTRY_SIZE>()
+        .0
+        .iter()
+        .map(|entry| read_command::<DisplayListInlineClip>(entry))
 }
 
 pub fn read_header(bytes: &[u8]) -> DisplayListCommandHeader {
@@ -659,7 +672,6 @@ mod tests {
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].context, root);
         assert_eq!(runs[0].ink_bounds, IntRect::new(0, 0, 30, 30));
-        assert!(!runs[0].has_unbounded_draw);
         assert!(!runs[0].has_compositor_metadata);
     }
 
@@ -708,7 +720,6 @@ mod tests {
         let run = builder.command_runs()[0];
         assert_eq!(run.ink_bounds, IntRect::new(5, 5, 10, 10));
         assert!(run.has_compositor_metadata);
-        assert!(!run.has_unbounded_draw);
     }
 
     fn inline_clip_entries(builder: &DisplayListBuilder, record_offset: usize) -> Vec<DisplayListInlineClip> {

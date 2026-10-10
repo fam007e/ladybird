@@ -3112,6 +3112,7 @@ fn keyframe_parent_snapshot_for_style_record(
 
 /// Results of one longhand drive that remain outside the Rust longhand table.
 #[repr(C)]
+#[derive(Clone)]
 pub struct FfiLonghandDriverResults {
     /// Longhands whose specified-to-computed evaluation ran in this drive.
     pub longhand_evaluations: u32,
@@ -5102,6 +5103,28 @@ pub unsafe extern "C" fn rust_create_document_longhand_table(
     longhand_table.into_raw_shared().cast_mut()
 }
 
+/// Builds the document's own style from the longhand table `rust_create_document_longhand_table` created and interns
+/// its record, which the caller pins. Answers the record.
+///
+/// # Safety
+/// `host` must be a live document host, on its document's thread. `table` must point at a frozen table, `font` at
+/// the platform font inputs of its font group and `length` at the context its lengths resolve against, each live for
+/// the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rust_intern_document_style(
+    host: &crate::render_state::DocumentHost,
+    read: &crate::render_state::BegunRead,
+    table: *const ComputedLonghandTable,
+    font: *const crate::css::table_group_builder::FfiFontGroupBuildInputs,
+    length: *const FfiLengthResolutionContext,
+) -> u64 {
+    // SAFETY: Guaranteed by the caller.
+    let (table, font, length) = unsafe { (&*table, &*font, &*length) };
+    crate::css::style::engine_calls::with_engine(read, host, |engine| unsafe {
+        crate::css::style::bridge::intern_document_style(engine, table, font, length)
+    })
+}
+
 /// Computes every selected keyframe longhand through the Rust longhand driver.
 /// Each keyframe gets a temporary table and the driver's coordination inputs
 /// from the underlying style, then all of that keyframe's specified values are
@@ -5367,6 +5390,8 @@ pub struct FfiEffectTiming {
     pub timeline_scroller: i64,
     pub has_start_time: bool,
     pub has_hold_time: bool,
+    /// The effect's animation is paused, which holds its time, as one whose play is pending does too.
+    pub paused: bool,
     /// `Bindings::FillMode`, in IDL order.
     pub fill_mode: u8,
     /// `Bindings::PlaybackDirection`, in IDL order.
@@ -7073,11 +7098,23 @@ pub(crate) mod ffi_test_stubs {
     #[unsafe(no_mangle)]
     extern "C" fn web_css_custom_property_data_reference(_data: *const c_void) {}
     #[unsafe(no_mangle)]
+    extern "C" fn web_css_font_face_snapshot_reference(_snapshot: *const c_void) {}
+    #[unsafe(no_mangle)]
+    extern "C" fn web_css_font_cascade_memo_reference(_memo: *const c_void) {}
+    #[unsafe(no_mangle)]
     extern "C" fn web_css_font_face_snapshot_unreference(_snapshot: *const c_void) {}
     #[unsafe(no_mangle)]
     extern "C" fn web_css_font_cascade_memo_unreference(_memo: *const c_void) {}
     #[unsafe(no_mangle)]
     extern "C" fn web_css_resolve_font(
+        _memo: *const c_void,
+        _snapshot: *const c_void,
+        _request: crate::css::style::bridge::FfiFontResolutionRequest,
+    ) -> crate::css::style::bridge::FfiResolvedFont {
+        crate::css::style::bridge::FfiResolvedFont::default()
+    }
+    #[unsafe(no_mangle)]
+    extern "C" fn web_css_resolve_font_for_fork(
         _memo: *const c_void,
         _snapshot: *const c_void,
         _request: crate::css::style::bridge::FfiFontResolutionRequest,
@@ -7098,11 +7135,11 @@ pub(crate) mod ffi_test_stubs {
         unreachable!("no unit test applies style reactions");
     }
     #[unsafe(no_mangle)]
-    extern "C" fn web_css_engine_record_environment_is_installable(
+    extern "C" fn web_css_engine_record_environment(
         _application: *mut HostStyleReactionApplication,
         _element: *mut HostElement,
         _style_record: u64,
-    ) -> bool {
+    ) -> crate::css::style::reaction_application::FfiRecordEnvironment {
         unreachable!("no unit test applies style reactions");
     }
     #[unsafe(no_mangle)]

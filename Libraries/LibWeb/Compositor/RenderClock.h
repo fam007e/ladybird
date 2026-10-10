@@ -6,13 +6,17 @@
 
 #pragma once
 
+#include <AK/Atomic.h>
 #include <AK/ConditionVariable.h>
 #include <AK/Function.h>
 #include <AK/HashMap.h>
 #include <AK/Mutex.h>
 #include <AK/NonnullOwnPtr.h>
+#include <AK/Optional.h>
+#include <AK/RefCounted.h>
 #include <AK/RefPtr.h>
 #include <LibCore/Forward.h>
+#include <LibGfx/Point.h>
 #include <LibIPC/TransportHandle.h>
 #include <LibThreading/Forward.h>
 #include <LibWeb/Export.h>
@@ -29,8 +33,17 @@ namespace Web::Compositor {
 
 class RenderClockChannel;
 
-// A reference to the ticks of a document's clock lease, which hands them on to the lease.
-class WEB_API ClockTicksHandle {
+// What a document's clock lanes want once they heard where the pointer went.
+enum class PointerAnswer : u8 {
+    // The moves that follow, but no display tick: no lane hovers the move.
+    Moves = 1,
+    // Display ticks too, until a tick declines the next one.
+    Ticks = 2,
+};
+
+// A reference to the ticks of a document's clock lanes, which hands them on to the lane that follows the frame the
+// document presented last.
+class WEB_API ClockTicksHandle : public RefCounted<ClockTicksHandle> {
     AK_MAKE_NONCOPYABLE(ClockTicksHandle);
 
 public:
@@ -38,14 +51,16 @@ public:
         : m_ticks(ticks)
     {
     }
-    ClockTicksHandle(ClockTicksHandle&& other)
-        : m_ticks(exchange(other.m_ticks, nullptr))
-    {
-    }
     ~ClockTicksHandle();
 
-    // Hands the lease a tick, with where the Compositor had scrolled to then, and answers whether it wants the next one.
+    // Hands the lane a tick, with where the Compositor had scrolled to then, and answers whether it wants the next one.
     bool tick(i64 frame_time_nanoseconds, ReadonlySpan<Web::CompositorScrollOffset>) const;
+
+    // Hands the lane where the pointer went, or that it left, with the input event id of the mouse event the main thread
+    // takes beside it, and answers what the lanes want next.
+    PointerAnswer pointer_moved(Optional<Gfx::FloatPoint> device_position, u32 buttons, bool scrolled_since_frame, u64 input_event_id) const;
+
+    bool hands_on_to(ClockTicksHandle const& other) const { return m_ticks == other.m_ticks; }
 
 private:
     Layout::RustFFI::ClockTicks const* m_ticks { nullptr };
@@ -76,9 +91,28 @@ public:
     // end to offer the Compositor. Blocks until the channel exists.
     ErrorOr<IPC::TransportHandle> attach();
 
-    // Asynchronous. A context is armed until it declines a tick or the channel is lost; a tick that arrives for a
-    // context that is not armed is dropped. Arming an armed context replaces what it hands ticks to.
-    void arm(Web::CompositorContextId, double maximum_frames_per_second, OnTick);
+    // Asynchronous. Hands the pointer moves over the context to `ticks` from now on, until another document's ticks take
+    // their place or the channel is lost, and arms the context's ticks for them where they ask for them; with
+    // `tick_now_at`, ticks them at once at that frame time, where no display tick drives them already. A context is
+    // armed until it declines a tick or the channel is lost; a tick that arrives for a context that is not armed is
+    // dropped.
+    void arm_lane(Web::CompositorContextId, double maximum_frames_per_second, NonnullRefPtr<ClockTicksHandle> ticks, Optional<i64> tick_now_at);
+
+    // Asynchronous. Disarms the context, which is destroyed, and lets go of the ticks its pointer moves went to.
+    void forget_context(Web::CompositorContextId);
+
+    // Synchronous. Disarms every context, whose ticks a test injects itself from now on: no display tick reaches them
+    // after this returns. For a test.
+    void disarm_all_for_testing();
+
+    // Hands the ticks that hear of the pointer moves over the context a move, as the compositor hands them those over a
+    // page's context, from the lane of the document around a same-process iframe's. Asynchronous, but for a test that
+    // ticks by hand, whose ticks hear of it before this returns.
+    void hand_pointer_move(Web::CompositorContextId, Optional<Gfx::FloatPoint> device_position, u32 buttons, bool scrolled_since_frame, u64 input_event_id);
+
+    // Has a test tick the lanes by hand, whose pointer moves then arm no context.
+    void set_manual_for_testing(bool manual) { m_manual_for_testing = manual; }
+    bool is_manual_for_testing() const { return m_manual_for_testing; }
 
 private:
     struct ArmedContext {
@@ -91,15 +125,18 @@ private:
     RenderClock();
     intptr_t thread_main();
     [[nodiscard]] bool invoke_on_clock_thread(Function<void()>);
+    void run_on_clock_thread_and_wait(Function<void()>);
 
     // On the clock thread.
     ErrorOr<IPC::TransportHandle> replace_channel();
     void drop_channel();
     void request_clock_tick(Web::CompositorContextId, double maximum_frames_per_second);
     void did_receive_clock_tick(Web::CompositorContextId, i64 frame_time_nanoseconds, ReadonlySpan<Web::CompositorScrollOffset>);
+    void did_receive_pointer_move(Web::CompositorContextId, Optional<Gfx::FloatPoint> device_position, u32 buttons, bool scrolled_since_frame, u64 input_event_id);
     void did_lose_channel();
 
     NonnullRefPtr<Threading::Thread> m_thread;
+    Atomic<bool> m_manual_for_testing { false };
 
     Mutex m_mutex;
     ConditionVariable m_condition { m_mutex };
@@ -109,6 +146,11 @@ private:
     // Owned by the clock thread.
     RefPtr<RenderClockChannel> m_channel;
     HashMap<Web::CompositorContextId, ArmedContext> m_armed_contexts;
+    struct PointerLane {
+        double maximum_frames_per_second { 60.0 };
+        NonnullRefPtr<ClockTicksHandle> ticks;
+    };
+    HashMap<Web::CompositorContextId, PointerLane> m_pointer_lanes;
 };
 
 }
