@@ -630,6 +630,10 @@ void StyleComputer::finish_animation_refresh(Layout::BegunRead const& read, DOM:
 ComputedValuesFFI::FfiEffectTiming style_engine_effect_timing(Animations::KeyframeEffect const& effect, Animations::Animation const& animation)
 {
     ComputedValuesFFI::FfiEffectTiming timing {};
+
+    timing.is_relevant = animation.is_relevant();
+    timing.is_removed = animation.replace_state() == Animations::AnimationReplaceState::Removed;
+
     Optional<Animations::TimeValue::Type> unit;
     bool one_unit = true;
     auto duration = [&](Animations::TimeValue const& time) {
@@ -700,12 +704,10 @@ NonnullOwnPtr<StyleComputer::AnimationSample> StyleComputer::begin_animation_sam
         if (!animation)
             continue;
         auto timing = style_engine_effect_timing(*effect, *animation);
-        double current_key = 0;
+        Optional<double> current_key;
         if (!timing.decidable) {
-            auto output_progress = effect->transformed_progress();
-            if (!output_progress.has_value())
-                continue;
-            current_key = clamp(*output_progress * 100.0 * Animations::KeyframeEffect::AnimationKeyFrameKeyScaleFactor, static_cast<double>(NumericLimits<i64>::min()), static_cast<double>(NumericLimits<i64>::max()));
+            if (auto output_progress = effect->transformed_progress(); output_progress.has_value())
+                current_key = clamp(*output_progress * 100.0 * Animations::KeyframeEffect::AnimationKeyFrameKeyScaleFactor, static_cast<double>(NumericLimits<i64>::min()), static_cast<double>(NumericLimits<i64>::max()));
         }
         easing_points.unchecked_append({});
         sampled_effects.unchecked_append({
@@ -1266,7 +1268,7 @@ void StyleComputer::start_needed_transitions(Layout::BegunRead const& read, Comp
     // A transition action is provisional until the stabilization epoch commits, but the style
     // published by this pass must already reflect that decision. Rebuild the effect stack without
     // transitions which are being removed, then layer any proposed replacements on top.
-    if (!replaced_transition_effects.is_empty()) {
+    if (!replaced_transition_effects.is_empty() || !newly_started_transition_effects.is_empty()) {
         new_style.clear_animated_properties(Badge<StyleComputer> {});
         auto animations = abstract_element.element().get_animations_internal(
             Animations::Animatable::GetAnimationsSorted::Yes,
@@ -1286,14 +1288,16 @@ void StyleComputer::start_needed_transitions(Layout::BegunRead const& read, Comp
                     continue;
                 remaining_effects.append(keyframe_effect);
             }
+            remaining_effects.extend(newly_started_transition_effects);
+            quick_sort(remaining_effects, [](auto const& a, auto const& b) {
+                return Animations::KeyframeEffect::composite_order(a, b) < 0;
+            });
             if (!remaining_effects.is_empty())
                 collect_animations_into(read, abstract_element, remaining_effects.span(), new_style, AnimationRefresh::Yes);
         }
     }
 
-    // Immediately set the properties to the transitions' current values, to prevent single-frame jumps.
     if (!newly_started_transition_effects.is_empty()) {
-        collect_animations_into(read, abstract_element, newly_started_transition_effects.span(), new_style, AnimationRefresh::Yes);
         // NB: Construction does not invalidate animated style because the effects were just evaluated. Request the
         //     first animation frame directly so timeline updates can schedule subsequent animated style updates.
         m_document->page().client().request_frame();
@@ -2159,15 +2163,7 @@ void StyleComputer::apply_animated_properties_to_reconstruction(ComputedStyleWor
     auto const* animated_properties = computed_values.animated_properties();
     if (!animated_properties)
         return;
-    for (auto const& entry : animated_properties->entries()) {
-        auto property_id = static_cast<PropertyID>(entry.property);
-        style.set_animated_property(
-            Badge<StyleComputer> {}, property_id, animated_properties->property(property_id),
-            // NB: An adjustment wins over an important declaration as a transition's value does, and the working
-            //     set's flag says only that.
-            entry.result_of_transition || entry.post_compute_adjustment ? AnimatedPropertyResultOfTransition::Yes : AnimatedPropertyResultOfTransition::No,
-            entry.inherited ? ComputedStyleWorkingSet::Inherited::Yes : ComputedStyleWorkingSet::Inherited::No);
-    }
+    style.install_animated_overlay(Badge<StyleComputer> {}, animated_properties->overlay());
 }
 
 NonnullRefPtr<ComputedStyleWorkingSet> StyleComputer::reconstruct_computed_properties_for_animation(Layout::BegunRead const& read, StyleRecordID style_record) const
