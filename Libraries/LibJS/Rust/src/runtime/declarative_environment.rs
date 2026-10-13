@@ -21,6 +21,7 @@ use crate::gc::class_id::ClassId;
 use crate::gc::gc_ref_cell::GcRefCell;
 use crate::gc::visitor::{Trace, Visitor};
 use crate::interpreter::vm::Vm;
+use crate::jit::dependencies::{CellId, Dependency};
 use crate::layout::buffer::InterpreterBuffer;
 use crate::layout::cell::Gc;
 pub use crate::layout::environment::{DeclarativeEnvironment, DeclarativeEnvironmentRareData};
@@ -135,6 +136,13 @@ pub struct DeclarativeEnvironmentRareDataStorage {
     environment_shape_cache: Cell<Option<EnvironmentShapeCache>>,
     expected_binding_count: Cell<usize>,
     is_catch_environment: Cell<bool>,
+    /// Whether the environment notes which bindings are assigned (see `track_binding_assignments()`).
+    tracks_assignments: Cell<bool>,
+    /// The bindings that were assigned since their initialization, if the environment tracks assignments.
+    #[gc(untraced)]
+    assigned_bindings: GcRefCell<Bitmap>,
+    /// Whether JIT code depends on the environment getting no bindings and on its bindings staying unassigned.
+    has_dependent_code: Cell<bool>,
 }
 
 impl DeclarativeEnvironmentRareData {
@@ -148,6 +156,8 @@ impl DeclarativeEnvironmentRareData {
             && storage.environment_shape_cache.get().is_none()
             && storage.expected_binding_count.get() == 0
             && !storage.is_catch_environment.get()
+            && !storage.tracks_assignments.get()
+            && !storage.has_dependent_code.get()
     }
 }
 
@@ -175,10 +185,75 @@ unsafe impl Trace for DeclarativeEnvironment {
 
 impl Finalize for DeclarativeEnvironment {
     fn finalize(&self) {
-        self.binding_values.clear();
+        if self.binding_values_are_inline.get() {
+            self.binding_values.forget_unowned_storage();
+        } else {
+            self.binding_values.clear();
+        }
         self.free_rare_data();
     }
 }
+
+/// How many binding values the size classes of an environment class have room for after the fields of the class.
+/// Environments with more bindings keep them in malloc storage.
+pub const INLINE_BINDING_CAPACITIES: [u8; 8] = [1, 2, 3, 4, 6, 8, 12, 16];
+
+/// The cell sizes of the size classes of an environment class whose cells are `cell_size` bytes.
+pub const fn inline_binding_cell_sizes(cell_size: usize) -> [u32; INLINE_BINDING_CAPACITIES.len()] {
+    let mut cell_sizes = [0; INLINE_BINDING_CAPACITIES.len()];
+    let mut index = 0;
+    while index < cell_sizes.len() {
+        cell_sizes[index] = (cell_size + INLINE_BINDING_CAPACITIES[index] as usize * size_of::<Value>()) as u32;
+        index += 1;
+    }
+    cell_sizes
+}
+
+/// The size class (an index into INLINE_BINDING_CAPACITIES) of environments with room for `binding_capacity` binding
+/// values, or None if they need none or more than any size class has.
+pub fn inline_binding_size_class(binding_capacity: usize) -> Option<usize> {
+    if binding_capacity == 0 {
+        return None;
+    }
+    INLINE_BINDING_CAPACITIES
+        .iter()
+        .position(|&capacity| binding_capacity <= capacity as usize)
+}
+
+/// Moves `environment`, a new environment of class T without bindings, into the heap, with room for
+/// `binding_capacity` binding values in its cell if a size class of T (with `cell_sizes`, from
+/// inline_binding_cell_sizes()) has room for them.
+pub fn allocate_environment<T: GcCell>(
+    vm: &Vm,
+    environment: T,
+    binding_capacity: usize,
+    cell_sizes: &[u32; INLINE_BINDING_CAPACITIES.len()],
+    declarative: fn(&T) -> &DeclarativeEnvironment,
+) -> Gc<T> {
+    let heap = vm.heap();
+    let Some(size_class) = inline_binding_size_class(binding_capacity) else {
+        return heap.allocate(environment);
+    };
+    let environment = heap.allocate_with_size_class(
+        heap.size_classes(T::CLASS, cell_sizes)[size_class],
+        environment,
+        Value::EMPTY,
+    );
+    let declarative_environment = declarative(&environment);
+    // SAFETY: The cell has room for the size class's binding values after the fields of T, as long as it lives.
+    unsafe {
+        let inline_values = environment.as_ptr().cast::<u8>().add(size_of::<T>()).cast::<Value>();
+        declarative_environment
+            .binding_values
+            .use_unowned_storage(inline_values, usize::from(INLINE_BINDING_CAPACITIES[size_class]));
+    }
+    declarative_environment.binding_values_are_inline.set(true);
+    environment
+}
+
+/// The cell sizes of the size classes of declarative environments.
+pub const DECLARATIVE_ENVIRONMENT_CELL_SIZES: [u32; INLINE_BINDING_CAPACITIES.len()] =
+    inline_binding_cell_sizes(size_of::<DeclarativeEnvironment>());
 
 impl Deref for DeclarativeEnvironment {
     type Target = Environment;
@@ -235,6 +310,21 @@ impl DeclarativeEnvironment {
         vm.heap().allocate(Self::new(Self::CLASS, outer_environment))
     }
 
+    /// A new environment with room for `binding_capacity` bindings in its cell, if a size class has that much.
+    pub fn create_with_binding_capacity(
+        vm: &Vm,
+        outer_environment: Option<Gc<Environment>>,
+        binding_capacity: usize,
+    ) -> Gc<DeclarativeEnvironment> {
+        allocate_environment(
+            vm,
+            Self::new(Self::CLASS, outer_environment),
+            binding_capacity,
+            &DECLARATIVE_ENVIRONMENT_CELL_SIZES,
+            |environment| environment,
+        )
+    }
+
     fn rare_data(&self) -> Option<&DeclarativeEnvironmentRareData> {
         // SAFETY: The rare data belongs to this environment. Only drop_rare_data_if_empty and finalize free it, and
         // nothing keeps a reference to it across either.
@@ -268,7 +358,7 @@ impl DeclarativeEnvironment {
         rare_data.binding_flags.clear();
     }
 
-    fn increment_environment_serial_number(&self) {
+    fn increment_environment_serial_number(&self, vm: &Vm) {
         if self.shape.get().is_some() {
             return;
         }
@@ -278,7 +368,78 @@ impl DeclarativeEnvironment {
         {
             return;
         }
-        self.serial_number.set(self.serial_number.get() + 1);
+        let serial = self.serial_number.get();
+        self.serial_number.set(serial + 1);
+        if self.has_dependent_code() {
+            crate::jit::dependencies::invalidate_dependents(
+                vm,
+                Dependency::GlobalDeclarations {
+                    environment: CellId(core::ptr::from_ref(self) as u64),
+                    serial,
+                },
+            );
+        }
+    }
+
+    /// Makes the environment note which bindings are assigned after their initialization, which JIT code may treat
+    /// as constants until then. Only the global declarative environment does, which no static environment coordinate
+    /// reaches: nothing but `set_mutable_binding_direct()` and SetGlobal, which notes the bindings its caches find,
+    /// assigns its bindings.
+    pub fn track_binding_assignments(&self) {
+        self.ensure_rare_data().storage.tracks_assignments.set(true);
+    }
+
+    /// Whether binding `index` may have been assigned since its initialization.
+    pub fn binding_may_have_been_assigned(&self, index: usize) -> bool {
+        let Some(rare_data) = self
+            .rare_data()
+            .filter(|rare_data| rare_data.storage.tracks_assignments.get())
+        else {
+            return true;
+        };
+        let assigned = rare_data.storage.assigned_bindings.borrow();
+        index < assigned.size() && assigned.get(index)
+    }
+
+    /// Notes that binding `index` is assigned, or is about to be by code that does not tell the environment, which
+    /// invalidates JIT code that depends on it staying unassigned.
+    pub fn note_binding_assignment(&self, vm: &Vm, index: usize) {
+        let Some(rare_data) = self
+            .rare_data()
+            .filter(|rare_data| rare_data.storage.tracks_assignments.get())
+        else {
+            return;
+        };
+        {
+            let mut assigned = rare_data.storage.assigned_bindings.borrow_mut();
+            if index < assigned.size() && assigned.get(index) {
+                return;
+            }
+            if index >= assigned.size() {
+                let size = (index + 1).next_power_of_two().max(64);
+                assigned.grow(size, false);
+            }
+            assigned.set(index, true);
+        }
+        if rare_data.storage.has_dependent_code.get() {
+            crate::jit::dependencies::invalidate_dependents(
+                vm,
+                Dependency::GlobalBindingUnassigned {
+                    environment: CellId(core::ptr::from_ref(self) as u64),
+                    index: u32::try_from(index).expect("binding indices fit in u32"),
+                },
+            );
+        }
+    }
+
+    fn has_dependent_code(&self) -> bool {
+        self.rare_data()
+            .is_some_and(|rare_data| rare_data.storage.has_dependent_code.get())
+    }
+
+    /// Notes that JIT code depends on the environment getting no bindings, or on bindings of it staying unassigned.
+    pub fn set_has_dependent_code(&self) {
+        self.ensure_rare_data().storage.has_dependent_code.set(true);
     }
 
     pub fn is_catch_environment(&self) -> bool {
@@ -350,6 +511,9 @@ impl DeclarativeEnvironment {
             rare_data.binding_flags.append(flags);
         }
 
+        if self.binding_values_are_inline.get() && index == self.binding_values.capacity() {
+            self.move_binding_values_out_of_cell(index + 1);
+        }
         self.binding_values.append(if binding.initialized {
             binding.value
         } else {
@@ -426,8 +590,22 @@ impl DeclarativeEnvironment {
         (self.binding_flags(index) & Self::BINDING_FLAG_STRICT) != 0
     }
 
-    fn binding_is_mutable(&self, index: usize) -> bool {
+    pub(crate) fn binding_is_mutable(&self, index: usize) -> bool {
         (self.binding_flags(index) & Self::BINDING_FLAG_MUTABLE) != 0
+    }
+
+    /// Whether binding `index` is one the environment's shape declares mutable and never deleted, which every
+    /// environment with the shape declares the same way.
+    #[cfg(feature = "jit")]
+    pub(crate) fn binding_is_declared_mutable(&self, index: usize) -> bool {
+        let Some(shape) = self.shape.get() else {
+            return false;
+        };
+        if index >= shape.size() {
+            return false;
+        }
+        let flags = shape.binding_flags(index);
+        flags & Self::BINDING_FLAG_MUTABLE != 0 && flags & Self::BINDING_FLAG_CAN_BE_DELETED == 0
     }
 
     fn binding_can_be_deleted(&self, index: usize) -> bool {
@@ -574,7 +752,7 @@ impl DeclarativeEnvironment {
         });
         self.maybe_finalize_environment_shape(vm);
 
-        self.increment_environment_serial_number();
+        self.increment_environment_serial_number(vm);
 
         // 3. Return unused.
         Ok(())
@@ -596,7 +774,7 @@ impl DeclarativeEnvironment {
         });
         self.maybe_finalize_environment_shape(vm);
 
-        self.increment_environment_serial_number();
+        self.increment_environment_serial_number(vm);
 
         // 3. Return unused.
         Ok(())
@@ -687,6 +865,7 @@ impl DeclarativeEnvironment {
         value: Value,
         strict: bool,
     ) -> ThrowCompletionOr<()> {
+        self.note_binding_assignment(vm, index);
         let strict = strict || self.binding_is_strict(index);
 
         if !self.binding_is_initialized(index) {
@@ -781,7 +960,7 @@ impl DeclarativeEnvironment {
     }
 
     // 9.1.1.1.7 DeleteBinding ( N ), https://tc39.es/ecma262/#sec-declarative-environment-records-deletebinding-n
-    pub fn delete_binding(&self, _vm: &Vm, name: &Utf16FlyString) -> ThrowCompletionOr<bool> {
+    pub fn delete_binding(&self, vm: &Vm, name: &Utf16FlyString) -> ThrowCompletionOr<bool> {
         // 1. Assert: envRec has a binding for the name that is the value of N.
         let binding_and_index = self
             .find_binding_and_index(name)
@@ -803,7 +982,7 @@ impl DeclarativeEnvironment {
         // NOTE: We keep the entry in the parallel vectors to avoid disturbing indices.
         self.clear_binding(name, index);
 
-        self.increment_environment_serial_number();
+        self.increment_environment_serial_number(vm);
 
         // 4. Return true.
         Ok(true)
@@ -862,11 +1041,22 @@ impl DeclarativeEnvironment {
         {
             return false;
         }
+        if self.binding_values_are_inline.get() && index == self.binding_values.capacity() {
+            self.move_binding_values_out_of_cell(index + 1);
+        }
         self.binding_values.append(Value::EMPTY);
         true
     }
 
+    fn move_binding_values_out_of_cell(&self, needed_capacity: usize) {
+        self.binding_values.move_to_owned_storage(needed_capacity);
+        self.binding_values_are_inline.set(false);
+    }
+
     pub fn ensure_capacity(&self, needed_capacity: usize) {
+        if needed_capacity > self.binding_values.capacity() && self.binding_values_are_inline.get() {
+            self.move_binding_values_out_of_cell(needed_capacity);
+        }
         self.binding_values.ensure_capacity(needed_capacity);
         if self.shape.get().is_some() || needed_capacity == 0 {
             return;
@@ -882,7 +1072,9 @@ impl DeclarativeEnvironment {
     }
 
     pub fn shrink_to_fit(&self) {
-        self.binding_values.shrink_to_fit();
+        if !self.binding_values_are_inline.get() {
+            self.binding_values.shrink_to_fit();
+        }
 
         let Some(rare_data) = self.rare_data() else {
             return;

@@ -68,14 +68,19 @@ Compositing::AsyncScrollEnqueueResult CompositorContextHandle::async_scroll_by(U
     return m_host.async_scroll_by(m_context_id, expected_document_id, position, delta_in_device_pixels, viewport_rect, wheel_delta_precision, scroll_gesture_phase, modifiers, operation_tracking);
 }
 
-Compositing::AsyncScrollEnqueueResult CompositorContextHandle::smooth_scroll_to(Web::AsyncScrollNodeStableID stable_node_id, Gfx::FloatPoint offset_in_device_pixels, Gfx::FloatPoint main_thread_offset_in_device_pixels, Gfx::IntRect viewport_rect, Compositing::ScrollAnimationKind animation_kind, Compositing::SmoothScrollInitiator initiator)
+Compositing::AsyncScrollEnqueueResult CompositorContextHandle::smooth_scroll_to(Web::AsyncScrollNodeStableID stable_node_id, Gfx::FloatPoint offset_in_device_pixels, Gfx::FloatPoint main_thread_offset_in_device_pixels, Gfx::IntRect viewport_rect, Compositing::ScrollAnimationKind animation_kind, Compositing::SmoothScrollInitiator initiator, Optional<Compositing::AsyncScrollOperationID> operation_to_continue)
 {
-    return m_host.smooth_scroll_to(m_context_id, stable_node_id, offset_in_device_pixels, main_thread_offset_in_device_pixels, viewport_rect, animation_kind, initiator);
+    return m_host.smooth_scroll_to(m_context_id, stable_node_id, offset_in_device_pixels, main_thread_offset_in_device_pixels, viewport_rect, animation_kind, initiator, operation_to_continue);
 }
 
 void CompositorContextHandle::cancel_smooth_scroll(Web::AsyncScrollNodeStableID stable_node_id)
 {
     m_host.cancel_smooth_scroll(m_context_id, stable_node_id);
+}
+
+Gfx::FloatPoint CompositorContextHandle::elastic_overscroll_stretch_for_testing(Web::AsyncScrollNodeStableID stable_node_id)
+{
+    return m_host.elastic_overscroll_stretch_for_testing(m_context_id, stable_node_id);
 }
 
 Compositing::PendingAsyncScrollUpdates CompositorContextHandle::take_pending_async_scroll_updates(Compositing::AsyncScrollUpdateFreshness freshness)
@@ -411,10 +416,10 @@ Compositing::AsyncScrollEnqueueResult CompositorHost::async_scroll_by(Web::Compo
     return {};
 }
 
-Compositing::AsyncScrollEnqueueResult CompositorHost::smooth_scroll_to(Web::CompositorContextId context_id, Web::AsyncScrollNodeStableID stable_node_id, Gfx::FloatPoint offset_in_device_pixels, Gfx::FloatPoint main_thread_offset_in_device_pixels, Gfx::IntRect viewport_rect, Compositing::ScrollAnimationKind animation_kind, Compositing::SmoothScrollInitiator initiator)
+Compositing::AsyncScrollEnqueueResult CompositorHost::smooth_scroll_to(Web::CompositorContextId context_id, Web::AsyncScrollNodeStableID stable_node_id, Gfx::FloatPoint offset_in_device_pixels, Gfx::FloatPoint main_thread_offset_in_device_pixels, Gfx::IntRect viewport_rect, Compositing::ScrollAnimationKind animation_kind, Compositing::SmoothScrollInitiator initiator, Optional<Compositing::AsyncScrollOperationID> operation_to_continue)
 {
     if (auto* connection = compositor_connection())
-        return connection->smooth_scroll_to(context_id, stable_node_id, offset_in_device_pixels, main_thread_offset_in_device_pixels, viewport_rect, animation_kind, initiator);
+        return connection->smooth_scroll_to(context_id, stable_node_id, offset_in_device_pixels, main_thread_offset_in_device_pixels, viewport_rect, animation_kind, initiator, operation_to_continue);
     return {};
 }
 
@@ -422,6 +427,13 @@ void CompositorHost::cancel_smooth_scroll(Web::CompositorContextId context_id, W
 {
     if (auto* connection = compositor_connection())
         connection->cancel_smooth_scroll(context_id, stable_node_id);
+}
+
+Gfx::FloatPoint CompositorHost::elastic_overscroll_stretch_for_testing(Web::CompositorContextId context_id, Web::AsyncScrollNodeStableID stable_node_id)
+{
+    if (auto* connection = compositor_connection())
+        return connection->elastic_overscroll_stretch_for_testing(context_id, stable_node_id);
+    return {};
 }
 
 Compositing::PendingAsyncScrollUpdates CompositorHost::take_pending_async_scroll_updates(Web::CompositorContextId context_id, Compositing::AsyncScrollUpdateFreshness freshness)

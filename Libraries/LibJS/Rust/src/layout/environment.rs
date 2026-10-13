@@ -23,6 +23,8 @@ pub struct Environment {
     pub this_binding_status: Cell<u8>,
     pub permanently_screwed_by_eval: Cell<bool>,
     pub declarative: Cell<bool>,
+    /// Whether the binding values of a declarative environment are stored in its cell, after the fields of its class.
+    pub binding_values_are_inline: Cell<bool>,
     pub outer: Cell<Option<Gc<Environment>>>,
 }
 
@@ -60,6 +62,9 @@ pub struct PrivateEnvironment {
 pub struct EnvironmentShape {
     pub header: CellHeader,
     pub binding_flags: InterpreterBuffer<u8>,
+    /// The first of the names of the bindings (the one-word Utf16FlyStrings of the storage), one per flag, which never
+    /// change.
+    pub binding_names: *const usize,
     /// Whether no two bindings have the same name, and none has the empty name.
     pub has_unique_binding_names: bool,
     pub storage: EnvironmentShapeStorage,

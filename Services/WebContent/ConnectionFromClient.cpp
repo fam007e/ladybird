@@ -26,7 +26,7 @@
 #include <LibGC/Heap.h>
 #include <LibGfx/Bitmap.h>
 #include <LibGfx/Color.h>
-#include <LibGfx/SystemTheme.h>
+#include <LibGfx/Palette.h>
 #include <LibIPC/Transport.h>
 #include <LibJS/Runtime/ConsoleObject.h>
 #include <LibJS/Runtime/Date.h>
@@ -239,6 +239,12 @@ void ConnectionFromClient::set_viewport_is_fullscreen(Web::PageId page_id, Web::
 {
     if (auto page = this->page(page_id); page.has_value())
         page->page().set_viewport_is_fullscreen(is_fullscreen);
+}
+
+void ConnectionFromClient::deny_fullscreen_window(Web::PageId page_id)
+{
+    if (auto page = this->page(page_id); page.has_value())
+        page->page().did_deny_fullscreen_window();
 }
 
 void ConnectionFromClient::set_ongoing_navigation(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id, Utf16String navigation_id)
@@ -466,10 +472,10 @@ void ConnectionFromClient::compositor_process_reconnected()
     m_page_host->compositor_process_reconnected();
 }
 
-void ConnectionFromClient::connect_to_request_server(IPC::TransportHandle handle)
+void ConnectionFromClient::connect_to_request_server(IPC::TransportHandle handle, int client_id)
 {
     if (on_request_server_connection)
-        on_request_server_connection(handle);
+        on_request_server_connection(handle, client_id);
 }
 
 ErrorOr<NonnullOwnPtr<IPC::Transport>> ConnectionFromClient::request_media_server_transport()
@@ -477,6 +483,14 @@ ErrorOr<NonnullOwnPtr<IPC::Transport>> ConnectionFromClient::request_media_serve
     auto response = send_sync_but_allow_failure<Messages::WebContentClient::RequestMediaServerConnection>();
     if (!response || !response->handle().has_value())
         return Error::from_string_literal("The Browser did not connect a media server");
+    return response->take_handle()->create_transport();
+}
+
+ErrorOr<NonnullOwnPtr<IPC::Transport>> ConnectionFromClient::request_audio_server_transport()
+{
+    auto response = send_sync_but_allow_failure<Messages::WebContentClient::RequestAudioServerConnection>();
+    if (!response || !response->handle().has_value())
+        return Error::from_string_literal("The Browser did not connect an audio server");
     return response->take_handle()->create_transport();
 }
 
@@ -499,7 +513,6 @@ void ConnectionFromClient::update_system_theme(Web::PageId page_id, Core::Anonym
     if (!page.has_value())
         return;
 
-    Gfx::set_system_theme(theme_buffer);
     auto impl = Gfx::PaletteImpl::create_with_anonymous_buffer(theme_buffer);
     page->set_palette_impl(*impl);
 }
@@ -3170,6 +3183,12 @@ void ConnectionFromClient::geolocation_position_response(Web::PageId page_id, u6
 {
     if (auto page = this->page(page_id); page.has_value())
         page->geolocation_position_response(request_id, position, error_code);
+}
+
+void ConnectionFromClient::permission_request_completed(Web::PageId page_id, u64 request_id, bool granted)
+{
+    if (auto page = this->page(page_id); page.has_value())
+        page->permission_request_completed(request_id, granted);
 }
 
 void ConnectionFromClient::set_has_focus(Web::PageId page_id, bool has_focus)

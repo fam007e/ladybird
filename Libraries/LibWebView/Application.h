@@ -90,6 +90,7 @@ public:
     ErrorOr<int> execute();
 
     static Application& the() { return *s_the; }
+    static bool is_initialized() { return s_the != nullptr; }
 
     static Settings& settings() { return *the().m_settings; }
     static Profile const& profile() { return *the().m_profile; }
@@ -103,6 +104,7 @@ public:
     static FontService& font_service() { return *the().m_font_service; }
     static FontServiceHost& font_service_host() { return *the().m_font_service_host; }
     JsonValue const& site_compatibility_data() const { return m_site_compatibility_data; }
+    bool blocks_pop_ups() const;
     ErrorOr<void> reload_site_compatibility_data();
 
     bool claim_cpu_profiler(ProcessType);
@@ -111,9 +113,12 @@ public:
     virtual Optional<String> system_font_family() const { return {}; }
     virtual Optional<String> ui_font_family() const { return {}; }
 
-    static Requests::RequestClient& request_server_client(IsPrivate = IsPrivate::No);
-    static Requests::RequestControlClient& request_server_control_client() { return *the().m_request_server_control_client; }
-    static bool has_request_server_control_client() { return the().m_request_server_control_client; }
+    static RequestServerManager& request_server_manager() { return *the().m_request_server_manager; }
+    // The UI process's own client of the session's RequestServer with no site.
+    static ErrorOr<NonnullRefPtr<Requests::RequestClient>> request_server_client(IsPrivate = IsPrivate::No);
+    // The control connection of the default session's RequestServer with no site.
+    static Requests::RequestControlClient& request_server_control_client();
+    static bool has_request_server_control_client() { return the().m_request_server_manager; }
 #if defined(HAVE_WASM_COMPILER_SERVICE)
     static WasmCompilerClient::Client& wasm_compiler_client() { return *the().m_wasm_compiler_client; }
 #endif
@@ -125,6 +130,9 @@ public:
     // Returns true if the platform sends momentum scroll events after a touchpad flick.
     // If it does not, the compositor makes the fling.
     virtual bool platform_reports_scroll_momentum() const { return true; }
+    // Returns true if a touchpad may pull a scroller past the edges of its scroll range, from where it springs back.
+    // This needs the platform to say when the fingers lift from the touchpad, or the scroller would stay stretched.
+    virtual bool platform_scrolls_elastically() const { return false; }
 
     void appearance_changed(Badge<ApplicationSettingsObserver>);
     void tab_settings_changed(Badge<ApplicationSettingsObserver>);
@@ -170,6 +178,10 @@ public:
 
     // A RequestServer client uses the cookies of the browsing session it was created for, whatever RequestServer says.
     void did_connect_request_server_client(int client_id, BrowsingSession&, RequestServer::SiteBinding);
+    void did_disconnect_request_server_client(int client_id);
+    // Installs what every RequestServer asks the UI process for: cookies, and where to put the HSTS policies and
+    // cookies of responses.
+    void configure_request_server_control_client(Requests::RequestControlClient&);
     RefPtr<BrowsingSession> session_for_request_server_client(int client_id) const;
     Vector<int> request_server_client_ids_for_testing(BrowsingSession const&) const;
 
@@ -251,7 +263,7 @@ public:
 
     // FIXME: Should these methods be part of Application, instead of deferring to ProcessManager?
 #if defined(AK_OS_MACH)
-    void set_process_mach_port(pid_t, Core::MachPort&&);
+    void set_process_task_name_port(pid_t, Core::MachPort&&);
 #endif
     Optional<Process&> find_process(pid_t);
 
@@ -374,7 +386,7 @@ protected:
     virtual bool should_coordinate_browser_process() const { return true; }
     // An application whose state must not leak between runs — or into a developer's own browsing state.
     virtual bool should_use_temporary_profile_by_default() const { return false; }
-    virtual SiteIsolationMode default_site_isolation_mode() const { return SiteIsolationMode::TopLevel; }
+    virtual SiteIsolationMode default_site_isolation_mode() const { return SiteIsolationMode::IFrame; }
 
     virtual Optional<ByteString> ask_user_for_download_path([[maybe_unused]] ByteString const& file) const { return {}; }
 
@@ -571,9 +583,7 @@ private:
     bool m_webdriver_browser_connection_failed { false };
     WebDriverSessionConfig m_webdriver_session_config;
 
-    RefPtr<Requests::RequestControlClient> m_request_server_control_client;
-    RefPtr<Requests::RequestClient> m_request_server_client;
-    RefPtr<Requests::RequestClient> m_private_request_server_client;
+    OwnPtr<RequestServerManager> m_request_server_manager;
     HashMap<pid_t, Function<void()>> m_image_decoder_exit_handlers;
 #if defined(HAVE_WASM_COMPILER_SERVICE)
     RefPtr<WasmCompilerClient::Client> m_wasm_compiler_client;

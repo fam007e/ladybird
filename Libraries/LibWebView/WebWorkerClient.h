@@ -43,6 +43,7 @@ public:
     void remove_blob_url_entries();
 
     pid_t pid() const { return m_pid; }
+    void terminate_process();
 
     Optional<CanonicalEnvironmentSettingsObject const&> hosted_environment(Web::HTML::EnvironmentId const& environment_id) const;
     void set_pid(pid_t pid) { m_pid = pid; }
@@ -74,8 +75,11 @@ private:
     pid_t m_pid { -1 };
     Web::HTML::WorkerAgentId m_agent_id { 0 };
 
-    // The controller connection to the MediaServer spawned for this process, from its first media use until it exits.
+    // The controller connections to the MediaServer and AudioServer spawned for this process, from its first media use
+    // until it exits.
     RefPtr<MediaClient::Client> m_media_server_client;
+    RefPtr<AudioServerControlClient> m_audio_server_client;
+    u64 m_audio_tab_id { 0 };
 };
 
 }

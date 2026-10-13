@@ -21,8 +21,7 @@ use crate::layout::cell::Gc;
 use crate::layout::execution_context::{ExecutionContext, ScriptOrModule};
 use crate::layout::value::Value;
 use crate::runtime::abstract_operations::{
-    call, get_this_environment, new_declarative_environment, new_object_environment, new_private_environment,
-    perform_import_call,
+    call, get_this_environment, new_object_environment, new_private_environment, perform_import_call,
 };
 use crate::runtime::completion::{Must, ThrowCompletionOr};
 use crate::runtime::declarative_environment::DeclarativeEnvironment;
@@ -126,7 +125,8 @@ pub fn create_lexical_environment(
     capacity: u32,
     is_catch_environment: bool,
 ) -> Gc<DeclarativeEnvironment> {
-    let environment = new_declarative_environment(vm, parent);
+    // NB: NewDeclarativeEnvironment(parent), with room for the bindings the code creates.
+    let environment = DeclarativeEnvironment::create_with_binding_capacity(vm, Some(parent), capacity as usize);
     environment.set_environment_shape_cache(shape_cache, capacity as usize);
     environment.ensure_capacity(capacity as usize);
     environment.set_is_catch_environment(is_catch_environment);
@@ -142,7 +142,9 @@ pub fn create_variable_environment(
     shape_cache: Option<EnvironmentShapeCache>,
     capacity: u32,
 ) -> Gc<DeclarativeEnvironment> {
-    let var_environment = new_declarative_environment(vm, lexical_environment);
+    // NB: NewDeclarativeEnvironment(lexicalEnvironment), with room for the bindings the code creates.
+    let var_environment =
+        DeclarativeEnvironment::create_with_binding_capacity(vm, Some(lexical_environment), capacity as usize);
     if let Some(shape_cache) = shape_cache {
         var_environment.set_environment_shape_cache(shape_cache, capacity as usize);
     }
@@ -553,6 +555,61 @@ pub fn get_binding(
     advance_or_continue(pc, next_pc, op::GetBinding::LENGTH)
 }
 
+/// Only JIT code calls this: the interpreter reads initialized bindings inline.
+pub fn get_initialized_binding(
+    vm: &Vm,
+    pc: u32,
+    instruction: &op::GetInitializedBinding,
+    values: &mut op::GetInitializedBindingValues,
+) -> SlowPathControl {
+    let next_pc = asm_get_binding(
+        vm,
+        pc,
+        &mut values.dst,
+        instruction.cache,
+        AsmBindingIsKnownToBeInitialized::Yes,
+    );
+    advance_or_continue(pc, next_pc, op::GetInitializedBinding::LENGTH)
+}
+
+/// Only JIT code calls this: the interpreter initializes bindings inline.
+pub fn initialize_lexical_binding(
+    vm: &Vm,
+    pc: u32,
+    instruction: &op::InitializeLexicalBinding,
+    values: &mut op::InitializeLexicalBindingValues,
+) -> SlowPathControl {
+    let next_pc = asm_initialize_or_set_binding(
+        vm,
+        pc,
+        EnvironmentMode::Lexical,
+        BindingInitializationMode::Initialize,
+        strict_of(&instruction.header),
+        values.src,
+        instruction.cache,
+    );
+    advance_or_continue(pc, next_pc, op::InitializeLexicalBinding::LENGTH)
+}
+
+/// Only JIT code calls this: the interpreter initializes bindings inline.
+pub fn initialize_variable_binding(
+    vm: &Vm,
+    pc: u32,
+    instruction: &op::InitializeVariableBinding,
+    values: &mut op::InitializeVariableBindingValues,
+) -> SlowPathControl {
+    let next_pc = asm_initialize_or_set_binding(
+        vm,
+        pc,
+        EnvironmentMode::Var,
+        BindingInitializationMode::Initialize,
+        strict_of(&instruction.header),
+        values.src,
+        instruction.cache,
+    );
+    advance_or_continue(pc, next_pc, op::InitializeVariableBinding::LENGTH)
+}
+
 pub fn dynamic_get_binding(
     vm: &Vm,
     pc: u32,
@@ -841,6 +898,8 @@ pub fn set_global(vm: &Vm, pc: u32, instruction: &op::SetGlobal, values: &mut op
     let mut offset = None;
     if asm_try!(vm, pc, declarative_record.has_binding(&identifier, Some(&mut offset))) {
         let offset = offset.expect("the global declarative record reports the index of its bindings");
+        // NB: Fast paths assign the binding through the cache from now on, without telling the environment.
+        declarative_record.note_binding_assignment(vm, offset);
         cache().environment_binding_index.set(offset as u32);
         cache().has_environment_binding_index.set(true);
         asm_try!(

@@ -136,6 +136,7 @@ void Page::visit_edges(JS::Cell::Visitor& visitor)
     visitor.visit(m_offscreen_canvases_pending_placeholder_commit);
     for (auto const& request : m_pending_geolocation_requests)
         visitor.visit(request.value.callback);
+    visitor.visit(m_pending_permission_requests);
     m_pending_fullscreen_operations.for_each([&](auto const& operation) {
         operation.visit([&](PendingFullscreenEnter const& enter_operation) {
                 visitor.visit(enter_operation.element);
@@ -268,6 +269,18 @@ Gfx::Palette Page::palette() const
     return m_client->palette();
 }
 
+static CSSPixelRect screen_rect_in_css_pixels_ignoring_zoom(PageClient const& client)
+{
+    auto device_pixel_rect = client.screen_rect();
+    auto scale = client.device_pixel_ratio();
+    return {
+        device_pixel_rect.x().value() / scale,
+        device_pixel_rect.y().value() / scale,
+        device_pixel_rect.width().value() / scale,
+        device_pixel_rect.height().value() / scale
+    };
+}
+
 // https://drafts.csswg.org/cssom-view-1/#web-exposed-screen-area
 CSSPixelRect Page::web_exposed_screen_area() const
 {
@@ -278,15 +291,10 @@ CSSPixelRect Page::web_exposed_screen_area() const
     // 4. Otherwise, return one of the following:
     //    - The area of the output device, in CSS pixels.
     //    - The area of the viewport, in CSS pixels.
-    // NB: This is the area of the output device, but in device pixels.
-    // See: https://github.com/LadybirdBrowser/ladybird/pull/4084
-    auto device_pixel_rect = m_client->screen_rect();
-    return {
-        device_pixel_rect.x().value(),
-        device_pixel_rect.y().value(),
-        device_pixel_rect.width().value(),
-        device_pixel_rect.height().value()
-    };
+    // NB: This is the area of the output device in CSS pixels at a zoom level of 1. Like Chrome and Safari, we leave the
+    //     page zoom out of it, so zooming in doesn't make sites switch to their tablet or phone layouts.
+    //     See: https://github.com/LadybirdBrowser/ladybird/pull/4084
+    return screen_rect_in_css_pixels_ignoring_zoom(*m_client);
 }
 
 // https://drafts.csswg.org/cssom-view-1/#web-exposed-available-screen-area
@@ -300,14 +308,8 @@ CSSPixelRect Page::web_exposed_available_screen_area() const
     //    - The available area of the rendering surface of the output device, in CSS pixels.
     //    - The area of the output device, in CSS pixels.
     //    - The area of the viewport, in CSS pixels.
-    // NB: This is the area of the output device, but in device pixels. See note in web_exposed_screen_area()
-    auto device_pixel_rect = m_client->screen_rect();
-    return {
-        device_pixel_rect.x().value(),
-        device_pixel_rect.y().value(),
-        device_pixel_rect.width().value(),
-        device_pixel_rect.height().value()
-    };
+    // NB: This is the area of the output device. See note in web_exposed_screen_area().
+    return screen_rect_in_css_pixels_ignoring_zoom(*m_client);
 }
 
 CSS::PreferredColorScheme Page::preferred_color_scheme() const
@@ -1289,6 +1291,19 @@ void Page::unregister_emulated_position_data_observer(u64 observer_id)
     m_emulated_position_data_observers.remove(observer_id);
 }
 
+void Page::request_permission(Utf16String const& name, PermissionPromptCallback callback)
+{
+    auto request_id = m_next_permission_request_id++;
+    m_pending_permission_requests.set(request_id, callback);
+    client().page_did_request_permission(request_id, name);
+}
+
+void Page::permission_request_completed(u64 request_id, bool granted)
+{
+    if (auto callback = m_pending_permission_requests.take(request_id); callback.has_value())
+        callback.value()->function()(granted);
+}
+
 u64 Page::request_geolocation_position(GeolocationPositionCallback callback, GeolocationRequestType type)
 {
     // This is the browser-process bridge for the Geolocation spec's "try to acquire position data from the underlying system" step.
@@ -2084,6 +2099,20 @@ void Page::set_viewport_is_fullscreen(ViewportIsFullscreen is_fullscreen)
         return;
     m_viewport_is_fullscreen = is_fullscreen;
     m_fullscreen_ipc_sent_to_ui = false;
+    process_pending_fullscreen_operations();
+}
+
+// AD-HOC: The UI process makes the window fullscreen only for user activation from input it delivered. A request it
+//         refuses fails as one without transient activation does, instead of waiting for the window forever.
+void Page::did_deny_fullscreen_window()
+{
+    if (!m_fullscreen_ipc_sent_to_ui || m_viewport_is_fullscreen == ViewportIsFullscreen::Yes || m_pending_fullscreen_operations.is_empty())
+        return;
+    auto* enter = m_pending_fullscreen_operations.head().get_pointer<PendingFullscreenEnter>();
+    if (!enter || enter->container_chain != ContainerChain::NotStarted || enter->error != DOM::RequestFullscreenError::False)
+        return;
+    m_fullscreen_ipc_sent_to_ui = false;
+    enter->error = DOM::RequestFullscreenError::NoTransientUserActivation;
     process_pending_fullscreen_operations();
 }
 

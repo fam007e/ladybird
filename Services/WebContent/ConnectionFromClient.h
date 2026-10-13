@@ -69,11 +69,12 @@ public:
     Web::Compositor::CompositorConnection* compositor_process_connection() const;
     void did_destroy_compositor_context(Web::CompositorContextId);
 
-    Function<void(IPC::TransportHandle const&)> on_request_server_connection;
+    Function<void(IPC::TransportHandle const&, Optional<int> client_id)> on_request_server_connection;
     Function<void(IPC::TransportHandle const&)> on_image_decoder_connection;
 
     // Asks the Browser to spawn this process's MediaServer if it has none, and to connect a client to it.
     ErrorOr<NonnullOwnPtr<IPC::Transport>> request_media_server_transport();
+    ErrorOr<NonnullOwnPtr<IPC::Transport>> request_audio_server_transport();
 #if defined(HAVE_WASM_COMPILER_SERVICE)
     Function<void(IPC::TransportHandle)> on_wasm_compiler_connection;
 #endif
@@ -112,7 +113,7 @@ private:
     virtual void run_webdriver_user_prompt_handling(Web::PageId page_id, u64 request_id) override;
     virtual void did_handle_webdriver_mouse_event(Web::PageId page_id, u64 request_id) override;
     virtual void connect_to_web_ui(Web::PageId page_id, IPC::TransportHandle handle) override;
-    virtual void connect_to_request_server(IPC::TransportHandle handle) override;
+    virtual void connect_to_request_server(IPC::TransportHandle handle, int client_id) override;
     virtual void connect_to_test_endpoint(IPC::TransportHandle handle) override;
     virtual void connect_to_image_decoder(IPC::TransportHandle handle) override;
     virtual void connect_to_wasm_compiler(IPC::TransportHandle handle) override;
@@ -162,6 +163,7 @@ private:
     virtual void complete_history_operation(Web::PageId page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::HistoryStepResult result, Optional<i32> committed_step, u64 session_history_entry_count) override;
     virtual void set_viewport(Web::PageId page_id, Web::DevicePixelSize, double device_pixel_ratio, Web::ViewportIsFullscreen is_fullscreen) override;
     virtual void set_viewport_is_fullscreen(Web::PageId page_id, Web::ViewportIsFullscreen is_fullscreen) override;
+    virtual void deny_fullscreen_window(Web::PageId page_id) override;
     virtual void key_event(Web::PageId page_id, Web::KeyEvent) override;
     virtual void mouse_event(Web::PageId page_id, Web::MouseEvent) override;
     virtual void mouse_event_in_hosted_root(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id, Web::MouseEvent) override;
@@ -240,6 +242,7 @@ private:
     virtual void set_enable_global_privacy_control(Web::PageId page_id, bool) override;
     virtual void set_geolocation_emulated_position(Web::PageId page_id, WebView::GeolocationPositionData, Optional<u16> error_code) override;
     virtual void geolocation_position_response(Web::PageId page_id, u64 request_id, WebView::GeolocationPositionData, Optional<u16> error_code) override;
+    virtual void permission_request_completed(Web::PageId page_id, u64 request_id, bool granted) override;
     virtual void set_has_focus(Web::PageId page_id, bool) override;
     virtual void set_focused_navigable(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id) override;
     virtual void consume_user_activation(Web::PageId page_id, Web::HTML::UserActivationConsumption) override;

@@ -5,6 +5,7 @@
  */
 
 #include <AK/LexicalPath.h>
+#include <LibAudio/ClientConnection.h>
 #include <LibCore/ArgsParser.h>
 #include <LibCore/CrashHandler.h>
 #include <LibCore/Environment.h>
@@ -24,7 +25,6 @@
 #include <LibMain/Main.h>
 #include <LibMediaClient/Client.h>
 #include <LibRequests/RequestClient.h>
-#include <LibSandbox/ConnectBroker.h>
 #include <LibUnicode/TimeZone.h>
 #include <LibWeb/Bindings/MainThreadVM.h>
 #include <LibWeb/DOM/Document.h>
@@ -102,7 +102,7 @@ static void install_crash_signal_handlers()
 }
 #endif
 
-static ErrorOr<void> connect_to_resource_loader(GC::Heap& heap, IPC::TransportHandle const& handle);
+static ErrorOr<void> connect_to_resource_loader(GC::Heap& heap, IPC::TransportHandle const& handle, Optional<int> client_id);
 static ErrorOr<void> connect_to_image_decoder(IPC::TransportHandle const& handle);
 
 ErrorOr<int> ladybird_main(Main::Arguments arguments)
@@ -122,7 +122,6 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
     StringView mach_server_name {};
     Vector<ByteString> certificates;
     int crash_report_fd = -1;
-    int connect_broker_fd = -1;
     bool enable_test_mode = false;
     bool expose_experimental_interfaces = false;
     bool expose_internals_object = false;
@@ -140,7 +139,6 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
 
     Core::ArgsParser args_parser;
     args_parser.add_option(crash_report_fd, "Descriptor for anonymous crash diagnostics", "crash-report-fd", 0, "fd");
-    args_parser.add_option(connect_broker_fd, "Descriptor for the sandbox connection broker", "connect-broker-fd", 0, "fd");
     args_parser.add_option(enable_test_mode, "Enable test mode", "test-mode");
     args_parser.add_option(expose_experimental_interfaces, "Expose experimental IDL interfaces", "expose-experimental-interfaces");
     args_parser.add_option(expose_internals_object, "Expose internals object", "expose-internals-object");
@@ -215,13 +213,8 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
         JS::set_log_all_js_exceptions(true);
     }
 
-#if defined(AK_OS_LINUX)
-    if (connect_broker_fd != -1)
-        Sandbox::set_connect_broker_fd(connect_broker_fd);
-#endif
-
     if (!disable_sandbox)
-        TRY(RendererSandbox::apply_sandbox(mach_server_name, RendererSandbox::AudioAccess::Yes));
+        TRY(RendererSandbox::apply_sandbox(mach_server_name));
 
 #if defined(AK_OS_MACOS)
     auto browser_port = TRY(Core::MachPort::look_up_from_bootstrap_server(ByteString { mach_server_name }));
@@ -233,8 +226,8 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
 #endif
 
     auto& heap = Web::Bindings::main_thread_vm().heap();
-    webcontent_client->on_request_server_connection = [&heap](auto const& handle) {
-        if (auto result = connect_to_resource_loader(heap, handle); result.is_error())
+    webcontent_client->on_request_server_connection = [&heap](auto const& handle, auto client_id) {
+        if (auto result = connect_to_resource_loader(heap, handle, client_id); result.is_error())
             dbgln("Failed to connect to resource loader: {}", result.error());
     };
     webcontent_client->on_image_decoder_connection = [](auto const& handle) {
@@ -244,6 +237,10 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
 
     MediaClient::Client::set_transport_factory([webcontent_client] {
         return webcontent_client->request_media_server_transport();
+    });
+    // WebAudio's output plays through the AudioServer; this process never reaches a device itself.
+    Audio::ClientConnection::set_transport_factory([webcontent_client] {
+        return webcontent_client->request_audio_server_transport();
     });
 
 #if defined(HAVE_WASM_COMPILER_SERVICE)
@@ -259,10 +256,13 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
     return event_loop.exec();
 }
 
-ErrorOr<void> connect_to_resource_loader(GC::Heap& heap, IPC::TransportHandle const& handle)
+ErrorOr<void> connect_to_resource_loader(GC::Heap& heap, IPC::TransportHandle const& handle, Optional<int> client_id)
 {
     auto transport = TRY(handle.create_transport());
-    auto request_client = TRY(try_make_ref_counted<Requests::RequestClient>(move(transport)));
+    // Querying the client ID runs the event loop and could dispatch a request before the client is ready.
+    auto request_client = client_id.has_value()
+        ? TRY(try_make_ref_counted<Requests::RequestClient>(move(transport), *client_id))
+        : TRY(try_make_ref_counted<Requests::RequestClient>(move(transport)));
 #ifdef AK_OS_WINDOWS
     auto response = request_client->send_sync<Messages::RequestServer::InitTransport>(Core::System::getpid());
     request_client->transport().set_peer_pid(response->peer_pid());

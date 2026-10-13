@@ -31,15 +31,46 @@ HeapBlock::HeapBlock(Heap& heap, CellAllocator& cell_allocator)
     : HeapBlockBase(heap, cell_allocator.type_info())
     , m_cell_allocator(cell_allocator)
     , m_cell_size(cell_allocator.cell_size())
+    , m_cell_count((BLOCK_SIZE - sizeof(HeapBlock)) / m_cell_size)
 {
     VERIFY(m_cell_size >= sizeof(FreelistEntry));
     ASAN_POISON_MEMORY_REGION(m_storage, BLOCK_SIZE - sizeof(HeapBlock));
 }
 
+Cell* HeapBlock::take_free_cells()
+{
+    auto head = bit_cast<FlatPtr>(freelist_head());
+    m_freelist = 0;
+
+    // NB: The lazily initialized cells come first, in address order.
+    for (size_t index = cell_count(); index-- > m_next_lazy_freelist_index;) {
+        auto* free_cell = cell(index);
+        ASAN_UNPOISON_MEMORY_REGION(free_cell, sizeof(FreelistEntry));
+        auto* freelist_entry = new (free_cell) FreelistEntry();
+        freelist_entry->set_state(Cell::State::Dead);
+        freelist_entry->next = head;
+        head = bit_cast<FlatPtr>(freelist_entry);
+    }
+    m_next_lazy_freelist_index = cell_count();
+    return bit_cast<Cell*>(head);
+}
+
+void HeapBlock::give_back_free_cells(Cell* cells)
+{
+    for (auto* head = cells; !is_end_of_freelist(head);) {
+        VERIFY(is_valid_cell_pointer(head));
+        VERIFY(head->state() == Cell::State::Dead);
+        auto* next = next_free_cell(head);
+        static_cast<FreelistEntry*>(head)->next = m_freelist;
+        m_freelist = bit_cast<FlatPtr>(head);
+        head = next;
+    }
+}
+
 void HeapBlock::deallocate(Cell* cell)
 {
-    VERIFY(is_valid_cell_pointer(cell));
-    VERIFY(!m_freelist || is_valid_cell_pointer(m_freelist.ptr()));
+    // NB: The cell is one of this block's, since for_each_cell() found it, and the free list only ever holds cells
+    //     that this function or give_back_free_cells() put there, which checks them.
     VERIFY(cell->state() == Cell::State::Live);
     VERIFY(!cell->is_marked());
 
@@ -48,7 +79,7 @@ void HeapBlock::deallocate(Cell* cell)
     auto* freelist_entry = new (cell) FreelistEntry();
     freelist_entry->set_state(Cell::State::Dead);
     freelist_entry->next = m_freelist;
-    m_freelist = freelist_entry;
+    m_freelist = bit_cast<FlatPtr>(freelist_entry);
 
 #ifdef HAS_ADDRESS_SANITIZER
     auto dword_after_freelist = round_up_to_power_of_two(reinterpret_cast<uintptr_t>(freelist_entry) + sizeof(FreelistEntry), 8);

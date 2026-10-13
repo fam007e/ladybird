@@ -10,13 +10,14 @@
 #include <LibCore/File.h>
 #include <LibCore/Process.h>
 #include <LibCore/System.h>
-#include <LibMedia/Audio/AudioServerPath.h>
 #include <LibSandbox/ConnectBroker.h>
 #include <LibWebView/Application.h>
+#include <LibWebView/AudioServerControlClient.h>
 #include <LibWebView/CompositorClient.h>
 #include <LibWebView/FontService.h>
 #include <LibWebView/FontServiceHost.h>
 #include <LibWebView/HelperProcess.h>
+#include <LibWebView/RequestServerManager.h>
 #include <LibWebView/Utilities.h>
 
 #if defined(AK_OS_MACOS)
@@ -24,6 +25,8 @@
 #    include <signal.h>
 #    include <sys/wait.h>
 #elif defined(AK_OS_LINUX)
+#    include <AudioServer/BrokeredAudioDaemon.h>
+#    include <LibWebView/AudioDaemonSocket.h>
 #    include <signal.h>
 #    include <sys/socket.h>
 #    include <sys/wait.h>
@@ -216,26 +219,23 @@ static ErrorOr<pid_t> launch_helper_process(StringView server_name, Vector<ByteS
         OwnPtr<Sandbox::ConnectBroker> connect_broker;
         OwnPtr<Core::File> connect_broker_child_file;
 
-        // The audio clients cannot create a socket of their own, so the one endpoint they are allowed to
-        // reach is opened here and handed over as a connected descriptor.
-        if (process_type == ProcessType::WebContent || process_type == ProcessType::MediaServer) {
-            if (auto audio_server_paths = Audio::audio_server_path_candidates(); !audio_server_paths.is_empty()) {
-                // Asking again covers an audio server that was not reachable when the renderer
-                // started, and a configured fallback the audio library had not got to yet.
-                auto broker = Sandbox::ConnectBroker::create(move(audio_server_paths), [] {
-                    return Audio::audio_server_path_candidates();
-                });
-                if (broker.is_error()) {
-                    warnln("Could not start the {} connection broker: {}", server_name, broker.error());
-                } else {
-                    connect_broker = broker.release_value();
-                    // Reserve a distinct destination so dup2 clears close-on-exec in the child.
-                    auto child_fd = TRY(Core::System::fcntl(connect_broker->helper_fd(), F_DUPFD_CLOEXEC, 0));
-                    connect_broker_child_file = TRY(Core::File::adopt_fd(child_fd, Core::File::OpenMode::ReadWrite));
-                    options.file_actions.append(Core::FileAction::DupFd { .write_fd = connect_broker->helper_fd(), .fd = child_fd });
-                    process_arguments.append("--connect-broker-fd"sv);
-                    process_arguments.append(ByteString::number(connect_broker_child_file->fd()));
-                }
+        // The AudioServer cannot create a socket of its own. It connects to a name nothing listens on, and the
+        // broker connects that socket to the audio daemon wherever it is at the time, so the daemon is found
+        // without anyone knowing its address in advance, and found again should it move.
+        if (process_type == ProcessType::AudioServer) {
+            auto broker = Sandbox::ConnectBroker::create(ByteString { AudioServer::brokered_audio_daemon_path }, [] {
+                return audio_daemon_socket_path();
+            });
+            if (broker.is_error()) {
+                warnln("Could not start the {} connection broker: {}", server_name, broker.error());
+            } else {
+                connect_broker = broker.release_value();
+                // Reserve a distinct destination so dup2 clears close-on-exec in the child.
+                auto child_fd = TRY(Core::System::fcntl(connect_broker->helper_fd(), F_DUPFD_CLOEXEC, 0));
+                connect_broker_child_file = TRY(Core::File::adopt_fd(child_fd, Core::File::OpenMode::ReadWrite));
+                options.file_actions.append(Core::FileAction::DupFd { .write_fd = connect_broker->helper_fd(), .fd = child_fd });
+                process_arguments.append("--connect-broker-fd"sv);
+                process_arguments.append(ByteString::number(connect_broker_child_file->fd()));
             }
         }
 #endif
@@ -431,6 +431,23 @@ void connect_to_image_decoder(WebWorkerClient& client, ImageDecoderConnection de
     connect_client_to_image_decoder(client, move(decoder));
 }
 
+ErrorOr<NonnullRefPtr<AudioServerControlClient>> launch_audio_server_process()
+{
+    auto const& browser_options = WebView::Application::browser_options();
+
+    Vector<ByteString> arguments;
+    if (browser_options.headless_mode.has_value())
+        arguments.append("--headless"sv);
+    if (browser_options.disable_sandbox == DisableSandbox::Yes)
+        arguments.append("--disable-sandbox"sv);
+    if (auto server = mach_server_name(); server.has_value()) {
+        arguments.append("--mach-server-name"sv);
+        arguments.append(server.value());
+    }
+
+    return launch_server_process<AudioServerControlClient>("AudioServer"sv, arguments);
+}
+
 ErrorOr<NonnullRefPtr<MediaClient::Client>> launch_media_server_process()
 {
     auto const& browser_options = WebView::Application::browser_options();
@@ -539,7 +556,23 @@ ErrorOr<NonnullRefPtr<WebWorkerClient>> launch_web_worker_process(Web::HTML::Age
     return client;
 }
 
-ErrorOr<NonnullRefPtr<Requests::RequestControlClient>> launch_request_server_process()
+void apply_dns_settings(Requests::RequestControlClient& client)
+{
+    Application::settings().dns_settings().visit(
+        [&](SystemDNS) {
+            client.async_set_use_system_dns();
+        },
+        [&](DNSOverTLS const& dns_over_tls) {
+            dbgln("Setting DNS server to {}:{} with TLS ({} local dnssec)", dns_over_tls.server_address, dns_over_tls.port, dns_over_tls.validate_dnssec_locally ? "with" : "without");
+            client.async_set_dns_server(dns_over_tls.server_address, dns_over_tls.port, true, dns_over_tls.validate_dnssec_locally);
+        },
+        [&](DNSOverUDP const& dns_over_udp) {
+            dbgln("Setting DNS server to {}:{} ({} local dnssec)", dns_over_udp.server_address, dns_over_udp.port, dns_over_udp.validate_dnssec_locally ? "with" : "without");
+            client.async_set_dns_server(dns_over_udp.server_address, dns_over_udp.port, false, dns_over_udp.validate_dnssec_locally);
+        });
+}
+
+ErrorOr<NonnullRefPtr<Requests::RequestControlClient>> launch_request_server_process(ByteString const& cache_path, Optional<Utf16String> const& site, HTTPDiskCacheMode http_disk_cache_mode)
 {
     auto const& browser_options = Application::browser_options();
     auto const& request_server_options = Application::request_server_options();
@@ -547,7 +580,12 @@ ErrorOr<NonnullRefPtr<Requests::RequestControlClient>> launch_request_server_pro
     Vector<ByteString> arguments;
 
     arguments.append("--cache-path"sv);
-    arguments.append(request_server_options.cache_path);
+    arguments.append(cache_path);
+
+    if (site.has_value()) {
+        arguments.append("--site"sv);
+        arguments.append(site->to_byte_string());
+    }
 
     if (browser_options.disable_sandbox == DisableSandbox::Yes)
         arguments.append("--disable-sandbox"sv);
@@ -556,7 +594,7 @@ ErrorOr<NonnullRefPtr<Requests::RequestControlClient>> launch_request_server_pro
 
     arguments.append("--http-disk-cache-mode"sv);
 
-    switch (request_server_options.http_disk_cache_mode) {
+    switch (http_disk_cache_mode) {
     case HTTPDiskCacheMode::Disabled:
         arguments.append("disabled"sv);
         break;
@@ -580,34 +618,48 @@ ErrorOr<NonnullRefPtr<Requests::RequestControlClient>> launch_request_server_pro
 
     auto const& browsing_data_settings = Application::settings().browsing_data_settings();
     client->async_set_disk_cache_settings(browsing_data_settings.disk_cache_settings);
-
-    Application::settings().dns_settings().visit(
-        [](SystemDNS) {},
-        [&](DNSOverTLS const& dns_over_tls) {
-            dbgln("Setting DNS server to {}:{} with TLS ({} local dnssec)", dns_over_tls.server_address, dns_over_tls.port, dns_over_tls.validate_dnssec_locally ? "with" : "without");
-            client->async_set_dns_server(dns_over_tls.server_address, dns_over_tls.port, true, dns_over_tls.validate_dnssec_locally);
-        },
-        [&](DNSOverUDP const& dns_over_udp) {
-            dbgln("Setting DNS server to {}:{} ({} local dnssec)", dns_over_udp.server_address, dns_over_udp.port, dns_over_udp.validate_dnssec_locally ? "with" : "without");
-            client->async_set_dns_server(dns_over_udp.server_address, dns_over_udp.port, false, dns_over_udp.validate_dnssec_locally);
-        });
+    client->async_set_proxy_configuration(request_server_options.proxy_configuration);
+    if (!Application::settings().dns_settings().has<SystemDNS>())
+        apply_dns_settings(*client);
 
     return client;
 }
 
 ErrorOr<RequestServerClientConnection> connect_new_request_server_client(BrowsingSession& session, RequestServer::SiteBinding site_binding)
 {
-    auto response = Application::request_server_control_client().send_sync_but_allow_failure<Messages::RequestServerControl::ConnectNewClient>(session.is_private() == IsPrivate::Yes ? RequestServer::IsPrivate::Yes : RequestServer::IsPrivate::No, site_binding);
-    if (!response || response->client_id() < 0)
-        return Error::from_string_literal("Failed to connect to RequestServer");
-    Application::the().did_connect_request_server_client(response->client_id(), session, site_binding);
-    return RequestServerClientConnection { .handle = response->take_handle(), .client_id = response->client_id() };
+    auto instance = TRY(RequestServerManager::the().browser_instance(session));
+    return RequestServerManager::the().connect_new_client(*instance, session, site_binding);
 }
 
-ErrorOr<IPC::TransportHandle> connect_new_media_server_client(RefPtr<MediaClient::Client>& controller)
+u64 allocate_audio_tab_id()
+{
+    static u64 s_next_audio_tab_id { 1 };
+    return s_next_audio_tab_id++;
+}
+
+ErrorOr<void> ensure_audio_server_is_running(RefPtr<AudioServerControlClient>& controller)
 {
     if (!controller || !controller->is_open())
+        controller = TRY(launch_audio_server_process());
+    return {};
+}
+
+ErrorOr<IPC::TransportHandle> connect_new_audio_server_client(RefPtr<AudioServerControlClient>& controller, u64 audio_tab_id)
+{
+    TRY(ensure_audio_server_is_running(controller));
+
+    auto response = controller->send_sync_but_allow_failure<Messages::AudioServerControl::ConnectNewClient>(audio_tab_id);
+    if (!response || !response->handle().has_value())
+        return Error::from_string_literal("Failed to connect to AudioServer");
+    return response->take_handle().release_value();
+}
+
+ErrorOr<IPC::TransportHandle> connect_new_media_server_client(RefPtr<MediaClient::Client>& controller, Function<ErrorOr<IPC::TransportHandle>()> connect_audio_server)
+{
+    if (!controller || !controller->is_open()) {
         controller = TRY(launch_media_server_process());
+        controller->on_request_audio_server_connection = move(connect_audio_server);
+    }
 
     auto response = controller->send_sync_but_allow_failure<Messages::MediaServer::ConnectNewClient>();
     if (!response || !response->handle().has_value())

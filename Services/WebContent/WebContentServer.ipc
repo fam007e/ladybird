@@ -83,7 +83,7 @@ endpoint WebContentServer routed by Web::PageId page_id
     did_handle_webdriver_mouse_event(Web::PageId page_id, u64 request_id) =|
     set_webdriver_session_config(Web::PageId page_id, Web::WebDriver::UserPromptHandler user_prompt_handler, Web::WebDriver::PageLoadStrategy page_load_strategy, bool strict_file_interactability, JsonValue timeouts) =|
     connect_to_web_ui(Web::PageId page_id, IPC::TransportHandle handle) =|
-    connect_to_request_server(IPC::TransportHandle handle) =|
+    connect_to_request_server(IPC::TransportHandle handle, int client_id) =|
     connect_to_test_endpoint(IPC::TransportHandle handle) =|
     connect_to_image_decoder(IPC::TransportHandle handle) =|
     connect_to_wasm_compiler(IPC::TransportHandle handle) =|
@@ -137,6 +137,7 @@ endpoint WebContentServer routed by Web::PageId page_id
 
     set_viewport(Web::PageId page_id, Web::DevicePixelSize size, double device_pixel_ratio, Web::ViewportIsFullscreen is_fullscreen) =|
     set_viewport_is_fullscreen(Web::PageId page_id, Web::ViewportIsFullscreen is_fullscreen) =|
+    deny_fullscreen_window(Web::PageId page_id) =|
 
     key_event(Web::PageId page_id, Web::KeyEvent event) =|
     mouse_event(Web::PageId page_id, Web::MouseEvent event) =|
@@ -247,6 +248,7 @@ endpoint WebContentServer routed by Web::PageId page_id
     set_enable_global_privacy_control(Web::PageId page_id, bool enable) =|
     set_geolocation_emulated_position(Web::PageId page_id, WebView::GeolocationPositionData position, Optional<u16> error_code) =|
     geolocation_position_response(Web::PageId page_id, u64 request_id, WebView::GeolocationPositionData position, Optional<u16> error_code) =|
+    permission_request_completed(Web::PageId page_id, u64 request_id, bool granted) =|
     set_has_focus(Web::PageId page_id, bool has_focus) =|
     set_focused_navigable(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id) =|
     consume_user_activation(Web::PageId page_id, Web::HTML::UserActivationConsumption consumption) =|

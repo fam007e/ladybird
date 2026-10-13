@@ -626,9 +626,10 @@ impl DocumentHost {
 
     /// The layout node C++ made for the row `id`, which the host reads without asking where it knows the row live: a
     /// row frees only in a job or a frame, whose freed rows the host destroys the layout nodes of once it has them back,
-    /// and C++ makes a layout node only for a row the arena stamped.
+    /// and C++ makes a layout node only for a row the arena stamped. A queued identity write may free the row when
+    /// the next read applies it, so it must be applied before handing out the layout node.
     pub(crate) fn held_shell(&self, id: crate::layout::node_data::NodeSlotId) -> Option<*mut std::ffi::c_void> {
-        if self.in_job.get() || self.waits_for_frame.get() {
+        if self.in_job.get() || self.waits_for_frame.get() || self.changes.moves().rows == RowWrite::Identities {
             return None;
         }
         self.host_tables.shells.borrow().get(&id).map(|shell| shell.as_ptr())
@@ -1527,6 +1528,7 @@ mod tests {
             node: Some(parent),
             reaction: STYLE_REACTION_INHERITED_STYLE,
             inherited_style_groups_changed: INHERITED_STYLE_GROUPS,
+            changed_non_inherited_style_groups: 0,
             facts: 0,
         }));
         host.ask(ScriptForcedRead::for_test(), |_| ());

@@ -14,6 +14,7 @@ use crate::interpreter::vm::Vm;
 use crate::layout::cell::Gc;
 use crate::layout::object::Object;
 use crate::layout::value::Value;
+use crate::layout_forward::RawNativeFunctionPointer;
 use crate::random::XorShift128PlusRNG;
 use crate::runtime::abstract_operations::require_object_coercible;
 use crate::runtime::completion::{Completion, ThrowCompletionOr};
@@ -111,6 +112,11 @@ impl core::ops::Deref for CoercedArguments {
     }
 }
 
+/// The native functions of Math.max and Math.min, which JIT code knows.
+pub(crate) static MAX_FUNCTION: RawNativeFunctionPointer = raw_native!(MathObject::max);
+pub(crate) static MIN_FUNCTION: RawNativeFunctionPointer = raw_native!(MathObject::min);
+pub(crate) static IMUL_FUNCTION: RawNativeFunctionPointer = raw_native!(MathObject::imul);
+
 impl MathObject {
     pub fn create(vm: &Vm, realm: Gc<Realm>) -> Gc<MathObject> {
         realm.create_object(
@@ -153,8 +159,8 @@ impl MathObject {
             1,
             Some(Builtin::MathRound),
         );
-        define(&names.max, raw_native!(MathObject::max), 2, None);
-        define(&names.min, raw_native!(MathObject::min), 2, None);
+        define(&names.max, MAX_FUNCTION, 2, None);
+        define(&names.min, MIN_FUNCTION, 2, None);
         define(&names.trunc, raw_native!(MathObject::trunc), 1, None);
         define(&names.sin, raw_native!(MathObject::sin), 1, Some(Builtin::MathSin));
         define(&names.cos, raw_native!(MathObject::cos), 1, Some(Builtin::MathCos));
@@ -176,7 +182,7 @@ impl MathObject {
         define(&names.fround, raw_native!(MathObject::fround), 1, None);
         define(&names.f16round, raw_native!(MathObject::f16round), 1, None);
         define(&names.hypot, raw_native!(MathObject::hypot), 2, None);
-        define(&names.imul, raw_native!(MathObject::imul), 2, Some(Builtin::MathImul));
+        define(&names.imul, IMUL_FUNCTION, 2, Some(Builtin::MathImul));
         define(&names.log, raw_native!(MathObject::log), 1, Some(Builtin::MathLog));
         define(&names.log2, raw_native!(MathObject::log2), 1, None);
         define(&names.log10, raw_native!(MathObject::log10), 1, None);

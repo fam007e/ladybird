@@ -4,12 +4,11 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <LibAudio/ChannelMap.h>
 #include <LibCore/EventLoop.h>
 #include <LibCore/File.h>
 #include <LibCore/System.h>
-#include <LibMedia/Audio/ChannelMap.h>
-#include <LibMedia/Containers/Matroska/MatroskaDemuxer.h>
-#include <LibMedia/FFmpeg/FFmpegDemuxer.h>
+#include <LibMedia/DemuxerRegistry.h>
 #include <LibMedia/IncrementallyPopulatedStream.h>
 #include <LibMedia/MediaClock.h>
 #include <LibMedia/MonotonicMediaClock.h>
@@ -34,10 +33,7 @@ static NonnullRefPtr<Media::IncrementallyPopulatedStream> load_test_file(StringV
 
 static NonnullRefPtr<Media::Demuxer> create_demuxer(NonnullRefPtr<Media::IncrementallyPopulatedStream> const& stream)
 {
-    auto matroska_result = Media::Matroska::MatroskaDemuxer::from_stream(stream);
-    if (!matroska_result.is_error())
-        return matroska_result.release_value();
-    return MUST(Media::FFmpeg::FFmpegDemuxer::from_stream(stream));
+    return MUST(Media::create_demuxer(stream));
 }
 
 template<typename Condition>
@@ -531,7 +527,7 @@ TEST_CASE(audio_playback_sink_reseeks_its_input_from_the_written_output_without_
 {
     auto& loop = never_destroyed_event_loop();
 
-    auto sink = MUST(Media::AudioPlaybackSink::try_create([](Media::PipelineStatus) { }, Media::AudioOutput::Null));
+    auto sink = MUST(Media::AudioPlaybackSink::try_create([](Media::PipelineStatus) { }, Audio::AudioOutput::Null));
     auto producer = RecordingAudioProducer::create();
     MUST(sink->connect_input(producer));
     sink->start();

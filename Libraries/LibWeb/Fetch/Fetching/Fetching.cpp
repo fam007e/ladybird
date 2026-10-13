@@ -1308,9 +1308,11 @@ GC::Ref<PendingResponse> scheme_fetch(JS::Realm& realm, Infrastructure::FetchPar
             return error;
 
         auto origin_is_allowed = [&] {
-            // Only a client that itself came from a file:// URL may reach the local file system.
+            // Only a client that itself came from a file:// URL may reach the local file system. Traversing back to a
+            // file:// entry fetches it with the client of the document it replaces, though, which the UI process lets
+            // read the file of an entry that held local file content.
             if (request->current_url().scheme() == "file"sv)
-                return origin->is_file_origin();
+                return origin->is_file_origin() || (request->mode() == Infrastructure::Request::Mode::Navigate && request->history_navigation());
 
             // resource:// URLs are bundled browser assets rather than user data, and the internal pages that
             // load them do have a standard opaque origin, so any opaque origin is accepted for those.
@@ -2060,7 +2062,8 @@ GC::Ref<PendingResponse> http_network_or_cache_fetch(JS::Realm& realm, Infrastru
             //    invalidate appropriate stored responses in httpCache, as per the "Invalidation" chapter of HTTP
             //    Caching, and set storedResponse to null.
             if (method_is_unsafe && forward_response->status() >= 200 && forward_response->status() <= 399) {
-                // FIXME: "invalidate appropriate stored responses in httpCache, as per the "Invalidation" chapter of HTTP Caching"
+                if (http_cache)
+                    http_cache->invalidate(http_request->current_url());
                 stored_response = nullptr;
             }
 

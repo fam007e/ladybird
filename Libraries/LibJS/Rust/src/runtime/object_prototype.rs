@@ -118,6 +118,9 @@ pub fn builtin_tag(object: &Object, is_array: bool) -> &'static str {
     }
 }
 
+/// The native function of Object.prototype.hasOwnProperty, which JIT code knows.
+pub(crate) static HAS_OWN_PROPERTY_FUNCTION: RawNativeFunctionPointer = raw_native!(ObjectPrototype::has_own_property);
+
 impl ObjectPrototype {
     pub fn new(vm: &Vm, realm: Gc<Realm>) -> ObjectPrototype {
         ObjectPrototype {
@@ -138,7 +141,7 @@ impl ObjectPrototype {
         let define_native_function = |property_key: &PropertyKey, function, length| {
             object.define_native_function(vm, realm, property_key, function, length, attr, None);
         };
-        define_native_function(&names.hasOwnProperty, raw_native!(ObjectPrototype::has_own_property), 1);
+        define_native_function(&names.hasOwnProperty, HAS_OWN_PROPERTY_FUNCTION, 1);
         define_native_function(&names.toString, raw_native!(ObjectPrototype::to_string), 0);
         define_native_function(&names.toLocaleString, raw_native!(ObjectPrototype::to_locale_string), 0);
         define_native_function(&names.valueOf, VALUE_OF_FUNCTION, 0);

@@ -1509,10 +1509,34 @@ void CanonicalTraversable::continue_history_navigation_population(Web::HTML::Cro
     }
     add_history_operation_completion_endpoint(*operation, *endpoint);
     auto& job = *pending_job.value();
-    endpoint->owe_reply({ OwedReply::Kind::ChangingJob, operation_id, navigable_id });
-    endpoint->async_continue_history_navigation_population(operation_id, job.job.target_entry_descriptor(), job.job.navigation_type,
-        Web::HTML::HistoryNavigationPopulation { loader->request(), loader->take_result() });
     job.population_loader = move(loader);
+    auto finish_handoff = [weak_this = make_weak_ptr(), weak_loader = job.population_loader->make_weak_ptr(), operation_id, navigable_id, endpoint](bool succeeded) {
+        if (!weak_this || !weak_loader)
+            return;
+        auto& traversable = static_cast<CanonicalTraversable&>(*weak_this);
+        auto* operation = traversable.find_history_operation(operation_id);
+        if (!operation)
+            return;
+        auto pending_job = operation->pending_changing_jobs.get(navigable_id);
+        if (!pending_job.has_value() || pending_job.value()->population_loader.ptr() != weak_loader.ptr())
+            return;
+        if (!succeeded || !endpoint->is_open()) {
+            traversable.did_fail_history_navigation_population(operation_id, navigable_id, *endpoint);
+            return;
+        }
+        auto& job = *pending_job.value();
+        auto& loader = *job.population_loader;
+        endpoint->owe_reply({ OwedReply::Kind::ChangingJob, operation_id, navigable_id });
+        endpoint->async_continue_history_navigation_population(operation_id, job.job.target_entry_descriptor(), job.job.navigation_type,
+            Web::HTML::HistoryNavigationPopulation { loader.request(), loader.take_result() });
+    };
+    if (auto client_id = endpoint->client().request_server_site_bindings().client_id(); client_id.has_value()) {
+        if (auto request_server = RequestServerManager::the().instance_for_client(*client_id)) {
+            job.population_loader->move_response_body_to(*request_server, move(finish_handoff));
+            return;
+        }
+    }
+    finish_handoff(false);
 }
 
 void CanonicalTraversable::dispatch_changing_navigable_history_step_job(HistoryOperation& operation, Web::HTML::CrossProcessId navigable_id)
@@ -1864,6 +1888,24 @@ bool CanonicalTraversable::is_handing_navigable_to_another_page(CanonicalNavigab
             && job.unload_displayed_document == Web::HTML::UnloadDisplayedDocument::Yes
             && changing_job_endpoint(navigable, *job.job.target_entry->document_state) != navigable.active_document().host()) {
             return true;
+        }
+    }
+    return false;
+}
+
+// A history step's changing job populates its target entry's document in the process hosting the navigable, which need
+// not have hosted local file content. For an entry whose document state held local file content, that process reads the
+// file the entry's file: URL names.
+bool CanonicalTraversable::page_populates_a_history_entry_for_local_file(WebContentPage const& page, ByteString const& path) const
+{
+    for (auto const& [operation_id, operation] : m_history_operations) {
+        for (auto const& [navigable_id, pending_job] : operation->pending_changing_jobs) {
+            auto const& target_entry = *pending_job->job.target_entry;
+            if (target_entry.document_state->held_local_file_content
+                && target_entry.url.scheme() == "file"sv
+                && target_entry.url.file_path() == path
+                && changing_job_endpoint(*operation, navigable_id) == &page)
+                return true;
         }
     }
     return false;
@@ -2595,7 +2637,10 @@ void CanonicalTraversable::finalize_a_cross_document_navigation(HistoryOperation
         //     initiator origin: initiatorOrigin
         //     origin: initiatorOrigin
         history_entry->document_state->origin = initiator_origin;
-        navigable->populate_document(history_entry->document_state, navigable->create_and_initialize_a_document(response_document));
+        if (!navigable->populate_document_for_javascript_url(history_entry->document_state, navigable->create_and_initialize_a_document(response_document))) {
+            finish_history_operation(operation.operation_id, Web::HTML::HistoryStepResult::NoMatchingEntry, {});
+            return;
+        }
     }
 
     // 1. Assert: this is running on navigable's traversable navigable's session history traversal queue.

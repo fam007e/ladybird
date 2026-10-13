@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/AnyOf.h>
 #include <AK/Debug.h>
 #include <LibCore/EventLoop.h>
 #include <LibMedia/VideoFrame.h>
@@ -19,7 +20,7 @@ static Media::DecoderError media_server_gone_error()
     return Media::DecoderError::with_description(Media::DecoderErrorCategory::Unknown, "The media server is gone"sv);
 }
 
-NonnullOwnPtr<RemotePlaybackManager> RemotePlaybackManager::create(Media::AudioOutput audio_output)
+NonnullOwnPtr<RemotePlaybackManager> RemotePlaybackManager::create()
 {
     auto client_or_error = Client::acquire();
     if (client_or_error.is_error()) {
@@ -35,7 +36,7 @@ NonnullOwnPtr<RemotePlaybackManager> RemotePlaybackManager::create(Media::AudioO
     auto client = client_or_error.release_value();
     auto playback_manager = adopt_own(*new RemotePlaybackManager(client, client->allocate_id()));
     client->register_playback_manager({}, *playback_manager);
-    client->async_create_playback_session(playback_manager->session_id(), audio_output);
+    client->async_create_playback_session(playback_manager->session_id());
     return playback_manager;
 }
 
@@ -256,18 +257,33 @@ bool RemotePlaybackManager::source_has_enabled_track(ReadonlySpan<Media::Track> 
 
 // The ranges are calculated here from the state of each source, so that enabling or disabling tracks and reaching the
 // end of a source buffer's stream are reflected at once.
-Media::TimeRanges RemotePlaybackManager::buffered_time_ranges() const
+Media::BufferedRanges RemotePlaybackManager::buffered_time_ranges() const
 {
-    Vector<Media::DemuxerScanState> active_sources;
+    Vector<Media::CombinedScanState> active_sources;
     for (auto const& [stream_id, source] : m_media_stream_sources) {
         if (source_has_enabled_track(source.audio_tracks, source.video_tracks))
-            active_sources.append(source.scan_state);
+            active_sources.append(scan_state_for_enabled_tracks(source.scan_state, source.audio_tracks, source.video_tracks));
     }
     for (auto const& [source_buffer_id, source_buffer] : m_source_buffers) {
         if (source_has_enabled_track(source_buffer->audio_tracks(), source_buffer->video_tracks()))
-            active_sources.append(source_buffer->scan_state());
+            active_sources.append(scan_state_for_enabled_tracks(source_buffer->scan_state(), source_buffer->audio_tracks(), source_buffer->video_tracks()));
     }
     return Media::DemuxerScanState::buffered_ranges_of_sources(active_sources);
+}
+
+Media::CombinedScanState RemotePlaybackManager::scan_state_for_enabled_tracks(Media::DemuxerScanState const& state, ReadonlySpan<Media::Track> audio_tracks, ReadonlySpan<Media::Track> video_tracks) const
+{
+    return state.combined_scan_state([&](u64 identifier) {
+        for (auto const& track : audio_tracks) {
+            if (track.identifier() == identifier)
+                return m_enabled_audio_tracks.contains(track);
+        }
+        for (auto const& track : video_tracks) {
+            if (track.identifier() == identifier)
+                return any_of(m_video_sinks, [&](auto const& entry) { return entry.value.track == track; });
+        }
+        return false;
+    });
 }
 
 void RemotePlaybackManager::register_source_buffer(Badge<RemoteSourceBuffer>, RemoteSourceBuffer& source_buffer)

@@ -65,6 +65,7 @@
 #include <LibWebCommon/WebView/DictionaryLookup.h>
 #include <LibWebCommon/WebView/PageInfo.h>
 #include <LibWebCommon/WebView/StorageSetResult.h>
+#include <LibWebCommon/WebView/ZoomLevel.h>
 #include <LibWebView/BookmarkStore.h>
 #include <LibWebView/BrowsingSession.h>
 #include <LibWebView/CanonicalTraversable.h>
@@ -179,14 +180,25 @@ public:
     void zoom_in();
     void zoom_out();
     void set_zoom(double zoom_level);
+    void set_device_pixel_ratio_for_testing(WebContentPage&, double device_pixel_ratio);
     void reset_zoom();
     double zoom_level() const { return m_zoom_level; }
     double device_pixel_ratio() const { return m_device_pixel_ratio; }
     Optional<u64> display_id() const { return m_display_id; }
     double maximum_frames_per_second() const { return m_maximum_frames_per_second; }
     void enqueue_input_event(Web::InputEvent);
-    void did_finish_handling_input_event(Badge<WebContentPage>, u64 event_id, Web::EventResult event_result);
-    void did_forward_input_event(Badge<WebContentPage>, u64 event_id, WebContentPage& endpoint);
+    // The page reporting on an event must be the one handling it.
+    void did_finish_handling_input_event(Badge<WebContentPage>, WebContentPage const& reporting_page, u64 event_id, Web::EventResult event_result);
+    void did_forward_input_event(Badge<WebContentPage>, WebContentPage const& reporting_page, u64 event_id, WebContentPage& endpoint);
+    // Whether the page has yet to finish handling input that gives it user activation.
+    bool is_delivering_user_activation_to(WebContentPage const&) const;
+    // Consumes the activation of the earliest input giving the page activation that the page has yet to finish
+    // handling, which leaves the input queued behind it the activation it gives.
+    void consume_user_activation_of_input_in_flight_to(Badge<WebContentPage>, WebContentPage const&);
+    // Consumes the activation of the input the page is handling, if that input gives activation.
+    void consume_user_activation_of_input_handled_by(Badge<WebContentPage>, WebContentPage const&);
+    // Opening a link in a new tab takes one key or mouse press the view delivered.
+    bool take_input_to_open_link_in_new_tab(Badge<WebContentPage>);
     void did_lose_input_event_endpoint(Badge<WebContentClient>, WebContentPage&);
     void did_consume_input_event_in_compositor(Badge<WebContentPage>, u64 event_id);
     void did_not_dispatch_input_event_through_compositor(Badge<WebContentPage>, u64 event_id);
@@ -200,6 +212,7 @@ public:
     void set_preferred_motion(Web::CSS::PreferredMotion);
     // A page created to host documents of the tab in another process takes the preferences the view's page has.
     void send_preferences_to_page(WebContentPage&);
+    virtual void send_system_theme_to_page(WebContentPage&) { }
 
     void notify_cookies_changed(HashTable<String> const& changed_domains, ReadonlySpan<HTTP::Cookie::Cookie> page_cookies, ReadonlySpan<HTTP::Cookie::Cookie> host_cookies);
     void listen_for_host_cookie_changes(DevTools::DevToolsDelegate::OnHostCookieChange);
@@ -483,6 +496,7 @@ public:
     Function<void(WebContentPage& requesting_page, u64 request_id)> on_cancel_geolocation_position_request;
     Function<void(WebContentPage& requesting_page, u64 request_id)> on_start_geolocation_position_watch;
     Function<void(WebContentPage& requesting_page, u64 request_id)> on_stop_geolocation_position_watch;
+    Function<void(Utf16String const& name, URL::Origin const&, Function<void(bool granted)> on_decided)> on_request_permission;
     Function<void(Web::HTML::FileFilter const& accepted_file_types, Web::HTML::AllowMultipleFiles)> on_request_file_picker;
     Function<void(Gfx::IntPoint content_position, i32 minimum_width, Vector<Web::HTML::SelectItem> items)> on_request_select_dropdown;
     Function<void(Web::KeyEvent const&)> on_finish_handling_key_event;
@@ -547,8 +561,6 @@ protected:
     virtual void did_accept_presented_backing_store(i32, Gfx::IntRect) { }
     void release_backing_store(i32 bitmap_id);
 
-    static constexpr auto ZOOM_MIN_LEVEL = 0.3;
-    static constexpr auto ZOOM_MAX_LEVEL = 5.0;
     static constexpr auto ZOOM_STEP = 0.1;
 
     explicit ViewImplementation(IsPrivate = IsPrivate::No);
@@ -753,8 +765,19 @@ protected:
         // Set while the compositor decides whether it consumes the event, forwards it or hands it back. A compositor
         // that dies forwards none of the events still marked this way.
         bool routed_through_compositor { false };
+
+        // When the view delivered an event that gives user activation, until something consumes that activation.
+        Optional<MonotonicTime> user_activation_time {};
     };
     Vector<PendingInputEvent> m_pending_input_events;
+    Optional<size_t> index_of_input_in_flight_giving_user_activation_to(WebContentPage const&) const;
+
+    // The key and mouse presses the view delivered that have yet to open a link in a new tab.
+    struct InputToOpenLinkInNewTab {
+        u64 event_id { 0 };
+        MonotonicTime delivered_at;
+    };
+    Vector<InputToOpenLinkInNewTab> m_inputs_to_open_links_in_new_tabs;
     u64 m_next_input_event_id { 1 };
     bool m_debugger_is_attached { false };
     bool m_debugger_paused { false };

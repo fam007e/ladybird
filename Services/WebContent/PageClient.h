@@ -103,6 +103,7 @@ public:
 
     void set_geolocation_emulated_position(WebView::GeolocationPositionData const&, Optional<u16> error_code);
     void geolocation_position_response(u64 request_id, WebView::GeolocationPositionData const&, Optional<u16> error_code);
+    void permission_request_completed(u64 request_id, bool granted);
 
     void alert_closed();
     void confirm_closed(bool accepted);
@@ -174,6 +175,7 @@ private:
 
     void request_rendering_opportunity_if_needed();
     void hurry_outstanding_rendering_opportunity();
+    void device_pixels_per_css_pixel_did_change();
     Optional<Web::Compositor::CompositorContextHandle&> rendering_opportunity_context();
     bool hosted_documents_are_hidden() const;
     void schedule_local_rendering_opportunity();
@@ -294,7 +296,6 @@ private:
     virtual void page_did_update_indexed_database(String const& url, Web::IndexedDB::TransactionChanges const&) override;
     virtual void page_did_update_resource_count(i32) override;
     virtual NewWebViewResult page_did_request_new_web_view(Web::HTML::ActivateTab, Web::HTML::WebViewHints, Optional<Web::HTML::CrossProcessId> opener_navigable_id, Optional<URL::URL> opener_base_url, Utf16String const& target_name, Web::HTML::SandboxingFlagSet popup_sandboxing_flag_set) override;
-    virtual void page_did_request_activate_tab() override;
     virtual void page_did_close() override;
     virtual void page_did_change_needs_beforeunload_check(bool needs_beforeunload_check) override;
     virtual void page_did_consume_user_activation(Web::HTML::UserActivationConsumption) override;
@@ -334,6 +335,7 @@ private:
     virtual void page_did_cancel_geolocation_position_request(u64 request_id) override;
     virtual void page_did_start_geolocation_position_watch(u64 request_id) override;
     virtual void page_did_stop_geolocation_position_watch(u64 request_id) override;
+    virtual void page_did_request_permission(u64 request_id, Utf16String const& name) override;
     virtual void page_did_finish_test(Utf16String const& text) override;
     virtual void page_did_set_test_timeout(double milliseconds) override;
     virtual void page_did_receive_reference_test_metadata(JsonValue) override;
@@ -382,6 +384,8 @@ private:
     size_t m_main_screen_index { 0 };
     Web::DevicePixelSize m_viewport_size;
     double m_device_pixel_ratio { 1.0 };
+    Optional<double> m_pending_device_pixel_ratio_for_testing;
+    Optional<double> m_pending_browser_zoom;
     double m_zoom_level { 1.0 };
     double m_maximum_frames_per_second { 60.0 };
     Web::PageId m_id { 0 };

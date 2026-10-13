@@ -13,6 +13,7 @@ use crate::interpreter::vm::Vm;
 use crate::layout::cell::Gc;
 use crate::layout::object::Object;
 use crate::layout::value::Value;
+use crate::layout_forward::RawNativeFunctionPointer;
 use crate::runtime::abstract_operations::{call_function_object, checked_js_string_length_sum, species_constructor};
 use crate::runtime::array::{Holes, sort_indexed_properties};
 use crate::runtime::array_buffer::{ElementType, Order, clone_array_buffer};
@@ -531,6 +532,9 @@ fn set_typed_array_from_array_like(
     Ok(())
 }
 
+/// The native getter of %TypedArray%.prototype.length, which JIT code knows.
+pub(crate) static LENGTH_GETTER: RawNativeFunctionPointer = raw_native!(TypedArrayPrototype::length_getter);
+
 impl TypedArrayPrototype {
     pub fn create(vm: &Vm, realm: Gc<Realm>) -> Gc<TypedArrayPrototype> {
         realm.create_object(
@@ -557,7 +561,7 @@ impl TypedArrayPrototype {
         define_accessor(&names.buffer, raw_native!(TypedArrayPrototype::buffer_getter));
         define_accessor(&names.byteLength, raw_native!(TypedArrayPrototype::byte_length_getter));
         define_accessor(&names.byteOffset, raw_native!(TypedArrayPrototype::byte_offset_getter));
-        define_accessor(&names.length, raw_native!(TypedArrayPrototype::length_getter));
+        define_accessor(&names.length, LENGTH_GETTER);
 
         let define_function = |property_key: &PropertyKey, function, length| {
             object.define_native_function(vm, realm, property_key, function, length, attr, None);

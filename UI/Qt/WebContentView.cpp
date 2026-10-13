@@ -486,19 +486,23 @@ struct WheelDelta {
     Web::WheelDeltaPrecision precision { Web::WheelDeltaPrecision::Discrete };
 };
 
-static bool wheel_event_scrolls_continuously(QWheelEvent const& wheel_event)
-{
-    if (wheel_event.phase() != Qt::NoScrollPhase)
-        return true;
-    // Some platforms deliver touchpad scrolling without scroll phases, so fall back to the type of the device.
-    auto const* pointing_device = wheel_event.pointingDevice();
-    return pointing_device && pointing_device->type() == QInputDevice::DeviceType::TouchPad;
-}
-
 static bool is_running_on_wayland()
 {
     static bool const is_wayland = QGuiApplication::platformName().startsWith(QStringLiteral("wayland"));
     return is_wayland;
+}
+
+bool wheel_event_scrolls_continuously(QWheelEvent const& wheel_event)
+{
+    if (wheel_event.phase() != Qt::NoScrollPhase)
+        return true;
+    // Qt on Wayland reports every pointer device as a touchpad, but marks touchpad and continuous scrolling as
+    // synthesized by the system.
+    if (is_running_on_wayland())
+        return wheel_event.source() != Qt::MouseEventNotSynthesized;
+    // Some platforms deliver touchpad scrolling without scroll phases, so fall back to the type of the device.
+    auto const* pointing_device = wheel_event.pointingDevice();
+    return pointing_device && pointing_device->type() == QInputDevice::DeviceType::TouchPad;
 }
 
 // Qt on Wayland gives touchpad scroll distances in axis units, at 1 pixel per unit. This scrolls too slowly, so we
@@ -1594,12 +1598,18 @@ static Core::AnonymousBuffer make_system_theme_from_qt_palette(QWidget& widget, 
 void WebContentView::update_palette(PaletteMode mode)
 {
     set_page_background_color_to_system_canvas(is_using_dark_system_theme(*this));
-    update_palette(page(), mode);
+
+    // NB: Every page hosting documents of this tab takes the palette, including the pages of out-of-process iframes.
+    //     Their prefers-color-scheme and system colors resolve against it.
+    auto theme = make_system_theme_from_qt_palette(*this, mode);
+    traversable().for_each_hosting_page([&](WebView::WebContentPage& page) {
+        page.async_update_system_theme(theme);
+    });
 }
 
-void WebContentView::update_palette(WebView::WebContentPage& page, PaletteMode mode)
+void WebContentView::send_system_theme_to_page(WebView::WebContentPage& page)
 {
-    page.async_update_system_theme(make_system_theme_from_qt_palette(*this, mode));
+    page.async_update_system_theme(make_system_theme_from_qt_palette(*this, PaletteMode::Default));
 }
 
 #if !defined(Q_OS_MACOS) && !defined(Q_OS_WIN)
@@ -1683,7 +1693,7 @@ void WebContentView::update_screen_rects(WebView::WebContentPage& page)
             //       by the device pixel ratio to get the 'physical pixels' of the display.
             auto geometry = screen->geometry();
             auto device_pixel_ratio = screen->devicePixelRatio();
-            screen_rects.append(Web::DevicePixelRect(geometry.x(), geometry.y(), geometry.width() * device_pixel_ratio, geometry.height() * device_pixel_ratio));
+            screen_rects.append(Web::DevicePixelRect(geometry.x() * device_pixel_ratio, geometry.y() * device_pixel_ratio, geometry.width() * device_pixel_ratio, geometry.height() * device_pixel_ratio));
         }
 
         // NOTE: The first item in QGuiApplication::screens is always the primary screen.
@@ -1698,7 +1708,6 @@ void WebContentView::prepare_page_for_tab(WebView::WebContentPage& page)
     ViewImplementation::prepare_page_for_tab(page);
 
     update_compositor_display_metadata(page);
-    update_palette(page);
     update_screen_rects(page);
 }
 

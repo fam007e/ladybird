@@ -19,8 +19,8 @@
 #include <AK/Vector.h>
 #include <LibCore/EventLoop.h>
 #include <LibCore/Promise.h>
-#include <LibMedia/AudioOutput.h>
 #include <LibMedia/DecoderError.h>
+#include <LibMedia/DemuxerScanState.h>
 #include <LibMedia/Export.h>
 #include <LibMedia/Forward.h>
 #include <LibMedia/MediaClock.h>
@@ -63,8 +63,6 @@ public:
     static NonnullOwnPtr<PlaybackManager> create();
     ~PlaybackManager();
 
-    void set_audio_output(AudioOutput audio_output) { m_audio_output = audio_output; }
-
     AK::Duration duration() const { return m_duration; }
     void set_duration(AK::Duration);
     AK::Duration current_time() const;
@@ -99,7 +97,7 @@ public:
     bool is_playing();
     PlaybackState state();
     AvailableData available_data();
-    TimeRanges buffered_time_ranges() const;
+    BufferedRanges buffered_time_ranges() const;
 
     void set_volume(double);
     void set_playback_rate(float);
@@ -189,7 +187,8 @@ private:
     void on_video_sink_state_changed(Track const&, PipelineStatus);
     void update_duration_from_scan_states();
     bool source_has_enabled_track(Demuxer const&) const;
-    static Optional<AK::Duration> verified_end_time_for_source(Demuxer const&);
+    Optional<AK::Duration> verified_end_time_for_source(Demuxer const&) const;
+    CombinedScanState scan_state_for_enabled_tracks(Demuxer const&) const;
     void update_pipeline_state();
     void reset_pipeline_state();
     PipelineStatus combined_pipeline_status() const;
@@ -251,7 +250,6 @@ private:
     HostHooks m_host_hooks;
     float m_playback_rate { 1.0f };
 
-    AudioOutput m_audio_output { AudioOutput::Platform };
     bool m_started { false };
 
     Vector<NonnullRefPtr<Demuxer>> m_demuxers;
