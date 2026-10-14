@@ -337,7 +337,14 @@ public:
     Vector<GC::Ref<Range>> const& find_in_page_highlighted_matches() const { return m_find_in_page_highlighted_matches; }
     void set_find_in_page_highlighted_matches(Vector<GC::Ref<Range>>);
     void remove_find_in_page_highlighted_matches_whose_text_changed();
+
+    Editing::SpellingMarkers& spelling_markers();
+    Editing::SpellCheckController& spell_check_controller();
+    Editing::SpellCheckController* spell_check_controller_if_exists() { return m_spell_check_controller.ptr(); }
+    bool has_spelling_markers() const;
     void recompute_search_text_paint_states(Layout::BegunRead const&);
+    void note_spelling_markers_changed();
+    void recompute_spelling_error_paint_states(Layout::BegunRead const&);
 
     WebIDL::ExceptionOr<Utf16String> cookie();
     WebIDL::ExceptionOr<void> set_cookie(Utf16View);
@@ -960,6 +967,9 @@ public:
     bool is_initial_about_blank() const { return m_is_initial_about_blank; }
     void set_is_initial_about_blank(bool b) { m_is_initial_about_blank = b; }
 
+    HTML::CrossProcessId id() const { return m_id.value(); }
+    void set_id(HTML::CrossProcessId);
+
     // https://html.spec.whatwg.org/multipage/dom.html#concept-document-about-base-url
     Optional<URL::URL> about_base_url() const { return m_about_base_url; }
     void set_about_base_url(Optional<URL::URL> url)
@@ -1035,7 +1045,7 @@ public:
         Yes,
     };
     WebIDL::ExceptionOr<bool> exec_command(Utf16FlyString const& command, bool show_ui, Utf16View value);
-    WebIDL::ExceptionOr<bool> exec_command_internal(Utf16FlyString const& command, bool show_ui, Utf16View value, DispatchInputEvent, Optional<Utf16FlyString> const& user_input_type = {});
+    WebIDL::ExceptionOr<bool> exec_command_internal(Utf16FlyString const& command, bool show_ui, Utf16View value, DispatchInputEvent, Optional<Utf16FlyString> const& user_input_type = {}, GC::Ptr<StaticRange> deletion_range = nullptr);
     WebIDL::ExceptionOr<bool> query_command_enabled(Utf16FlyString const& command);
     WebIDL::ExceptionOr<bool> query_command_indeterm(Utf16FlyString const& command);
     WebIDL::ExceptionOr<bool> query_command_state(Utf16FlyString const& command);
@@ -1084,6 +1094,10 @@ public:
     void register_resize_observer(Badge<ResizeObserver::ResizeObserver>, ResizeObserver::ResizeObserver&);
     bool has_resize_observers() const { return !m_resize_observers.is_empty(); }
     void unregister_resize_observer(Badge<ResizeObserver::ResizeObserver>, ResizeObserver::ResizeObserver&);
+
+    void add_shadow_root_needing_slot_assignment(Badge<ShadowRoot>, ShadowRoot&);
+    void remove_shadow_root_needing_slot_assignment(Badge<ShadowRoot>, ShadowRoot&);
+    void assign_slottables_if_needed();
 
     void run_the_update_intersection_observations_steps(HighResolutionTime::DOMHighResTimeStamp time);
 
@@ -1586,6 +1600,9 @@ public:
     RefPtr<SelectorQuery const> selector_query_for(Utf16View) const;
     QuerySelectorResultCache& query_selector_result_cache();
 
+    // Whether the aria-labelledby or aria-describedby of an element in the tree of root references id.
+    bool tree_references_id_from_aria(Node const& root, Utf16FlyString const& id) const;
+
     GC::Ptr<HTML::CustomElementRegistry> custom_element_registry() const;
     void set_custom_element_registry(GC::Ptr<HTML::CustomElementRegistry> custom_element_registry) { m_custom_element_registry = custom_element_registry; }
     GC::Ptr<HTML::CustomElementRegistry> effective_global_custom_element_registry() const;
@@ -1912,6 +1929,7 @@ private:
 
     // https://html.spec.whatwg.org/multipage/dom.html#is-initial-about:blank
     bool m_is_initial_about_blank { false };
+    Optional<HTML::CrossProcessId> m_id;
 
     // https://html.spec.whatwg.org/multipage/dom.html#concept-document-about-base-url
     Optional<URL::URL> m_about_base_url;
@@ -1976,8 +1994,11 @@ private:
     GC::Ptr<Range> m_find_in_page_active_match;
     bool m_selection_states_are_stale { false };
     bool m_search_text_states_are_stale { false };
+    bool m_spelling_error_states_are_stale { false };
     Utf16String m_find_in_page_active_match_text;
     Vector<GC::Ref<Range>> m_find_in_page_highlighted_matches;
+    OwnPtr<Editing::SpellingMarkers> m_spelling_markers;
+    OwnPtr<Editing::SpellCheckController> m_spell_check_controller;
     Vector<Utf16String> m_find_in_page_highlighted_match_texts;
     u64 m_find_in_page_highlighted_matches_dom_tree_version { 0 };
     u64 m_find_in_page_highlighted_matches_character_data_version { 0 };
@@ -1986,7 +2007,7 @@ private:
         bool observable { false };
         bool needs_update { true };
     };
-    Array<HighlightStyleObservability, 2> m_highlight_style_observability;
+    Array<HighlightStyleObservability, 3> m_highlight_style_observability;
     HighlightStyleObservability& highlight_style_observability(CSS::PseudoElement);
     void update_highlight_style_observability(CSS::PseudoElement);
     void update_highlight_style_observability();
@@ -2019,6 +2040,8 @@ private:
     GC::Ptr<IntersectionObserver::IntersectionObserver> m_lazy_load_intersection_observer;
 
     Vector<GC::Weak<ResizeObserver::ResizeObserver>> m_resize_observers;
+
+    ShadowRoot::DocumentSlotAssignmentList m_shadow_roots_needing_slot_assignment;
 
     // https://html.spec.whatwg.org/multipage/semantics.html#will-declaratively-refresh
     // A Document object has an associated will declaratively refresh (a boolean). It is initially false.
@@ -2248,6 +2271,15 @@ private:
 
     // Cache of querySelectorAll results, validated lazily against the query root's dom_tree_version/character_data_version.
     OwnPtr<QuerySelectorResultCache> m_query_selector_result_cache;
+
+    // The ids that aria-labelledby and aria-describedby reference in a tree, validated lazily against the tree's
+    // dom_tree_version. Computing accessible names asks this for the parent and the ancestors of every text node.
+    struct IdsReferencedFromAria {
+        GC::Weak<Node> root;
+        u64 dom_tree_version { 0 };
+        HashTable<Utf16FlyString> ids;
+    };
+    mutable HashMap<GC::RawPtr<Node const>, IdsReferencedFromAria> m_ids_referenced_from_aria;
 
     // https://fullscreen.spec.whatwg.org/#list-of-pending-fullscreen-events
     Vector<PendingFullscreenEvent> m_pending_fullscreen_events;

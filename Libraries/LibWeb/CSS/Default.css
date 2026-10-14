@@ -361,6 +361,11 @@ rt {
     outline: auto;
 }
 
+/* This matches the behavior of other engines. */
+html:focus-visible, body:focus-visible {
+    outline-style: none;
+}
+
 mark {
     background: Mark;
     color: MarkText;
@@ -2168,4 +2173,9 @@ iframe:fullscreen {
   /* FIXME: If the image is directional, it must respond to the writing mode of the element */
   symbols: \25B8;
   /* ▸ */
+}
+
+/* https://drafts.csswg.org/css-pseudo-4/#highlight-ua-styles */
+:root::spelling-error {
+    text-decoration: spelling-error;
 }

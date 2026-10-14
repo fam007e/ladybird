@@ -547,6 +547,8 @@ namespace Web::Editing {
 
 class EditCommand;
 class EditingHistory;
+class SpellCheckController;
+class SpellingMarkers;
 class UndoStep;
 enum class HistoryAction : u8;
 
@@ -554,8 +556,6 @@ enum class HistoryAction : u8;
 
 namespace Web::Encoding {
 
-class TextDecoder;
-class TextEncoder;
 class TextEncoderStream;
 
 }
@@ -1080,7 +1080,6 @@ class SpeechGrammarList;
 class SpeechRecognition;
 class SpeechRecognitionAlternative;
 class SpeechRecognitionEvent;
-class SpeechRecognitionPhrase;
 class SpeechRecognitionResult;
 class SpeechRecognitionResultList;
 class SpeechSynthesis;
@@ -1091,8 +1090,6 @@ class SpeechSynthesisVoice;
 
 namespace Web::Streams {
 
-class ByteLengthQueuingStrategy;
-class CountQueuingStrategy;
 class ReadableByteStreamController;
 class ReadableStream;
 class ReadableStreamAsyncIterator;
@@ -1197,12 +1194,6 @@ class UIEvent;
 
 }
 
-namespace Web::URLPattern {
-
-class URLPattern;
-
-}
-
 namespace Web::DOMURL {
 
 class DOMURL;
@@ -1274,39 +1265,10 @@ class PeriodicWave;
 namespace Web::WebGL {
 
 class RemoteWebGLTransport;
-class WebGLContextProxy;
 class WebGL2RenderingContext;
-class WebGLActiveInfo;
-class WebGLBuffer;
 class WebGLContextEvent;
-class WebGLFramebuffer;
-class WebGLObject;
-class WebGLProgram;
-class WebGLQuery;
-class WebGLRenderbuffer;
 class WebGLRenderingContext;
 class WebGLRenderingContextBase;
-class WebGLSampler;
-class WebGLShader;
-class WebGLShaderPrecisionFormat;
-class WebGLSync;
-class WebGLTexture;
-class WebGLTransformFeedback;
-class WebGLUniformLocation;
-class WebGLVertexArrayObject;
-class ANGLEInstancedArrays;
-class EXTBlendMinMax;
-class EXTColorBufferFloat;
-class EXTRenderSnorm;
-class EXTTextureFilterAnisotropic;
-class EXTTextureNorm16;
-class OESElementIndexUint;
-class OESStandardDerivatives;
-class OESVertexArrayObject;
-class WebGLCompressedTextureS3tc;
-class WebGLCompressedTextureS3tcSrgb;
-class WebGLDrawBuffers;
-class WebGLVertexArrayObjectOES;
 
 }
 

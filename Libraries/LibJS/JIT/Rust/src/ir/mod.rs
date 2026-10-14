@@ -1869,6 +1869,10 @@ pub struct FrameState {
     /// arguments than its `Call` instruction's (a call forwarded through
     /// `Function.prototype.apply` or `call`, or a bound function): how many.
     pub passed_argument_count: Option<u32>,
+    /// The argument slots whose values code that calls in the frame run can
+    /// read through the legacy `arguments` of the frame's function. Only
+    /// frames of inlined calls of functions that are not strict have them.
+    pub legacy_arguments: core::ops::Range<u32>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1900,12 +1904,23 @@ pub struct Graph {
     /// already running in the interpreter enters compiled code, with the pc of
     /// the loop back edge each one starts at. The frame holds every value.
     pub osr_entries: Vec<(u32, BlockId)>,
+    /// The pcs of the loop back edges in the loops of the on-stack
+    /// replacement entries (including those of the entries), from where a
+    /// frame running in the interpreter reaches an entry.
+    pub osr_loop_back_edges: Vec<u32>,
+    /// The pcs of the loop back edges in the loops around the loops of the
+    /// on-stack replacement entries, from where a frame running in the
+    /// interpreter may reach an entry on a later iteration.
+    pub osr_outer_loop_back_edges: Vec<u32>,
     /// The register-saving `CallSlowPath` nodes that may run before the
     /// frame is initialized, and so initialize it first if it is not.
     pub slow_paths_initializing_frame: Vec<NodeId>,
     /// Where exits of each executable were taken before, as (executable,
     /// pc, kind), for passes that must not repeat a failed speculation.
     pub exit_sites: Vec<(u32, u32, ExitKind)>,
+    /// The argument slots of the compiled function that its legacy
+    /// `arguments` shows. Empty for functions without legacy `arguments`.
+    pub legacy_arguments: core::ops::Range<u32>,
 }
 
 impl Graph {
@@ -1986,6 +2001,23 @@ impl Graph {
                 .into_iter()
                 .flat_map(|id| self.frame_state_values(id).map(|(_, value)| value)),
         )
+    }
+
+    pub fn legacy_argument_values_read_by(&self, node: NodeId) -> Vec<NodeId> {
+        let data = self.node(node);
+        let Some(frame_state) = data.frame_state.filter(|_| data.op.properties().runs_code) else {
+            return Vec::new();
+        };
+        let mut values = Vec::new();
+        for id in self.frame_state_chain(frame_state) {
+            let frame_state = self.frame_state(id);
+            for (slot, value) in &frame_state.values {
+                if frame_state.legacy_arguments.contains(slot) {
+                    values.push(*value);
+                }
+            }
+        }
+        values
     }
 
     /// The values of every frame of a frame state chain, innermost frame first.
@@ -2167,6 +2199,7 @@ mod tests {
             in_frame: Vec::new(),
             parent,
             passed_argument_count: None,
+            legacy_arguments: 0..0,
         })
     }
 

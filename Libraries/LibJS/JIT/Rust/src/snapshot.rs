@@ -89,6 +89,9 @@ pub struct ExecutableSnapshot {
     /// Whether the function's mapped arguments object (made by `CreateArguments`
     /// of the mapped kind) aliases parameters, so that it changes when they do.
     pub mapped_arguments_alias_parameters: bool,
+    /// Whether the snapshotted function has a legacy `arguments` property.
+    /// Other closures of its executable need not have the same eligibility.
+    pub supports_legacy_arguments: bool,
     /// The shape `NewObject` gives an object without a cached shape: an
     /// empty shape with `%Object.prototype%` of the executable's realm.
     pub new_object_shape: Option<ShapeSnapshot>,
@@ -357,6 +360,11 @@ impl ExecutableSnapshot {
             + u64::from(self.layout.number_of_constants)
             + u64::from(passed_argument_count.max(formal_parameter_count));
         u64::from(execution_context_size) + 8 * slots
+    }
+
+    /// Whether this is a function that is not strict (and no builtin).
+    pub fn is_non_strict_function(&self) -> bool {
+        !self.builtin && self.function.is_some_and(|function| !function.strict)
     }
 }
 
@@ -1122,16 +1130,22 @@ pub struct DynamicCallLayout {
 ///    `allocated + cell_size` > the u64 at `heap + heap_threshold_offset`,
 ///    take the slow path (the heap collects garbage there).
 /// 3. Let `cell` = the pointer at `allocator + local_free_list_offset`. If
-///    `cell & freelist_link_mask` is 0, the list is empty: take the slow
-///    path (it refills the list).
-/// 4. Let `link` = the u64 at `cell + freelist_next_offset`. Store
+///    `cell & freelist_link_mask` is 0, the list is empty: go to step 4.
+///    Otherwise let `link` = the u64 at `cell + freelist_next_offset`, store
 ///    `(cell & !freelist_link_mask) | (link & freelist_link_mask)`, the next
 ///    cell, which is in the block of `cell` whatever `link` is (cells are in
 ///    the heap region, where anything may have been corrupted), to
-///    `allocator + local_free_list_offset`, `allocated + cell_size` to
-///    `heap + heap_allocated_bytes_offset`, and add `cell_size` to the u64 at
+///    `allocator + local_free_list_offset`, and go to step 5.
+/// 4. Let `cell` = the pointer at `allocator + local_cursor_offset`. If it is
+///    not below the pointer at `allocator + local_end_offset`, take the slow
+///    path (it refills the list and the cursor). Otherwise store `cell` plus
+///    the u64 at `allocator + local_cell_size_offset` to
+///    `allocator + local_cursor_offset`. These words are outside the heap
+///    region.
+/// 5. Store `allocated + cell_size` to `heap + heap_allocated_bytes_offset`,
+///    and add `cell_size` to the u64 at
 ///    `heap + heap_total_allocated_bytes_offset`.
-/// 5. Copy `template` (`8 * template.len()` bytes, the start of every cell) to
+/// 6. Copy `template` (`8 * template.len()` bytes, the start of every cell) to
 ///    `cell`. Then store `inline_capacity` (a u8) at
 ///    `cell + inline_capacity_offset`, the shape at `cell + shape_offset`,
 ///    `cell + inline_storage_offset` (the address) at
@@ -1141,9 +1155,9 @@ pub struct DynamicCallLayout {
 ///    initialized yet) followed by NaN-boxed `undefined` up to
 ///    `inline_capacity` values.
 ///
-/// No garbage can be collected between steps 2 and 5, and the cell needs no
-/// marking: local free lists only ever hold cells of blocks that the
-/// incremental sweep is done with.
+/// No garbage can be collected between steps 2 and 6, and the cell needs no
+/// marking: local free lists and never-allocated cells only ever come from
+/// blocks that the incremental sweep is done with.
 ///
 /// Slow path: `Object* libjs_jit_allocate_object(VM*, Shape*, u32 reserve)`
 /// returns a complete object of that shape with every named property
@@ -1162,6 +1176,11 @@ pub struct ObjectAllocationInfo {
     pub local_free_list_offset: u32,
     pub freelist_next_offset: u32,
     pub freelist_link_mask: u32,
+    /// Where the cursor, the end and the cell size of an allocator's
+    /// never-allocated cells are, relative to its `allocator` address.
+    pub local_cursor_offset: u32,
+    pub local_end_offset: u32,
+    pub local_cell_size_offset: u32,
     /// The bytes every new plain object starts with, as u64 words.
     pub template: Vec<u64>,
     pub shape_offset: u32,

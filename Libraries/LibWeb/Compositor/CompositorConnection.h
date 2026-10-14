@@ -81,7 +81,7 @@ public:
     void set_webgl_command_buffer(Compositing::CanvasId, Core::AnonymousBuffer const&);
     void send_webgl_commands_from_shared_buffer(Compositing::CanvasId, u64 offset, u64 size_in_bytes, u64 flush_sequence_number, Vector<Gfx::DecodedImageFrame> const& bitmaps);
     bool drain_webgl_command_buffer(Compositing::CanvasId);
-    void send_webgl_commands(Compositing::CanvasId, ByteBuffer const&, Vector<Gfx::DecodedImageFrame> const& bitmaps);
+    void send_webgl_commands(Compositing::CanvasId, ReadonlyBytes, Vector<Gfx::DecodedImageFrame> const& bitmaps);
     void present_webgl_canvas(Compositing::CanvasId, bool preserve_drawing_buffer);
     void clear_webgl_drawing_buffer(Compositing::CanvasId);
     ByteBuffer webgl_sync_call(Compositing::CanvasId, ByteBuffer request);
@@ -89,11 +89,14 @@ public:
     bool read_webgl_buffer_sub_data(Compositing::CanvasId, Compositing::WebGL::GLenum target, Compositing::WebGL::GLintptr offset, Compositing::WebGL::GLintptr size, Core::AnonymousBuffer const& data);
 
     void ensure_video_presentation_channel();
-    // Offers the Compositor the process's render clock, which it delivers display ticks to from then on.
-    void attach_render_clock();
+    // Takes up the render clock channel the Browser made between this process and the Compositor, which delivers
+    // display ticks over it from then on.
+    void attach_render_clock(IPC::TransportHandle);
     Function<void(Web::PageId page_id, Web::MouseEvent)> on_mouse_event;
     Function<void(Web::PageId page_id, Web::KeyEvent)> on_key_event;
     Function<void()> on_compositor_lost;
+    // Asks the Browser to connect this process's media server to the Compositor.
+    Function<void()> on_request_video_presentation_channel;
 
 private:
     // Only a test of the transport hands a frame straight to the compositor.

@@ -129,6 +129,8 @@
 #include <LibWeb/DOMURL/DOMURL.h>
 #include <LibWeb/Dump.h>
 #include <LibWeb/Editing/EditingHistory.h>
+#include <LibWeb/Editing/SpellCheckController.h>
+#include <LibWeb/Editing/SpellingMarkers.h>
 #include <LibWeb/Fetch/Fetching/Checks.h>
 #include <LibWeb/Fetch/Infrastructure/FetchController.h>
 #include <LibWeb/Fetch/Infrastructure/FetchRecord.h>
@@ -480,6 +482,7 @@ WebIDL::ExceptionOr<GC::Ref<Document>> Document::create_and_initialize(Type type
     document->m_was_created_via_cross_origin_redirects = navigation_params.response->redirect_taint() != Fetch::Infrastructure::RedirectTaint::SameOrigin;
     document->m_about_base_url = navigation_params.about_base_url;
     document->set_url(*creation_url);
+    document->set_id(navigation_params.document_id.has_value() ? *navigation_params.document_id : browsing_context->page().client().allocate_cross_process_id());
 
     // AD-HOC: Record when the readiness becomes "loading" for PerformanceTiming's domLoading. The window is not yet
     //         associated with document, so relate the time to loadTimingInfo directly.
@@ -919,6 +922,10 @@ void Document::visit_edges(Cell::Visitor& visitor)
     m_anchor_name_map.visit_edges(visitor);
     if (m_query_selector_result_cache)
         m_query_selector_result_cache->visit_edges(visitor);
+    if (m_spelling_markers)
+        m_spelling_markers->visit_edges(visitor);
+    if (m_spell_check_controller)
+        m_spell_check_controller->visit_edges(visitor);
 
     for (auto& event : m_pending_animation_event_queue) {
         visitor.visit(event.event);
@@ -1064,6 +1071,8 @@ void Document::note_selection_changed()
 {
     m_selection_states_are_stale = true;
     request_frame_for_pending_repaint();
+    if (m_spell_check_controller)
+        m_spell_check_controller->did_change_selection();
 }
 
 void Document::update_highlight_states_if_needed(Layout::BegunRead const& read)
@@ -1080,6 +1089,10 @@ void Document::update_highlight_states_if_needed(Layout::BegunRead const& read)
     }
     if (exchange(m_search_text_states_are_stale, false) && has_committed_viewport_box()) {
         recompute_search_text_paint_states(read);
+        Node::set_needs_repaint(InvalidateDisplayList::PaintCommands);
+    }
+    if (exchange(m_spelling_error_states_are_stale, false) && has_committed_viewport_box()) {
+        recompute_spelling_error_paint_states(read);
         Node::set_needs_repaint(InvalidateDisplayList::PaintCommands);
     }
 }
@@ -1129,6 +1142,42 @@ void Document::collapse_find_in_page_active_match_if_its_text_changed()
     if (!match || match->collapsed() || realign_find_in_page_match_to_its_text(*match, m_find_in_page_active_match_text))
         return;
     set_find_in_page_active_match(Range::create(match->start_container(), match->start_offset(), match->start_container(), match->start_offset()));
+}
+
+Editing::SpellingMarkers& Document::spelling_markers()
+{
+    if (!m_spelling_markers)
+        m_spelling_markers = make<Editing::SpellingMarkers>(*this);
+    return *m_spelling_markers;
+}
+
+Editing::SpellCheckController& Document::spell_check_controller()
+{
+    if (!m_spell_check_controller)
+        m_spell_check_controller = make<Editing::SpellCheckController>(*this);
+    return *m_spell_check_controller;
+}
+
+bool Document::has_spelling_markers() const
+{
+    return m_spelling_markers && !m_spelling_markers->is_empty();
+}
+
+void Document::note_spelling_markers_changed()
+{
+    set_needs_highlight_style_update(CSS::PseudoElement::SpellingError);
+    // The boxes the markers paint through are found at the next read of the paint state, as for find-in-page matches.
+    m_spelling_error_states_are_stale = true;
+    request_frame_for_pending_repaint();
+}
+
+void Document::recompute_spelling_error_paint_states(Layout::BegunRead const& read)
+{
+    if (!has_spelling_markers()) {
+        paint_state().reset_spelling_error_states();
+        return;
+    }
+    paint_state().recompute_spelling_error_states(read, *this, spelling_markers());
 }
 
 void Document::remove_find_in_page_highlighted_matches_whose_text_changed()
@@ -1244,12 +1293,8 @@ WebIDL::ExceptionOr<Document*> Document::open(Optional<Utf16String> const&, Opti
         return this;
 
     // 8. If document's node navigable is non-null and document's node navigable's ongoing navigation is a navigation ID, then stop loading document's node navigable.
-    // AD-HOC: Pending navigations can also sit in m_pending_navigations, so we need to cancel those too.
-    if (auto navigable = this->navigable()) {
-        navigable->clear_pending_navigations();
-        if (navigable->ongoing_navigation().has<Utf16String>())
-            navigable->stop_loading();
-    }
+    if (auto navigable = this->navigable(); navigable && navigable->ongoing_navigation().has<Utf16String>())
+        navigable->stop_loading();
 
     // 9. For each shadow-including inclusive descendant node of document, erase all event listeners and handlers given node.
     for_each_shadow_including_inclusive_descendant([](Node& node) {
@@ -1872,6 +1917,12 @@ void Document::respond_to_base_url_changes(URL::URL const& old_document_url, URL
     // FIXME: 4. Consider speculative loads given document.
 }
 
+void Document::set_id(HTML::CrossProcessId id)
+{
+    VERIFY(!m_id.has_value());
+    m_id = id;
+}
+
 // https://html.spec.whatwg.org/multipage/urls-and-fetching.html#set-the-url
 void Document::set_url(URL::URL const& url)
 {
@@ -2090,6 +2141,7 @@ void Document::after_layout_commit(Layout::BegunRead const& read, LayoutTreeChan
     collapse_find_in_page_active_match_if_its_text_changed();
     remove_find_in_page_highlighted_matches_whose_text_changed();
     recompute_search_text_paint_states(read);
+    recompute_spelling_error_paint_states(read);
 
     if (layout_tree_changed == LayoutTreeChanged::Yes) {
         // Broadcast the current viewport rect to any new committed boxes, so they know whether
@@ -3927,6 +3979,9 @@ void Document::set_focused_area(GC::Ptr<Node> node, InvalidateFocusPseudoClasses
     set_needs_repaint(InvalidateDisplayList::PaintCommands);
 
     update_active_element();
+
+    if (navigable() && page().spell_checking_available())
+        spell_check_controller().did_focus(m_focused_area);
 }
 
 Element const* Document::active_element() const
@@ -4693,7 +4748,7 @@ void Document::completely_finish_loading()
     //     document, reached through the UI process, which mirrors that the document is completely loaded.
     if (container)
         container->content_navigable_completely_finished_loading();
-    navigable->page().client().page_did_completely_finish_loading(navigable->id());
+    navigable->page().client().page_did_completely_finish_loading(navigable->id(), *this);
 }
 
 // https://html.spec.whatwg.org/multipage/dom.html#dom-document-cookie
@@ -5388,11 +5443,6 @@ void Document::set_ready_for_post_load_tasks(bool ready)
     m_ready_for_post_load_tasks = ready;
     if (ready) {
         if (auto navigable = this->navigable()) {
-            // AD-HOC: Clear the navigation load event guard now that the document is ready.
-            //         This guard was set in finalize_a_cross_document_navigation to prevent the parent's
-            //         load event from firing while the about:blank was still the active document.
-            navigable->clear_navigation_load_event_guard();
-
             if (auto container = navigable->container())
                 container->document().schedule_html_parser_end_check();
             else
@@ -6573,6 +6623,22 @@ void Document::unregister_resize_observer(Badge<ResizeObserver::ResizeObserver>,
     m_resize_observers.remove_all_matching([&](auto const& entry) { return !entry || entry.ptr().ptr() == &observer; });
 }
 
+void Document::add_shadow_root_needing_slot_assignment(Badge<ShadowRoot>, ShadowRoot& shadow_root)
+{
+    m_shadow_roots_needing_slot_assignment.append(shadow_root);
+}
+
+void Document::remove_shadow_root_needing_slot_assignment(Badge<ShadowRoot>, ShadowRoot& shadow_root)
+{
+    m_shadow_roots_needing_slot_assignment.remove(shadow_root);
+}
+
+void Document::assign_slottables_if_needed()
+{
+    while (auto* shadow_root = m_shadow_roots_needing_slot_assignment.first())
+        shadow_root->assign_slottables_if_needed();
+}
+
 // https://www.w3.org/TR/intersection-observer/#queue-an-intersection-observer-task
 void Document::queue_intersection_observer_task()
 {
@@ -6645,11 +6711,13 @@ static CSSPixelRect compute_intersection(Layout::BegunRead const& read, GC::Ref<
             scroll_margin[3].to_px(clip_rect.width()));
         return clip_rect;
     };
-    return Layout::RustFFI::layout_script_intersection_observer_intersection_rect(
+    CSSPixelRect rect;
+    Layout::RustFFI::layout_script_intersection_observer_intersection_rect(
         document.layout_node_arena().host(), Layout::Node::slot_id(target->layout_node(read)), target_rect,
         Layout::Node::slot_id(root_layout_box), root_bounds,
         Painting::rect_to_viewport_transform(document, visual_context_tree),
-        const_cast<Vector<CSS::LengthPercentage>*>(&scroll_margin), inflate_scroll_container_clip_rect_by_scroll_margin);
+        const_cast<Vector<CSS::LengthPercentage>*>(&scroll_margin), inflate_scroll_container_clip_rect_by_scroll_margin, &rect);
+    return rect;
 }
 
 // https://www.w3.org/TR/intersection-observer/#run-the-update-intersection-observations-steps
@@ -7893,8 +7961,10 @@ void Document::update_compositor_animations(Layout::BegunRead const& read)
         auto viewport_bounds = CSSPixelRect { { 0, 0 }, viewport_rect().size() };
         auto rect_to_viewport_transform = Painting::rect_to_viewport_transform(*this, *visual_context_tree);
         auto bounds_in_viewport = [&](Layout::Node const& node) -> CSSPixelRect {
-            return Layout::RustFFI::layout_script_bounding_client_rect(
-                node.document_host(), Layout::Node::slot_id(&node), rect_to_viewport_transform);
+            CSSPixelRect rect;
+            Layout::RustFFI::layout_script_bounding_client_rect(
+                node.document_host(), Layout::Node::slot_id(&node), rect_to_viewport_transform, &rect);
+            return rect;
         };
         HashTable<Layout::Node const*> containing_blocks;
         for (auto const* container = layout_node->containing_block(); container; container = container->containing_block())
@@ -9996,6 +10066,10 @@ void Document::parse_html_from_a_string(Utf16View html)
     // 1. Set document's type to "html".
     set_document_type(DOM::Document::Type::HTML);
 
+    // OPTIMIZATION: Simple markup builds the document directly, without a parser.
+    if (HTML::HTMLParser::try_parse_document_fast(*this, html))
+        return;
+
     // 2. Let parser be a new HTML parser whose allow declarative shadow roots is document's allow declarative shadow roots,
     //    associated with document.
     // 3. Place html into the input stream for parser. The encoding confidence is irrelevant.
@@ -10077,9 +10151,10 @@ Optional<CSSPixelRect> Document::current_caret_rect()
     };
 
     if (is<DOM::Text>(dom_node)) {
-        auto result = Layout::RustFFI::layout_script_text_caret_rect_in_dom_range(
-            layout_node->document_host(), Layout::Node::slot_id(layout_node), position->offset());
-        if (result.has_value)
+        Layout::RustFFI::FfiCaretRectResult result;
+        Layout::RustFFI::layout_script_text_caret_rect_for_position(
+            layout_node->document_host(), Layout::Node::slot_id(layout_node), position->offset(), position->affinity() == TextAffinity::Downstream, &result);
+        if (result.found)
             return to_viewport_rect(result.rect);
     }
 
@@ -11327,6 +11402,27 @@ QuerySelectorResultCache& Document::query_selector_result_cache()
     if (!m_query_selector_result_cache)
         m_query_selector_result_cache = make<QuerySelectorResultCache>();
     return *m_query_selector_result_cache;
+}
+
+bool Document::tree_references_id_from_aria(Node const& root, Utf16FlyString const& id) const
+{
+    auto dom_tree_version = root.dom_tree_version();
+    if (auto entry = m_ids_referenced_from_aria.get(&root); entry.has_value() && entry->root.ptr().ptr() == &root && entry->dom_tree_version == dom_tree_version)
+        return entry->ids.contains(id);
+
+    m_ids_referenced_from_aria.remove_all_matching([](auto const&, auto const& entry) { return !entry.root; });
+
+    IdsReferencedFromAria entry { root, dom_tree_version, {} };
+    root.for_each_in_subtree_of_type<HTML::HTMLElement>([&](auto const& element) {
+        for (auto& reference : element.parse_id_reference_list(element.aria_labelled_by()))
+            entry.ids.set(Utf16FlyString { move(reference) });
+        for (auto& reference : element.parse_id_reference_list(element.aria_described_by()))
+            entry.ids.set(Utf16FlyString { move(reference) });
+        return TraversalDecision::Continue;
+    });
+    auto is_referenced = entry.ids.contains(id);
+    m_ids_referenced_from_aria.set(&root, move(entry));
+    return is_referenced;
 }
 
 }

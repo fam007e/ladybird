@@ -52,8 +52,8 @@ ALLOWED_REALM_MENTIONS = {
     "FileAPI": (6, 11, "File/Blob/FileReader algorithms still create streams, buffers, and events in selected realms"),
     "Geometry": (8, 8, "geometry constructors and structured clone still materialize JS-facing geometry objects"),
     "HTML": (
-        73,
-        223,
+        71,
+        221,
         "HTML algorithms still contain structured serialization, including posted-message preparation, canvas, navigation transfer/reconstruction, worker/worklet, and event realm use, and cross-origin Window/Location property functions are created in the current realm; RemoteWindow mirrors Window's postMessage",
     ),
     "IndexedDB": (
@@ -86,7 +86,7 @@ ALLOWED_REALM_MENTIONS = {
         "WebAudio buffers, AudioParamMap, and AudioWorklet APIs still materialize JS buffers and callback/promise values in selected realms",
     ),
     "WebDriver": (2, 7, "WebDriver execute/JSON conversion still materializes JS values for automation"),
-    "WebGL": (72, 120, "WebGL APIs still materialize buffers, typed arrays, extensions, and wrapper objects"),
+    "WebGL": (4, 9, "WebGL contexts are created in the realm of their canvas, and their events and promises in it"),
     "WebLocks": (6, 7, "Web Locks queue/callback algorithms still use callback and promise realms"),
     "XHR": (4, 7, "XHR/FormData/FileReader-style paths still materialize JS values and events"),
 }

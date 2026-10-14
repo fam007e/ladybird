@@ -46,8 +46,8 @@
 
 namespace GC {
 
-static constexpr size_t GC_MIN_BYTES_THRESHOLD { 8 * 1024 * 1024 };
-static constexpr size_t GC_HEAP_GROWTH_FACTOR_NUMERATOR { 7 };
+static constexpr size_t GC_MIN_BYTES_THRESHOLD { 32 * 1024 * 1024 };
+static constexpr size_t GC_HEAP_GROWTH_FACTOR_NUMERATOR { 16 };
 static constexpr size_t GC_HEAP_GROWTH_FACTOR_DENOMINATOR { 4 };
 
 static constexpr int GC_INCREMENTAL_SWEEP_INTERVAL_MS = 16;
@@ -581,6 +581,11 @@ AK::JsonObject Heap::build_graph(ReadonlySpan<FlatPtr> callee_saved_registers)
         .callee_saved_registers = callee_saved_registers,
     };
 
+    // NB: While an allocator has a block's never-allocated cells out, the block counts them as cells, and the
+    //     conservative scan in gather_roots() would take a possible pointer into one for a live cell. Give them back,
+    //     as a collection does, so that they are the block's lazy region again.
+    give_back_local_free_lists();
+
     // An in-progress incremental sweep would leave parts of the heap as freelist
     // entries while the conservative scan in gather_roots() can still pick up
     // not-yet-swept (but unreachable) cells whose internal pointers lead to
@@ -772,6 +777,10 @@ void Heap::run_post_gc_tasks()
 
 void Heap::dump_allocators()
 {
+    // NB: While an allocator has a block's never-allocated cells out, the block counts them as cells. Give them back,
+    //     so that they are the block's lazy region again and are not counted.
+    give_back_local_free_lists();
+
     size_t total_in_committed_blocks = 0;
     size_t total_waste = 0;
     for (auto& allocator : m_all_cell_allocators) {

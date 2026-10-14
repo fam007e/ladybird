@@ -77,6 +77,7 @@
 #include <LibWeb/DOM/ShadowRoot.h>
 #include <LibWeb/DOM/Text.h>
 #include <LibWeb/Editing/EditingHistory.h>
+#include <LibWeb/Editing/SpellCheckController.h>
 #include <LibWeb/Fetch/Fetching/Fetching.h>
 #include <LibWeb/Fetch/Infrastructure/FetchAlgorithms.h>
 #include <LibWeb/Fetch/Infrastructure/FetchController.h>
@@ -305,6 +306,53 @@ static void for_each_ascii_whitespace_separated_token(Utf16View input, Function<
     }
 }
 
+NonnullOwnPtr<Element::AttributeList> Element::AttributeList::create(size_t capacity)
+{
+    VERIFY(capacity > 0 && capacity <= NumericLimits<u32>::max());
+    auto allocation_size = Checked<size_t>(capacity);
+    allocation_size *= sizeof(Attribute);
+    allocation_size += sizeof(AttributeList);
+    auto* memory = AttributeList::operator new(allocation_size.value());
+    return adopt_own(*new (memory) AttributeList(static_cast<u32>(capacity)));
+}
+
+Element::AttributeList::~AttributeList()
+{
+    for (auto& attribute : span())
+        attribute.~Attribute();
+}
+
+NonnullOwnPtr<Element::AttributeList> Element::AttributeList::ensure_room_for_one_more(NonnullOwnPtr<AttributeList> list)
+{
+    if (list->m_size < list->m_capacity)
+        return list;
+    return list->moved_into_new_list(max(static_cast<size_t>(list->m_capacity) * 2, static_cast<size_t>(4)));
+}
+
+NonnullOwnPtr<Element::AttributeList> Element::AttributeList::moved_into_new_list(size_t capacity)
+{
+    VERIFY(capacity >= m_size);
+    auto new_list = create(capacity);
+    for (auto& attribute : span())
+        new (&new_list->attributes()[new_list->m_size++]) Attribute(move(attribute));
+    return new_list;
+}
+
+void Element::AttributeList::unchecked_append(QualifiedName name, Utf16String value)
+{
+    VERIFY(m_size < m_capacity);
+    new (&attributes()[m_size++]) Attribute(move(name), move(value));
+}
+
+void Element::AttributeList::remove(size_t index)
+{
+    VERIFY(index < m_size);
+    auto* attributes = this->attributes();
+    for (size_t i = index; i + 1 < m_size; ++i)
+        attributes[i] = move(attributes[i + 1]);
+    attributes[--m_size].~Attribute();
+}
+
 Element::Element(Document& document, DOM::QualifiedName qualified_name)
     : ParentNode(document, NodeType::ELEMENT_NODE)
     , m_qualified_name(move(qualified_name))
@@ -313,17 +361,14 @@ Element::Element(Document& document, DOM::QualifiedName qualified_name)
 
 Element::~Element() = default;
 
-Element::AttributeList& Element::ensure_attribute_list()
-{
-    if (!m_attributes)
-        m_attributes = make<AttributeList>();
-    return *m_attributes;
-}
-
 void Element::append_to_attribute_list(QualifiedName name, Utf16String value)
 {
     add_to_subtree_attribute_name_filter(attribute_name_filter_bit(name.local_name()));
-    ensure_attribute_list().empend(move(name), move(value));
+    if (!m_attributes)
+        m_attributes = AttributeList::create(1);
+    else
+        m_attributes = AttributeList::ensure_room_for_one_more(m_attributes.release_nonnull());
+    m_attributes->unchecked_append(move(name), move(value));
 }
 
 void Element::add_to_subtree_attribute_name_filter(u64 bits)
@@ -337,7 +382,10 @@ void Element::ensure_attribute_capacity(size_t capacity)
 {
     if (capacity == 0)
         return;
-    ensure_attribute_list().ensure_capacity(capacity);
+    if (!m_attributes)
+        m_attributes = AttributeList::create(capacity);
+    else if (m_attributes->capacity() < capacity)
+        m_attributes = m_attributes->moved_into_new_list(capacity);
 }
 
 void Element::synchronize_attribute(Utf16FlyString const& qualified_name) const
@@ -412,9 +460,8 @@ size_t Element::external_memory_size() const
     if (!m_attributes)
         return size;
 
-    size = JS::saturating_add_external_memory_size(size, sizeof(AttributeList));
-    size = JS::saturating_add_external_memory_size(size, JS::vector_external_memory_size(*m_attributes));
-    for (auto const& attribute : *m_attributes)
+    size = JS::saturating_add_external_memory_size(size, sizeof(AttributeList) + m_attributes->capacity() * sizeof(Attribute));
+    for (auto const& attribute : m_attributes->span())
         size = JS::saturating_add_external_memory_size(size, JS::utf16_string_external_memory_size(attribute.value));
     return size;
 }
@@ -1175,7 +1222,7 @@ Vector<Utf16FlyString> Element::get_attribute_names() const
     if (!m_attributes)
         return {};
     Vector<Utf16FlyString> names;
-    for (auto const& attribute : *m_attributes)
+    for (auto const& attribute : m_attributes->span())
         names.append(attribute.name.as_string());
     return names;
 }
@@ -1335,6 +1382,12 @@ void Element::run_attribute_change_steps(Utf16FlyString const& local_name, Optio
     // tests has to be heard about however it was written.
     if (old_value != value)
         CSS::record_element_attribute_changed(*this, local_name, namespace_, old_value, value);
+
+    if (old_value != value
+        && local_name.is_one_of(HTML::AttributeNames::spellcheck, HTML::AttributeNames::readonly, HTML::AttributeNames::disabled, HTML::AttributeNames::type, HTML::AttributeNames::contenteditable)) {
+        if (auto* controller = document().spell_check_controller_if_exists())
+            controller->did_change_checking_state(*this);
+    }
 
     if (old_value != value) {
         // An SVG element's parsed attributes are layout input, published under its style node. Published here,
@@ -1504,7 +1557,8 @@ CSS::RequiredInvalidationAfterStyleChange Element::recompute_pseudo_element_styl
             && !(m_rendered_in_top_layer && may_have_style(CSS::PseudoElement::Backdrop))
             && !highlight_may_have_style(CSS::PseudoElement::Selection)
             && !highlight_may_have_style(CSS::PseudoElement::SearchText)
-            && !highlight_may_have_style(CSS::PseudoElement::SearchTextCurrent))
+            && !highlight_may_have_style(CSS::PseudoElement::SearchTextCurrent)
+            && !highlight_may_have_style(CSS::PseudoElement::SpellingError))
             return false;
         auto settled = CSS::StyleEngineFFI::style_engine_settle_pseudo_records_after_host_record(style_computer.style_engine().host(), &read, style_node_id().value(), had_list_marker);
         // What the settled pseudo-elements' container-relative lengths read of the element's containers.
@@ -1652,6 +1706,7 @@ CSS::RequiredInvalidationAfterStyleChange Element::recompute_pseudo_element_styl
     recompute_pseudo_element_style(CSS::PseudoElement::Selection);
     recompute_pseudo_element_style(CSS::PseudoElement::SearchText);
     recompute_pseudo_element_style(CSS::PseudoElement::SearchTextCurrent);
+    recompute_pseudo_element_style(CSS::PseudoElement::SpellingError);
     // An element that left the top layer drops the ::backdrop it held.
     if (m_rendered_in_top_layer || !!style_record_identity(CSS::PseudoElement::Backdrop))
         recompute_pseudo_element_style(CSS::PseudoElement::Backdrop);
@@ -2700,12 +2755,20 @@ WebIDL::ExceptionOr<void> Element::set_inner_html(Utf16View html)
     auto* template_element = as_if<HTML::HTMLTemplateElement>(*this);
     if (template_element)
         target = template_element->content();
-    auto fragment = TRY(parse_fragment(target, html));
 
-    // 5. Replace all with fragment within target.
-    target.visit([&](auto node) {
-        node->replace_all(fragment);
-    });
+    // OPTIMIZATION: Markup the fast fragment parser supports needs no fragment. Inserting the parsed nodes directly
+    //               runs their insertion steps once and skips removing them from a fragment no one can observe.
+    GC::RootVector<GC::Ref<Node>> fast_parsed_nodes;
+    if (!template_element && HTML::HTMLParser::try_parse_html_fragment_fast_into_detached_nodes(*this, html, fast_parsed_nodes)) {
+        replace_all(move(fast_parsed_nodes));
+    } else {
+        auto fragment = TRY(parse_fragment(target, html, HTML::ParserScriptingMode::Inert, HTML::FragmentFastPath::Skip));
+
+        // 5. Replace all with fragment within target.
+        target.visit([&](auto node) {
+            node->replace_all(fragment);
+        });
+    }
 
     // NOTE: We don't invalidate style & layout for <template> elements since they don't affect rendering.
     if (!template_element) {
@@ -2879,7 +2942,7 @@ void Element::did_update_inline_style()
     bool had_style_attribute = m_style_attribute_is_dirty;
     Optional<Utf16String> old_value;
     if (m_attributes) {
-        for (auto const& attribute : *m_attributes) {
+        for (auto const& attribute : m_attributes->span()) {
             if (!attribute.name.namespace_().has_value() && attribute.name.local_name() == HTML::AttributeNames::style) {
                 had_style_attribute = true;
                 old_value = attribute.value;
@@ -3934,7 +3997,7 @@ bool Element::is_actually_disabled() const
 }
 
 // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#fragment-parsing-algorithm-steps
-WebIDL::ExceptionOr<GC::Ref<DOM::DocumentFragment>> Element::parse_fragment(Variant<GC::Ref<Element>, GC::Ref<DocumentFragment>> target, Utf16View markup, HTML::ParserScriptingMode scripting_mode)
+WebIDL::ExceptionOr<GC::Ref<DOM::DocumentFragment>> Element::parse_fragment(Variant<GC::Ref<Element>, GC::Ref<DocumentFragment>> target, Utf16View markup, HTML::ParserScriptingMode scripting_mode, HTML::FragmentFastPath fast_path)
 {
     // 1. Assert: scriptingMode is either Inert or Fragment.
     VERIFY(scripting_mode == HTML::ParserScriptingMode::Inert || scripting_mode == HTML::ParserScriptingMode::Fragment);
@@ -3945,7 +4008,7 @@ WebIDL::ExceptionOr<GC::Ref<DOM::DocumentFragment>> Element::parse_fragment(Vari
         return XMLFragmentParser::parse_xml_fragment(target, markup);
 
     // 3. If context's node document is an XML document, then set newChildren to the result of invoking the XML fragment parsing algorithm given context and markup.
-    return HTML::HTMLParser::parse_html_fragment(target, markup, HTML::HTMLParser::AllowDeclarativeShadowRoots::No, scripting_mode);
+    return HTML::HTMLParser::parse_html_fragment(target, markup, HTML::HTMLParser::AllowDeclarativeShadowRoots::No, scripting_mode, fast_path);
 }
 
 // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-element-outerhtml
@@ -4645,27 +4708,7 @@ bool Element::has_hidden_ancestor(Layout::BegunRead const& read) const
 
 bool Element::is_referenced() const
 {
-    bool is_referenced = false;
-    if (id().has_value()) {
-        auto id_view = id()->view();
-        root().for_each_in_subtree_of_type<HTML::HTMLElement>([&](auto& element) {
-            auto aria_data = MUST(Web::ARIA::AriaData::build_data(element));
-            auto references_id = [&](Vector<Utf16String> const& references) {
-                for (auto const& id_reference : references) {
-                    if (id_reference.utf16_view() == id_view)
-                        return true;
-                }
-                return false;
-            };
-            if (references_id(aria_data->aria_labelled_by_or_default())
-                || references_id(aria_data->aria_described_by_or_default())) {
-                is_referenced = true;
-                return TraversalDecision::Break;
-            }
-            return TraversalDecision::Continue;
-        });
-    }
-    return is_referenced;
+    return id().has_value() && document().tree_references_id_from_aria(root(), *id());
 }
 
 bool Element::has_referenced_and_hidden_ancestor(Layout::BegunRead const& read) const
@@ -6206,6 +6249,10 @@ void Element::attribute_changed(Utf16FlyString const& local_name, Optional<Utf16
         // 3. If value is the empty string and oldValue is null, then return.
         if (value == Utf16String {} && !old_value.has_value())
             return;
+
+        // AD-HOC: Assigned nodes are recomputed lazily.
+        if (auto assigned_slot = assigned_slot_internal())
+            assigned_slot->assign_slottables_if_needed();
 
         // 4. If value is null or the empty string, then set element’s name to the empty string.
         if (!value.has_value() || value->is_empty())

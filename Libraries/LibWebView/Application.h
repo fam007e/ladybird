@@ -101,6 +101,9 @@ public:
     static BrowserOptions const& browser_options() { return the().m_browser_options; }
     static RequestServerOptions const& request_server_options() { return the().m_request_server_options; }
     static WebContentOptions& web_content_options() { return the().m_web_content_options; }
+
+    SpellChecker* spell_checker() { return m_spell_checker.ptr(); }
+    void set_spell_checker(OwnPtr<SpellChecker>);
     static FontService& font_service() { return *the().m_font_service; }
     static FontServiceHost& font_service_host() { return *the().m_font_service_host; }
     JsonValue const& site_compatibility_data() const { return m_site_compatibility_data; }
@@ -189,6 +192,9 @@ public:
     static SessionStore* session_store(IsPrivate);
 
     static ProcessManager& process_manager() { return *the().m_process_manager; }
+#if defined(AK_OS_WINDOWS)
+    static IPC::HandleBrokerServer& handle_broker_server() { return *the().m_handle_broker_server; }
+#endif
 
     // Runs the handler when the ImageDecoder with the given pid exits.
     void set_image_decoder_exit_handler(pid_t, Function<void()>);
@@ -225,6 +231,9 @@ public:
 
     Web::CompositorContextId allocate_compositor_context_id();
     ErrorOr<void> connect_web_content_to_compositor(WebContentClient&);
+    // Hands the Compositor its end of a video presentation channel for the renderer. False if the renderer has no
+    // Compositor connection to pair it with.
+    bool connect_video_presentation_to_compositor(WebContentClient&, IPC::TransportHandle compositor_end);
     ErrorOr<IPC::TransportHandle> connect_new_compositor_canvas_client();
     void register_compositor_context(WebContentClient&, Web::CompositorContextId, Optional<Web::PageId> page_id);
     ErrorOr<void> try_register_compositor_context(WebContentClient&, Web::CompositorContextId, Optional<Web::PageId> page_id);
@@ -618,9 +627,13 @@ private:
     bool request_server_client_may_use_cookies_in(int client_id, URL::URL const&, Optional<HTTP::Cookie::PartitionContext> const&) const;
 
     OwnPtr<Core::GeolocationProvider> m_geolocation_provider;
+    OwnPtr<SpellChecker> m_spell_checker;
     OwnPtr<Core::TimeZoneWatcher> m_time_zone_watcher;
 
     Core::EventLoop* m_event_loop { nullptr };
+#if defined(AK_OS_WINDOWS)
+    OwnPtr<IPC::HandleBrokerServer> m_handle_broker_server;
+#endif
     OwnPtr<ProcessManager> m_process_manager;
 
     RefPtr<Action> m_reload_action;

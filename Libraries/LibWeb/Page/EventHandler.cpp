@@ -1624,7 +1624,118 @@ EventHandler::KeyboardScrollSnapshot EventHandler::keyboard_scroll_snapshot() co
     return snapshot;
 }
 
-EventResult EventHandler::handle_keydown(UIEvents::KeyCode key, u32 modifiers, u32 code_point, bool repeat, bool should_insert_text, bool async_scroll_performed_default_action)
+EventResult EventHandler::handle_text_editing_command(TextEditingCommand const& command)
+{
+    auto document = m_navigable->active_document();
+    if (!document || !document->is_fully_active())
+        return EventResult::Dropped;
+    auto* target = document->active_input_events_target();
+    if (!target)
+        return EventResult::Accepted;
+    auto scope = target->mouse_selection_scope();
+    if (!scope || !scope->is_connected())
+        return EventResult::Handled;
+    auto collapse = command.extend_selection ? InputEventsTarget::CollapseSelection::No : InputEventsTarget::CollapseSelection::Yes;
+    using Type = TextEditingCommand::Type;
+    switch (command.type) {
+    case Type::MoveBackward:
+        target->decrement_cursor_position_offset(collapse);
+        break;
+    case Type::MoveForward:
+        target->increment_cursor_position_offset(collapse);
+        break;
+    case Type::MoveWordBackward:
+        target->decrement_cursor_position_to_previous_word(collapse);
+        break;
+    case Type::MoveWordForward:
+        target->increment_cursor_position_to_next_word(collapse);
+        break;
+    case Type::MoveUp:
+        target->decrement_cursor_position_to_previous_line(collapse);
+        break;
+    case Type::MoveDown:
+        target->increment_cursor_position_to_next_line(collapse);
+        break;
+    case Type::MoveToBeginningOfParagraph:
+        target->move_cursor_to_start_of_paragraph(collapse);
+        break;
+    case Type::MoveToEndOfParagraph:
+        target->move_cursor_to_end_of_paragraph(collapse);
+        break;
+    case Type::MoveToBeginningOfLine:
+        target->move_cursor_to_start_of_current_line(collapse);
+        break;
+    case Type::MoveToEndOfLine:
+        target->move_cursor_to_end_of_current_line(collapse);
+        break;
+    case Type::MoveToLeftEndOfLine:
+        target->move_cursor_to_physical_line_boundary(true, collapse);
+        break;
+    case Type::MoveToRightEndOfLine:
+        target->move_cursor_to_physical_line_boundary(false, collapse);
+        break;
+    case Type::PageUp:
+        target->move_cursor_to_previous_page(collapse);
+        break;
+    case Type::PageDown:
+        target->move_cursor_to_next_page(collapse);
+        break;
+    case Type::DeleteBackward:
+    case Type::DeleteForward:
+    case Type::DeleteWordBackward:
+    case Type::DeleteWordForward:
+    case Type::DeleteToEndOfParagraph: {
+        auto input_type = UIEvents::InputTypes::deleteContentBackward;
+        switch (command.type) {
+        case Type::DeleteForward:
+            input_type = UIEvents::InputTypes::deleteContentForward;
+            break;
+        case Type::DeleteWordBackward:
+            input_type = UIEvents::InputTypes::deleteWordBackward;
+            break;
+        case Type::DeleteWordForward:
+            input_type = UIEvents::InputTypes::deleteWordForward;
+            break;
+        case Type::DeleteToEndOfParagraph:
+            input_type = UIEvents::InputTypes::deleteHardLineForward;
+            break;
+        default:
+            break;
+        }
+        GC::Root<DOM::Document> rooted_document { document };
+        GC::Root<JS::Cell> rooted_target { target->as_cell() };
+        GC::Root<DOM::Node> scope { target->mouse_selection_scope() };
+        GC::Root<DOM::StaticRange> range { target->deletion_target_range(input_type) };
+        if (!range)
+            return EventResult::Handled;
+        bool selected = false;
+        if (auto* control = document->focused_area() ? as_if<HTML::FormAssociatedTextControlElement>(*document->focused_area()) : nullptr)
+            selected = control->selection_start() != control->selection_end();
+        else if (auto selection = document->get_selection())
+            selected = !selection->is_collapsed();
+        if (selected)
+            input_type = first_is_one_of(command.type, Type::DeleteBackward, Type::DeleteWordBackward)
+                ? UIEvents::InputTypes::deleteContentBackward
+                : UIEvents::InputTypes::deleteContentForward;
+        auto result = input_event(UIEvents::EventNames::beforeinput, input_type, m_navigable, 0u, range.ptr());
+        if (result != EventResult::Accepted)
+            return result;
+        if (m_navigable->active_document() != document || !document->is_fully_active()
+            || document->active_input_events_target() != target || !scope || !scope->is_connected()
+            || target->mouse_selection_scope().ptr() != scope.ptr())
+            return EventResult::Handled;
+        if (!target->deletion_target_range(input_type))
+            return EventResult::Handled;
+        target->handle_delete(input_type);
+        break;
+    }
+    default:
+        return EventResult::Dropped;
+    }
+    return EventResult::Handled;
+}
+
+EventResult EventHandler::handle_keydown(UIEvents::KeyCode key, u32 modifiers, u32 code_point, bool repeat, bool should_insert_text, bool async_scroll_performed_default_action, ReadonlySpan<TextEditingCommand> editing_commands, bool native_editing_binding_resolved)
 {
     if (!m_navigable->active_document())
         return EventResult::Dropped;
@@ -1647,6 +1758,9 @@ EventResult EventHandler::handle_keydown(UIEvents::KeyCode key, u32 modifiers, u
         return EventResult::Handled;
     };
 
+    GC::Root<DOM::Document> native_command_document;
+    if (native_editing_binding_resolved)
+        native_command_document = m_navigable->active_document();
     auto dispatch_result = fire_keyboard_event(UIEvents::EventNames::keydown, m_navigable, key, modifiers, code_point, repeat);
     if (dispatch_result != EventResult::Accepted)
         return dispatch_result;
@@ -1662,6 +1776,20 @@ EventResult EventHandler::handle_keydown(UIEvents::KeyCode key, u32 modifiers, u
         dispatch_result = fire_keyboard_event(UIEvents::EventNames::keypress, m_navigable, key, modifiers, code_point, repeat);
         if (dispatch_result != EventResult::Accepted)
             return dispatch_result;
+    }
+
+    if (native_editing_binding_resolved) {
+        for (auto const& command : editing_commands) {
+            if (m_navigable->active_document().ptr() != native_command_document.ptr() || !native_command_document->is_fully_active())
+                return EventResult::Dropped;
+            auto navigable = m_navigable->page().hosted_focused_navigable();
+            if (!navigable)
+                return EventResult::Dropped;
+            auto result = navigable->event_handler().handle_text_editing_command(command);
+            if (result != EventResult::Handled && result != EventResult::Accepted)
+                return result;
+        }
+        return EventResult::Handled;
     }
 
     // The compositor already performed this key's default action. Do not scroll twice, or insert text if focus has
@@ -2434,6 +2562,26 @@ EventResult EventHandler::insert_pasted_content(Utf16View plain_text, Optional<U
     return EventResult::Handled;
 }
 
+// https://w3c.github.io/input-events/#interface-InputEvent-Attributes
+// "insertReplacementText": insert or replace existing content by means of a spell checker, auto-correct, writing
+// suggestions or similar
+EventResult EventHandler::insert_replacement_text(Utf16String const& text)
+{
+    auto active_document = m_navigable->active_document();
+    if (!active_document || !active_document->is_fully_active())
+        return EventResult::Dropped;
+
+    auto* target = active_document->active_input_events_target();
+    if (!target)
+        return EventResult::Dropped;
+
+    // FIXME: For an editing host, data should be null and dataTransfer should hold the text, but InputEvent has no
+    //        dataTransfer yet.
+    FIRE(input_event(UIEvents::EventNames::beforeinput, UIEvents::InputTypes::insertReplacementText, m_navigable, text));
+    target->handle_insert(UIEvents::InputTypes::insertReplacementText, text);
+    return EventResult::Handled;
+}
+
 void EventHandler::handle_gamepad_connected(Gamepad::GamepadDescription const& description)
 {
     auto active_document = m_navigable->active_document();
@@ -2583,7 +2731,7 @@ EventResult EventHandler::fire_text_input_event(HTML::LocalNavigable& navigable,
     return EventResult::Accepted;
 }
 
-EventResult EventHandler::input_event(Utf16FlyString const& event_name, Utf16FlyString const& input_type, HTML::LocalNavigable& navigable, Variant<u32, Utf16String> code_point_or_string)
+EventResult EventHandler::input_event(Utf16FlyString const& event_name, Utf16FlyString const& input_type, HTML::LocalNavigable& navigable, Variant<u32, Utf16String> code_point_or_string, GC::Ptr<DOM::StaticRange> deletion_range)
 {
     auto document = navigable.active_document();
     if (!document)
@@ -2591,6 +2739,13 @@ EventResult EventHandler::input_event(Utf16FlyString const& event_name, Utf16Fly
     if (!document->is_fully_active())
         return EventResult::Dropped;
 
+    GC::Root<DOM::StaticRange> rooted_range { deletion_range };
+    auto target_ranges = target_ranges_for_input_event(*document, input_type);
+    if (deletion_range) {
+        target_ranges.clear();
+        if (!document->focused_area() || !as_if<HTML::FormAssociatedTextControlElement>(*document->focused_area()))
+            target_ranges.append(*deletion_range);
+    }
     UIEvents::InputEventInit input_event_init;
 
     code_point_or_string.visit(
@@ -2616,11 +2771,11 @@ EventResult EventHandler::input_event(Utf16FlyString const& event_name, Utf16Fly
             }
         }
 
-        auto event = UIEvents::InputEvent::create_from_platform_event(event_name, input_event_init, target_ranges_for_input_event(*document, input_type), HighResolutionTime::current_high_resolution_time(HTML::relevant_global_object(*document)));
+        auto event = UIEvents::InputEvent::create_from_platform_event(event_name, input_event_init, move(target_ranges), HighResolutionTime::current_high_resolution_time(HTML::relevant_global_object(*document)));
         return focused_area->dispatch_event(event) ? EventResult::Accepted : EventResult::Cancelled;
     }
 
-    auto event = UIEvents::InputEvent::create_from_platform_event(event_name, input_event_init, target_ranges_for_input_event(*document, input_type), HighResolutionTime::current_high_resolution_time(HTML::relevant_global_object(*document)));
+    auto event = UIEvents::InputEvent::create_from_platform_event(event_name, input_event_init, move(target_ranges), HighResolutionTime::current_high_resolution_time(HTML::relevant_global_object(*document)));
 
     if (auto* body = document->body())
         return body->dispatch_event(event) ? EventResult::Accepted : EventResult::Cancelled;
@@ -3239,11 +3394,17 @@ void EventHandler::maybe_show_context_menu(GC::Ref<DOM::Node> node, MouseEventCo
             m_navigable->page().record_context_menu_request({}, { .kind = Page::ContextMenuRequest::Kind::Media, .target = media_element });
             m_navigable->page().did_request_media_context_menu(media_element.unique_id(), local_root_id, page_viewport_position, "", modifiers, menu, move(navigation));
         } else {
-            select_context_menu_text(read, document, coordinates.visual_viewport_position);
+            auto misspelling = select_context_menu_misspelling(read, document, coordinates.visual_viewport_position);
+            if (!misspelling.has_value())
+                select_context_menu_text(read, document, coordinates.visual_viewport_position);
+            Optional<Utf16String> misspelled_word;
+            if (misspelling.has_value())
+                misspelled_word = misspelling->word;
+            m_navigable->page().record_context_menu_misspelling({}, move(misspelling));
 
             auto for_input_events_target = document->active_input_events_target() ? ContextMenuForInputEventsTarget::Yes : ContextMenuForInputEventsTarget::No;
             m_navigable->page().record_context_menu_request({}, { .kind = Page::ContextMenuRequest::Kind::Page, .target = context_menu_node });
-            m_navigable->page().client().page_did_request_context_menu(local_root_id, page_viewport_position, for_input_events_target);
+            m_navigable->page().client().page_did_request_context_menu(local_root_id, page_viewport_position, for_input_events_target, move(misspelled_word));
         }
     }
 }
@@ -3484,6 +3645,50 @@ bool EventHandler::initiate_character_selection(DOM::Document& document, Paintin
     return true;
 }
 
+// A right-click on a misspelled word selects exactly the misspelling, so the menu's guesses replace just that.
+Optional<Editing::ContextMenuMisspelling> EventHandler::select_context_menu_misspelling(Layout::BegunRead const& read, DOM::Document& document, CSSPixelPoint visual_viewport_position)
+{
+    if (!document.has_spelling_markers())
+        return {};
+    auto caret_position = document.caret_position_from_point_for_selection_start(read, visual_viewport_position);
+    if (!caret_position.has_value())
+        return {};
+    auto* text = as_if<DOM::Text>(caret_position->boundary_node().ptr());
+    if (!text)
+        return {};
+    auto marker = document.spelling_markers().marker_containing(*text, caret_position->boundary.offset);
+    if (!marker.has_value())
+        return {};
+
+    // A misspelling in a field the user has left gets the field focused first, so the guess the user picks can replace
+    // it there.
+    if (!document.active_input_events_target(text)) {
+        if (auto focus_candidate = focus_candidate_for_position(read, visual_viewport_position))
+            HTML::run_focusing_steps(focus_candidate, nullptr, HTML::FocusTrigger::Click);
+        else if (auto editing_host = text->editing_host())
+            HTML::run_focusing_steps(editing_host, nullptr, HTML::FocusTrigger::Click);
+
+        // NB: Focusing may have invalidated layout.
+        document.update_layout(DOM::UpdateLayoutReason::EventHandlerShowContextMenu);
+
+        // A focus listener runs inside the focusing steps, and an edit it makes moves or drops the text's markers — so
+        // the misspelling the click landed on counts only if its marker is still where it was.
+        if (!document.spelling_markers().markers_for(*text).contains_slow(*marker))
+            return {};
+    }
+
+    // A field that didn't take focus has nowhere for a guess to go.
+    auto* target = document.active_input_events_target(text);
+    if (!target)
+        return {};
+    target->set_selection_anchor(*text, marker->start);
+    target->set_selection_focus(*text, marker->end);
+    stop_updating_selection();
+
+    auto word = Utf16String::from_utf16(text->data().utf16_view().substring_view(marker->start, marker->end - marker->start));
+    return Editing::ContextMenuMisspelling { *text, marker->start, marker->end, move(word) };
+}
+
 bool EventHandler::initiate_word_selection(Layout::BegunRead const& read, DOM::Document& document, Painting::CaretPosition const& caret_position, CSS::UserSelect user_select)
 {
     auto* boundary_node = as_if<DOM::Text>(caret_position.boundary_node().ptr());
@@ -3516,51 +3721,6 @@ bool EventHandler::initiate_word_selection(Layout::BegunRead const& read, DOM::D
     return true;
 }
 
-// Find paragraph boundaries for triple-click selection. A paragraph is delimited by block nodes or <br> elements.
-static GC::Ref<DOM::Range> find_paragraph_range(DOM::Text& text_node, WebIDL::UnsignedLong offset)
-{
-    GC::Ptr<DOM::Node> start_node = text_node;
-    WebIDL::UnsignedLong start_offset = offset;
-    GC::Ptr<DOM::Node> end_node = text_node;
-    WebIDL::UnsignedLong end_offset = offset;
-
-    // Walk backwards to find the paragraph start (a block boundary point).
-    if (!Editing::is_block_start_point({ *start_node, start_offset })) {
-        do {
-            if (start_offset == 0) {
-                start_offset = start_node->index();
-                start_node = start_node->parent();
-            } else {
-                --start_offset;
-            }
-        } while (start_node && !Editing::is_block_boundary_point({ *start_node, start_offset }));
-    }
-
-    // Walk forwards to find the paragraph end (a block boundary point).
-    if (!Editing::is_block_end_point({ *end_node, end_offset })) {
-        do {
-            if (end_offset == end_node->length()) {
-                end_offset = end_node->index() + 1;
-                end_node = end_node->parent();
-            } else {
-                ++end_offset;
-            }
-        } while (end_node && !Editing::is_block_boundary_point({ *end_node, end_offset }));
-    }
-
-    // Fallback if we couldn't find boundaries.
-    if (!start_node) {
-        start_node = text_node;
-        start_offset = 0;
-    }
-    if (!end_node) {
-        end_node = text_node;
-        end_offset = text_node.length();
-    }
-
-    return DOM::Range::create(*start_node, start_offset, *end_node, end_offset);
-}
-
 bool EventHandler::initiate_paragraph_selection(DOM::Document& document, Painting::CaretPosition const& caret_position, CSS::UserSelect user_select)
 {
     auto* boundary_node = as_if<DOM::Text>(caret_position.boundary_node().ptr());
@@ -3583,7 +3743,7 @@ bool EventHandler::initiate_paragraph_selection(DOM::Document& document, Paintin
         target->set_selection_focus(hit_node, line_end);
     } else if (auto selection = document.get_selection()) {
         // For regular content, find paragraph boundaries within the containing block.
-        m_selection_origin = find_paragraph_range(hit_node, hit_index);
+        m_selection_origin = Editing::paragraph_range_containing(hit_node, hit_index);
 
         m_selection_mode = SelectionMode::Paragraph;
         m_mouse_selection_target = nullptr;
@@ -3777,7 +3937,7 @@ void EventHandler::apply_mouse_selection(Layout::BegunRead const& read, CSSPixel
         GC::Ref<DOM::Range> paragraph_range = m_mouse_selection_target
             ? DOM::Range::create(focus_text_node, find_line_start(focus_text_node.data().utf16_view(), focus_index),
                   focus_text_node, find_line_end(focus_text_node.data().utf16_view(), focus_index))
-            : find_paragraph_range(focus_text_node, focus_index);
+            : Editing::paragraph_range_containing(focus_text_node, focus_index);
 
         // Determine cursor position relative to origin.
         auto position = m_selection_origin->compare_point(*focus_node, focus_index);

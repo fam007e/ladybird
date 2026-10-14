@@ -82,6 +82,12 @@ public:
     GC::Ptr<JS::Object> hit_test_result(double x, double y);
     GC::Ptr<JS::Object> take_context_menu_request();
 
+    WebIDL::ExceptionOr<void> add_spelling_error_for_testing(GC::Ref<DOM::Node>, WebIDL::UnsignedLong start, WebIDL::UnsignedLong end);
+    Utf16String spelling_error_ranges(GC::Ref<DOM::Node>);
+    GC::Ref<WebIDL::Promise> check_spelling_for_testing(Utf16String const& text);
+    GC::Ref<WebIDL::Promise> spell_check_settled();
+    GC::Ref<WebIDL::Promise> activate_spelling_menu_item(Bindings::SpellingMenuItem, WebIDL::UnsignedLong guess_index);
+
     void send_text(HTML::HTMLElement&, Utf16String const&, WebIDL::UnsignedShort modifiers);
     void send_text_through_ui_process(Utf16String const&);
     void grant_transient_activation();
@@ -89,6 +95,7 @@ public:
     void click_through_ui_process(double x, double y);
     void wheel_through_ui_process(double x, double y, double delta_x, double delta_y, bool precise, Bindings::ScrollGesturePhase, GC::Ref<WebIDL::Promise>);
     void send_key(HTML::HTMLElement&, Utf16String const&, WebIDL::UnsignedShort modifiers, WebIDL::UnsignedLong repeat_count);
+    WebIDL::ExceptionOr<void> send_text_editing_command(HTML::HTMLElement&, Utf16String const& command_name, bool extend_selection);
     void paste(HTML::HTMLElement& target, Utf16String const& text);
     void paste_from_clipboard();
     void commit_text();

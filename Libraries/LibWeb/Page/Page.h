@@ -39,6 +39,7 @@
 #include <LibWeb/Bindings/AgentType.h>
 #include <LibWeb/Bindings/Navigation.h>
 #include <LibWeb/DOM/RequestFullscreenError.h>
+#include <LibWeb/Editing/SpellingMarkers.h>
 #include <LibWeb/Export.h>
 #include <LibWeb/Forward.h>
 #include <LibWeb/Geolocation/Geolocation.h>
@@ -88,6 +89,8 @@
 #include <LibWebCommon/Page/PageId.h>
 #include <LibWebCommon/Page/PendingDialog.h>
 #include <LibWebCommon/Page/QueuedInputEvent.h>
+#include <LibWebCommon/Page/SpellingError.h>
+#include <LibWebCommon/Page/TextEditingCommand.h>
 #include <LibWebCommon/Page/ViewportIsFullscreen.h>
 #include <LibWebCommon/PixelUnits.h>
 #include <LibWebCommon/StorageAPI/StorageEndpoint.h>
@@ -205,7 +208,7 @@ public:
     EventResult handle_drag_and_drop_event(DragEvent::Type, DevicePixelPoint, DevicePixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers, Vector<HTML::SelectedFile> files);
     EventResult handle_pinch_event(DevicePixelPoint point, unsigned modifiers, double scale);
 
-    EventResult handle_keydown(UIEvents::KeyCode, unsigned modifiers, u32 code_point, bool repeat, bool should_insert_text, bool async_scroll_performed_default_action = false);
+    EventResult handle_keydown(UIEvents::KeyCode, unsigned modifiers, u32 code_point, bool repeat, bool should_insert_text, bool async_scroll_performed_default_action = false, ReadonlySpan<TextEditingCommand> editing_commands = {}, bool native_editing_binding_resolved = false);
     EventResult handle_keyup(UIEvents::KeyCode, unsigned modifiers, u32 code_point, bool repeat);
 
     void handle_gamepad_connected(Gamepad::GamepadDescription const&);
@@ -298,6 +301,17 @@ public:
     void request_clipboard_entries(ClipboardRequest);
     void retrieved_clipboard_entries(u64 request_id, Vector<Clipboard::SystemClipboardItem>);
 
+    using SpellCheckRequest = GC::Ref<GC::Function<void(Vector<SpellingError>)>>;
+    bool spell_checking_available() const { return m_spell_checking_available; }
+    void set_spell_checking_available(bool available) { m_spell_checking_available = available; }
+    void request_spell_check(Utf16String const& text, SpellCheckRequest);
+    void did_check_spelling(u64 request_id, Vector<SpellingError>);
+    bool has_pending_spell_checks() const { return !m_pending_spell_check_requests.is_empty(); }
+
+    // For tests: Calls the callback once no document of the page has spellchecking queued or in flight.
+    void when_spell_checking_settled(GC::Ref<GC::Function<void()>>);
+    void notify_spell_check_progress();
+
     using GeolocationPositionResult = Variant<Geolocation::CoordinatesData, Geolocation::GeolocationPositionError::ErrorCode>;
     using GeolocationPositionCallback = GC::Ref<GC::Function<void(GeolocationPositionResult)>>;
     enum class GeolocationRequestType : u8 {
@@ -356,6 +370,14 @@ public:
     };
     void record_context_menu_request(Badge<EventHandler>, ContextMenuRequest);
     void clear_context_menu_request() { m_context_menu_request.clear(); }
+    void record_context_menu_misspelling(Badge<EventHandler>, Optional<Editing::ContextMenuMisspelling> misspelling) { m_context_menu_misspelling = move(misspelling); }
+    void replace_context_menu_misspelling(Utf16String const& replacement);
+    void accept_spelling_word(Utf16String const& word);
+    bool is_accepted_spelling_word(Utf16View word) const;
+    void forget_accepted_spelling_words() { m_accepted_spelling_words.clear(); }
+
+    void request_spelling_menu_action_for_testing(SpellingMenuActionForTesting, u32 guess_index, GC::Ref<GC::Function<void(String)>> on_complete);
+    void did_complete_spelling_menu_action_for_testing(String menu);
     Optional<ContextMenuRequest> take_context_menu_request();
 
     using MediaContextMenu = Web::MediaContextMenu;
@@ -505,6 +527,11 @@ private:
     HashMap<u64, ClipboardRequest> m_pending_clipboard_requests;
     u64 m_next_clipboard_request_id { 0 };
 
+    bool m_spell_checking_available { false };
+    HashMap<u64, SpellCheckRequest> m_pending_spell_check_requests;
+    u64 m_next_spell_check_request_id { 0 };
+    Vector<GC::Ref<GC::Function<void()>>> m_spell_checking_settled_callbacks;
+
     struct PendingGeolocationRequest {
         GeolocationPositionCallback callback;
         GeolocationRequestType type;
@@ -530,6 +557,9 @@ private:
     Web::HTML::MuteState m_mute_state { Web::HTML::MuteState::Unmuted };
 
     Optional<ContextMenuRequest> m_context_menu_request;
+    Optional<Editing::ContextMenuMisspelling> m_context_menu_misspelling;
+    HashTable<Utf16String> m_accepted_spelling_words;
+    GC::Ptr<GC::Function<void(String)>> m_on_spelling_menu_action_for_testing;
     size_t m_active_screen_wake_lock_count { 0 };
 
     Optional<Utf16String> m_user_style_sheet_source;
@@ -597,8 +627,7 @@ public:
     virtual void set_has_focus([[maybe_unused]] bool has_focus) { }
     virtual bool has_active_devtools_client() const { return false; }
     virtual void request_navigation_start(HTML::LocalNavigable&, NavigationTarget, URL::URL const& url, Utf16String navigation_id, Optional<HTML::NavigationStartRequest>);
-    virtual void request_navigation_population(HTML::LocalNavigable&, NavigationTarget, HTML::NavigationPopulationRequest);
-    virtual void request_navigation_of_navigable(HTML::Navigable&, HTML::PreparedNavigationDescriptor) { VERIFY_NOT_REACHED(); }
+    virtual void request_navigation_of_navigable(HTML::Navigable&, HTML::Navigable&, DOM::Document const&, HTML::PreparedNavigationDescriptor) { VERIFY_NOT_REACHED(); }
     virtual void request_post_message_to_remote_navigable(HTML::RemoteNavigable&, HTML::PostedMessageDescriptor) { VERIFY_NOT_REACHED(); }
     virtual void request_close_of_remote_traversable(HTML::RemoteNavigable&, HTML::LocalNavigable const&) { VERIFY_NOT_REACHED(); }
     virtual void request_focusing_steps_for_remote_navigable(HTML::RemoteNavigable&, HTML::FocusTrigger) { VERIFY_NOT_REACHED(); }
@@ -607,11 +636,11 @@ public:
     virtual void navigation_params_creation_finished(HTML::LocalNavigable&, HTML::NavigationPopulationRequest, HTML::NavigationPopulationResult);
     virtual void history_navigation_params_creation_finished(HTML::CrossProcessId operation_id, HTML::HistoryNavigationPopulation);
     virtual void navigation_population_failed(HTML::CrossProcessId, Utf16String const&) { }
-    virtual void page_did_create_populated_document_with_an_origin_of_its_own(HTML::CrossProcessId, HTML::PopulatedDocumentOrigin, HTML::EnvironmentId const&) { }
-    virtual void page_did_create_child_frame(HTML::CrossProcessId, HTML::CrossProcessId, HTML::HostedNavigableState const&, HTML::PendingSessionHistoryEntryDescriptor const&, URL::Origin const&, HTML::EnvironmentId const&) { }
+    virtual void page_did_create_populated_document_with_an_origin_of_its_own(HTML::CrossProcessId, HTML::CrossProcessId, HTML::PopulatedDocumentOrigin, HTML::EnvironmentId const&) { }
+    virtual void page_did_create_child_frame(HTML::CrossProcessId, DOM::Document const&, HTML::CrossProcessId, HTML::HostedNavigableState const&, HTML::PendingSessionHistoryEntryDescriptor const&, URL::Origin const&, HTML::EnvironmentId const&, HTML::CrossProcessId) { }
     virtual void page_did_change_hosted_navigable_state([[maybe_unused]] HTML::CrossProcessId navigable_id, [[maybe_unused]] HTML::HostedNavigableState const& state) { }
     virtual void page_did_set_opener_browsing_context([[maybe_unused]] HTML::CrossProcessId navigable_id, [[maybe_unused]] Optional<HTML::CrossProcessId> opener_navigable_id) { }
-    virtual void page_did_completely_finish_loading([[maybe_unused]] HTML::CrossProcessId navigable_id) { }
+    virtual void page_did_completely_finish_loading([[maybe_unused]] HTML::CrossProcessId navigable_id, DOM::Document const&) { }
     virtual void page_did_change_navigable_container_state([[maybe_unused]] HTML::CrossProcessId navigable_id, [[maybe_unused]] HTML::ReplicatedContainerState const& state) { }
     virtual void page_did_update_child_frame_viewport(HTML::CrossProcessId, [[maybe_unused]] DevicePixelRect viewport_rect, [[maybe_unused]] DevicePixelRect viewport_intersection) { }
     virtual void page_did_destroy_child_frame(HTML::CrossProcessId) { }
@@ -695,7 +724,7 @@ public:
     // The node an assistive technology should treat as focused: the focused element, or the document element once
     // nothing in the document is focused.
     virtual void page_did_change_accessibility_focus(Web::UniqueNodeID) { }
-    virtual void page_did_request_context_menu([[maybe_unused]] HTML::CrossProcessId local_root_id, CSSPixelPoint, ContextMenuForInputEventsTarget) { }
+    virtual void page_did_request_context_menu([[maybe_unused]] HTML::CrossProcessId local_root_id, CSSPixelPoint, ContextMenuForInputEventsTarget, [[maybe_unused]] Optional<Utf16String> misspelled_word) { }
     virtual void page_did_request_link_context_menu([[maybe_unused]] HTML::CrossProcessId local_root_id, CSSPixelPoint, HTML::PreparedNavigationDescriptor, [[maybe_unused]] ByteString const& target, [[maybe_unused]] unsigned modifiers) { }
     virtual void page_did_request_image_context_menu([[maybe_unused]] HTML::CrossProcessId local_root_id, CSSPixelPoint, HTML::PreparedNavigationDescriptor, [[maybe_unused]] ByteString const& target, [[maybe_unused]] unsigned modifiers, Optional<Gfx::Bitmap const*>) { }
     virtual void page_did_request_media_context_menu([[maybe_unused]] HTML::CrossProcessId local_root_id, CSSPixelPoint, [[maybe_unused]] ByteString const& target, [[maybe_unused]] unsigned modifiers, Page::MediaContextMenu const&, HTML::PreparedNavigationDescriptor) { }
@@ -751,6 +780,7 @@ public:
         String window_handle;
         Optional<HTML::SessionHistoryEntryDescriptor> initial_history_entry;
         Optional<Web::HTML::EnvironmentId> initial_environment_id;
+        Optional<HTML::CrossProcessId> initial_document_id;
         Optional<u64> browsing_context_group_id;
     };
     virtual NewWebViewResult page_did_request_new_web_view(HTML::ActivateTab, HTML::WebViewHints, [[maybe_unused]] Optional<HTML::CrossProcessId> opener_navigable_id, [[maybe_unused]] Optional<URL::URL> opener_base_url, [[maybe_unused]] Utf16String const& target_name, [[maybe_unused]] HTML::SandboxingFlagSet popup_sandboxing_flag_set) { return {}; }
@@ -762,6 +792,7 @@ public:
     virtual void page_did_request_set_system_focus([[maybe_unused]] bool has_system_focus) { }
     virtual void page_did_change_focused_navigable([[maybe_unused]] HTML::CrossProcessId navigable_id) { }
     virtual void page_did_request_key_event_for_testing([[maybe_unused]] Web::KeyEvent event) { }
+    virtual void page_did_request_spelling_menu_action_for_testing([[maybe_unused]] SpellingMenuActionForTesting action, [[maybe_unused]] u32 guess_index) { }
     virtual void page_did_request_webdriver_mouse_event([[maybe_unused]] HTML::CrossProcessId local_root_id, [[maybe_unused]] Web::MouseEvent event, GC::Ref<GC::Function<void()>> on_handled) { on_handled->function()(); }
     virtual void page_did_request_set_system_visibility_state([[maybe_unused]] HTML::VisibilityState visibility_state) { }
     virtual String page_did_request_ui_process_session_history_for_testing() { return "{}"_string; }
@@ -771,6 +802,7 @@ public:
     virtual bool page_did_request_register_session_store_tab_for_testing() { return false; }
     virtual String page_did_request_session_store_tab_state_for_testing() { return "{}"_string; }
     virtual void page_did_request_history_operation([[maybe_unused]] HTML::CrossProcessId operation_id, [[maybe_unused]] HistoryOperationParameters parameters) { }
+    virtual void page_did_revoke_history_operation([[maybe_unused]] HTML::CrossProcessId operation_id) { }
     virtual void page_did_request_child_navigable_unload([[maybe_unused]] HTML::CrossProcessId navigable_id) { }
     virtual void page_did_request_remote_document_abort([[maybe_unused]] HTML::CrossProcessId navigable_id) { }
     virtual void page_did_request_remote_document_unfullscreen([[maybe_unused]] HTML::CrossProcessId navigable_id) { }
@@ -806,6 +838,7 @@ public:
 
     virtual void page_did_insert_clipboard_item(Clipboard::SystemClipboardItem const&, [[maybe_unused]] StringView presentation_style) { }
     virtual void page_did_request_clipboard_entries([[maybe_unused]] u64 request_id) { }
+    virtual void page_did_request_spell_check([[maybe_unused]] u64 request_id, [[maybe_unused]] Utf16String const& text) { }
     virtual void page_did_request_primary_paste() { }
     virtual void page_did_complete_paste_action() { }
     virtual void page_did_update_primary_selection(Utf16String const&) { }

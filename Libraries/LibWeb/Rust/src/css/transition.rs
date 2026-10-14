@@ -153,11 +153,7 @@ fn property_values_are_transitionable(
         0.5,
     );
     assert!(result.handled);
-    if !result.value.is_null() {
-        unsafe { crate::css::style_value::release_style_value(result.value) };
-        return true;
-    }
-    false
+    result.value.is_some()
 }
 
 fn values_equal(first: *const StyleValueData, second: *const StyleValueData) -> bool {
@@ -374,8 +370,7 @@ pub(crate) fn records_compute_differently(
 ) -> bool {
     let value = |record| {
         let view = engine.style_record_view(record)?;
-        // SAFETY: A live record's table lives as long as the record.
-        let table = unsafe { view.longhand_table.as_ref() }?;
+        let table = view.longhand_table?;
         Some(table.get(property_id)?.pointer())
     };
     match (value(first), value(second)) {
@@ -465,10 +460,9 @@ impl TransitionDecision {
         reference_box: Option<crate::css::css_pixels::CssPixelRect>,
         existing: &[FfiExistingTransition],
     ) -> Vec<FfiTransitionAction> {
-        // SAFETY: A live record's table lives as long as the record.
         let Some(after_table) = engine
             .style_record_view(self.after)
-            .and_then(|after| unsafe { after.longhand_table.as_ref() })
+            .and_then(|after| after.longhand_table)
         else {
             debug_assert!(false, "the records of a transition step carry longhand tables");
             return Vec::new();
@@ -511,25 +505,23 @@ impl TransitionDecision {
             debug_assert!(false, "the records a transition step decides over remain live");
             return Vec::new();
         };
-        // SAFETY: A live record's table and overlay live as long as the record.
-        let (Some(before_table), before_overlay, Some(after_table), record_after_overlay) = (unsafe {
-            (
-                before.longhand_table.as_ref(),
-                before.animated_overlay.as_ref(),
-                after.longhand_table.as_ref(),
-                after.animated_overlay.as_ref(),
-            )
-        }) else {
+        let (Some(before_table), before_overlay, Some(after_table), record_after_overlay) = (
+            before.longhand_table,
+            before.animated_overlay,
+            after.longhand_table,
+            after.animated_overlay,
+        ) else {
             debug_assert!(false, "the records of a transition step carry longhand tables");
             return Vec::new();
         };
         let after_overlay = after_overlay.or(record_after_overlay);
         let mut context = crate::css::animation::FfiAnimationContext {
             allow_discrete: false,
-            current_color: after_table
-                .effective_value(after_overlay, crate::css::property_metadata::property_id::COLOR, true)
-                .value
-                .cast(),
+            current_color: Some(
+                after_table
+                    .effective_value_handle(after_overlay, crate::css::property_metadata::property_id::COLOR, true)
+                    .0,
+            ),
             has_length_resolution_context: length_resolution_context.is_some(),
             length_resolution_context: length_resolution_context.unwrap_or_default(),
             has_transform_reference_box: false,
@@ -791,12 +783,11 @@ impl RowTransitions {
         let after = row.new_style_record;
         let before_view = engine.style_record_view(before).ok_or("a record that is gone")?;
         let after_view = engine.style_record_view(after).ok_or("a record that is gone")?;
-        // SAFETY: A live record's table lives as long as the record.
-        let after_table = unsafe { after_view.longhand_table.as_ref() }.ok_or("a record without a table")?;
+        let after_table = after_view.longhand_table.ok_or("a record without a table")?;
         if before_view.dependency_flags & crate::css::computed_longhand_table::IN_DISPLAY_NONE_SUBTREE != 0 {
             return Err("a style under display: none");
         }
-        if !after_view.animated_overlay.is_null() {
+        if after_view.animated_overlay.is_some() {
             return Err("an animated record");
         }
         // A declaration whose delay and duration are each the single value 0s starts nothing, so it matters only to an
@@ -1042,21 +1033,18 @@ impl FreshTransitionSample {
     /// Answers the host's sample `input`, where it samples what this one did: the transitions the step started, over
     /// the record it moved its element to, each at the key this one sampled it at. Writes the overlay into the working
     /// set and answers what the sample found, with the timing each effect was sampled with, which the engine keeps.
-    ///
-    /// # Safety
-    /// As for `rust_sample_animation_effects`.
-    pub(crate) unsafe fn answer(
+    pub(crate) fn answer(
         self,
-        input: &crate::css::style_compute::FfiHostAnimationSample,
+        input: &crate::css::style_compute::AnimationSampleInput,
+        host: &mut dyn crate::css::style_compute::AnimationSampleHost,
     ) -> Option<(
         crate::css::style_compute::FfiHostAnimationSampleResult,
         crate::css::style::animations::SampledEffectTimings,
     )> {
-        if input.style_record != self.after || !input.animated_overlay.is_null() {
+        if input.style_record != self.after || input.has_animated_overlay {
             return None;
         }
-        // SAFETY: Guaranteed by the caller.
-        let effects = unsafe { crate::css::custom_properties::ffi_slice(input.effects, input.effect_count) };
+        let effects = input.effects.as_slice();
         if effects.len() != self.keys.len() {
             return None;
         }
@@ -1067,7 +1055,7 @@ impl FreshTransitionSample {
                     effect.identity,
                     crate::css::style::animations::EffectTiming {
                         timing: effect.timing,
-                        // SAFETY: As above.
+                        // SAFETY: The host's easings are live for as long as its effects are borrowed.
                         easing: unsafe { crate::css::easing::Easing::from_descriptor(&effect.easing) },
                     },
                 )
@@ -1086,10 +1074,7 @@ impl FreshTransitionSample {
             return None;
         }
         if self.result.outcome == crate::css::style_compute::FfiHostAnimationSampleOutcome::Evaluated {
-            // SAFETY: As above.
-            let overlay = unsafe { (input.prepare_overlay_for_mutation)(input.callback_context) };
-            // SAFETY: The working set hands over its overlay, uniquely owned for the sample.
-            unsafe { *overlay.cast::<crate::css::animated_overlay::AnimatedOverlay>() = self.overlay };
+            *host.overlay_for_mutation() = self.overlay;
         }
         Some((self.result, timings))
     }
@@ -1567,7 +1552,7 @@ pub unsafe extern "C" fn rust_transition_has_matching_entries(
 mod tests {
     use super::*;
 
-    fn animation_context() -> crate::css::animation::FfiAnimationContext {
+    fn animation_context() -> crate::css::animation::FfiAnimationContext<'static> {
         let font_metrics = || crate::css::animation::FfiAnimationFontMetrics {
             font_size: 0.0,
             x_height: 0.0,
@@ -1577,7 +1562,7 @@ mod tests {
         };
         crate::css::animation::FfiAnimationContext {
             allow_discrete: false,
-            current_color: std::ptr::null(),
+            current_color: None,
             has_length_resolution_context: false,
             length_resolution_context: crate::css::animation::FfiAnimationLengthResolutionContext {
                 viewport_width: 0.0,
@@ -1640,10 +1625,10 @@ mod tests {
     #[test]
     fn equal_nested_values_do_not_start_a_transition() {
         let nested_value = || {
-            let number = std::sync::Arc::into_raw(std::sync::Arc::new(StyleValueData::Number { value: 0.5 }));
-            StyleValueData::OpacityValue {
-                value: unsafe { crate::css::style_value::RetainedStyleValueData::from_retained_pointer(number) },
-            }
+            let number = crate::css::style_value::RetainedStyleValueData::from_arc(std::sync::Arc::new(
+                StyleValueData::Number { value: 0.5 },
+            ));
+            StyleValueData::OpacityValue { value: number }
         };
         let before = nested_value();
         let after = nested_value();

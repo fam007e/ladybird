@@ -58,6 +58,7 @@
 #include <LibWeb/DOM/ShadowRoot.h>
 #include <LibWeb/DOMURL/DOMURL.h>
 #include <LibWeb/Dump.h>
+#include <LibWeb/Editing/SpellingMarkers.h>
 #include <LibWeb/Fetch/Fetching/Fetching.h>
 #include <LibWeb/Fetch/Infrastructure/NetworkPartitionKey.h>
 #include <LibWeb/Geolocation/Geolocation.h>
@@ -452,9 +453,10 @@ WebIDL::ExceptionOr<Utf16String> Internals::set_time_zone(Utf16String const& tim
 
 bool Internals::wrapper_is_preserved(JS::Object& object)
 {
-    if (!Bindings::wrappable_impl_from(&object))
+    auto* platform_object = Bindings::as_platform_object(object);
+    if (!platform_object)
         return false;
-    return Bindings::wrapper_is_preserved(*Bindings::as_platform_object(object));
+    return Bindings::wrapper_is_preserved(*platform_object);
 }
 
 bool Internals::has_activity_root(JS::Object& object)
@@ -550,6 +552,45 @@ static constexpr Optional<WebDriverKeyData> webdriver_key_to_key_code(u32 code_p
         return WebDriverKeyData { UIEvents::Key_LeftSuper, UIEvents::Mod_Super, 0 };
     }
     return {};
+}
+
+WebIDL::ExceptionOr<void> Internals::send_text_editing_command(HTML::HTMLElement& target, Utf16String const& command_name, bool extend_selection)
+{
+    using Type = Web::TextEditingCommand::Type;
+    struct NamedCommand {
+        Utf16View name;
+        Type type;
+    };
+    static constexpr NamedCommand commands[] = {
+        { u"MoveBackward"sv, Type::MoveBackward },
+        { u"MoveForward"sv, Type::MoveForward },
+        { u"MoveWordBackward"sv, Type::MoveWordBackward },
+        { u"MoveWordForward"sv, Type::MoveWordForward },
+        { u"MoveUp"sv, Type::MoveUp },
+        { u"MoveDown"sv, Type::MoveDown },
+        { u"MoveToBeginningOfParagraph"sv, Type::MoveToBeginningOfParagraph },
+        { u"MoveToEndOfParagraph"sv, Type::MoveToEndOfParagraph },
+        { u"MoveToBeginningOfLine"sv, Type::MoveToBeginningOfLine },
+        { u"MoveToEndOfLine"sv, Type::MoveToEndOfLine },
+        { u"MoveToLeftEndOfLine"sv, Type::MoveToLeftEndOfLine },
+        { u"MoveToRightEndOfLine"sv, Type::MoveToRightEndOfLine },
+        { u"PageUp"sv, Type::PageUp },
+        { u"PageDown"sv, Type::PageDown },
+        { u"DeleteBackward"sv, Type::DeleteBackward },
+        { u"DeleteForward"sv, Type::DeleteForward },
+        { u"DeleteWordBackward"sv, Type::DeleteWordBackward },
+        { u"DeleteWordForward"sv, Type::DeleteWordForward },
+        { u"DeleteToEndOfParagraph"sv, Type::DeleteToEndOfParagraph },
+    };
+    for (auto const& command : commands) {
+        if (command_name.utf16_view() != command.name)
+            continue;
+        target.focus();
+        Array<TextEditingCommand, 1> editing_commands { TextEditingCommand { command.type, extend_selection } };
+        page().handle_keydown(UIEvents::KeyCode::Key_A, UIEvents::Mod_Ctrl, 'a', false, false, false, editing_commands, true);
+        return {};
+    }
+    return WebIDL::SimpleException { WebIDL::SimpleExceptionType::TypeError, "Unknown text editing command"_utf16 };
 }
 
 void Internals::send_text(HTML::HTMLElement& target, Utf16String const& text, WebIDL::UnsignedShort modifiers)
@@ -1578,7 +1619,7 @@ GC::Ref<WebIDL::Promise> Internals::flush_session_history_traversal_queue()
     navigable->page().history_executor().request_history_operation(
         FlushSessionHistoryTraversalQueueOperationParameters {},
         {
-            .on_complete = GC::create_function(heap(), [&realm, promise](Web::HTML::HistoryStepResult) {
+            .on_complete = GC::create_function(heap(), [&realm, promise] {
                 HTML::TemporaryExecutionContext execution_context { realm };
                 WebIDL::resolve_promise(promise);
             }),
@@ -2572,6 +2613,96 @@ GC::Ptr<JS::Object> Internals::take_context_menu_request()
     auto target = Bindings::wrap(Bindings::host_defined_wrapper_world(realm), realm, request->target);
     object->define_direct_property("target"_utf16_fly_string, target, JS::default_attributes);
     return object;
+}
+
+// The text node a spellchecking test names: the node itself, or the inner text node of a text control.
+static GC::Ptr<DOM::Text> spelling_test_text_node(DOM::Node& node)
+{
+    if (auto* text = as_if<DOM::Text>(node))
+        return text;
+    if (auto* text_control = as_if<HTML::FormAssociatedTextControlElement>(node))
+        return text_control->form_associated_element_to_text_node();
+    return nullptr;
+}
+
+WebIDL::ExceptionOr<void> Internals::add_spelling_error_for_testing(GC::Ref<DOM::Node> node, WebIDL::UnsignedLong start, WebIDL::UnsignedLong end)
+{
+    auto text = spelling_test_text_node(node);
+    if (!text || start >= end || end > text->length_in_utf16_code_units())
+        return WebIDL::IndexSizeError::create("No text to flag in that range"_utf16);
+    text->document().spelling_markers().add(*text, start, end);
+    return {};
+}
+
+Utf16String Internals::spelling_error_ranges(GC::Ref<DOM::Node> node)
+{
+    auto text = spelling_test_text_node(node);
+    if (!text)
+        return {};
+    StringBuilder builder;
+    for (auto const& marker : text->document().spelling_markers().markers_for(*text)) {
+        if (!builder.is_empty())
+            builder.append(' ');
+        builder.appendff("{}-{}", marker.start, marker.end);
+    }
+    return Utf16String::from_utf8(builder.string_view());
+}
+
+GC::Ref<WebIDL::Promise> Internals::check_spelling_for_testing(Utf16String const& text)
+{
+    auto& realm = window().principal_realm();
+    auto promise = WebIDL::create_promise_for(window());
+    auto& page = this->page();
+    if (!page.spell_checking_available()) {
+        WebIDL::reject_promise(realm, promise, JS::PrimitiveString::create(vm(), "Spellchecking is unavailable"_utf16));
+        return promise;
+    }
+    page.request_spell_check(text, GC::create_function(heap(), [&realm, promise](Vector<SpellingError> errors) {
+        HTML::TemporaryExecutionContext execution_context { realm };
+        StringBuilder builder;
+        for (auto const& error : errors) {
+            if (!builder.is_empty())
+                builder.append(' ');
+            builder.appendff("{}-{}", error.offset, error.offset + error.length);
+        }
+        WebIDL::resolve_promise(realm, promise, JS::PrimitiveString::create(realm.vm(), Utf16String::from_utf8(builder.string_view())));
+    }));
+    return promise;
+}
+
+GC::Ref<WebIDL::Promise> Internals::spell_check_settled()
+{
+    auto& realm = window().principal_realm();
+    auto promise = WebIDL::create_promise_for(window());
+    page().when_spell_checking_settled(GC::create_function(heap(), [&realm, promise] {
+        HTML::TemporaryExecutionContext execution_context { realm };
+        WebIDL::resolve_promise(promise);
+    }));
+    return promise;
+}
+
+GC::Ref<WebIDL::Promise> Internals::activate_spelling_menu_item(Bindings::SpellingMenuItem item, WebIDL::UnsignedLong guess_index)
+{
+    auto& realm = window().principal_realm();
+    auto promise = WebIDL::create_promise_for(window());
+    auto action = [&] {
+        switch (item) {
+        case Bindings::SpellingMenuItem::None:
+            return SpellingMenuActionForTesting::None;
+        case Bindings::SpellingMenuItem::Guess:
+            return SpellingMenuActionForTesting::Guess;
+        case Bindings::SpellingMenuItem::Ignore:
+            return SpellingMenuActionForTesting::IgnoreSpelling;
+        case Bindings::SpellingMenuItem::Learn:
+            return SpellingMenuActionForTesting::LearnSpelling;
+        }
+        VERIFY_NOT_REACHED();
+    }();
+    page().request_spelling_menu_action_for_testing(action, guess_index, GC::create_function(heap(), [&realm, promise](String menu) {
+        HTML::TemporaryExecutionContext execution_context { realm };
+        WebIDL::resolve_promise(realm, promise, JS::PrimitiveString::create(realm.vm(), Utf16String::from_utf8(menu)));
+    }));
+    return promise;
 }
 
 GC::Ptr<JS::Object> Internals::hit_test_result(double x, double y)

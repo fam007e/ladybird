@@ -75,6 +75,7 @@
 #include <LibWebView/SessionHistory.h>
 #include <LibWebView/SessionStore.h>
 #include <LibWebView/Settings.h>
+#include <LibWebView/SpellChecker.h>
 #include <LibWebView/TabPerformanceStats.h>
 #include <LibWebView/WebContentClient.h>
 #include <LibWebView/WebContentPage.h>
@@ -111,6 +112,8 @@ public:
     CanonicalTraversable& traversable() const;
     virtual void prepare_page_for_tab(WebContentPage&);
     void did_change_display_page(Badge<CanonicalNavigable>, RefPtr<WebContentPage> previous_page);
+    void did_cancel_loading(Badge<CanonicalNavigable>, bool canceled_navigation);
+    void did_stop_loading(Badge<CanonicalTraversable>, bool stopped_navigation);
 
     void set_url(Badge<WebContentPage>, URL::URL url) { set_url(move(url)); }
     URL::URL const& url() const { return m_url; }
@@ -146,7 +149,6 @@ public:
     void reload();
     void stop_loading();
     bool is_loading() const { return m_is_loading; }
-    void cancel_uncommitted_top_level_navigation_for_browser_traversal();
 
     bool crash_overlay_active() const { return m_crash_state.has_value(); }
     String crash_overlay_failed_url() const;
@@ -170,7 +172,7 @@ public:
         Function<void()> on_ready = nullptr);
     [[nodiscard]] Vector<SessionHistoryTraversalMenuItem> session_history_traversal_menu_items(int direction) const;
 
-    [[nodiscard]] Optional<SessionHistorySnapshot> session_history_snapshot() const;
+    [[nodiscard]] SessionHistorySnapshot session_history_snapshot() const;
     [[nodiscard]] ErrorOr<void> restore_session_history_from_snapshot(SessionHistorySnapshot);
 
     Optional<SessionTabId> session_tab_id() const { return m_session_tab_id; }
@@ -367,7 +369,6 @@ public:
     void did_change_screen_wake_lock_state(Badge<WebContentPage>, Web::ScreenWakeLockState);
     Web::ScreenWakeLockState screen_wake_lock_state() const { return m_screen_wake_lock_state; }
 
-    void request_history_operation(Badge<WebContentPage>, WebContentPage& requesting_page, Web::HTML::CrossProcessId operation_id, Web::HistoryOperationParameters);
     void did_reset_session_history_for_testing(Badge<WebContentPage>, Web::HTML::SessionHistoryEntryDescriptor);
     bool capture_session_history_snapshot_for_testing(Badge<WebContentPage>);
     bool restore_captured_session_history_snapshot_for_testing(Badge<WebContentPage>);
@@ -528,7 +529,11 @@ public:
     Menu& bookmark_context_menu() { return *m_bookmark_context_menu; }
     Menu& bookmark_folder_context_menu() { return *m_bookmark_folder_context_menu; }
 
-    void did_request_page_context_menu(Badge<WebContentPage>, Gfx::IntPoint content_position, Web::ContextMenuForInputEventsTarget for_input_events_target);
+    void did_request_page_context_menu(Badge<WebContentPage>, WebContentPage& requesting_page, Gfx::IntPoint content_position, Web::ContextMenuForInputEventsTarget for_input_events_target, Optional<Utf16String> misspelled_word);
+    void activate_spelling_menu_action_for_testing(Badge<WebContentPage>, WebContentPage& requesting_page, Web::SpellingMenuActionForTesting, u32 guess_index);
+
+    void did_request_spell_check(Badge<WebContentPage>, WebContentPage& requesting_page, u64 request_id, Utf16String text);
+    void reset_spell_checking();
     void did_request_link_context_menu(Badge<WebContentPage>, Gfx::IntPoint content_position, Web::HTML::PreparedNavigationDescriptor);
     void did_request_image_context_menu(Badge<WebContentPage>, Gfx::IntPoint content_position, Web::HTML::PreparedNavigationDescriptor, Optional<Gfx::ShareableBitmap> bitmap);
     void did_request_media_context_menu(Badge<WebContentPage>, WebContentPage& requesting_page, Gfx::IntPoint content_position, Web::MediaContextMenu menu, Web::HTML::PreparedNavigationDescriptor);
@@ -552,7 +557,8 @@ public:
 protected:
     void will_apply_history_traversal_step(Web::HTML::CrossProcessId operation_id);
     void did_apply_top_level_history_traversal_step(Web::HTML::CrossProcessId operation_id);
-    void did_finish_history_traversal(Web::HTML::CrossProcessId operation_id, Web::HTML::HistoryStepResult);
+    void did_finish_history_traversal(Web::HTML::CrossProcessId operation_id);
+    void did_commit_history_step();
 
     virtual Web::Clipboard::SystemClipboardItem clipboard_item() const;
     virtual void insert_clipboard_item(Web::Clipboard::SystemClipboardItem);
@@ -566,11 +572,9 @@ protected:
     explicit ViewImplementation(IsPrivate = IsPrivate::No);
 
     void set_url(URL::URL);
-    void did_start_navigation(Optional<Utf16String> navigation_id, URL::URL const&);
-    void did_cancel_loading(Optional<Utf16String> const& navigation_id);
-    bool did_cancel_navigation(Optional<Utf16String> const& navigation_id);
+    void did_start_navigation();
     void did_finish_navigation();
-    bool matches_ongoing_navigation(Optional<Utf16String> const& navigation_id) const;
+    void did_end_uncommitted_navigation(StringView reason);
     void set_loading_state(bool);
     void complete_webdriver_navigation_completion(u64 request_id, Web::WebDriver::Response);
     void set_webdriver_current_browsing_context(CanonicalNavigable const&);
@@ -583,6 +587,7 @@ protected:
     void complete_webdriver_navigation(u64 navigation_id);
     void complete_webdriver_history_traversal(Web::HTML::CrossProcessId operation_id);
     void update_navigation_action_state();
+    void did_not_apply_reload();
     void notify_session_history_changed();
     enum class SessionHistoryDumpMode {
         IfDebuggingEnabled,
@@ -591,7 +596,6 @@ protected:
     void dump_session_history(StringView reason, SessionHistoryDumpMode = SessionHistoryDumpMode::IfDebuggingEnabled) const;
     void recover_current_session_history_entry_with_history_operation();
     void reconstruct_current_session_history_entry_with_history_operation(StringView reason);
-    bool cancel_uncommitted_top_level_navigation(StringView reason, bool stop_loading);
     NonnullRefPtr<Core::Promise<Empty>> reset_session_history_for_testing();
 
     virtual void update_zoom();
@@ -701,6 +705,9 @@ protected:
     RefPtr<Menu> m_image_context_menu;
     RefPtr<Menu> m_media_context_menu;
     u64 m_context_menu_request_id { 0 };
+
+    SpellChecker::DocumentTag spell_document_tag();
+    Optional<SpellChecker::DocumentTag> m_spell_document_tag;
 
     RefPtr<Menu> m_bookmarks_bar_context_menu;
     RefPtr<Menu> m_bookmark_context_menu;
@@ -887,6 +894,20 @@ protected:
     RefPtr<WebContentPage> m_file_picker_page;
     RefPtr<WebContentPage> m_select_dropdown_page;
     RefPtr<WebContentPage> m_media_context_menu_page;
+
+    static constexpr size_t MAX_SPELLING_GUESSES = 5;
+    void update_spelling_menu_actions(Optional<Utf16String> misspelled_word);
+    void ignore_context_menu_misspelling();
+    void learn_context_menu_misspelling();
+    String describe_spelling_menu_for_testing() const;
+
+    Vector<NonnullRefPtr<Action>> m_spelling_guess_actions;
+    RefPtr<Action> m_no_spelling_guesses_action;
+    RefPtr<Action> m_ignore_spelling_action;
+    RefPtr<Action> m_learn_spelling_action;
+    Optional<Utf16String> m_context_menu_misspelled_word;
+    Vector<Utf16String> m_spelling_guesses;
+    RefPtr<WebContentPage> m_spelling_context_menu_page;
 
     HashMap<GeolocationRequestKey, Core::GeolocationProvider::RequestId> m_geolocation_position_request_ids;
     HashMap<GeolocationRequestKey, Core::GeolocationProvider::WatchId> m_geolocation_watch_ids;

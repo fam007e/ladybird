@@ -22,6 +22,7 @@
 #include <LibWeb/CSS/PseudoElement.h>
 #include <LibWeb/DOM/HoverEventData.h>
 #include <LibWeb/DOM/NodeIdentity.h>
+#include <LibWeb/Editing/SpellingMarkers.h>
 #include <LibWeb/Export.h>
 #include <LibWeb/Forward.h>
 #include <LibWeb/Layout/LayoutRustFFI.h>
@@ -68,6 +69,7 @@ public:
     EventResult handle_mouseup(CSSPixelPoint, CSSPixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers, Optional<RemoteInputEventTarget>* remote_target = nullptr);
     EventResult handle_mousewheel(CSSPixelPoint, CSSPixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers, double wheel_delta_x, double wheel_delta_y, Web::WheelDeltaPrecision = Web::WheelDeltaPrecision::Discrete, Web::ScrollGesturePhase = Web::ScrollGesturePhase::None, bool async_scroll_performed_default_action = false, Optional<AsyncScrollOperation>* async_scroll_operation = nullptr, Optional<RemoteInputEventTarget>* remote_target = nullptr);
     EventResult handle_mouseleave();
+    EventResult insert_replacement_text(Utf16String const&);
 #if defined(AK_OS_MACOS)
     bool select_word_for_dictionary_lookup(CSSPixelPoint visual_viewport_position);
 #endif
@@ -80,7 +82,8 @@ public:
     void update_cursor_after_rendering_update();
     GC::Ptr<DOM::Node> target_node_for_mouse_position(CSSPixelPoint);
 
-    EventResult handle_keydown(UIEvents::KeyCode, unsigned modifiers, u32 code_point, bool repeat, bool should_insert_text, bool async_scroll_performed_default_action = false);
+    EventResult handle_keydown(UIEvents::KeyCode, unsigned modifiers, u32 code_point, bool repeat, bool should_insert_text, bool async_scroll_performed_default_action = false, ReadonlySpan<TextEditingCommand> editing_commands = {}, bool native_editing_binding_resolved = false);
+    EventResult handle_text_editing_command(TextEditingCommand const&);
     struct KeyboardScrollSnapshot {
         Compositing::KeyboardScrollState state;
         Vector<GC::Weak<DOM::EventTarget>> event_path;
@@ -126,7 +129,7 @@ private:
 
     EventResult fire_keyboard_event(Utf16FlyString const& event_name, HTML::LocalNavigable&, UIEvents::KeyCode, unsigned modifiers, u32 code_point, bool repeat);
     [[nodiscard]] EventResult fire_text_input_event(HTML::LocalNavigable&, Utf16String const& data);
-    [[nodiscard]] EventResult input_event(Utf16FlyString const& event_name, Utf16FlyString const& input_type, HTML::LocalNavigable&, Variant<u32, Utf16String> code_point_or_string);
+    [[nodiscard]] EventResult input_event(Utf16FlyString const& event_name, Utf16FlyString const& input_type, HTML::LocalNavigable&, Variant<u32, Utf16String> code_point_or_string, GC::Ptr<DOM::StaticRange> deletion_range = nullptr);
 
     [[nodiscard]] EventResult perform_copy_action();
     [[nodiscard]] EventResult perform_cut_action();
@@ -172,6 +175,7 @@ private:
     bool initiate_word_selection(Layout::BegunRead const& read, DOM::Document&, Painting::CaretPosition const&, CSS::UserSelect);
     bool initiate_paragraph_selection(DOM::Document&, Painting::CaretPosition const&, CSS::UserSelect);
     bool select_context_menu_text(Layout::BegunRead const& read, DOM::Document&, CSSPixelPoint visual_viewport_position);
+    Optional<Editing::ContextMenuMisspelling> select_context_menu_misspelling(Layout::BegunRead const& read, DOM::Document&, CSSPixelPoint visual_viewport_position);
     bool select_context_menu_url_token(DOM::Document&, Painting::CaretPosition const&, CSS::UserSelect);
 #if defined(AK_OS_MACOS)
     bool select_word_at_position(Layout::BegunRead const& read, DOM::Document&, CSSPixelPoint visual_viewport_position);

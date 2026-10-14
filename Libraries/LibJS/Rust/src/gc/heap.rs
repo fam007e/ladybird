@@ -12,7 +12,7 @@ use std::collections::HashMap;
 
 use super::capi::{self, GCAllocator, GCGatherRootsCallback, GCHeap, GCLayout};
 use super::class::{CellTypeInfo, Class, GcCell};
-use super::class_id::CLASS_COUNT;
+use super::class_id::{CLASS_COUNT, ClassId};
 use super::weak::WEAK_IMPL_POINTER_OFFSET;
 use crate::build_configuration::{HEAP_REGION_OFFSET_MASK, PRIMITIVE_STORAGE_CAGE_OFFSET_MASK};
 use crate::layout::cell::{CellHeader, CellState, Gc};
@@ -24,7 +24,8 @@ use crate::layout::cell::{CellHeader, CellState, Gc};
 pub struct Heap {
     raw: NonNull<GCHeap>,
     allocators: [Cell<Option<HeapAllocator>>; CLASS_COUNT],
-    /// The allocators of the classes derived at run time, by the address of their class.
+    /// The allocators of the classes that have no id of their own, the classes derived at run time and the classes
+    /// of an embedder's cells, by the address of their class.
     runtime_class_allocators: RefCell<HashMap<usize, HeapAllocator, foldhash::fast::RandomState>>,
     /// The size classes of each class, by class id, out of line, as few classes have any.
     size_class_tables: Box<[OnceCell<SizeClassTable>; CLASS_COUNT]>,
@@ -48,6 +49,11 @@ pub struct InlineAllocationInfo {
     pub total_allocated_bytes: NonNull<usize>,
     pub free_cell_next_offset: usize,
     pub free_cell_link_mask: usize,
+    /// Where an allocator keeps the cursor, the end and the cell size of the never-allocated cells it bumps through
+    /// once its local free list is empty, relative to the head of the list.
+    pub local_cursor_offset: usize,
+    pub local_end_offset: usize,
+    pub local_cell_size_offset: usize,
 }
 
 /// An allocator of a heap, with the address of its local free list in the heap, which is null if every cell has to be
@@ -146,8 +152,11 @@ impl Heap {
         // SAFETY: The caller keeps the context alive for the heap's lifetime.
         let raw = unsafe { capi::gc_heap_create(gather_roots, context, become_process_default) };
         let raw = NonNull::new(raw).expect("LibGC creates the heap");
-        // SAFETY: LibGC reports offsets of fields of its heap.
-        let counter = |offset: u32| unsafe { raw.byte_add(offset as usize) }.cast::<usize>();
+        // NB: LibGC reports offsets of fields of its heap.
+        let counter = |offset: u32| {
+            NonNull::new(raw.as_ptr().wrapping_byte_add(offset as usize).cast::<usize>())
+                .expect("the fields of LibGC's heap are not at null")
+        };
         Self {
             raw,
             allocators: [const { Cell::new(None) }; CLASS_COUNT],
@@ -159,6 +168,9 @@ impl Heap {
                 total_allocated_bytes: counter(layout.heap_total_allocated_bytes_offset),
                 free_cell_next_offset: layout.free_cell_next_offset as usize,
                 free_cell_link_mask: layout.free_cell_link_mask as usize,
+                local_cursor_offset: layout.local_cursor_offset as usize,
+                local_end_offset: layout.local_end_offset as usize,
+                local_cell_size_offset: layout.local_cell_size_offset as usize,
             },
         }
     }
@@ -174,6 +186,12 @@ impl Heap {
 
     pub fn raw(&self) -> *mut GCHeap {
         self.raw.as_ptr()
+    }
+
+    /// LibGC's heap, for the functions of its C API that only need it to be live.
+    pub fn handle(&self) -> &GCHeap {
+        // SAFETY: This owns the heap, which stays live for as long as this does.
+        unsafe { self.raw.as_ref() }
     }
 
     /// Moves `cell` into the heap. Nothing can collect garbage between taking the storage and writing the cell, so
@@ -322,8 +340,9 @@ impl Heap {
         }
     }
 
-    /// Pops the allocator's local free list, unless LibGC has to collect garbage first or the list is empty, with the
-    /// bookkeeping gc_heap_allocator_local_free_list() describes. Cells from the list never need marking.
+    /// Takes a cell from the allocator's local free list, or else from its never-allocated cells, unless LibGC has to
+    /// collect garbage first or there is no local free cell, with the bookkeeping gc_heap_allocator_local_free_list()
+    /// describes. These cells never need marking.
     ///
     /// # Safety
     ///
@@ -338,13 +357,22 @@ impl Heap {
         let local_free_list = allocator.local_free_list()?;
         let info = &self.inline_allocation_info;
         let link_mask = info.free_cell_link_mask;
-        // SAFETY: The list and the counters are fields of the live heap, and every cell on the list is a free cell that
-        //         keeps the link to the next one at free_cell_next_offset.
+        // SAFETY: The list, the cursor, the end and the counters are fields of the live heap, and every cell on the list
+        //         is a free cell that keeps the link to the next one at free_cell_next_offset.
         unsafe {
-            let cell = local_free_list.read();
-            if cell.addr() & link_mask == 0 {
-                return None;
-            }
+            let cursor = local_free_list.byte_add(info.local_cursor_offset).cast::<*mut c_void>();
+            let head = local_free_list.read();
+            let from_list = head.addr() & link_mask != 0;
+            let cell = if from_list {
+                head
+            } else {
+                let cursor_cell = cursor.read();
+                let end = local_free_list.byte_add(info.local_end_offset).cast::<usize>().read();
+                if cursor_cell.addr() >= end {
+                    return None;
+                }
+                cursor_cell
+            };
             let cell = NonNull::new_unchecked(cell);
             if let AllocationKind::Cell = kind {
                 let allocated_bytes = info.allocated_bytes_since_last_gc.read() + cell_size;
@@ -355,13 +383,17 @@ impl Heap {
             }
             info.total_allocated_bytes
                 .write(info.total_allocated_bytes.read() + cell_size);
-            // NB: Only the bits of the link under the mask count, so that the next cell is in the block of this one
-            //     whatever the link was overwritten with.
-            let link = cell.byte_add(info.free_cell_next_offset).cast::<usize>().read();
-            local_free_list.write(
-                cell.as_ptr()
-                    .map_addr(|address| (address & !link_mask) | (link & link_mask)),
-            );
+            if from_list {
+                // NB: Only the bits of the link under the mask count, so that the next cell is in the block of this one
+                //     whatever the link was overwritten with.
+                let link = cell.byte_add(info.free_cell_next_offset).cast::<usize>().read();
+                local_free_list.write(
+                    cell.as_ptr()
+                        .map_addr(|address| (address & !link_mask) | (link & link_mask)),
+                );
+            } else {
+                cursor.write(cell.as_ptr().byte_add(cell_size));
+            }
             Some(cell)
         }
     }
@@ -387,13 +419,33 @@ impl Heap {
             "the cells of {} come from the allocator of its id",
             class.name
         );
-        let allocator = *self
+        RuntimeClassAllocator {
+            class,
+            allocator: self.allocator_kept_by_class_address(class),
+        }
+    }
+
+    /// The allocator of `class`, the class of an embedder's cells, which the first call for the class creates. Such
+    /// classes all have ClassId::EmbedderCell, so each has an allocator of its own, kept by its address.
+    pub fn embedder_class_allocator(&self, class: &'static Class) -> RuntimeClassAllocator {
+        assert!(
+            class.id == ClassId::EmbedderCell && class.parent.is_none(),
+            "{} is not the class of an embedder's cells",
+            class.name
+        );
+        RuntimeClassAllocator {
+            class,
+            allocator: self.allocator_kept_by_class_address(class),
+        }
+    }
+
+    fn allocator_kept_by_class_address(&self, class: &'static Class) -> HeapAllocator {
+        *self
             .runtime_class_allocators
             .borrow_mut()
             .entry(core::ptr::from_ref(class) as usize)
             // SAFETY: The class and its name live as long as the process, so they outlive the allocator.
-            .or_insert_with(|| unsafe { self.create_allocator(&raw const class.type_info, class.name) });
-        RuntimeClassAllocator { class, allocator }
+            .or_insert_with(|| unsafe { self.create_allocator(&raw const class.type_info, class.name) })
     }
 
     /// The size classes of `class`, whose cells have `cell_sizes` bytes, in that order, which the first call for the
@@ -417,6 +469,11 @@ impl Heap {
         assert!(
             !class.is_derived_at_run_time(),
             "a class derived at run time shares the id of {}",
+            class.name
+        );
+        assert!(
+            class.id != ClassId::EmbedderCell,
+            "the class of an embedder's cells, {}, shares its id",
             class.name
         );
         let type_infos: Box<[CellTypeInfo]> = cell_sizes
@@ -454,6 +511,11 @@ impl Heap {
         if let Some(allocator) = slot.get() {
             return allocator;
         }
+        assert!(
+            class.id != ClassId::EmbedderCell,
+            "the cells of an embedder class, {}, come from the allocator kept by its address",
+            class.name
+        );
         // SAFETY: The class and its name are static, so they outlive the allocator.
         let allocator = unsafe { self.create_allocator(&raw const class.type_info, class.name) };
         slot.set(Some(allocator));
@@ -461,8 +523,7 @@ impl Heap {
     }
 
     pub fn collect_garbage(&self) {
-        // SAFETY: The heap is live.
-        unsafe { capi::gc_heap_collect_garbage(self.raw.as_ptr(), capi::GC_COLLECTION_TYPE_COLLECT_GARBAGE, false) };
+        capi::gc_heap_collect_garbage(self.handle(), capi::GC_COLLECTION_TYPE_COLLECT_GARBAGE, false);
     }
 
     /// Calls `callback` with `context` during every collection, after marking and finalization and before dead cells
@@ -488,13 +549,11 @@ impl Heap {
 
     /// Counts memory a cell allocated outside the heap towards the next collection, which this may start.
     pub fn did_allocate_external_memory(&self, size: usize) {
-        // SAFETY: The heap is live.
-        unsafe { capi::gc_heap_did_allocate_external_memory(self.raw.as_ptr(), size) };
+        capi::gc_heap_did_allocate_external_memory(self.handle(), size);
     }
 
     pub fn did_free_external_memory(&self, size: usize) {
-        // SAFETY: The heap is live.
-        unsafe { capi::gc_heap_did_free_external_memory(self.raw.as_ptr(), size) };
+        capi::gc_heap_did_free_external_memory(self.handle(), size);
     }
 
     pub fn account_external_memory_change(&self, old_size: usize, new_size: usize) {
@@ -506,13 +565,11 @@ impl Heap {
     }
 
     pub fn should_collect_on_every_allocation(&self) -> bool {
-        // SAFETY: The heap is live.
-        unsafe { capi::gc_heap_should_collect_on_every_allocation(self.raw.as_ptr()) }
+        capi::gc_heap_should_collect_on_every_allocation(self.handle())
     }
 
     pub fn set_should_collect_on_every_allocation(&self, should_collect: bool) {
-        // SAFETY: The heap is live.
-        unsafe { capi::gc_heap_set_should_collect_on_every_allocation(self.raw.as_ptr(), should_collect) };
+        capi::gc_heap_set_should_collect_on_every_allocation(self.handle(), should_collect);
     }
 
     /// Heap::uproot_cell(): has the next collection leave `cell` out of its roots, so that copies of it on the stack or
@@ -526,8 +583,7 @@ impl Heap {
     /// The lowest and highest addresses of the stack of the thread that created the heap.
     pub fn stack_bounds(&self) -> (usize, usize) {
         let (mut base, mut top) = (0, 0);
-        // SAFETY: The heap is live.
-        unsafe { capi::gc_heap_stack_bounds(self.raw.as_ptr(), &raw mut base, &raw mut top) };
+        capi::gc_heap_stack_bounds(self.handle(), &mut base, &mut top);
         (base, top)
     }
 }
@@ -563,8 +619,7 @@ pub fn cell_is_dead<T>(cell: Gc<T>) -> bool {
 /// Checks the layouts this crate mirrors against the LibGC it is linked with, and returns LibGC's layout.
 fn check_layout() -> GCLayout {
     let mut layout = GCLayout::default();
-    // SAFETY: LibGC fills in the whole struct.
-    unsafe { capi::gc_get_layout(&raw mut layout) };
+    capi::gc_get_layout(&mut layout);
     let expect = |what: &str, actual: u64, expected: u64| {
         assert!(
             actual == expected,

@@ -451,7 +451,7 @@ impl StyleEngine {
             .retained
             .computed_group_sets
             .style_record_view(element.raw())
-            .and_then(|view| unsafe { view.longhand_table.as_ref() })
+            .and_then(|view| view.longhand_table)
             .is_some_and(|table| table.display_is_list_item());
         // A highlight pseudo-element without rules of its own inherits its ancestor's.
         let generated = kinds_with_rules & (1 << kind) != 0
@@ -654,7 +654,7 @@ impl RetainedState {
                 // substituted shorthand, which the same declarations hold.
                 let (substituted_property, written) = match declaration.value.as_ref() {
                     data @ StyleValueData::Shorthand { .. } => match shorthand_longhand_data(property, data) {
-                        Some(longhand) => (None, retained(longhand)),
+                        Some(longhand) => (None, longhand.clone()),
                         None => continue,
                     },
                     data @ StyleValueData::Unresolved { .. } => (Some(property), retained(data)),

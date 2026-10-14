@@ -88,8 +88,8 @@ impl JitEntryTable {
 
     #[cfg(feature = "address-sanitizer")]
     fn code_start(&self) -> *const c_void {
-        // SAFETY: The offset is inside the mapping.
-        unsafe { self.base.as_ptr().add(JIT_ENTRY_TABLE_CODE_OFFSET).cast() }
+        // NB: The offset is inside the mapping.
+        self.base.as_ptr().wrapping_add(JIT_ENTRY_TABLE_CODE_OFFSET).cast()
     }
 
     /// The address of the entries, which JIT code embeds.
@@ -148,20 +148,21 @@ impl JitEntryTable {
         slot
     }
 
-    /// Frees the slot of the executable whose head is at `owner`, which died, and drops its code.
-    pub fn free(&self, slot: u32, owner: u64) {
+    /// Frees the slot of the executable whose head is at `owner`, which died, and returns its code.
+    pub fn free(&self, slot: u32, owner: u64) -> Option<Box<JitCode>> {
         let slot = slot & JIT_ENTRY_SLOT_MASK;
         if slot == NO_JIT_ENTRY_SLOT {
-            return;
+            return None;
         }
         assert!(
             self.is_owned_by(slot, owner),
             "only the owner of a JIT entry slot frees it"
         );
-        drop(self.code_cell(slot).take());
+        let code = self.code_cell(slot).take();
         self.entry_cell(slot).set(self.not_compiled_entry);
         self.owner_cell(slot).set(0);
         self.free_slots.borrow_mut().push(slot);
+        code
     }
 
     /// Whether the slot belongs to the executable whose head is at `owner`.
