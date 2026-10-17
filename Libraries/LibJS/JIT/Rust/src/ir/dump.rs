@@ -12,6 +12,7 @@ use super::Graph;
 use super::NodeId;
 use super::Op;
 use super::ShapeCheck;
+use super::SuspendKind;
 use super::value;
 use crate::bytecode::FrameLayout;
 use crate::bytecode::Operand;
@@ -74,7 +75,10 @@ fn condition_text(condition: BranchCondition) -> String {
         BranchCondition::IndexInBounds => "IndexInBounds".to_string(),
         BranchCondition::MagicalLength => "MagicalLength".to_string(),
         BranchCondition::Extensible => "Extensible".to_string(),
+        BranchCondition::HoleFillableArray => "HoleFillableArray".to_string(),
         BranchCondition::ArrayIterator => "ArrayIterator".to_string(),
+        BranchCondition::GeneratorObject => "GeneratorObject".to_string(),
+        BranchCondition::PlainArrayPrototypeChain => "PlainArrayPrototypeChain".to_string(),
         BranchCondition::Shape(shape) => format!("Shape {}", shapes_text(std::iter::once(&shape))),
         BranchCondition::NonNegativeInt32 => "NonNegativeInt32".to_string(),
         BranchCondition::Int32(comparison) => format!("Int32{comparison:?}"),
@@ -109,6 +113,15 @@ fn op_text(layout: &FrameLayout, op: &Op, inputs: &str) -> String {
         Op::InitializeFrame => with_inputs("InitializeFrame"),
         Op::EnsureFrameInitialized => with_inputs("EnsureFrameInitialized"),
         Op::PublishFrame => with_inputs("PublishFrame"),
+        Op::Suspend { continuation, kind } => {
+            let continuation = continuation.map_or("completed".to_string(), |pc| format!("pc {pc}"));
+            let kind = match kind {
+                SuspendKind::Yield => "",
+                SuspendKind::YieldIteratorResult => " iterator-result",
+                SuspendKind::Await => " await",
+            };
+            with_inputs(&format!("Suspend {continuation}{kind}"))
+        }
         Op::BoxCell => with_inputs("BoxCell"),
         Op::LoadOuterEnvironment => with_inputs("LoadOuterEnvironment"),
         Op::LoadEnvironmentBinding { index } => with_inputs(&format!("LoadEnvironmentBinding {index}")),
@@ -255,6 +268,7 @@ fn op_text(layout: &FrameLayout, op: &Op, inputs: &str) -> String {
             with_inputs(&format!("{} {} {location}", op.name(), opcode.name()))
         }
         Op::Float64Unary { op } => with_inputs(&format!("Float64{}", op.name())),
+        Op::CallFloat64Function { function } => with_inputs(&format!("CallFloat64{}", function.name())),
         Op::Float64Binary { op } => with_inputs(&format!("Float64{op:?}")),
         Op::Float64Compare { comparison } => with_inputs(&format!("Float64{comparison:?}")),
         Op::Refine { condition, holds } => {
@@ -289,11 +303,13 @@ fn op_text(layout: &FrameLayout, op: &Op, inputs: &str) -> String {
         | Op::LoadElementsCapacity
         | Op::AppendElement
         | Op::CallArrayPush
-        | Op::CreateArrayIterator
+        | Op::OpenArrayIteration
         | Op::LoadArrayIteratorArray
         | Op::LoadArrayIteratorIndex
         | Op::StoreArrayIteratorIndex
         | Op::FinishArrayIterator
+        | Op::LoadGeneratorCompletionType
+        | Op::LoadGeneratorCompletionValue
         | Op::LoadPropertyIteratorKeyCount
         | Op::LoadPropertyIteratorKey => with_inputs(op.name()),
         Op::CheckBounds

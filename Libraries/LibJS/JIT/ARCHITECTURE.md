@@ -14,10 +14,10 @@ LibJS has two tiers: the bytecode interpreter, whose instructions keep per-site 
 feedback, and this optimizing JIT. An executable that uses up its tier-up budget (calls and loop
 iterations) is snapshotted and compiled on one of the compile threads. The interpreter keeps running
 it meanwhile; the main thread installs the code when the job finishes. Loops that run long enough
-enter compiled code at their back edges (on-stack replacement). A call from compiled code into a
-function the interpreter runs counts as several invocations of it (`callee-boost`): code hot enough
-to be compiled calls it, so it is likely to be hot as well, and there is no baseline tier to run it
-in meanwhile.
+enter compiled code at their back edges (on-stack replacement), and generators and async functions
+enter it where they resume (section 4.1). A call from compiled code into a function the interpreter
+runs counts as several invocations of it (`callee-boost`): code hot enough to be compiled calls it,
+so it is likely to be hot as well, and there is no baseline tier to run it in meanwhile.
 
 There is no baseline tier. The interpreter's caches are the baseline: the JIT translates what they
 saw into speculation, and leaves to the interpreter wherever a speculation fails.
@@ -42,8 +42,8 @@ and are rematerialized at every use. Every value has a representation (`Repr`): 
 float64, bool or pointer. Cold blocks hold code that rarely runs (slow paths of checks); they come last
 in the final block order.
 
-Blocks without predecessors are entries: block 0 and the on-stack replacement entries. Every block
-is reachable from one.
+Blocks without predecessors are entries: block 0, the on-stack replacement entries and the resume
+entries of generators (section 4.1). Every block is reachable from one.
 
 The compiled function's slots are SSA values. The builder tracks, per slot, whether only frame
 memory holds it or which value holds it (and whether memory holds that too). Merges and loop
@@ -63,11 +63,14 @@ from them alone:
 - **Exits.** `Op::can_eager_exit()`, whether the op has an exit kind (`Op::exit_kind()`): may exit
   before its side effects, resuming at the current bytecode (needs the eager frame state).
   `can_lazy_exit`: may need to exit after it returns, resuming after the current bytecode.
-- **Call.** `is_call`: calls out of compiled code and clobbers every caller-saved register.
+- **Call.** `is_call`: calls out of compiled code and clobbers every caller-saved register. That
+  is no effect: a call without any of the other effects only computes its value, and passes treat
+  it like any other node that does.
 - **Memory.** `reads` and `writes`: sets of abstract locations (`ir::Locations`): `FRAME`,
   `NAMED_SLOTS` (property values), `SHAPES` (shapes and prototypes), `ELEMENTS` (element values),
   `ELEMENT_COUNTS` (element storage kind, length, capacity and the storage offset of typed arrays), `GLOBAL_BINDINGS` and `BINDINGS` (the
-  bindings of declarative environments), and `ITERATORS` (the state of iterators). Passes ask
+  bindings of declarative environments), `ITERATORS` (the state of iterators), and `COLLECTIONS` (the
+  entries of Map, Set, WeakMap and WeakSet objects). Passes ask
   one question: whether one node's writes intersect another's reads. `runs_code`: may run other
   code, which may write anything, or invalidate the compiled code. The op table below names the
   locations coarsely (Named for slots and shapes, Elements for values and counts, Any for all);
@@ -121,7 +124,7 @@ Exits: E = eager, L = lazy. Every node that can exit has a frame state. "Call" m
 | Constant | A NaN-boxed constant. | | | | cse |
 | Phi | One input per predecessor, in predecessor order. | | | | |
 | LoadSlot | Reads a frame slot. | | Frame | | |
-| StoreSlot | Writes input 0 to a frame slot: a reserved register (the this value, the saved lexical environment), a written constant, an argument the legacy `arguments` shows, or a slot the next call reading the frame reads. The verifier enforces this. | | | Frame | |
+| StoreSlot | Writes input 0 to a frame slot: a reserved register (the this value, the saved lexical environment), a written constant, an argument the legacy `arguments` shows, or a slot the next call reading the frame or `Suspend` reads. The verifier enforces this. | | | Frame | |
 | BoxInt32, BoxBool | The tagged value of an unboxed input. | | | | cse |
 | CheckInt32 | Input 0 as an int32; exits unless it is one. | E | | | cse |
 | CheckNumber | Input 0 as a float64; exits unless it is a number. | E | | | cse |
@@ -142,6 +145,7 @@ Exits: E = eager, L = lazy. Every node that can exit has a frame state. "Call" m
 | IsCallable | Whether input 0 is a function object. | | | | cse |
 | Typeof, TypeofIs | `typeof` of input 0, or whether it is one kind. | | | | cse |
 | ToBoolean | Truthiness through the runtime's `to_boolean`; the slow path of `BranchTruthy`. | | | | call, cse |
+| CallFloat64Function | `Math.exp`, `log`, `sin`, `cos`, `tan` and `pow` of float64 values, through the runtime's function of doubles for each, which only computes. | | | | call, cse |
 | PrimitiveToString, ToObject | ToString of a primitive, and ToObject of a primitive (but undefined and null) as a builtin of the running realm makes it (else the empty value), through the runtime. | | | | call, allocates |
 | CallIntrinsic | A builtin of a `this` value and arguments of the kinds its `HelperCall` lists (like a string and an int32 position for `String.prototype.indexOf`), through its runtime helper, without a native frame; the helper runs in the realm of the calling code. Helpers that return any value return the empty value where they decline, having done nothing observable. | | Per `HelperCall` | Per `HelperCall` | call, allocates |
 | ArrayCreate | `new Array(length)` as the running realm's `Array` constructor makes it, through the runtime. | | | | call, allocates |
@@ -185,9 +189,10 @@ Exits: E = eager, L = lazy. Every node that can exit has a frame state. "Call" m
 | ConcatenateStrings | The concatenation of two strings, a rope or a cached short string, or the empty value where only the slow path makes it. | | | | allocates |
 | IntegerToString | The VM's cached string of an int32, or the empty value. | | | | cse |
 | LoadPropertyIteratorKeyCount, LoadPropertyIteratorKey | The keys of a property iterator cache, at an index refined to be in bounds. The keys never change. | | | | cse |
-| CreateArrayIterator | `GetIterator` of an array that iterates with `%Array.prototype.values%` and the builtin `next` (input 1), through a runtime call that preserves every register: a new array iterator over its values, or the empty value for anything else. | | Any | | allocates |
+| OpenArrayIteration | `GetIterator` in fast array mode, through a runtime call that preserves every register: the iterable, if it is an array that iterates with `%Array.prototype.values%` and whose array iterators have the builtin `next`, or the empty value. The iteration then keeps the index of the next element in the iterator operand and the array in the next operand, and makes no iterator. | | Any | | |
 | LoadArrayIteratorArray, LoadArrayIteratorIndex | The iterated array (`undefined` once done) and the low 32 bits of the next index of an array iterator (a `Repr::Pointer` that `BranchCondition::ArrayIterator` established is one). | | Iterators | | |
 | StoreArrayIteratorIndex, FinishArrayIterator | Sets the next index of an array iterator, or makes it done. | | | Iterators | |
+| LoadGeneratorCompletionType, LoadGeneratorCompletionValue | The type (as an int32) and the value of the completion a generator object (which a branch on `GeneratorObject` established it is) resumed with. | | Iterators | | |
 | LoadGlobalBinding | A binding of the global declarative environment; exits while uninitialized. | E | Global | | cse |
 | StoreGlobalBinding | Stores a mutable global binding; exits while uninitialized. | E | Global | Global | |
 | **Allocation** | | | | | |
@@ -198,6 +203,7 @@ Exits: E = eager, L = lazy. Every node that can exit has a frame state. "Call" m
 | **Frames and environments** | | | | | |
 | InitializeFrame, EnsureFrameInitialized | The `Enter` bytecode: publishes the frame, empties the registers and locals, copies the constants (the second only if the frame is not initialized yet). | | | Frame | |
 | PublishFrame | Makes the frame the running execution context, which direct calls leave to their callee's code. | | | Frame | |
+| Suspend | Records where the frame's generator or async function resumes (a continuation, or none once it completes) and what the value it returns is (yielded, an iterator result, or awaited), right before the `Return` of a `Yield`, `YieldIteratorResult` or `Await` (section 4.1). | | Frame | Frame | |
 | LoadFrameField | A field of the running execution context (an environment, the realm, the executable) as a pointer. The builder loads each once per path, until an instruction may replace it. | | Frame | | |
 | SetLexicalEnvironment | Makes a cell value the frame's lexical environment; its value is the environment's pointer. | | Frame | Frame | |
 | LeavePrivateEnvironment | Makes the private environment's outer one the frame's. | | Frame | Frame | |
@@ -269,12 +275,39 @@ collect garbage or exit lazily before that. Eager exits publish the frame in the
 the prologue's resumption in the interpreter publishes it inline.
 
 
+### 4.1 Generators and async functions
+
+A generator runs in its own frame, which it keeps while it is suspended. Compiled code suspends it
+like the interpreter's `Yield` and `YieldIteratorResult` do: `StoreSlot`s put every slot live at
+the continuation in frame memory, `Suspend` records the continuation in the frame, and `Return`
+returns the yielded value to the runtime. So a suspended generator's frame is the frame the
+interpreter would have left, whichever of the two ran it.
+
+Async functions and async generators are generators to the runtime: `AsyncFunctionDriverWrapper`
+and `AsyncGenerator` resume them the same way, and their `Await` suspends them like a `Yield`, except
+that `Suspend` marks the value as awaited (`yield_is_await`), which tells an async generator to
+await it rather than yield it.
+
+Each continuation then gets a resume entry (`builder/osr.rs`), like an on-stack replacement entry:
+a block without predecessors that loads the slots live there from the frame and jumps to the
+continuation's block, which nothing else in compiled code reaches. Both kinds of entry are listed in
+`Graph::osr_entries` by pc, since both continue a frame whose memory holds every value at that pc.
+`GeneratorObject::execute()` runs the generator from its continuation through `run_executable()`,
+which enters compiled code at the resume entry if the executable has code with one there, and
+interprets it otherwise. A continuation starts by reading the completion the generator resumed
+with (`GetCompletionFields`), which compiled code loads from the generator object; an async
+generator's completion comes from its `AsyncGenerator` through the slow path. The function's start
+is compiled like any function's: its `Enter`, and for generators and async generators the initial
+`Yield`. Async functions have no initial `Yield`; their call runs the body until it first awaits.
+
 ## 5. Dependencies and invalidation
 
 Compiled code may assume facts that hold until a rare runtime event (`code::Dependency`): a
 prototype chain stays valid, a shape stays stable, a global binding or a property of the global
 object is never assigned, the global declarative environment gets no bindings, no `[[IsHTMLDDA]]`
-object exists.
+object exists. Each of the first and the last kinds is a `WatchpointSet` that stays valid
+(`runtime/watchpoint_set.rs`), such as one of a realm for the iterator protocol
+(`runtime/realm_watchpoints.rs`).
 
 - The builder and check elimination record the dependencies they rely on in
   `Graph::dependencies`.
@@ -308,12 +341,14 @@ unreachable. Each one keeps the graph valid (`passes/verify.rs`), and IR tests i
 |---|---|
 | Trivial phi removal | Phis whose inputs are all one value (or the phi itself) become that value. |
 | Truncation | Int32 additions, subtractions and unsigned right shifts whose users only read the low 32 bits of their results (bitwise operations, shifts, wrapping arithmetic, integer typed array stores) and no frame state holds become `Int32WrappingBinary`, which never exits. Comparisons of uint32 values (`x >>> 0`) first become unsigned comparisons of the shifted values. |
-| Simplification | Constant folding and strength reduction; branches on constants become jumps; unboxing a box is the boxed value; int32 operations that leave their left-hand side as it is, like `x \| 0`, become it. |
+| Simplification | Constant folding and strength reduction; branches on constants become jumps; unboxing a box is the boxed value, and so is an int32 check of the boxed double of an int32; int32 operations that leave their left-hand side as it is, like `x \| 0`, become it. |
 | Representation selection | Phis of int32, bool or float64 values become unboxed phis, and int32 inputs of float64 phis are converted. Tagged inputs of an int32 phi that the code checks somewhere (or of the phis connected to it) are checked where they enter, exiting to the start of the phi's block, unless such a check exited there before. |
 | Simplification | Again, for what unboxing made foldable. |
-| Check elimination | A forward dataflow of facts removes checks that passed already and reuses loads whose value is known; may turn shape checks into `AssumeValid` plus a stable shape dependency. |
-| Global value numbering | A CSE-able node computing what a dominating node computed is replaced by it. Memory reads are left to check elimination. |
-| Loop invariant code motion | Gives loops entered from several blocks a merged preheader, then moves effect-free nodes with inputs from outside the loop to it; nodes that may exit only from blocks every iteration runs, exiting to the loop header, and not where that kind of exit was taken there before. |
+| Global value numbering | A CSE-able node computing what a dominating node computed is replaced by it, so that check elimination sees one value where the builder computed it twice (like the index of `k[Math.abs(j)]` in two expressions). Memory reads are left to check elimination. |
+| Check elimination | A forward dataflow of facts removes checks that passed already, decides branches that a branch on the same values decided before, and reuses loads whose value is known; may turn shape checks into `AssumeValid` plus a stable shape dependency. |
+| Simplification | Again, for what the branches that check elimination decided left foldable (like the double path of `Math.abs` of an int32). |
+| Global value numbering | Again, for the nodes that check elimination and simplification made the same. |
+| Loop invariant code motion | Gives loops entered from several blocks a merged preheader, then moves effect-free nodes with inputs from outside the loop to it (but calls in cold blocks); nodes that may exit too, exiting to the loop header, and not where that kind of exit was taken there before. Those from blocks that not every iteration runs, but for cold ones, move speculatively: they exit with `Hoisted`, and stay in the loop where such an exit was taken there before. |
 | Bounds check elimination | Bounds checks against constant counts go away where the index is known to be in range: induction variables of loops whose back edge compares the grown counter with a constant bound, merges of values from outside a loop, and int32 arithmetic on them that cannot overflow. The counter an on-stack replacement entry brings is checked against the bound once where it enters, unless such a check exited there before. With the same ranges, `((x << k) + c) >> k` becomes `x + (c >> k)` where nothing overflows and `c` is a multiple of 2^k. Int32 additions, subtractions and multiplications become `Int32WrappingBinary` where the ranges of their operands keep the result an int32 (and not -0), with operands also bounded by the masks and shifts of any int32, and by the dominating bounds checks and in-bounds branches of indices. |
 | Exit unboxing | Frame states take the unboxed value of an int32, float64 or bool boxing that only frame states use, so that exits box it instead of the fast path. |
 | Dead code elimination | Removes nodes without uses and without effects; frame states count as uses. Branches whose edges lead to the same place doing the same thing become jumps. |

@@ -26,6 +26,7 @@
 #include <LibWebCommon/UIEvents/MouseButton.h>
 #include <LibWebView/Application.h>
 #include <LibWebView/CrashReport.h>
+#include <LibWebView/CrashReportStore.h>
 #include <LibWebView/PlatformColors.h>
 #include <LibWebView/Utilities.h>
 #include <LibWebView/WebContentClient.h>
@@ -143,9 +144,13 @@ WebContentView::WebContentView(QWidget* window, Optional<WebView::CanonicalTrave
         update_screen_rects();
     });
 
-    QObject::connect(qGuiApp, &QGuiApplication::screenAdded, this, [this](QScreen*) {
+    QObject::connect(qGuiApp, &QGuiApplication::screenAdded, this, [this](QScreen* screen) {
+        watch_screen_geometry(*screen);
         update_screen_rects();
     });
+
+    for (auto* screen : QGuiApplication::screens())
+        watch_screen_geometry(*screen);
 
     QObject::connect(QGuiApplication::styleHints(), &QStyleHints::colorSchemeChanged, this, [this] {
         QTimer::singleShot(0, this, [this] {
@@ -164,6 +169,8 @@ WebContentView::WebContentView(QWidget* window, Optional<WebView::CanonicalTrave
                 this);
     });
 
+    if (initial_state.owner_view)
+        set_owner_view(*initial_state.owner_view);
     initialize_tab(Web::HTML::VisibilityState::Hidden, traversable);
 
     m_accessibility_manager = make<WebView::AccessibilityTreeManager>();
@@ -803,6 +810,12 @@ void WebContentView::handle_pointer_leave()
     enqueue_native_event(Web::MouseEvent::Type::MouseLeave, mouse_event);
 }
 
+void WebContentView::cancel_mouse_press()
+{
+    static QMouseEvent mouse_event { QEvent::Type::MouseButtonRelease, {}, {}, Qt::MouseButton::NoButton, Qt::MouseButton::NoButton, Qt::KeyboardModifier::NoModifier };
+    enqueue_native_event(Web::MouseEvent::Type::MouseCancel, mouse_event);
+}
+
 void WebContentView::mouseMoveEvent(QMouseEvent* event)
 {
     if (is_node_picker_active()) {
@@ -1052,10 +1065,21 @@ void WebContentView::paintEvent(QPaintEvent*)
 
     if (bitmap) {
         QImage q_image(bitmap->scanline_u8(0), bitmap->width(), bitmap->height(), bitmap->pitch(), QImage::Format_RGB32);
-        painter.drawImage(QPoint(0, 0), q_image, QRect(0, 0, bitmap_size.width(), bitmap_size.height()));
+        QRect source_rect(0, 0, bitmap_size.width(), bitmap_size.height());
 
         auto background_color = page_background_color();
         auto fallback_color = QColor(background_color.red(), background_color.green(), background_color.blue());
+
+        if (m_scales_frames_to_fit && !bitmap_size.is_empty()) {
+            auto destination = rect_fitting_frame(bitmap_size, m_viewport_size);
+            painter.fillRect(QRect(0, 0, m_viewport_size.width(), m_viewport_size.height()), fallback_color);
+            painter.setRenderHint(QPainter::SmoothPixmapTransform);
+            painter.drawImage(QRect(destination.x(), destination.y(), destination.width(), destination.height()), q_image, source_rect);
+            return;
+        }
+
+        painter.drawImage(QPoint(0, 0), q_image, source_rect);
+
         if (bitmap_size.width() < m_viewport_size.width()) {
             painter.fillRect(bitmap_size.width(), 0, m_viewport_size.width() - bitmap_size.width(), bitmap->height(), fallback_color);
         }
@@ -1363,8 +1387,11 @@ void WebContentView::show_crash_report_review(Optional<ByteString> const& hidden
         return;
     }
     m_crash_report_review->on_exit = [this, is_hidden_crash] {
-        // The tab was opened only for the review, and a report on its way keeps going without it.
+        // The tab was opened only for the review, and a report on its way keeps going without it. Closing it also
+        // declines the reports still waiting, so none of them is offered again.
         if (is_hidden_crash) {
+            if (auto result = WebView::CrashReportStore::the().mark_all_seen(); result.is_error())
+                warnln("Could not mark crash reports as seen: {}", result.error());
             if (on_close)
                 on_close();
             return;
@@ -1677,9 +1704,23 @@ void WebContentView::accessibilityActiveChanged(bool active)
 }
 #endif
 
+// A screen's geometry changes when its resolution or scale does, and its available geometry when the dock or a
+// taskbar changes size, so each is reported as it happens.
+void WebContentView::watch_screen_geometry(QScreen& screen)
+{
+    QObject::connect(&screen, &QScreen::geometryChanged, this, [this](QRect const&) {
+        update_screen_rects();
+    });
+    QObject::connect(&screen, &QScreen::availableGeometryChanged, this, [this](QRect const&) {
+        update_screen_rects();
+    });
+}
+
 void WebContentView::update_screen_rects()
 {
-    update_screen_rects(page());
+    traversable().for_each_hosting_page([&](WebView::WebContentPage& page) {
+        update_screen_rects(page);
+    });
 }
 
 void WebContentView::update_screen_rects(WebView::WebContentPage& page)
@@ -1688,24 +1729,29 @@ void WebContentView::update_screen_rects(WebView::WebContentPage& page)
 
     if (!screens.empty()) {
         Vector<Web::DevicePixelRect> screen_rects;
+        Vector<Web::DevicePixelRect> available_screen_rects;
         for (auto const& screen : screens) {
             // NOTE: QScreen::geometry() returns the 'device-independent pixels', we multiply
             //       by the device pixel ratio to get the 'physical pixels' of the display.
-            auto geometry = screen->geometry();
             auto device_pixel_ratio = screen->devicePixelRatio();
-            screen_rects.append(Web::DevicePixelRect(geometry.x() * device_pixel_ratio, geometry.y() * device_pixel_ratio, geometry.width() * device_pixel_ratio, geometry.height() * device_pixel_ratio));
+            auto to_device_pixels = [&](QRect const& geometry) {
+                return Web::DevicePixelRect(geometry.x() * device_pixel_ratio, geometry.y() * device_pixel_ratio, geometry.width() * device_pixel_ratio, geometry.height() * device_pixel_ratio);
+            };
+            screen_rects.append(to_device_pixels(screen->geometry()));
+            // The available geometry leaves out what the system keeps for itself, such as a menu bar or a dock.
+            available_screen_rects.append(to_device_pixels(screen->availableGeometry()));
         }
 
         // NOTE: The first item in QGuiApplication::screens is always the primary screen.
         //       This is not specified in the documentation but QGuiApplication::primaryScreen
         //       always returns the first item in the list if it isn't empty.
-        page.async_update_screen_rects(screen_rects, 0);
+        page.async_update_screen_rects(screen_rects, available_screen_rects, 0);
     }
 }
 
-void WebContentView::prepare_page_for_tab(WebView::WebContentPage& page)
+void WebContentView::prepare_page_for_navigable(WebView::WebContentPage& page)
 {
-    ViewImplementation::prepare_page_for_tab(page);
+    ViewImplementation::prepare_page_for_navigable(page);
 
     update_compositor_display_metadata(page);
     update_screen_rects(page);

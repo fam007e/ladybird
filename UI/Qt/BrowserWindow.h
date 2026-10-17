@@ -19,6 +19,8 @@
 #include <UI/Qt/FullscreenDebounce.h>
 #include <UI/Qt/Tab.h>
 #include <UI/Qt/TabBar.h>
+#include <UI/Qt/WindowCloseCoordinator.h>
+#include <UI/Qt/WindowScreenObserver.h>
 
 #include <QMainWindow>
 #include <QPushButton>
@@ -150,6 +152,14 @@ public:
     void duplicate_tab(Tab&);
     Tab* current_tab() const { return m_current_tab; }
     bool activate_tab_with_url(URL::URL const&);
+    // Asks every tab's page if the window may close, without closing it, and reports the answer. Once the pages agree,
+    // a close() goes straight through.
+    void request_close_preflight_for_quit(Function<void(bool approved)> on_complete);
+    // Brings the window forward for a page's beforeunload prompt, when the prompt is part of a quit's check.
+    void raise_for_quit_prompt();
+    bool is_window_close_approved() const { return m_window_close_approved; }
+    void cancel_window_close_preflight();
+    void on_tab_load_start(Tab&);
     FullscreenMode& fullscreen_mode();
 
     QMenu& hamburger_menu() const { return *m_hamburger_menu; }
@@ -169,8 +179,8 @@ public:
     void move_tab_to_window(int index, BrowserWindow& target_window, int target_index);
     void adopt_tab(Tab&, int index);
 
-    double refresh_rate() const { return m_refresh_rate; }
-    Optional<u64> display_id() const { return m_display_id; }
+    double refresh_rate() const { return m_screen_observer->refresh_rate(); }
+    Optional<u64> display_id() const { return m_screen_observer->display_id(); }
 
     void on_devtools_enabled();
     void on_devtools_disabled();
@@ -178,8 +188,6 @@ public:
     void set_window_rect(Optional<Web::DevicePixels> x, Optional<Web::DevicePixels> y, Optional<Web::DevicePixels> width, Optional<Web::DevicePixels> height);
 
 public slots:
-    void device_pixel_ratio_changed(qreal dpi);
-    void refresh_rate_changed(qreal refresh_rate);
     void tab_title_changed(int index, QString const&);
     void tab_favicon_changed(int index, QIcon const& icon);
     void tab_audio_play_state_changed(int index, Web::HTML::AudioPlayState);
@@ -200,7 +208,6 @@ private:
     virtual bool event(QEvent*) override;
     virtual bool eventFilter(QObject*, QEvent*) override;
     virtual void resizeEvent(QResizeEvent*) override;
-    virtual void showEvent(QShowEvent*) override;
     virtual void changeEvent(QEvent* event) override;
     virtual void moveEvent(QMoveEvent*) override;
     virtual void paintEvent(QPaintEvent*) override;
@@ -216,6 +223,7 @@ private:
     void update_window_title(QString const&);
     void register_window_with_session_store();
     void sync_session_tab_order();
+    void begin_window_close_preflight(Function<void(bool approved)> on_complete = {});
 
     void set_current_tab(Tab* tab);
     Qt::Edges resize_edges_for_position(QPoint const&) const;
@@ -245,21 +253,11 @@ private:
     static bool uses_client_side_decorations();
     void toggle_window_maximized();
     bool start_window_move();
-    bool connect_window_screen_changed_signal();
-    void disconnect_window_screen_changed_signal();
-    void connect_screen_signals(QScreen*);
-    void disconnect_screen_signals(QScreen*);
-    void screen_changed(QScreen*);
-    void display_metadata_changed(Optional<u64> display_id, qreal refresh_rate);
 
     QIcon icon_for_page_mute_state(Tab&) const;
     QString tool_tip_for_page_mute_state(Tab&) const;
 
-    QScreen* m_current_screen { nullptr };
-    QWindow* m_window_screen_changed_signal_window { nullptr };
-    Optional<u64> m_display_id;
-    double m_device_pixel_ratio { 0 };
-    double m_refresh_rate { 60.0 };
+    WindowScreenObserver* m_screen_observer { nullptr };
 
     WebView::IsPrivate m_is_private { WebView::IsPrivate::No };
     NonnullRefPtr<WebView::BrowsingSession> m_session;
@@ -279,6 +277,13 @@ private:
     IsPopupWindow m_is_popup_window { IsPopupWindow::No };
 
     Optional<WebView::SessionWindowId> m_session_window_id;
+    Optional<i64> m_window_close_active_tab_index;
+    QPointer<Tab> m_window_close_original_active_tab;
+    QPointer<Tab> m_window_close_current_preflight_tab;
+    Vector<QPointer<Tab>> m_window_close_approved_tabs;
+    WindowCloseCoordinator m_window_close_coordinator;
+    Function<void(bool approved)> m_window_close_preflight_on_complete;
+    bool m_window_close_approved { false };
 
     ExitFullscreenButton* m_exit_button { nullptr };
     FullscreenMode* m_fullscreen_mode { nullptr };

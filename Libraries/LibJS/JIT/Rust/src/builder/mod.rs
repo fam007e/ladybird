@@ -88,17 +88,21 @@ use crate::ir::BranchCondition;
 use crate::ir::FrameField;
 use crate::ir::FrameStateId;
 use crate::ir::Graph;
+use crate::ir::Locations;
 use crate::ir::Node;
 use crate::ir::NodeId;
 use crate::ir::Op;
+use crate::ir::SuspendKind;
 use crate::ir::value;
 use crate::snapshot::CallFeedbackSnapshot;
+use crate::snapshot::CellId;
 use crate::snapshot::ExecutableSnapshot;
 use crate::snapshot::Intrinsic;
 use crate::snapshot::RuntimeInfo;
 use crate::snapshot::Snapshot;
 pub(crate) use slow_paths::is_ssa_slow_path_output;
 pub(crate) use slow_paths::js_call_operands;
+use std::cell::Cell;
 use std::cell::OnceCell;
 
 /// Builds the IR for `snapshot.executables[0]`.
@@ -145,18 +149,50 @@ pub fn build_graph_with_feedback(snapshot: &Snapshot, has_run: &dyn Fn(u32) -> b
     let decoded = (0..snapshot.executables.len())
         .map(|_| OnceCell::new())
         .collect::<Vec<_>>();
-    let graph = GraphBuilder::new(snapshot, has_run, &decoded, true, true)?.build()?;
+    let virtualized_inlined_arguments = Cell::new(false);
+    let build = |virtualize_arguments, virtualize_inlined_arguments, build_osr_entries| {
+        GraphBuilder::new(
+            snapshot,
+            has_run,
+            &decoded,
+            ArgumentsVirtualization {
+                compiled_function: virtualize_arguments,
+                inlined_callees: virtualize_inlined_arguments,
+                inlined_callees_virtualized: &virtualized_inlined_arguments,
+            },
+            build_osr_entries,
+        )?
+        .build()
+    };
+    // NB: Where an inlined callee had a virtual arguments object, a graph
+    //     that needs it, or a build that failed, is built again without
+    //     those (see `arguments`), which then are not inlined.
+    let graph = match build(true, true, true) {
+        Ok(graph) if !arguments::uses_virtual_arguments(&graph) => return Ok(graph),
+        _ if virtualized_inlined_arguments.get() => build(true, false, true)?,
+        result => result?,
+    };
     if !arguments::uses_virtual_arguments(&graph) {
         return Ok(graph);
     }
     if !graph.osr_entries.is_empty() {
-        let graph = GraphBuilder::new(snapshot, has_run, &decoded, true, false)?.build()?;
+        let graph = build(true, false, false)?;
         if !arguments::uses_virtual_arguments(&graph) {
             return Ok(graph);
         }
     }
     // Something needs the arguments object itself.
-    GraphBuilder::new(snapshot, has_run, &decoded, false, true)?.build()
+    build(false, false, true)
+}
+
+/// Where the graph builder may build virtual arguments objects (see
+/// `arguments`).
+#[derive(Clone, Copy)]
+struct ArgumentsVirtualization<'a> {
+    compiled_function: bool,
+    inlined_callees: bool,
+    /// Set once an inlined callee got a virtual arguments object.
+    inlined_callees_virtualized: &'a Cell<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -166,6 +202,10 @@ enum SlotState {
     /// The slot holds `node`. If `in_sync`, frame memory holds it as well.
     Value { node: NodeId, in_sync: bool },
 }
+
+/// How many allocated objects the graph builder knows the shapes of at once
+/// (see `AbstractFrame::fresh_shapes`).
+const MAX_FRESH_SHAPES: usize = 16;
 
 /// The builder's view of the frame's registers, locals and arguments,
 /// indexed by `FrameLayout::tracked_index()`, and of the fields of its
@@ -177,6 +217,10 @@ struct AbstractFrame {
     /// the field holds on this path, once loaded or set (see
     /// `GraphBuilder::frame_field()`).
     fields: [Option<NodeId>; FrameField::ALL.len()],
+    /// The shapes of objects the code allocated, by their allocation nodes,
+    /// as far as this path knows them: each object's shape since its last
+    /// addition, until something runs that may change shapes otherwise.
+    fresh_shapes: Vec<(NodeId, CellId)>,
 }
 
 impl AbstractFrame {
@@ -186,6 +230,7 @@ impl AbstractFrame {
         Self {
             slots: vec![SlotState::InMemory; slot_count],
             fields: [None; FrameField::ALL.len()],
+            fresh_shapes: Vec::new(),
         }
     }
 
@@ -195,6 +240,19 @@ impl AbstractFrame {
 
     fn set_field(&mut self, field: FrameField, value: NodeId) {
         self.fields[field as usize] = Some(value);
+    }
+
+    /// The shapes every one of `frames` (their `fresh_shapes`) knows its
+    /// objects have.
+    fn common_fresh_shapes<'f>(mut frames: impl Iterator<Item = &'f [(NodeId, CellId)]>) -> Vec<(NodeId, CellId)> {
+        let Some(first) = frames.next() else {
+            return Vec::new();
+        };
+        let mut shapes = first.to_vec();
+        for other in frames {
+            shapes.retain(|shape| other.contains(shape));
+        }
+        shapes
     }
 
     /// Forgets the environments, which an instruction may change.
@@ -485,12 +543,15 @@ struct GraphBuilder<'a> {
     callers: Vec<Function<'a>>,
     /// Bytecode instructions inlined so far, for the inlining budget.
     inlined_instructions: usize,
-    /// Whether `CreateArguments` may build a virtual arguments object.
-    virtualize_arguments: bool,
+    /// Where `CreateArguments` may build a virtual arguments object.
+    virtualize_arguments: ArgumentsVirtualization<'a>,
     /// Whether to build on-stack replacement entries (see `arguments`).
     build_osr_entries: bool,
     /// The intrinsics among the constants, by value.
     intrinsics: HashMap<u64, Intrinsic>,
+    /// The functions among the constants that calls may inline, by value:
+    /// their indices in `Snapshot::executables`.
+    inlinable_functions: HashMap<u64, u32>,
     /// How `instanceof` runs with the functions the code uses as constants
     /// on its right-hand side (see `GlobalValueSnapshot::has_instance`), by
     /// their bits.
@@ -502,7 +563,7 @@ impl<'a> GraphBuilder<'a> {
         snapshot: &'a Snapshot,
         has_run: &'a dyn Fn(u32) -> bool,
         decoded: &'a [OnceCell<Result<DecodedFunction, CompileFailure>>],
-        virtualize_arguments: bool,
+        virtualize_arguments: ArgumentsVirtualization<'a>,
         build_osr_entries: bool,
     ) -> Result<Self, CompileFailure> {
         let executable = snapshot.executables.first().ok_or(CompileFailure::InvalidBytecode {
@@ -536,6 +597,7 @@ impl<'a> GraphBuilder<'a> {
             virtualize_arguments,
             build_osr_entries,
             intrinsics: HashMap::default(),
+            inlinable_functions: HashMap::default(),
             has_instance: HashMap::default(),
         })
     }
@@ -547,6 +609,7 @@ impl<'a> GraphBuilder<'a> {
         self.enter_function(entry);
         if self.build_osr_entries {
             self.build_osr_entries()?;
+            self.build_resume_entries()?;
         }
         self.build_function()?;
 
@@ -705,6 +768,11 @@ impl<'a> GraphBuilder<'a> {
                 .loop_index
                 .is_some_and(|loop_index| self.function.loops_replacing_environments[loop_index]);
         let osr_loop_header = self.function.osr_loop_headers[block_index];
+        // NB: Loops may change the shapes their headers would know.
+        if !is_loop_header {
+            merged.fresh_shapes =
+                AbstractFrame::common_fresh_shapes(incoming.iter().map(|(_, frame)| frame.fresh_shapes.as_slice()));
+        }
         for field in FrameField::ALL {
             let first = incoming.first().and_then(|(_, frame)| frame.field(field));
             if let Some(value) = first
@@ -1007,7 +1075,46 @@ impl<'a> GraphBuilder<'a> {
         debug_assert!(!op.is_control());
         let node = self.graph.add_node(Node::new(op, inputs, repr, self.function.pc));
         self.graph.blocks[self.block.index()].body.push(node);
+        self.note_shape_changes(node);
         node
+    }
+
+    /// Updates the shapes the frame knows objects have (see
+    /// `AbstractFrame::fresh_shapes`) for the effects of `node`.
+    fn note_shape_changes(&mut self, node: NodeId) {
+        let node_data = self.graph.node(node);
+        match node_data.op {
+            Op::AllocateObject { shape, .. } => {
+                // NB: Only the latest allocations are worth knowing, and the
+                //     frames that copy their shapes stay small.
+                if self.frame.fresh_shapes.len() == MAX_FRESH_SHAPES {
+                    self.frame.fresh_shapes.remove(0);
+                }
+                self.frame.fresh_shapes.push((node, shape));
+            }
+            Op::AddNamed { shape, .. } => {
+                let object = self.graph.unrefined(node_data.inputs[0]);
+                self.frame.fresh_shapes.retain(|(known, _)| *known != object);
+                self.frame.fresh_shapes.push((object, shape));
+            }
+            ref op => {
+                let properties = op.properties();
+                if properties.runs_code || properties.writes.intersects(Locations::SHAPES) {
+                    self.frame.fresh_shapes.clear();
+                }
+            }
+        }
+    }
+
+    /// The shape the frame knows `object` has, if it is an object the code
+    /// allocated.
+    fn fresh_shape(&self, object: NodeId) -> Option<CellId> {
+        let object = self.graph.unrefined(object);
+        self.frame
+            .fresh_shapes
+            .iter()
+            .find(|(known, _)| *known == object)
+            .map(|(_, shape)| *shape)
     }
 
     fn set_control(&mut self, op: Op, inputs: Vec<NodeId>) -> NodeId {
@@ -1099,6 +1206,16 @@ impl<'a> GraphBuilder<'a> {
         };
         let bits = self.graph.constant_value(node)?;
         self.intrinsics.get(&bits).copied()
+    }
+
+    /// The snapshot executable of the function an operand holds as a
+    /// constant, if calls of it may be inlined.
+    fn constant_inlinable_function(&self, operand: Operand) -> Option<u32> {
+        let SlotState::Value { node, .. } = self.peek(operand) else {
+            return None;
+        };
+        let bits = self.graph.constant_value(node)?;
+        self.inlinable_functions.get(&bits).copied()
     }
 
     /// The feedback a call instruction recorded in its feedback slot `slot`.
@@ -1361,6 +1478,7 @@ impl<'a> GraphBuilder<'a> {
             Instruction::ToBoolean { dst, value } => self.build_truthiness_value(dst, value, false)?,
             Instruction::Return { value } => {
                 let value = self.read(value)?;
+                self.check_not_returning_virtual_arguments(value)?;
                 if self.function.is_virtual() {
                     return Ok(Some(self.build_inline_return(value, true)));
                 }
@@ -1378,6 +1496,7 @@ impl<'a> GraphBuilder<'a> {
             }
             Instruction::End { value } => {
                 let value = self.read(value)?;
+                self.check_not_returning_virtual_arguments(value)?;
                 // NB: In an inlined callee, End returns its value (never
                 //     empty) to the caller like Return does.
                 if self.function.is_virtual() {
@@ -1385,6 +1504,30 @@ impl<'a> GraphBuilder<'a> {
                 }
                 self.set_control(Op::Return, vec![value]);
                 return Ok(Some(Flow::Ended));
+            }
+            Instruction::Yield {
+                continuation_label,
+                value,
+            } => {
+                return self
+                    .build_suspend(continuation_label, value, SuspendKind::Yield)
+                    .map(Some);
+            }
+            Instruction::YieldIteratorResult {
+                continuation_label,
+                value,
+            } => {
+                return self
+                    .build_suspend(Some(continuation_label), value, SuspendKind::YieldIteratorResult)
+                    .map(Some);
+            }
+            Instruction::Await {
+                continuation_label,
+                argument,
+            } => {
+                return self
+                    .build_suspend(Some(continuation_label), argument, SuspendKind::Await)
+                    .map(Some);
             }
             Instruction::GetLexicalEnvironment { dst } => {
                 let address = self.frame_field(FrameField::LexicalEnvironment)?;
@@ -1412,14 +1555,8 @@ impl<'a> GraphBuilder<'a> {
                 };
                 self.write(dst, count)?;
             }
-            Instruction::CreateArguments {
-                dst,
-                kind,
-                creates_parameter_bindings,
-                ..
-            } => {
-                // NB: Creating the parameter bindings is a side effect that a virtual arguments object would skip.
-                if creates_parameter_bindings || !self.try_build_virtual_arguments(dst, kind)? {
+            Instruction::CreateArguments { .. } => {
+                if !self.try_build_virtual_arguments(instruction)? {
                     return Ok(None);
                 }
             }
@@ -1623,6 +1760,82 @@ impl<'a> GraphBuilder<'a> {
             _ => return Ok(None),
         }
         Ok(Some(Flow::Continue))
+    }
+
+    /// Builds a `Yield`, `YieldIteratorResult` or `Await`, which suspends
+    /// the generator or async function running the compiled function and
+    /// returns `value` to the code resuming it: puts the slots live at the
+    /// continuation in frame memory, where the resume entry of the
+    /// continuation (see `osr`) finds them, and records the continuation in
+    /// the frame like the interpreter's instruction.
+    fn build_suspend(
+        &mut self,
+        continuation: Option<Label>,
+        value: Operand,
+        kind: SuspendKind,
+    ) -> Result<Flow, CompileFailure> {
+        if self.function.is_virtual() {
+            return Err(CompileFailure::InvalidBytecode {
+                pc: self.function.pc,
+                reason: "suspension in an inlined callee",
+            });
+        }
+        let value = self.read(value)?;
+        self.check_not_returning_virtual_arguments(value)?;
+        if let Some(continuation) = continuation {
+            let block = self.block_for_label(continuation)?;
+            let start = self.function.cfg.blocks[block].instructions.start;
+            let live = self.function.liveness.live_in(start).clone();
+            for slot in live.iter() {
+                if self.tracks_slot(slot) {
+                    self.sync_slot(slot);
+                }
+            }
+        }
+        // NB: Like the interpreter's Yield and Await, an empty value yields
+        //     `undefined`.
+        let layout = self.function.layout;
+        let arguments = layout.arguments_base()..layout.arguments_base() + layout.number_of_arguments;
+        let value = if self.graph.is_known_non_empty(value, arguments) {
+            value
+        } else {
+            self.emit(Op::EmptyToUndefined, vec![value], Some(Repr::Tagged))
+        };
+        self.emit(
+            Op::Suspend {
+                continuation: continuation.map(|label| label.0),
+                kind,
+            },
+            Vec::new(),
+            None,
+        );
+        self.set_control(Op::Return, vec![value]);
+        Ok(Flow::Ended)
+    }
+
+    /// Builds `GetCompletionFields` (`Handling::Expanded`), which a
+    /// resumed generator or async function starts with: the type and the
+    /// value of the completion it resumed with, which the generator object
+    /// it finds in its accumulator holds, and the slow path for other
+    /// completion sources (async generators).
+    pub(super) fn build_get_completion_fields(
+        &mut self,
+        type_dst: Operand,
+        value_dst: Operand,
+        completion: Operand,
+    ) -> Result<Flow, CompileFailure> {
+        let source = self.read(completion)?;
+        let mut slow_paths = self.start_slow_paths(Some(Repr::Tagged))?;
+        let object = self.branch_to_slow_path(&mut slow_paths, BranchCondition::Object, vec![source], true);
+        let object = self.cell_address(object);
+        let generator = self.branch_to_slow_path(&mut slow_paths, BranchCondition::GeneratorObject, vec![object], true);
+        let completion_type = self.emit(Op::LoadGeneratorCompletionType, vec![generator], Some(Repr::Int32));
+        let completion_type = self.emit(Op::BoxInt32, vec![completion_type], Some(Repr::Tagged));
+        let value = self.emit(Op::LoadGeneratorCompletionValue, vec![generator], Some(Repr::Tagged));
+        let outputs = self.join_paths(slow_paths, vec![completion_type, value], |_, outputs| outputs);
+        self.write(type_dst, outputs[0])?;
+        self.write(value_dst, outputs[1])?;
+        Ok(Flow::Continue)
     }
 
     /// Builds an instruction as its handling table entry says.

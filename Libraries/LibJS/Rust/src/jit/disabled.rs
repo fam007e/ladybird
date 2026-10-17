@@ -153,6 +153,10 @@ pub mod entry_exit {
         unreachable!("no executable has JIT code");
     }
 
+    pub fn enter_jit_code_at_continuation(_vm: &Vm, _frame: NonNull<ExecutionContext>, _pc: u32) -> Option<JitResult> {
+        None
+    }
+
     pub fn helper_enter_jit_code(_vm: &Vm) -> i64 {
         unreachable!("only the profiling interpreter enters JIT code");
     }
@@ -176,7 +180,12 @@ pub mod translate {
         u64::from(low_half)
     }
 
-    pub fn call_site_frames(_frame: &ExecutionContext, _index: u32, _frame_pointer: u64) -> Vec<CallSiteFrame> {
+    pub fn call_site_frames(
+        _vm: &Vm,
+        _frame: &ExecutionContext,
+        _index: u32,
+        _frame_pointer: u64,
+    ) -> Vec<CallSiteFrame> {
         Vec::new()
     }
 
@@ -224,7 +233,7 @@ pub mod dependencies {
 
     /// What JIT code may depend on, which the runtime notes when it stops holding.
     pub enum Dependency {
-        PrototypeChainValid(CellId),
+        WatchpointSetValid(CellId),
         GlobalDeclarations { environment: CellId, serial: u64 },
         GlobalBindingUnassigned { environment: CellId, index: u32 },
         StableShape(CellId),

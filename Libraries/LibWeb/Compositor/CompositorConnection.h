@@ -16,6 +16,7 @@
 #include <LibCompositing/DisplayList/Canvas2DCommandStream.h>
 #include <LibCompositing/DisplayList/DisplayList.h>
 #include <LibCompositing/DisplayList/DisplayListResourceStorage.h>
+#include <LibCompositing/Scrolling/AsyncScrollTree.h>
 #include <LibCompositing/Scrolling/ScrollState.h>
 #include <LibCompositing/Types.h>
 #include <LibCompositing/WebGL/Types.h>
@@ -67,12 +68,16 @@ public:
     bool rasterize_display_list(Compositing::DisplayList const&, Compositing::AccumulatedVisualContextTree const&, Compositing::DisplayListResourceTransaction, NonnullRefPtr<Gfx::Bitmap> target);
     void invalidate_wheel_event_listener_state(Web::CompositorContextId, u64 generation);
     void invalidate_keyboard_scroll_state(Web::CompositorContextId, u64 generation);
-    Compositing::AsyncScrollEnqueueResult async_scroll_by(Web::CompositorContextId, Web::UniqueNodeID document_id, Gfx::FloatPoint position, Gfx::FloatPoint delta, Gfx::IntRect viewport_rect, Web::WheelDeltaPrecision, Web::ScrollGesturePhase, u32 modifiers, Compositing::AsyncScrollOperationTracking);
+    Compositing::AsyncScrollEnqueueResult async_scroll_by(Web::CompositorContextId, Web::UniqueNodeID document_id, Gfx::FloatPoint position, Gfx::FloatPoint delta, Gfx::IntRect viewport_rect, Web::WheelDeltaPrecision, Web::ScrollGesturePhase, u32 modifiers, Compositing::AsyncScrollOperationTracking, Compositing::WheelStepDispatch, u64 input_event_id);
     Compositing::AsyncScrollEnqueueResult smooth_scroll_to(Web::CompositorContextId, Web::AsyncScrollNodeStableID, Gfx::FloatPoint offset, Gfx::FloatPoint main_thread_offset, Gfx::IntRect viewport_rect, Compositing::ScrollAnimationKind, Compositing::SmoothScrollInitiator, Optional<Compositing::AsyncScrollOperationID> operation_to_continue);
     void cancel_smooth_scroll(Web::CompositorContextId, Web::AsyncScrollNodeStableID);
-    Gfx::FloatPoint elastic_overscroll_stretch_for_testing(Web::CompositorContextId, Web::AsyncScrollNodeStableID);
+    String scroll_state_for_testing(Web::CompositorContextId, Web::AsyncScrollNodeStableID stretched_scroller);
+    void synchronize_for_testing();
+    Optional<Compositing::FirstWheelStepRouteForTesting> route_first_wheel_step_for_testing(Web::CompositorContextId, Gfx::FloatPoint position, Gfx::FloatPoint delta_in_css_pixels);
+    void begin_input_trace_for_testing(Web::CompositorContextId);
+    Vector<Web::InputTraceRecord> take_input_trace_for_testing(Web::CompositorContextId);
     Compositing::PendingAsyncScrollUpdates take_pending_async_scroll_updates(Web::CompositorContextId, Compositing::AsyncScrollUpdateFreshness);
-    void viewport_size_updated(Web::CompositorContextId, Gfx::IntSize, Compositing::WindowResizingInProgress);
+    void viewport_size_updated(Web::CompositorContextId, Gfx::IntSize, double device_pixel_ratio, Compositing::WindowResizingInProgress);
     bool request_rendering_opportunity(Web::CompositorContextId, double maximum_frames_per_second);
     void hurry_rendering_opportunity(Web::CompositorContextId);
     void request_screenshot(Web::CompositorContextId, NonnullRefPtr<Gfx::Bitmap>, Function<void()>&&);
@@ -126,6 +131,8 @@ private:
     Optional<PendingScreenshot> take_screenshot(Compositing::ScreenshotRequestId);
 
     NonnullRefPtr<CompositorConnectionFrameSink> m_frame_sink;
+    u64 m_next_reserved_canvas_id { 0 };
+    u64 m_reserved_canvas_ids_remaining { 0 };
 
     HashMap<Compositing::ScreenshotRequestId, PendingScreenshot> m_screenshots;
     // What the compositor process scrolled since the last rendering update adopted it, per context.

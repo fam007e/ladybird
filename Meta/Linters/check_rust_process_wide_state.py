@@ -112,6 +112,7 @@ RENDER_STATE_ALLOWED = {
             "css/style/mod.rs:SELECTOR_TRUTH_DERIVATION",
             "css/style/mod.rs:STYLE_ANSWER_PATCH",
             "css/style/mod.rs:STYLE_PLAN_PROVENANCE",
+            "layout/in_flow_block_cache.rs:ENABLED",
             "render_state/clock/hover.rs:LOGS",
         ],
     ),
@@ -128,9 +129,15 @@ RENDER_STATE_ALLOWED = {
         ],
     ),
     **render_state_entries(
-        "the render owner's own states; only the owner's thread reaches its documents' render states",
-        ["render_state/owner.rs:STATES"],
+        "the render owner's slot; only the thread that holds it reaches its documents' render states",
+        ["render_state/owner.rs:SLOT"],
     ),
+    **render_state_entries(
+        "per-thread count of the holds of the render owner's slot the thread is in",
+        ["render_state/owner.rs:HOLDS"],
+    ),
+    f"{RENDER_STATE_CRATE}/src/render_state.rs:STACK_BASE": "per-thread cache of the thread's own stack bounds",
+    f"{RENDER_STATE_CRATE}/src/stage_thread.rs:UNFINISHED_HANDED": "per-thread count of the jobs the thread made for each stage thread that have yet to run",
     **render_state_entries(
         BUILT_ONCE,
         [

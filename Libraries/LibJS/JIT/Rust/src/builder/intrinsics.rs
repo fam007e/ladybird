@@ -19,6 +19,7 @@ use crate::ir::BinaryOp;
 use crate::ir::BranchCondition;
 use crate::ir::Comparison;
 use crate::ir::ElementsKind;
+use crate::ir::Float64Function;
 use crate::ir::Float64UnaryOp;
 use crate::ir::NodeId;
 use crate::ir::Op;
@@ -46,13 +47,16 @@ const MAX_MIN_MAX_ARGUMENTS: usize = 8;
 impl GraphBuilder<'_> {
     /// Builds `Math.<op>(argument)`, a `CallBuiltinMath*` instruction, for
     /// numbers, if `callee` is the builtin of any realm. The instruction's
-    /// slow path, which calls the callee, handles everything else.
+    /// slow path, which calls the callee, handles everything else, or the code
+    /// exits there where that did not happen before. A site that only saw
+    /// the builtin checks that `callee` is the function it saw instead.
     pub(super) fn build_math_function(
         &mut self,
         op: Float64UnaryOp,
         dst: Operand,
         callee: Operand,
         argument: Operand,
+        call_feedback: u16,
     ) -> Result<Flow, CompileFailure> {
         let layout = &self.runtime.layout;
         let builtin = match op {
@@ -63,10 +67,20 @@ impl GraphBuilder<'_> {
             Float64UnaryOp::Sqrt => layout.builtin_math_sqrt,
             Float64UnaryOp::Negate => unreachable!("no Math function negates"),
         };
+        let target = self
+            .call_feedback(call_feedback)
+            .and_then(|feedback| feedback.monomorphic_builtin(builtin))
+            .filter(|_| self.may_speculate(ExitKind::BadCallTarget));
+        if let Some(target) = target {
+            self.check_callee(callee, target)?;
+        }
         let callee = self.read(callee)?;
         let argument = self.read(argument)?;
         let mut slow_paths = self.start_slow_paths(Some(Repr::Tagged))?;
-        self.branch_to_slow_path(&mut slow_paths, BranchCondition::Builtin(builtin), vec![callee], true);
+        self.exit_instead_of_slow_path(&mut slow_paths);
+        if target.is_none() {
+            self.branch_to_slow_path(&mut slow_paths, BranchCondition::Builtin(builtin), vec![callee], true);
+        }
         let result = if let Some(integer) = self.int32_value_of(argument) {
             self.build_int32_math_function(&mut slow_paths, op, integer)
         } else {
@@ -88,6 +102,57 @@ impl GraphBuilder<'_> {
             self.join_blocks(vec![int32, double]);
             self.add_phi(vec![int32_result, double_result])
         };
+        let result = self
+            .join_slow_paths(slow_paths, Some(result))
+            .expect("the instruction has a value");
+        self.write(dst, result)?;
+        Ok(Flow::Continue)
+    }
+
+    /// Builds `Math.<function>(arguments...)`, a `CallBuiltinMath*`
+    /// instruction, for numbers, like `build_math_function()`: the code
+    /// calls the runtime's function of doubles for it, which only computes,
+    /// so nothing after the call forgets what it knew.
+    pub(super) fn build_math_call(
+        &mut self,
+        function: Float64Function,
+        dst: Operand,
+        callee: Operand,
+        arguments: &[Operand],
+        call_feedback: u16,
+    ) -> Result<Flow, CompileFailure> {
+        let layout = &self.runtime.layout;
+        let builtin = match function {
+            Float64Function::Exp => layout.builtin_math_exp,
+            Float64Function::Log => layout.builtin_math_log,
+            Float64Function::Sin => layout.builtin_math_sin,
+            Float64Function::Cos => layout.builtin_math_cos,
+            Float64Function::Tan => layout.builtin_math_tan,
+            Float64Function::Pow => layout.builtin_math_pow,
+        };
+        let target = self
+            .call_feedback(call_feedback)
+            .and_then(|feedback| feedback.monomorphic_builtin(builtin))
+            .filter(|_| self.may_speculate(ExitKind::BadCallTarget));
+        if let Some(target) = target {
+            self.check_callee(callee, target)?;
+        }
+        let callee = self.read(callee)?;
+        let arguments = arguments
+            .iter()
+            .map(|argument| self.read(*argument))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut slow_paths = self.start_slow_paths(Some(Repr::Tagged))?;
+        self.exit_instead_of_slow_path(&mut slow_paths);
+        if target.is_none() {
+            self.branch_to_slow_path(&mut slow_paths, BranchCondition::Builtin(builtin), vec![callee], true);
+        }
+        let numbers = arguments
+            .into_iter()
+            .map(|argument| self.float64_of_number(&mut slow_paths, argument))
+            .collect();
+        let result = self.emit(Op::CallFloat64Function { function }, numbers, Some(Repr::Float64));
+        let result = self.emit(Op::BoxFloat64, vec![result], Some(Repr::Tagged));
         let result = self
             .join_slow_paths(slow_paths, Some(result))
             .expect("the instruction has a value");
@@ -173,6 +238,13 @@ impl GraphBuilder<'_> {
     fn build_int32_math_function(&mut self, slow_paths: &mut SlowPaths, op: Float64UnaryOp, integer: NodeId) -> NodeId {
         match op {
             Float64UnaryOp::Floor | Float64UnaryOp::Ceil | Float64UnaryOp::Round => self.tagged(integer),
+            // NB: Negating the smallest int32 overflows, and exits.
+            Float64UnaryOp::Abs if self.may_speculate(ExitKind::Overflow) => {
+                let zero = self.int32_constant(0);
+                let negated = self.int32_binary(BinaryOp::Sub, zero, integer);
+                let result = self.emit(Op::Int32Max, vec![integer, negated], Some(Repr::Int32));
+                self.tagged(result)
+            }
             Float64UnaryOp::Abs => {
                 let smallest = self.int32_constant(i32::MIN);
                 let integer = self.branch_to_slow_path(

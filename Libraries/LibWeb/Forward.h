@@ -503,6 +503,7 @@ class ElementByIdMap;
 class Event;
 class EventHandler;
 class EventTarget;
+class FragmentDirective;
 class HTMLCollection;
 class IDLEventListener;
 class LiveNodeList;
@@ -1013,6 +1014,14 @@ namespace Web::PermissionsAPI {
 
 class Permissions;
 class PermissionStatus;
+
+}
+
+namespace Web::PictureInPicture {
+
+class PictureInPictureController;
+class PictureInPictureEvent;
+class PictureInPictureWindow;
 
 }
 

@@ -49,6 +49,7 @@ use crate::runtime::boolean_constructor::BooleanConstructor;
 use crate::runtime::bound_function::BoundFunction;
 use crate::runtime::ecmascript_function_object::as_ecmascript_function_object;
 use crate::runtime::function_prototype::{self, FunctionPrototype};
+use crate::runtime::map_prototype;
 use crate::runtime::math_object;
 use crate::runtime::native_javascript_backed_function::NativeJavaScriptBackedFunction;
 use crate::runtime::object_constructor::ObjectConstructor;
@@ -103,6 +104,9 @@ struct SnapshotBuilder<'vm> {
     lexical_environment_templates: Vec<Option<LexicalEnvironmentTemplateSnapshot>>,
     /// The environment templates of the direct calls of the executable whose snapshot is being made.
     environment_templates: Vec<EnvironmentTemplateSnapshot>,
+    /// For the constructors among the inlining candidates, by index: the shape of the `this` value their inlined
+    /// constructs create, whose entries their megamorphic caches describe.
+    construct_this_shapes: HashMap<u32, Gc<Shape>>,
 }
 
 /// The number of bytecode instructions of an executable, counted up to one past `limit`.
@@ -168,7 +172,7 @@ fn intrinsic_of(vm: &Vm, cell: Option<Gc<CellHeader>>) -> Option<Intrinsic> {
 }
 
 /// The intrinsics the compiler knows by their native functions (of any realm).
-static NATIVE_INTRINSICS: [(&RawNativeFunctionPointer, Intrinsic); 21] = [
+static NATIVE_INTRINSICS: [(&RawNativeFunctionPointer, Intrinsic); 23] = [
     (&function_prototype::APPLY_FUNCTION, Intrinsic::FunctionPrototypeApply),
     (&function_prototype::CALL_FUNCTION, Intrinsic::FunctionPrototypeCall),
     (&array_prototype::PUSH_FUNCTION, Intrinsic::ArrayPrototypePush),
@@ -217,6 +221,8 @@ static NATIVE_INTRINSICS: [(&RawNativeFunctionPointer, Intrinsic); 21] = [
         Intrinsic::StringPrototypeTrimStart,
     ),
     (&string_prototype::TRIM_END_FUNCTION, Intrinsic::StringPrototypeTrimEnd),
+    (&map_prototype::GET_FUNCTION, Intrinsic::MapPrototypeGet),
+    (&map_prototype::HAS_FUNCTION, Intrinsic::MapPrototypeHas),
 ];
 
 /// The builtin `%ArrayIteratorPrototype%.next` of the realm, if `%ArrayIteratorPrototype%` holds it.
@@ -353,7 +359,14 @@ impl SnapshotBuilder<'_> {
         }
     }
 
-    fn property_cache(&mut self, cache: &PropertyLookupCache, caller: &Entry) -> PropertyCacheSnapshot {
+    /// What property lookup cache `cache` of `caller` knows. Of a megamorphic cache, that is the entry for
+    /// `known_shape` if it has one: JIT code only uses megamorphic entries for objects whose shape it knows.
+    fn property_cache(
+        &mut self,
+        cache: &PropertyLookupCache,
+        caller: &Entry,
+        known_shape: Option<Gc<Shape>>,
+    ) -> PropertyCacheSnapshot {
         let kind = match cache.tier() {
             PropertyLookupCacheTier::Empty => PropertyCacheKind::Empty,
             PropertyLookupCacheTier::Monomorphic => PropertyCacheKind::Monomorphic,
@@ -371,7 +384,12 @@ impl SnapshotBuilder<'_> {
         ];
         let mut sees_primitives = false;
         let mut entries = Vec::new();
-        for slot in cache.entries() {
+        let known_shape_slot = known_shape.and_then(|shape| cache.megamorphic_entry_for_shape(shape, 0));
+        let slots = match known_shape_slot {
+            Some(slot) => core::slice::from_ref(slot),
+            None => cache.entries(),
+        };
+        for slot in slots {
             let entry = slot.get();
             if entry
                 .shape
@@ -428,6 +446,9 @@ impl SnapshotBuilder<'_> {
                     self.vm,
                     prototype_property.map(|object| Value::from_object(object).as_cell()),
                 ),
+                prototype_property_inline_executable: prototype_property.and_then(|object| {
+                    self.inline_executable_index(Some(Value::from_object(object).as_cell()), caller)
+                }),
                 accessor_function,
                 holds_accessor: entry_holds_accessor(slot),
             });
@@ -748,6 +769,7 @@ impl SnapshotBuilder<'_> {
             empty_shape.create_prototype_transition(self.vm, Some(prototype))
         };
         let index = self.inlined_function_index(function, caller)?;
+        self.construct_this_shapes.insert(index, this_shape);
         Some(ConstructTarget {
             executable: index,
             function_shape: self.cell(function_shape),
@@ -779,6 +801,9 @@ impl SnapshotBuilder<'_> {
             target: self.optional_cell(target),
             flags,
             target_intrinsic: intrinsic_of(self.vm, target),
+            target_builtin: target
+                .and_then(|target| target.downcast::<RawNativeFunction>()?.builtin())
+                .map(|builtin| builtin as u8),
             ..CallFeedbackSnapshot::default()
         };
         if monomorphic {
@@ -865,10 +890,15 @@ impl SnapshotBuilder<'_> {
             keyed,
         };
 
+        let construct_this_shape = entry
+            .function
+            .and_then(|function| self.indices.get(&function))
+            .and_then(|index| self.construct_this_shapes.get(index))
+            .copied();
         let property_caches = executable
             .property_lookup_caches()
             .iter()
-            .map(|cache| self.property_cache(cache, entry))
+            .map(|cache| self.property_cache(cache, entry, construct_this_shape))
             .collect();
         let object_shape_caches = executable
             .object_shape_caches()
@@ -1135,6 +1165,7 @@ pub fn capture_snapshot(
         closure_templates: Vec::new(),
         environment_templates: Vec::new(),
         lexical_environment_templates: Vec::new(),
+        construct_this_shapes: HashMap::new(),
     };
     builder.closure_templates = closure_template_snapshots(closure_templates, |sample| builder.cell(sample));
     builder.lexical_environment_templates =
@@ -1170,6 +1201,12 @@ pub fn capture_snapshot(
     builder.cell(realm.array_prototype());
     builder.cell(realm.object_prototype());
     runtime.array_iterator_next = builder.optional_cell(array_iterator_next(vm, realm));
+    runtime.array_iterator_return_watchpoint_set = builder.optional_cell(
+        realm
+            .array_iterator_return_watchpoint_set
+            .get()
+            .filter(|set| set.is_valid()),
+    );
     let options = &vm.jit.options;
     let snapshot = Snapshot {
         executables,

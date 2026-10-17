@@ -17,6 +17,7 @@
 #include <UI/Qt/CrashReportNotifier.h>
 
 #include <QApplication>
+#include <QPointer>
 
 class QAction;
 class QMenu;
@@ -60,7 +61,10 @@ public:
     void restart_private_browsing_session();
     void focus_location_editor();
     void show_process_manager();
+    // Asks every window's pages if they may unload, one window at a time. Once all of them agree, it confirms stopping
+    // the downloads and quits; if a page refuses or the downloads are kept, the quit is canceled and no window closes.
     void quit();
+    bool is_finishing_quit() const { return m_quit_is_finishing; }
     bool confirm_stop_active_downloads(QWidget* parent = nullptr);
 
     CrashReportNotifier& crash_report_notifier() { return m_crash_report_notifier; }
@@ -105,7 +109,11 @@ public:
 private:
     explicit Application();
 
-    virtual void create_platform_options(WebView::BrowserOptions&, WebView::RequestServerOptions&, WebView::WebContentOptions&) override;
+    void ask_next_window_to_close_for_quit();
+    bool ask_windows_yet_to_agree_to_quit();
+    void finish_quit();
+    void cancel_quit();
+
     virtual Core::EventLoop& create_platform_event_loop() override;
     virtual void create_platform_actions() override;
 
@@ -113,6 +121,9 @@ private:
 #if !defined(AK_OS_MACOS)
     virtual Optional<String> system_font_family() const override;
 #endif
+
+    virtual bool supports_picture_in_picture() const override { return true; }
+    virtual OwnPtr<WebView::PictureInPictureWindow> create_picture_in_picture_window(WebView::WebContentPage& requesting_page, WebView::CanonicalTraversable&, Gfx::IntSize video_size) override;
 
     virtual Optional<WebView::ViewImplementation&> active_web_view() const override;
     virtual Vector<WebView::ViewImplementation&> active_window_web_views() const override;
@@ -145,6 +156,7 @@ private:
     virtual bool supports_system_menu_bar() const override;
     virtual bool supports_vertical_tabs() const override { return true; }
     virtual bool supports_private_browsing_windows() const override { return true; }
+    virtual bool supports_content_blocking_controls() const override { return true; }
     virtual bool supports_client_side_window_decorations() const override
     {
 #if defined(AK_OS_MACOS)
@@ -156,6 +168,7 @@ private:
 
     virtual bool platform_reports_scroll_momentum() const override;
     virtual bool platform_scrolls_elastically() const override;
+    virtual Vector<String> platform_preferred_languages() const override;
 
     virtual void update_tabs_display() const override;
 
@@ -175,6 +188,10 @@ private:
     BrowserWindow* m_active_window { nullptr };
     OwnPtr<ProcessManagerWindow> m_process_manager_window;
     CrashReportNotifier m_crash_report_notifier;
+
+    bool m_quit_in_progress { false };
+    bool m_quit_is_finishing { false };
+    Vector<QPointer<BrowserWindow>> m_windows_awaiting_quit_preflight;
 };
 
 }

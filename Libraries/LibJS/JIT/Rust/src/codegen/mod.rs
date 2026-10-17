@@ -75,11 +75,13 @@ use crate::asm::MachineFrame;
 use crate::asm::PortableMacroAssembler;
 use crate::asm::disassembler;
 use crate::bytecode::DecodedInstruction;
+use crate::bytecode::NO_YIELD_CONTINUATION;
 use crate::bytecode::OpCode;
 use crate::bytecode::OperandRole;
 use crate::bytecode::SlowPathAbi;
 use crate::bytecode::decode_instruction;
 use crate::bytecode::slow_path_layout;
+use crate::code::ExitKind;
 use crate::code::JitStatus;
 use crate::code::Site;
 use crate::code::SiteKind;
@@ -92,6 +94,7 @@ use crate::ir::Graph;
 use crate::ir::NodeId;
 use crate::ir::Op;
 use crate::ir::ShapeCheck;
+use crate::ir::SuspendKind;
 use crate::ir::value;
 use crate::regalloc::Allocation;
 use crate::regalloc::Location;
@@ -972,7 +975,11 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
     /// Registers an exit of `node` (with its frame state) and returns the
     /// label its checks branch to when they fail.
     fn exit_site(&mut self, node: NodeId) -> Label {
-        let kind = self.graph.node(node).op.exit_kind().expect("the node can exit");
+        let kind = if self.graph.speculatively_hoisted.contains(&node) {
+            ExitKind::Hoisted
+        } else {
+            self.graph.node(node).op.exit_kind().expect("the node can exit")
+        };
         let index = u32::try_from(self.sites.len()).expect("site count fits in u32");
         self.sites.push((node, SiteKind::Exit(kind)));
         let label = self.masm.new_label();
@@ -1165,10 +1172,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
             }
             (Location::Constant(bits), Location::Register(to)) => match register_of(to) {
                 Register::General(to) => self.masm.move_imm64(to, bits),
-                Register::Float(to) => {
-                    self.masm.move_imm64(self.pinned.scratch, bits);
-                    self.masm.move_gpr_to_double(to, self.pinned.scratch);
-                }
+                Register::Float(to) => self.masm.move_double_imm(to, f64::from_bits(bits)),
             },
             (Location::Constant(bits), Location::Stack(to)) => {
                 let address = self.spill_address(to);
@@ -1214,7 +1218,10 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
     /// may be immediates.
     fn input_value(&self, node: NodeId, index: usize) -> InputValue {
         match self.allocation.node(node).inputs[index] {
-            Location::Register(register) => InputValue::Register(Gpr(register)),
+            Location::Register(register) => match register_of(register) {
+                Register::General(register) => InputValue::Register(register),
+                Register::Float(_) => unreachable!("float64 inputs are read with `float_input()`"),
+            },
             Location::Constant(bits) => InputValue::Constant(bits),
             Location::Stack(_) => unreachable!("inputs are in registers or constants"),
         }
@@ -1222,7 +1229,10 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
 
     fn output(&self, node: NodeId) -> Gpr {
         match self.allocation.node(node).output {
-            Some(Location::Register(register)) => Gpr(register),
+            Some(Location::Register(register)) => match register_of(register) {
+                Register::General(register) => register,
+                Register::Float(_) => unreachable!("float64 outputs are written with `float_output()`"),
+            },
             _ => unreachable!("the node has a register output"),
         }
     }
@@ -1290,6 +1300,24 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
                 self.emit_unbox_cell(output, self.input(node_id, 0));
                 let environment = self.frame_field(self.runtime.offsets.execution_context_lexical_environment);
                 self.masm.store64(&environment, output);
+            }
+            Op::Suspend { continuation, kind } => {
+                let offsets = self.runtime.offsets;
+                let continuation = continuation.unwrap_or(NO_YIELD_CONTINUATION);
+                let mut fields = [
+                    (offsets.execution_context_yield_continuation, 4, u64::from(continuation)),
+                    (
+                        offsets.execution_context_yield_is_await,
+                        1,
+                        u64::from(*kind == SuspendKind::Await),
+                    ),
+                    (
+                        offsets.execution_context_yield_value_is_iterator_result,
+                        1,
+                        u64::from(*kind == SuspendKind::YieldIteratorResult),
+                    ),
+                ];
+                self.emit_constant_fields(self.pinned.frame, self.pinned.scratch, &mut fields)?;
             }
             Op::LeavePrivateEnvironment => {
                 let scratch = self.pinned.scratch;
@@ -1641,6 +1669,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
             }
             Op::BoxFloat64 => self.emit_box_float64(node_id),
             Op::Float64Unary { op } => self.emit_float64_unary(node_id, *op),
+            Op::CallFloat64Function { function } => self.emit_call_float64_function(node_id, *function)?,
             Op::Float64Binary { op } => self.emit_float64_binary(node_id, *op),
             Op::Float64Min | Op::Float64Max => {
                 let (lhs, rhs, output) = (
@@ -1687,9 +1716,19 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
             Op::LoadElementsCapacity => self.emit_load_elements_capacity(node_id),
             Op::AppendElement => self.emit_append_element_node(node_id),
             Op::CallArrayPush => self.emit_call_array_push(node_id),
-            Op::CreateArrayIterator => self.emit_create_array_iterator(node_id),
+            Op::OpenArrayIteration => self.emit_open_array_iteration(node_id),
             Op::LoadArrayIteratorArray => self.emit_load_array_iterator_array(node_id),
             Op::LoadArrayIteratorIndex => self.emit_load_array_iterator_index(node_id),
+            Op::LoadGeneratorCompletionType => {
+                let (generator, output) = (self.input(node_id, 0), self.output(node_id));
+                let offset = self.runtime.layout.generator_object_pending_completion_type;
+                self.masm.load32(output, &Address::new(generator, offset as i32));
+            }
+            Op::LoadGeneratorCompletionValue => {
+                let (generator, output) = (self.input(node_id, 0), self.output(node_id));
+                let offset = self.runtime.layout.generator_object_pending_completion_value;
+                self.masm.load64(output, &Address::new(generator, offset as i32));
+            }
             Op::StoreArrayIteratorIndex => self.emit_store_array_iterator_index(node_id),
             Op::FinishArrayIterator => self.emit_finish_array_iterator(node_id),
             Op::SlowPathOutput { index } => self.emit_slow_path_output(node_id, *index)?,
@@ -2160,6 +2199,15 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
             BranchCondition::Shape(_) => unreachable!("only refinements of shape switch cases test one shape"),
             BranchCondition::Float64(_) => unreachable!("float64 comparisons branch above"),
             BranchCondition::ArrayIterator => self.emit_branch_on_array_iterator(input, target, invert),
+            BranchCondition::GeneratorObject => {
+                // NB: Cells start with the pointer to their class.
+                self.masm.load64(scratch, &Address::new(input, 0));
+                let class = self.runtime.layout.generator_object_class as i64;
+                self.masm.branch64_imm(when(Condition::Equal), scratch, class, target);
+            }
+            BranchCondition::PlainArrayPrototypeChain => {
+                self.emit_branch_on_plain_array_prototype_chain(node, input, target, invert);
+            }
             BranchCondition::MagicalLength | BranchCondition::Extensible => {
                 let flag = match condition {
                     BranchCondition::MagicalLength => self.runtime.layout.object_flag_has_magical_length,
@@ -2191,7 +2239,8 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
             | BranchCondition::Builtin(_)
             | BranchCondition::PropertyIteratorCacheValid
             | BranchCondition::BindingMutable { .. }
-            | BranchCondition::NextBindingOfShape { .. } => {
+            | BranchCondition::NextBindingOfShape { .. }
+            | BranchCondition::HoleFillableArray => {
                 // NB: These take several tests, which go to `yes` or `no`.
                 let other = self.masm.new_label();
                 let (yes, no) = if invert { (other, target) } else { (target, other) };
@@ -2211,6 +2260,10 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
                     }
                     BranchCondition::NextBindingOfShape { name, flags } => {
                         self.emit_next_binding_of_shape_test(node, input, name, flags, no);
+                        self.masm.jump(yes);
+                    }
+                    BranchCondition::HoleFillableArray => {
+                        self.branch_unless_plain_array(input, self.temp(node, 0), no);
                         self.masm.jump(yes);
                     }
                     _ => unreachable!(),

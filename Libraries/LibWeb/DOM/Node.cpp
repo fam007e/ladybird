@@ -519,6 +519,17 @@ void Node::bump_character_data_version()
         holder->m_character_data_version = ++s_last_tree_version;
 }
 
+// OPTIMIZATION: Computing a node's index walks all preceding siblings, so the live range steps defer it until a live
+//               range actually needs it.
+static auto lazy_index_of(Node const& node)
+{
+    return [&node, index = Optional<size_t> {}]() mutable {
+        if (!index.has_value())
+            index = node.index();
+        return *index;
+    };
+}
+
 // https://dom.spec.whatwg.org/#dom-node-normalize
 WebIDL::ExceptionOr<void> Node::normalize()
 {
@@ -592,7 +603,7 @@ WebIDL::ExceptionOr<void> Node::normalize()
             //    its end node to node and its end offset to length.
             // OPTIMIZATION: These steps are independent between ranges, so traverse the live ranges only once.
             auto* current_node_parent = current_node->parent();
-            auto current_node_index = current_node->index();
+            auto current_node_index = lazy_index_of(*current_node);
             for (auto& range : document().live_ranges()) {
                 if (range.start_container().ptr() == current_node) {
                     range.increase_start_offset(length);
@@ -602,11 +613,11 @@ WebIDL::ExceptionOr<void> Node::normalize()
                     range.increase_end_offset(length);
                     range.set_end_node(node);
                 }
-                if (range.start_container().ptr() == current_node_parent && range.start_offset() == current_node_index) {
+                if (range.start_container().ptr() == current_node_parent && range.start_offset() == current_node_index()) {
                     range.set_start_node(node);
                     range.set_start_offset(length);
                 }
-                if (range.end_container().ptr() == current_node_parent && range.end_offset() == current_node_index) {
+                if (range.end_container().ptr() == current_node_parent && range.end_offset() == current_node_index()) {
                     range.set_end_node(node);
                     range.set_end_offset(length);
                 }
@@ -689,7 +700,9 @@ void Node::record_style_environment_change()
     document().bump_style_environment_version();
 
     if (is_document()) {
-        CSS::StyleEngineFFI::style_engine_record_environment_change(document().style_computer().style_engine().host());
+        // NB: An engine created later starts from the environment as it is then.
+        if (auto* style_computer = document().style_computer_if_created())
+            CSS::StyleEngineFFI::style_engine_record_environment_change(style_computer->style_engine().host());
         return;
     }
 
@@ -958,11 +971,11 @@ void Node::adjust_live_ranges_for_insertion(Node& child, size_t count)
     // 2. For each live range whose end node is parent and end offset is greater than child’s index:
     //    increase its end offset by count.
     // OPTIMIZATION: These steps are independent between ranges, so traverse the live ranges only once.
-    auto child_index = child.index();
+    auto child_index = lazy_index_of(child);
     for (auto& range : document().live_ranges()) {
-        if (range.start_container().ptr() == this && range.start_offset() > child_index)
+        if (range.start_container().ptr() == this && range.start_offset() > child_index())
             range.increase_start_offset(count);
-        if (range.end_container().ptr() == this && range.end_offset() > child_index)
+        if (range.end_container().ptr() == this && range.end_offset() > child_index())
             range.increase_end_offset(count);
     }
 }
@@ -1278,7 +1291,7 @@ void Node::live_range_pre_remove()
     VERIFY(parent);
 
     // 3. Let index be node’s index.
-    auto index = this->index();
+    auto index = lazy_index_of(*this);
 
     // 4. For each live range whose start node is an inclusive descendant of node, set its start to (parent, index).
     // 5. For each live range whose end node is an inclusive descendant of node, set its end to (parent, index).
@@ -1288,12 +1301,12 @@ void Node::live_range_pre_remove()
     // OPTIMIZATION: These steps are independent between ranges, so traverse the live ranges only once.
     for (auto& range : document().live_ranges()) {
         if (range.start_container()->is_inclusive_descendant_of(*this))
-            MUST(range.set_start(*parent, index));
+            MUST(range.set_start(*parent, index()));
         if (range.end_container()->is_inclusive_descendant_of(*this))
-            MUST(range.set_end(*parent, index));
-        if (range.start_container().ptr() == parent && range.start_offset() > index)
+            MUST(range.set_end(*parent, index()));
+        if (range.start_container().ptr() == parent && range.start_offset() > index())
             range.decrease_start_offset(1);
-        if (range.end_container().ptr() == parent && range.end_offset() > index)
+        if (range.end_container().ptr() == parent && range.end_offset() > index())
             range.decrease_end_offset(1);
     }
 }
@@ -1378,7 +1391,8 @@ static void pin_bound_box_style_record_for_detachment(Node& node, Optional<CSS::
 
 class RemovalStyleRecordPins {
 public:
-    explicit RemovalStyleRecordPins(CSS::StyleComputer const& style_computer)
+    // NB: A document that has no style computer yet holds no style records to pin.
+    explicit RemovalStyleRecordPins(CSS::StyleComputer const* style_computer)
         : m_style_computer(style_computer)
     {
     }
@@ -1438,11 +1452,12 @@ private:
     {
         if (!style_record_identity)
             return;
+        VERIFY(m_style_computer);
         m_style_computer->pin_style_record(style_record_identity);
         m_dom_style_record_pins.append(style_record_identity);
     }
 
-    GC::Ref<CSS::StyleComputer const> m_style_computer;
+    GC::Ptr<CSS::StyleComputer const> m_style_computer;
     Vector<CSS::StyleRecordID, 16> m_dom_style_record_pins;
 };
 
@@ -1672,7 +1687,7 @@ void Node::remove(bool suppress_observers)
     auto& parent_root = parent->root();
     auto descendant_slots = descendant_slots_before_removal(parent_root);
 
-    RemovalStyleRecordPins removal_style_record_pins { document().style_computer() };
+    RemovalStyleRecordPins removal_style_record_pins { document().style_computer_if_created() };
     removal_style_record_pins.pin_style_records_before_removal(*this, was_tracked_by_style_engine);
     if (was_tracked_by_style_engine) {
         Layout::ForcedReadScope read { document() };
@@ -2039,11 +2054,11 @@ WebIDL::ExceptionOr<void> Node::move_node(Node& new_parent, Node* child)
         // 2. For each live range whose end node is newParent and end offset is greater than child’s index:
         //    increase its end offset by 1.
         // OPTIMIZATION: These steps are independent between ranges, so traverse the live ranges only once.
-        auto child_index = child->index();
+        auto child_index = lazy_index_of(*child);
         for (auto& range : new_parent.document().live_ranges()) {
-            if (range.start_container().ptr() == &new_parent && range.start_offset() > child_index)
+            if (range.start_container().ptr() == &new_parent && range.start_offset() > child_index())
                 range.increase_start_offset(1);
-            if (range.end_container().ptr() == &new_parent && range.end_offset() > child_index)
+            if (range.end_container().ptr() == &new_parent && range.end_offset() > child_index())
                 range.increase_end_offset(1);
         }
     }
@@ -2863,14 +2878,26 @@ Element* Node::parent_or_shadow_host_element()
     return nullptr;
 }
 
+// https://drafts.csswg.org/css-shadow-1/#flat-tree
 ParentNode* Node::flat_tree_parent()
 {
-    // If we're assigned to a slot, that slot is our flat tree parent.
+    // pending node is a slot
+    //     Find slottables for pending node, and append them to pending nodes, with pending node as their associated
+    //     parent.
     if (auto slot = assigned_slot_for_node(*this))
         return slot.ptr();
 
-    // Otherwise, this is the parent or shadow host.
-    return parent_or_shadow_host();
+    // pending node is a shadow host
+    //     Append the child nodes of the shadow root of the shadow tree it hosts to pending nodes, with pending node as
+    //     their associated parent.
+    auto* parent = parent_or_shadow_host();
+    if (auto* shadow_root = as_if<ShadowRoot>(parent))
+        return shadow_root->host();
+
+    // Otherwise,
+    //     Append the child nodes of pending node’s light tree to pending nodes, with pending node as their associated
+    //     parent.
+    return parent;
 }
 
 Element* Node::flat_tree_parent_element()
@@ -2990,7 +3017,7 @@ void Node::remove_all_children(bool suppress_observers)
 
         auto descendant_slots = child->descendant_slots_before_removal(parent_root);
 
-        RemovalStyleRecordPins removal_style_record_pins { document().style_computer() };
+        RemovalStyleRecordPins removal_style_record_pins { document().style_computer_if_created() };
         removal_style_record_pins.pin_style_records_before_removal(*child, was_tracked_by_style_engine);
         if (was_tracked_by_style_engine) {
             Layout::ForcedReadScope read { document() };

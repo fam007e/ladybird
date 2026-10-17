@@ -180,6 +180,7 @@ FontFaceSet
 FontFaceSetLoadEvent
 FormData
 FormDataEvent
+FragmentDirective
 Function
 GainNode
 Gamepad
@@ -369,6 +370,8 @@ PerformanceTiming
 PeriodicWave
 PermissionStatus
 Permissions
+PictureInPictureEvent
+PictureInPictureWindow
 Plugin
 PluginArray
 PointerEvent
@@ -599,12 +602,16 @@ XRSession
 XRSessionEvent
 XRSystem
 XRWebGLLayer
+__describeNodeOfInputHook
+__describeScrollerOfInputHook
 __finishTest
 __preventMultipleTestFunctions
 animationFrame
 asyncTest
+compositorScrollsWheelStepAt
 httpTestServer
 printElement
+printInputTrace
 println
 promiseTest
 removeTestErrorHandler
@@ -614,4 +621,5 @@ test
 timeout
 uniqueLocalhostHostname
 webkitURL
+wheelTargetToString
 withCollectedWrapper

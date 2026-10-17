@@ -43,11 +43,14 @@
 #include <LibWeb/Page/Page.h>
 #include <LibWeb/Painting/BoxViews.h>
 #include <LibWeb/Painting/PaintFacts.h>
+#include <LibWeb/PictureInPicture/PictureInPictureController.h>
 #include <LibWeb/Platform/EventLoopPlugin.h>
 #include <LibWeb/Selection/Selection.h>
+#include <LibWeb/WebIDL/Promise.h>
 #include <LibWebCommon/Clipboard/SystemClipboard.h>
 #include <LibWebCommon/HTML/NavigationPopulationRequest.h>
 #include <LibWebCommon/HTML/SelectedFile.h>
+#include <LibWebCommon/Loader/ContentBlocking.h>
 
 namespace Web {
 
@@ -61,6 +64,7 @@ GC::Ref<Page> Page::create(GC::Ref<PageClient> page_client)
 Page::Page(GC::Ref<PageClient> client)
     : m_client(client)
     , m_history_executor(GC::Heap::the().allocate<HTML::HistoryExecutor>(*this))
+    , m_picture_in_picture_controller(GC::Heap::the().allocate<PictureInPicture::PictureInPictureController>(*this))
 {
 }
 
@@ -129,6 +133,7 @@ void Page::visit_edges(JS::Cell::Visitor& visitor)
     visitor.visit(m_top_level_traversable);
     visitor.visit(m_navigables_being_destroyed);
     visitor.visit(m_history_executor);
+    visitor.visit(m_picture_in_picture_controller);
     visitor.visit(m_client);
     visitor.visit(m_window_rect_observer);
     visitor.visit(m_on_pending_dialog_closed);
@@ -274,9 +279,8 @@ Gfx::Palette Page::palette() const
     return m_client->palette();
 }
 
-static CSSPixelRect screen_rect_in_css_pixels_ignoring_zoom(PageClient const& client)
+static CSSPixelRect device_pixel_rect_in_css_pixels_ignoring_zoom(PageClient const& client, DevicePixelRect device_pixel_rect)
 {
-    auto device_pixel_rect = client.screen_rect();
     auto scale = client.device_pixel_ratio();
     return {
         device_pixel_rect.x().value() / scale,
@@ -299,7 +303,7 @@ CSSPixelRect Page::web_exposed_screen_area() const
     // NB: This is the area of the output device in CSS pixels at a zoom level of 1. Like Chrome and Safari, we leave the
     //     page zoom out of it, so zooming in doesn't make sites switch to their tablet or phone layouts.
     //     See: https://github.com/LadybirdBrowser/ladybird/pull/4084
-    return screen_rect_in_css_pixels_ignoring_zoom(*m_client);
+    return device_pixel_rect_in_css_pixels_ignoring_zoom(*m_client, m_client->screen_rect());
 }
 
 // https://drafts.csswg.org/cssom-view-1/#web-exposed-available-screen-area
@@ -313,8 +317,8 @@ CSSPixelRect Page::web_exposed_available_screen_area() const
     //    - The available area of the rendering surface of the output device, in CSS pixels.
     //    - The area of the output device, in CSS pixels.
     //    - The area of the viewport, in CSS pixels.
-    // NB: This is the area of the output device. See note in web_exposed_screen_area().
-    return screen_rect_in_css_pixels_ignoring_zoom(*m_client);
+    // NB: This is the available area of the output device, at a zoom level of 1 like web_exposed_screen_area().
+    return device_pixel_rect_in_css_pixels_ignoring_zoom(*m_client, m_client->available_screen_rect());
 }
 
 CSS::PreferredColorScheme Page::preferred_color_scheme() const
@@ -444,9 +448,9 @@ EventResult Page::handle_mousedown(HTML::LocalNavigable& root, DevicePixelPoint 
     return root.event_handler().handle_mousedown(device_to_css_point(position), device_to_css_point(screen_position), button, buttons, modifiers, click_count, scrollbar_dragged_by_compositor, remote_target);
 }
 
-EventResult Page::handle_mousedown(DevicePixelPoint position, DevicePixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers, int click_count, Optional<Web::ScrollbarDraggedByCompositor> const& scrollbar_dragged_by_compositor)
+EventResult Page::handle_mousedown(DevicePixelPoint position, DevicePixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers, int click_count)
 {
-    return handle_mousedown(local_traversable(), position, screen_position, button, buttons, modifiers, click_count, scrollbar_dragged_by_compositor, nullptr);
+    return handle_mousedown(local_traversable(), position, screen_position, button, buttons, modifiers, click_count, {}, nullptr);
 }
 
 void Page::set_mouse_event_tracking_navigable(Badge<EventHandler>, HTML::LocalNavigable& navigable)
@@ -477,6 +481,25 @@ EventResult Page::handle_mouseleave(HTML::LocalNavigable& root)
 EventResult Page::handle_mouseleave()
 {
     return handle_mouseleave(local_traversable());
+}
+
+EventResult Page::handle_mousecancel(HTML::LocalNavigable& root)
+{
+    // The press that is cancelled is tracked by the navigable it began in, which may be nested in the root.
+    GC::Ptr<HTML::LocalNavigable> navigable = m_mouse_event_tracking_navigable.ptr();
+    m_mouse_event_tracking_navigable = nullptr;
+    if (!navigable)
+        navigable = root;
+    auto result = navigable->event_handler().handle_mousecancel();
+
+    // The cancelled pointer has left the page, so no document in it hovers anything until the pointer moves again.
+    (void)root.event_handler().handle_mouseleave();
+    return result;
+}
+
+EventResult Page::handle_mousecancel()
+{
+    return handle_mousecancel(local_traversable());
 }
 
 #if defined(AK_OS_MACOS)
@@ -1056,10 +1079,10 @@ void Page::did_complete_window_rect_request(u64 completion_id)
 }
 
 template<typename ResponseType>
-static ResponseType spin_event_loop_until_dialog_closed(PageClient& client, Optional<ResponseType>& response, SourceLocation location = SourceLocation::current())
+static ResponseType spin_event_loop_until_dialog_closed(PageClient& client, Optional<ResponseType>& response, HTML::EventLoop* event_loop = nullptr, SourceLocation location = SourceLocation::current())
 {
-    auto& event_loop = Web::HTML::current_settings_object().responsible_event_loop();
-    auto pause_handle = event_loop.pause();
+    auto& responsible_event_loop = event_loop ? *event_loop : Web::HTML::current_settings_object().responsible_event_loop();
+    auto pause_handle = responsible_event_loop.pause();
 
     Web::Platform::EventLoopPlugin::the().spin_until(GC::create_function(GC::Heap::the(), [&]() {
         return response.has_value() || !client.is_connection_open();
@@ -1088,6 +1111,22 @@ void Page::alert_closed()
 {
     if (m_pending_dialog == PendingDialog::Alert) {
         m_pending_alert_response = Empty {};
+        on_pending_dialog_closed();
+    }
+}
+
+bool Page::did_request_before_unload(String const& source, HTML::EventLoop& event_loop)
+{
+    m_pending_dialog = PendingDialog::BeforeUnload;
+    m_client->page_did_request_before_unload(source);
+
+    return spin_event_loop_until_dialog_closed(*m_client, m_pending_before_unload_response, &event_loop);
+}
+
+void Page::before_unload_closed(bool accepted)
+{
+    if (m_pending_dialog == PendingDialog::BeforeUnload) {
+        m_pending_before_unload_response = accepted;
         on_pending_dialog_closed();
     }
 }
@@ -1133,6 +1172,11 @@ void Page::prompt_closed(Optional<Utf16String> response)
 // NB: A dialog blocks the whole tab, so every page of the tab holds the one a document of any of them opened.
 void Page::did_open_dialog_in_another_process(PendingDialog dialog, Utf16String const& message)
 {
+    if (dialog == PendingDialog::None) {
+        on_pending_dialog_closed();
+        return;
+    }
+
     m_pending_dialog = dialog;
     m_pending_dialog_text.clear();
     if (!message.is_empty())
@@ -1149,6 +1193,7 @@ void Page::dismiss_dialog(GC::Ref<GC::Function<void()>> on_dialog_closed)
     case PendingDialog::Alert:
         m_client->page_did_request_accept_dialog();
         break;
+    case PendingDialog::BeforeUnload:
     case PendingDialog::Confirm:
     case PendingDialog::Prompt:
         m_client->page_did_request_dismiss_dialog();
@@ -1164,6 +1209,7 @@ void Page::accept_dialog(GC::Ref<GC::Function<void()>> on_dialog_closed)
     case PendingDialog::None:
         break;
     case PendingDialog::Alert:
+    case PendingDialog::BeforeUnload:
     case PendingDialog::Confirm:
     case PendingDialog::Prompt:
         m_client->page_did_request_accept_dialog();
@@ -1517,8 +1563,6 @@ void Page::sync_media_element_video_sink_ticking()
 {
     for_each_media_element([&](auto& media_element) {
         media_element.sync_video_sink_ticking();
-        if (auto* video_element = as_if<HTML::HTMLVideoElement>(&media_element))
-            Painting::push_video_paint_facts(*video_element);
     });
 }
 
@@ -1606,7 +1650,7 @@ Optional<Page::ContextMenuRequest> Page::take_context_menu_request()
     return request;
 }
 
-void Page::did_request_media_context_menu(UniqueNodeID media_id, HTML::CrossProcessId local_root_id, CSSPixelPoint position, ByteString const& target, unsigned modifiers, MediaContextMenu const& menu, HTML::PreparedNavigationDescriptor navigation)
+void Page::did_request_media_context_menu(UniqueNodeID media_id, HTML::CrossProcessId local_root_id, CSSPixelPoint position, ByteString const& target, unsigned modifiers, MediaContextMenu const& menu, Optional<HTML::PreparedNavigationDescriptor> navigation)
 {
     m_media_context_menu_element_id = media_id;
     client().page_did_request_media_context_menu(local_root_id, position, target, modifiers, menu, move(navigation));
@@ -1661,6 +1705,25 @@ void Page::toggle_media_fullscreen_state()
     media_element->toggle_fullscreen();
 }
 
+void Page::toggle_media_picture_in_picture_state()
+{
+    auto* video_element = as_if<HTML::HTMLVideoElement>(media_context_menu_element().ptr());
+    if (!video_element)
+        return;
+
+    auto& document = video_element->document();
+    if (video_element->is_picture_in_picture_element()) {
+        picture_in_picture_controller().enqueue_exit(document, nullptr);
+        return;
+    }
+
+    // AD-HOC: An execution context is required for Promise creation hooks.
+    HTML::TemporaryExecutionContext execution_context { document.relevant_settings_object() };
+
+    // The request is the page's own, so a page that has changed since the menu opened can still reject it.
+    WebIDL::mark_promise_as_handled(video_element->request_picture_in_picture());
+}
+
 void Page::toggle_media_controls_state()
 {
     auto media_element = media_context_menu_element();
@@ -1673,6 +1736,22 @@ void Page::toggle_media_controls_state()
         media_element->remove_attribute(HTML::AttributeNames::controls);
     else
         media_element->set_attribute_value(HTML::AttributeNames::controls, Utf16String {});
+}
+
+// The browser's controls over a Picture-in-Picture window keep the controls of the player that its page shows up while
+// they are hovered or pressed, as the player's own controls do.
+void Page::set_picture_in_picture_window_controls_in_use(bool in_use)
+{
+    if (!has_local_traversable())
+        return;
+    auto document = local_traversable()->active_document();
+    if (!document)
+        return;
+
+    document->for_each_in_inclusive_subtree_of_type<HTML::HTMLMediaElement>([&](auto& media_element) {
+        media_element.set_picture_in_picture_window_controls_in_use(in_use);
+        return TraversalDecision::Continue;
+    });
 }
 
 void Page::set_page_mute_state(HTML::MuteState mute_state)
@@ -1714,18 +1793,6 @@ void Page::set_user_style(Utf16String source)
     invalidate_user_style();
 }
 
-void Page::set_content_blocking_enabled(bool enabled)
-{
-    auto& blocker = ContentBlocker::the();
-    if (blocker.filtering_enabled() == enabled)
-        return;
-
-    auto has_cosmetic_rules = blocker.has_cosmetic_rules();
-    blocker.set_filtering_enabled(enabled);
-    if (has_cosmetic_rules)
-        invalidate_user_style();
-}
-
 void Page::invalidate_user_style()
 {
     if (!has_top_level_traversable())
@@ -1762,6 +1829,32 @@ void Page::invalidate_style_for_preference_change()
         if (auto document = navigable->active_document())
             invalidate_document(*document);
     }
+}
+
+bool Page::content_blocking_enabled_for_url(Optional<URL::URL> const& url) const
+{
+    if (!m_content_blocking_enabled)
+        return false;
+    if (!url.has_value())
+        return true;
+
+    auto host = content_blocking_site(*url);
+    return !host.has_value() || !m_content_blocking_disabled_sites.contains(*host);
+}
+
+void Page::set_content_blocking_policy(bool enabled, ReadonlySpan<String> disabled_sites)
+{
+    HashTable<String> sites;
+    sites.ensure_capacity(disabled_sites.size());
+
+    for (auto const& site : disabled_sites) {
+        if (auto host = canonical_content_blocking_host(site); host.has_value())
+            sites.set(host.release_value());
+    }
+
+    m_content_blocking_enabled = enabled;
+    m_content_blocking_disabled_sites = move(sites);
+    invalidate_user_style();
 }
 
 Vector<GC::Root<DOM::Document>> Page::documents_in_active_window() const

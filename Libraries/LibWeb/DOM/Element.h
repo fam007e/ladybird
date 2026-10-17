@@ -95,6 +95,10 @@ WEB_API WebIDL::ExceptionOr<void> set_attribute_ns(DOM::Element&, Optional<Utf16
 
 namespace Web::DOM {
 
+using ScrollIntoViewTarget = Variant<Element*, Range*>;
+
+void scroll_a_target_into_view(Layout::BegunRead const&, ScrollIntoViewTarget, Bindings::ScrollBehavior, Bindings::ScrollLogicalPosition block, Bindings::ScrollLogicalPosition inline_, GC::Ptr<Element> container = nullptr, GC::Ptr<WebIDL::Promise> promise = nullptr);
+
 // https://html.spec.whatwg.org/multipage/custom-elements.html#upgrade-reaction
 // An upgrade reaction, which will upgrade the custom element and contains a custom element definition; or
 struct CustomElementUpgradeReaction {
@@ -546,6 +550,8 @@ public:
 
     GC::Ptr<WebIDL::CallbackType> onwebkitfullscreenerror();
     void set_onwebkitfullscreenerror(GC::Ptr<WebIDL::CallbackType>);
+
+    bool is_picture_in_picture_element() const;
 
     WebIDL::ExceptionOr<Utf16String> outer_html() const;
     WebIDL::ExceptionOr<void> set_outer_html(StringView html);

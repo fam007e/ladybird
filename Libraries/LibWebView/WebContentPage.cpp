@@ -27,6 +27,7 @@
 #include <LibWebView/CookieJar.h>
 #include <LibWebView/HistoryStore.h>
 #include <LibWebView/NavigationLoader.h>
+#include <LibWebView/PictureInPictureManager.h>
 #include <LibWebView/RequestServerManager.h>
 #include <LibWebView/StorageJar.h>
 #include <LibWebView/URL.h>
@@ -153,6 +154,11 @@ WebContentPage::WebContentPage(WebContentClient& client, Web::PageId id, Canonic
 }
 
 WebContentPage::~WebContentPage() = default;
+
+WebContentServerProxy* WebContentPage::routed_proxy() const
+{
+    return routed_connection();
+}
 
 WebContentClient& WebContentPage::client() const
 {
@@ -532,12 +538,12 @@ void WebContentPage::did_not_dispatch_input_event_through_compositor(u64 event_i
     }
 }
 
-void WebContentPage::did_present_bitmap(Gfx::IntRect content_rect, Gfx::IntRect damage_rect, i32 bitmap_id)
+void WebContentPage::did_present_bitmap(Gfx::IntRect content_rect, Gfx::IntRect damage_rect, i32 bitmap_id, double device_pixel_ratio)
 {
     dbgln_if(COMPOSITOR_DEBUG, "[Compositor] UI compositor IPC did_paint for page {} bitmap {} rect={}x{} at {},{}",
         m_id, bitmap_id, content_rect.width(), content_rect.height(), content_rect.x(), content_rect.y());
     if (displays_tab()) {
-        view().server_did_paint({}, bitmap_id, content_rect.size(), damage_rect);
+        view().server_did_paint({}, bitmap_id, content_rect.size(), damage_rect, device_pixel_ratio);
         return;
     }
     dbgln_if(COMPOSITOR_DEBUG, "[Compositor] UI dropping did_paint for page {} bitmap {}: no view", m_id, bitmap_id);
@@ -615,6 +621,7 @@ void WebContentPage::fail_renderer_owned_downloads()
 
 void WebContentPage::close()
 {
+    PictureInPictureManager::the().close_window(*this);
     m_is_open = false;
     m_needs_beforeunload_check = true;
     m_history_recorded_url_for_current_load.clear();
@@ -850,6 +857,12 @@ void WebContentPage::did_update_editing_history_state(bool can_undo, bool can_re
     view().set_editing_history_state(can_undo, can_redo);
 }
 
+void WebContentPage::did_set_text_fragment_indication_visibility(bool visible)
+{
+    if (displays_tab())
+        view().set_text_fragment_indication_visibility({}, visible);
+}
+
 void WebContentPage::did_request_tooltip_override(Gfx::IntPoint position, ByteString title)
 {
     if (displays_tab()) {
@@ -866,14 +879,12 @@ void WebContentPage::did_stop_tooltip_override()
 
 void WebContentPage::did_enter_tooltip_area(ByteString title)
 {
-    if (view().on_enter_tooltip_area)
-        view().on_enter_tooltip_area(title);
+    view().did_enter_tooltip_area({}, move(title));
 }
 
 void WebContentPage::did_leave_tooltip_area()
 {
-    if (view().on_leave_tooltip_area)
-        view().on_leave_tooltip_area();
+    view().did_leave_tooltip_area({});
 }
 
 void WebContentPage::did_hover_link(URL::URL url)
@@ -1153,6 +1164,11 @@ void WebContentPage::did_output_js_console_message(ConsoleOutput console_output)
     }
 }
 
+void WebContentPage::did_block_resource()
+{
+    view().did_block_resource({});
+}
+
 void WebContentPage::did_start_network_request(u64 request_id, URL::URL url, ByteString method, Vector<HTTP::Header> request_headers, ByteBuffer request_body, Optional<String> initiator_type, String referrer_policy, bool is_navigation_request, Web::Fetch::Infrastructure::RequestPriority priority)
 {
     if (displays_tab()) {
@@ -1403,6 +1419,21 @@ void WebContentPage::did_request_exit_fullscreen()
         view().on_exit_fullscreen_window();
 }
 
+void WebContentPage::did_exit_picture_in_picture()
+{
+    PictureInPictureManager::the().close_window(*this);
+}
+
+void WebContentPage::did_change_picture_in_picture_video_size(Gfx::IntSize video_size)
+{
+    PictureInPictureManager::the().video_size_did_change(*this, video_size);
+}
+
+void WebContentPage::did_change_picture_in_picture_player_controls_visibility(bool shown)
+{
+    view().did_change_picture_in_picture_player_controls_visibility({}, shown);
+}
+
 // A navigation's population steps run in the process with its source document, which need not have hosted local file
 // content. For a navigation to a file: URL the UI process admitted, that process reads the file the URL names, as it does
 // for a history step to an entry of one.
@@ -1636,14 +1667,9 @@ void WebContentPage::beforeunload_check_result(Web::HTML::CrossProcessId operati
     traversable().did_receive_beforeunload_check_result(*this, operation_id, result, unload_prompt_shown);
 }
 
-void WebContentPage::changing_navigable_history_job_ready(Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::ChangingNavigableHistoryStepJobDisposition disposition, Web::HTML::UnloadDisplayedDocument unload_displayed_document)
+void WebContentPage::changing_navigable_history_job_ready(Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::ChangingNavigableHistoryStepJobDisposition disposition, bool update_only, Optional<Web::HTML::CrossProcessId> target_document_id)
 {
-    traversable().did_receive_changing_navigable_history_job_ready(*this, operation_id, navigable_id, disposition, unload_displayed_document);
-}
-
-void WebContentPage::changing_navigable_unload_preparation_complete(Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id)
-{
-    traversable().did_receive_changing_navigable_unload_preparation_complete(*this, operation_id, navigable_id);
+    traversable().did_receive_changing_navigable_history_job_ready(*this, operation_id, navigable_id, disposition, update_only, target_document_id);
 }
 
 void WebContentPage::descendant_unload_task_complete(Web::HTML::CrossProcessId unload_id, Web::HTML::CrossProcessId navigable_id)
@@ -2228,18 +2254,19 @@ void WebContentPage::did_fail_download(u64 download_id, String error)
     Application::the().file_downloader().fail_download(download_id, move(error));
 }
 
-void WebContentPage::did_finish_loading(Web::HTML::CrossProcessId navigable_id, Optional<Utf16String> navigation_id)
+void WebContentPage::did_finish_loading(Web::HTML::CrossProcessId navigable_id, Web::HTML::CrossProcessId document_id)
 {
-    auto navigable = hosted_navigable(navigable_id);
-    if (!navigable.has_value())
+    // NB: Only the page hosting the active document finishes loading it. A page standing in for a document the
+    //     navigable lost, as the page displaying the tab after its process crashed does, finishes loading the stand-in;
+    //     that must not surface in the view.
+    auto navigable = traversable().find(navigable_id);
+    if (!navigable.has_value() || navigable->active_document().host() != this)
         return;
 
-    if (navigation_id != navigable->tracked_load_navigation_id())
+    if (navigable->active_document().id() != document_id)
         return;
 
-    // A page standing in for a document the navigable lost, as the page displaying the tab after its process crashed
-    // does, finishes loading the stand-in; that must not surface in the view.
-    if (navigable->active_document().host() != this)
+    if (navigable->tracked_load_navigation_id() != navigable->active_document_load().navigation_id)
         return;
 
     navigable->clear_active_document_load();
@@ -2310,10 +2337,10 @@ void WebContentPage::did_change_title(Utf16String title)
     }
 }
 
-void WebContentPage::did_request_context_menu(Web::HTML::CrossProcessId local_root_id, Gfx::IntPoint content_position, Web::ContextMenuForInputEventsTarget for_input_events_target, Optional<Utf16String> misspelled_word)
+void WebContentPage::did_request_context_menu(Web::HTML::CrossProcessId local_root_id, Gfx::IntPoint content_position, Web::ContextMenuForInputEventsTarget for_input_events_target, Optional<Utf16String> misspelled_word, Optional<u64> text_fragment_generation_id)
 {
     if (auto target = view_position(local_root_id, content_position); target.has_value())
-        target->view.did_request_page_context_menu({}, *this, target->position, for_input_events_target, move(misspelled_word));
+        target->view.did_request_page_context_menu({}, *this, target->position, for_input_events_target, move(misspelled_word), text_fragment_generation_id);
 }
 
 void WebContentPage::did_request_spelling_menu_action_for_testing(Web::SpellingMenuActionForTesting action, u32 guess_index)
@@ -2326,13 +2353,18 @@ void WebContentPage::did_request_spelling_menu_action_for_testing(Web::SpellingM
     view().activate_spelling_menu_action_for_testing({}, *this, action, guess_index);
 }
 
-void WebContentPage::did_request_link_context_menu(Web::HTML::CrossProcessId local_root_id, Gfx::IntPoint content_position, Web::HTML::PreparedNavigationDescriptor navigation, ByteString, unsigned)
+void WebContentPage::did_request_link_context_menu(Web::HTML::CrossProcessId local_root_id, Gfx::IntPoint content_position, Web::HTML::PreparedNavigationDescriptor navigation, ByteString, unsigned, Optional<u64> text_fragment_generation_id)
 {
     auto verified_navigation = navigation_from_page(client(), move(navigation));
     if (!verified_navigation.has_value())
         return;
     if (auto target = view_position(local_root_id, content_position); target.has_value())
-        target->view.did_request_link_context_menu({}, target->position, verified_navigation.release_value());
+        target->view.did_request_link_context_menu({}, target->position, verified_navigation.release_value(), text_fragment_generation_id);
+}
+
+void WebContentPage::did_generate_text_fragment_url(u64 request_id, Optional<URL::URL> url)
+{
+    view().did_generate_text_fragment_url(request_id, move(url));
 }
 
 void WebContentPage::did_request_image_context_menu(Web::HTML::CrossProcessId local_root_id, Gfx::IntPoint content_position, Web::HTML::PreparedNavigationDescriptor navigation, ByteString, unsigned, Optional<Gfx::ShareableBitmap> bitmap)
@@ -2344,13 +2376,16 @@ void WebContentPage::did_request_image_context_menu(Web::HTML::CrossProcessId lo
         target->view.did_request_image_context_menu({}, target->position, verified_navigation.release_value(), move(bitmap));
 }
 
-void WebContentPage::did_request_media_context_menu(Web::HTML::CrossProcessId local_root_id, Gfx::IntPoint content_position, ByteString, unsigned, Web::MediaContextMenu menu, Web::HTML::PreparedNavigationDescriptor navigation)
+void WebContentPage::did_request_media_context_menu(Web::HTML::CrossProcessId local_root_id, Gfx::IntPoint content_position, ByteString, unsigned, Web::MediaContextMenu menu, Optional<Web::HTML::PreparedNavigationDescriptor> navigation)
 {
-    auto verified_navigation = navigation_from_page(client(), move(navigation));
-    if (!verified_navigation.has_value())
-        return;
+    Optional<Web::HTML::PreparedNavigationDescriptor> verified_navigation;
+    if (navigation.has_value()) {
+        verified_navigation = navigation_from_page(client(), navigation.release_value());
+        if (!verified_navigation.has_value())
+            return;
+    }
     if (auto target = view_position(local_root_id, content_position); target.has_value())
-        target->view.did_request_media_context_menu({}, *this, target->position, move(menu), verified_navigation.release_value());
+        target->view.did_request_media_context_menu({}, *this, target->position, move(menu), move(verified_navigation));
 }
 
 void WebContentPage::did_get_highlighted_source(String html)
@@ -2431,6 +2466,31 @@ void WebContentPage::did_request_alert(Utf16String message)
         view().on_request_alert(message);
 }
 
+void WebContentPage::did_request_before_unload(String source)
+{
+    did_open_dialog(Web::PendingDialog::BeforeUnload, {});
+    auto weak_traversable = m_traversable;
+    auto origin_page_id = id();
+    auto close_prompt = [weak_traversable, origin_page_id](bool accepted) {
+        if (!weak_traversable)
+            return;
+
+        weak_traversable->for_each_hosting_page([&](WebContentPage& page) {
+            if (page.id() != origin_page_id)
+                page.async_did_open_dialog_in_another_process(Web::PendingDialog::None, Utf16View {});
+            else
+                page.routed_proxy()->async_before_unload_closed(origin_page_id, accepted);
+        });
+    };
+
+    if (view().on_request_before_unload) {
+        view().on_request_before_unload(source, move(close_prompt));
+        return;
+    }
+
+    close_prompt(true);
+}
+
 void WebContentPage::did_request_confirm(Utf16String message)
 {
     did_open_dialog(Web::PendingDialog::Confirm, message);
@@ -2480,10 +2540,24 @@ Messages::WebContentClient::DidRequestNewWebViewResponse WebContentPage::did_req
             return { {}, {}, {}, {}, {}, {}, Web::HTML::VisibilityState::Hidden, {} };
     }
 
-    // The popup blocker runs in the renderer, which a compromised renderer skips. Each popup takes the activation of
-    // input the UI process delivered to the page, as the renderer's popup consumes the activation of its window.
-    if (Application::the().blocks_pop_ups() && !consume_transient_user_activation())
-        return { {}, {}, {}, {}, {}, {}, Web::HTML::VisibilityState::Hidden, {} };
+    Optional<CanonicalNavigable&> picture_in_picture_navigable;
+    if (hints.picture_in_picture_window.has_value()) {
+        picture_in_picture_navigable = hosted_navigable(hints.picture_in_picture_window->navigable_id);
+        if (!picture_in_picture_navigable.has_value())
+            return { {}, {}, {}, {}, {}, {}, Web::HTML::VisibilityState::Hidden, {} };
+
+        // https://w3c.github.io/picture-in-picture/#request-picture-in-picture
+        // A window needs and consumes the activation of the user's input, which the renderer checks, unless the document
+        // asking for it has one open. A compromised renderer skips that check, so whatever the popup setting, the UI
+        // process checks the activation of input it delivered, and the window it opened for the navigable's document.
+        if (!PictureInPictureManager::the().document_has_open_window(*picture_in_picture_navigable) && !consume_transient_user_activation())
+            return { {}, {}, {}, {}, {}, {}, Web::HTML::VisibilityState::Hidden, {} };
+    } else {
+        // The popup blocker runs in the renderer, which a compromised renderer skips. Each popup takes the activation of
+        // input the UI process delivered to the page, as the renderer's popup consumes the activation of its window.
+        if (Application::the().blocks_pop_ups() && !consume_transient_user_activation())
+            return { {}, {}, {}, {}, {}, {}, Web::HTML::VisibilityState::Hidden, {} };
+    }
 
     auto root_navigable_id = Application::the().allocate_ui_process_cross_process_id();
     auto initial_history_entry = Web::HTML::create_initial_session_history_entry_descriptor(
@@ -2507,8 +2581,11 @@ Messages::WebContentClient::DidRequestNewWebViewResponse WebContentPage::did_req
     client().open_page_for_new_top_level_traversable(new_page_id, traversable);
 
     String window_handle;
-    if (view().on_new_web_view)
+    if (picture_in_picture_navigable.has_value()) {
+        window_handle = PictureInPictureManager::the().open_window(*this, *picture_in_picture_navigable, traversable, hints.picture_in_picture_window->video_size);
+    } else if (view().on_new_web_view) {
         window_handle = view().on_new_web_view(activate_tab, hints, traversable);
+    }
 
     if (!traversable.view().has_value()) {
         client().discard_page_of_undisplayed_top_level_traversable(new_page_id);
@@ -2536,6 +2613,12 @@ void WebContentPage::did_close_browsing_context()
         if (view.on_close)
             view.on_close();
     }
+}
+
+void WebContentPage::did_complete_close_preflight(u64 request_id, bool approved)
+{
+    if (displays_tab())
+        view().did_complete_close_preflight({}, request_id, approved);
 }
 
 void WebContentPage::did_request_select_dropdown(Web::HTML::CrossProcessId local_root_id, Gfx::IntPoint content_position, i32 minimum_width, Vector<Web::HTML::SelectItem> items)

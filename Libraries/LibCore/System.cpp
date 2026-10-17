@@ -764,6 +764,14 @@ ErrorOr<Array<int, 2>> pipe2(int flags, PipeReadEnd)
     if (::pipe2(fds.data(), flags) < 0)
         return Error::from_syscall("pipe2"sv, errno);
 #else
+#    if defined(AK_OS_MACOS) && __MAC_OS_X_VERSION_MAX_ALLOWED >= 270000
+    if (__builtin_available(macOS 27.0, *)) {
+        if (::pipe2(fds.data(), flags) < 0)
+            return Error::from_syscall("pipe2"sv, errno);
+        return fds;
+    }
+#    endif
+
     if (::pipe(fds.data()) < 0)
         return Error::from_syscall("pipe2"sv, errno);
 
@@ -834,7 +842,9 @@ ErrorOr<int> poll(Span<struct pollfd> poll_fds, int timeout)
 
 unsigned hardware_concurrency()
 {
-    return sysconf(_SC_NPROCESSORS_ONLN);
+    // A count the system can't report is one processor, rather than the failure's -1 cast to a huge count.
+    auto count = sysconf(_SC_NPROCESSORS_ONLN);
+    return count < 1 ? 1 : count;
 }
 
 u64 physical_memory_bytes()

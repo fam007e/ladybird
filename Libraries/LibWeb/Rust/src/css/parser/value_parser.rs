@@ -183,7 +183,8 @@ fn property_uses_special_keyword_parser(property: u16) -> bool {
     // NB: These properties have extra single-keyword grammar constraints or specialized value types.
     matches!(
         property,
-        property_id::ALIGN_ITEMS
+        property_id::ALIGN_CONTENT
+            | property_id::ALIGN_ITEMS
             | property_id::ALIGN_SELF
             | property_id::ANCHOR_NAME
             | property_id::ANCHOR_SCOPE
@@ -233,6 +234,7 @@ fn property_uses_special_keyword_parser(property: u16) -> bool {
             | property_id::GRID_TEMPLATE_AREAS
             | property_id::GRID_TEMPLATE_COLUMNS
             | property_id::GRID_TEMPLATE_ROWS
+            | property_id::JUSTIFY_CONTENT
             | property_id::JUSTIFY_ITEMS
             | property_id::JUSTIFY_SELF
             | property_id::MASK_REPEAT
@@ -1999,19 +2001,66 @@ fn parse_grid_auto_flow_property(values: &[ComponentValue]) -> ParseOutcome {
     ParseOutcome::Parsed(shared_style_value(StyleValueData::GridAutoFlow { row, dense }))
 }
 
+// https://drafts.csswg.org/css-align-3/#propdef-align-items
+// Value: normal | stretch | <baseline-position> | <overflow-position>? <self-position>
 fn parse_alignment_property(property: u16, values: &[ComponentValue]) -> ParseOutcome {
-    let Some(keyword) = single_non_whitespace_value(values)
-        .and_then(ComponentValue::ident)
-        .and_then(keyword_from_ascii_case_insensitive)
+    let Some(keywords) = values
+        .iter()
+        .filter(|value| !value.is_whitespace())
+        .map(|value| value.ident().and_then(keyword_from_ascii_case_insensitive))
+        .collect::<Option<Vec<_>>>()
     else {
         return ParseOutcome::Invalid;
     };
-    if matches!(keyword, keyword::SAFE | keyword::UNSAFE)
-        || property_accepted_keywords(property).binary_search(&keyword).is_err()
-    {
+    let accepted = property_accepted_keywords(property);
+    let is_justify = matches!(
+        property,
+        property_id::JUSTIFY_CONTENT | property_id::JUSTIFY_ITEMS | property_id::JUSTIFY_SELF
+    );
+    let is_position = |keyword: u16| {
+        matches!(
+            keyword,
+            keyword::START | keyword::END | keyword::CENTER | keyword::FLEX_START | keyword::FLEX_END
+        ) || (matches!(
+            property,
+            property_id::ALIGN_ITEMS | property_id::ALIGN_SELF | property_id::JUSTIFY_ITEMS | property_id::JUSTIFY_SELF
+        ) && matches!(keyword, keyword::SELF_START | keyword::SELF_END))
+            || (is_justify && matches!(keyword, keyword::LEFT | keyword::RIGHT))
+            || (matches!(property, property_id::ALIGN_SELF | property_id::JUSTIFY_SELF) && keyword == keyword::NORMAL)
+    };
+    let valid = match keywords.as_slice() {
+        [keyword] => !matches!(*keyword, keyword::SAFE | keyword::UNSAFE) && accepted.binary_search(keyword).is_ok(),
+        [keyword::FIRST | keyword::LAST, keyword::BASELINE] => accepted.binary_search(&keyword::BASELINE).is_ok(),
+        [keyword::SAFE | keyword::UNSAFE, position] => is_position(*position),
+        [keyword::LEGACY, keyword::LEFT | keyword::RIGHT | keyword::CENTER]
+        | [keyword::LEFT | keyword::RIGHT | keyword::CENTER, keyword::LEGACY] => property == property_id::JUSTIFY_ITEMS,
+        _ => false,
+    };
+    if !valid {
         return ParseOutcome::Invalid;
     }
-    ParseOutcome::Parsed(shared_style_value(StyleValueData::Keyword { keyword }))
+    let value = match keywords.as_slice() {
+        [keyword] | [keyword::FIRST, keyword @ keyword::BASELINE] => StyleValueData::Keyword { keyword: *keyword },
+        [keyword::LEFT | keyword::RIGHT | keyword::CENTER, keyword::LEGACY] => value_list(
+            vec![
+                StyleValueData::Keyword {
+                    keyword: keyword::LEGACY,
+                },
+                StyleValueData::Keyword { keyword: keywords[0] },
+            ],
+            0,
+            false,
+        ),
+        _ => value_list(
+            keywords
+                .iter()
+                .map(|&keyword| StyleValueData::Keyword { keyword })
+                .collect(),
+            0,
+            false,
+        ),
+    };
+    ParseOutcome::Parsed(shared_style_value(value))
 }
 
 fn parse_paint_property(context: &ParseContext, property: u16, values: &[ComponentValue]) -> ParseOutcome {
@@ -4308,14 +4357,28 @@ fn parse_place_shorthand(context: &ParseContext, property: u16, values: &[Compon
         property_id::PLACE_SELF => (property_id::ALIGN_SELF, property_id::JUSTIFY_SELF),
         _ => return ParseOutcome::NotHandled,
     };
-    if let ParseOutcome::Parsed(align_value) = parse_css_value(context, align, values)
-        && matches!(&*align_value, StyleValueData::Keyword { .. })
-        && matches!(parse_css_value(context, justify, values), ParseOutcome::Parsed(_))
+    if let (ParseOutcome::Parsed(align_value), ParseOutcome::Parsed(justify_value)) = (
+        parse_css_value(context, align, values),
+        parse_css_value(context, justify, values),
+    ) {
+        return ParseOutcome::Parsed(shared_style_value(shorthand_value(
+            property,
+            vec![align, justify],
+            vec![(*align_value).clone(), (*justify_value).clone()],
+        )));
+    }
+    if property == property_id::PLACE_CONTENT
+        && let ParseOutcome::Parsed(align_value) = parse_css_value(context, align, values)
     {
         return ParseOutcome::Parsed(shared_style_value(shorthand_value(
             property,
             vec![align, justify],
-            vec![(*align_value).clone(), (*align_value).clone()],
+            vec![
+                (*align_value).clone(),
+                StyleValueData::Keyword {
+                    keyword: keyword::START,
+                },
+            ],
         )));
     }
     let non_whitespace = values
@@ -4749,12 +4812,73 @@ fn parse_font_variant_shorthand(context: &ParseContext, values: &[ComponentValue
     )))
 }
 
+/// The family and size a system font keyword stands for: the font the platform draws that part of its UI with.
+/// https://drafts.csswg.org/css-fonts-4/#system-font-family-name-value
+fn system_font_for_keyword(ident: &[u16]) -> Option<(&'static [u8], &'static [u8])> {
+    // AD-HOC: The sizes are the ones macOS draws its controls, menus, dialogs, small labels, and status bars with
+    // (13px, 13px, 13px, 13px, 11px, 10px), on every platform, and the family is always the platform's UI font.
+    const SYSTEM_FONTS: [(&[u8], &[u8]); 6] = [
+        (b"caption", b"13px"),
+        (b"icon", b"13px"),
+        (b"menu", b"13px"),
+        (b"message-box", b"13px"),
+        (b"small-caption", b"11px"),
+        (b"status-bar", b"10px"),
+    ];
+    SYSTEM_FONTS
+        .iter()
+        .find(|(keyword, _)| equals_ascii_case_insensitive(ident, keyword))
+        .map(|&(_, size)| (b"system-ui" as &[u8], size))
+}
+
 fn parse_font_shorthand(context: &ParseContext, values: &[ComponentValue]) -> ParseOutcome {
     let components = values
         .iter()
         .filter(|value| !value.is_whitespace())
         .cloned()
         .collect::<Vec<_>>();
+    // A system font keyword on its own sets every longhand: the keyword's family and size, and the initial value of
+    // the rest.
+    if let [component] = components.as_slice()
+        && let Some(ident) = component.ident()
+        && let Some((family, size)) = system_font_for_keyword(ident)
+    {
+        let parse = |property: u16, source: &[u8]| {
+            let values = consume_a_list_of_component_values(tokenize_for_parser(source)).ok()?;
+            parse_slice_for_property(context, property, &values)
+        };
+        let (Some(font_family), Some(font_size)) = (
+            parse(property_id::FONT_FAMILY, family),
+            parse(property_id::FONT_SIZE, size),
+        ) else {
+            return ParseOutcome::Invalid;
+        };
+        // font-variant is a shorthand of its own, so its "normal" comes from its own parser.
+        let font_variant = consume_a_list_of_component_values(tokenize_for_parser(b"normal"))
+            .ok()
+            .and_then(|values| match parse_font_variant_shorthand(context, &values) {
+                ParseOutcome::Parsed(value) => Some((*value).clone()),
+                _ => None,
+            });
+        let longhands = longhands_for_shorthand(property_id::FONT);
+        let Some(output) = longhands
+            .iter()
+            .map(|&longhand| match longhand {
+                property_id::FONT_FAMILY => Some(font_family.clone()),
+                property_id::FONT_SIZE => Some(font_size.clone()),
+                property_id::FONT_VARIANT => font_variant.clone(),
+                _ => parse_initial_longhand(context, longhand),
+            })
+            .collect::<Option<Vec<_>>>()
+        else {
+            return ParseOutcome::Invalid;
+        };
+        return ParseOutcome::Parsed(shared_style_value(shorthand_value(
+            property_id::FONT,
+            longhands.to_vec(),
+            output,
+        )));
+    }
     let mut font_style = None;
     let mut font_variant = None;
     let mut font_weight = None;
@@ -5661,7 +5785,12 @@ fn parse_css_value_after_substitution_scan(
     }
     if matches!(
         property_id,
-        property_id::ALIGN_ITEMS | property_id::ALIGN_SELF | property_id::JUSTIFY_ITEMS | property_id::JUSTIFY_SELF
+        property_id::ALIGN_CONTENT
+            | property_id::ALIGN_ITEMS
+            | property_id::ALIGN_SELF
+            | property_id::JUSTIFY_CONTENT
+            | property_id::JUSTIFY_ITEMS
+            | property_id::JUSTIFY_SELF
     ) {
         return parse_alignment_property(property_id, values);
     }
@@ -6936,6 +7065,12 @@ mod tests {
             (property_id::ALIGN_ITEMS, "normal"),
             (property_id::ALIGN_SELF, "auto"),
             (property_id::JUSTIFY_ITEMS, "legacy"),
+            (property_id::JUSTIFY_ITEMS, "right legacy"),
+            (property_id::ALIGN_ITEMS, "last baseline"),
+            (property_id::ALIGN_SELF, "safe normal"),
+            (property_id::JUSTIFY_SELF, "unsafe normal"),
+            (property_id::ALIGN_CONTENT, "last baseline"),
+            (property_id::JUSTIFY_CONTENT, "safe flex-end"),
             (property_id::JUSTIFY_SELF, "baseline"),
             (property_id::GRID_AUTO_FLOW, "dense column"),
             (property_id::POSITION, "sticky"),
@@ -6946,7 +7081,9 @@ mod tests {
         }
         for (property, source) in [
             (property_id::ALIGN_ITEMS, "safe"),
-            (property_id::JUSTIFY_ITEMS, "legacy right"),
+            (property_id::ALIGN_ITEMS, "legacy right"),
+            (property_id::ALIGN_ITEMS, "safe normal"),
+            (property_id::JUSTIFY_CONTENT, "baseline"),
             (property_id::GRID_AUTO_FLOW, "row column"),
             (property_id::POSITION, "bogus"),
             (property_id::FILL, "url(#paint) red blue"),

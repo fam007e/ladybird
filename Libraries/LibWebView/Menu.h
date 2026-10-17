@@ -41,6 +41,7 @@ enum class ActionID {
 
     LookUpSelectedText,
     SearchSelectedText,
+    CopyLinkToHighlight,
     SpellingGuess,
     NoSpellingGuesses,
     IgnoreSpelling,
@@ -96,6 +97,8 @@ enum class ActionID {
     ToggleMediaLoopState,
     EnterFullscreen,
     ExitFullscreen,
+    EnterPictureInPicture,
+    ExitPictureInPicture,
 
     ZoomIn,
     ZoomOut,
@@ -128,7 +131,6 @@ enum class ActionID {
     SpoofUserAgent,
     NavigatorCompatibilityMode,
     EnableScripting,
-    EnableContentBlocking,
     BlockPopUps,
 };
 
@@ -260,7 +262,7 @@ public:
             item.visit(
                 [&](NonnullRefPtr<Action>& action) { callback(*action); },
                 [&](NonnullRefPtr<Menu>& submenu) { submenu->for_each_action(callback); },
-                [&](Separator) {});
+                [&](Separator) { });
         }
     }
 

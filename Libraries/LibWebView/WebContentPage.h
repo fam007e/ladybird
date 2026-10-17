@@ -35,7 +35,6 @@ struct OwedReply {
     enum class Kind : u8 {
         BeforeunloadCheck,
         ChangingJob,
-        UnloadPreparation,
         ContinuationApplied,
         NonchangingUpdate,
         DescendantUnload,
@@ -64,7 +63,7 @@ class WEBVIEW_API WebContentPage final
     : public RefCounted<WebContentPage>
     , public WebContentClientPageStub
     , public WebContentTestClientPageStub
-    , public WebContentServerPageProxy<WebContentPage> {
+    , public WebContentServerPageProxy {
     AK_MAKE_NONCOPYABLE(WebContentPage);
     AK_MAKE_NONMOVABLE(WebContentPage);
     AK_ALLOC_WITH_KMALLOC;
@@ -79,7 +78,8 @@ public:
     WebContentClient& client() const;
     Web::PageId id() const { return m_id; }
     WebContentClient* routed_connection() const { return m_is_open ? m_client.ptr() : nullptr; }
-    Web::PageId routed_page_id() const { return m_id; }
+    virtual WebContentServerProxy* routed_proxy() const override;
+    virtual Web::PageId routed_page_id() const override { return m_id; }
 
     CanonicalTraversable& traversable() const;
     ViewImplementation& view() const;
@@ -133,7 +133,7 @@ public:
     bool handle_and_dispatch_mouse_event_in_compositor(Web::MouseEvent const&);
     void did_consume_input_event_in_compositor(u64 event_id);
     void did_not_dispatch_input_event_through_compositor(u64 event_id);
-    void did_present_bitmap(Gfx::IntRect content_rect, Gfx::IntRect damage_rect, i32 bitmap_id);
+    void did_present_bitmap(Gfx::IntRect content_rect, Gfx::IntRect damage_rect, i32 bitmap_id, double device_pixel_ratio);
     void did_present_backing_stores(Vector<i32> bitmap_ids, Vector<Gfx::SharedImage> backing_stores);
     void did_add_backing_stores(Vector<i32> bitmap_ids, Vector<Gfx::SharedImage> backing_stores);
     void did_retire_backing_stores(ReadonlySpan<i32> bitmap_ids);
@@ -180,6 +180,7 @@ private:
     virtual void did_request_refresh() override;
     virtual void did_request_cursor_change(Gfx::Cursor cursor) override;
     virtual void did_update_editing_history_state(bool can_undo, bool can_redo) override;
+    virtual void did_set_text_fragment_indication_visibility(bool visible) override;
     virtual void did_request_tooltip_override(Gfx::IntPoint position, ByteString title) override;
     virtual void did_stop_tooltip_override() override;
     virtual void did_enter_tooltip_area(ByteString title) override;
@@ -215,6 +216,7 @@ private:
     virtual void did_cut_selected_text(u64 request_id, ByteString selection) override;
     virtual void did_execute_js_console_input(JsonValue result) override;
     virtual void did_output_js_console_message(ConsoleOutput console_output) override;
+    virtual void did_block_resource() override;
     virtual void did_start_network_request(u64 request_id, URL::URL url, ByteString method, Vector<HTTP::Header> request_headers, ByteBuffer request_body, Optional<String> initiator_type, String referrer_policy, bool is_navigation_request, Web::Fetch::Infrastructure::RequestPriority priority) override;
     virtual void did_receive_network_response_body(u64 request_id, ByteBuffer data) override;
     virtual void did_finish_network_request(u64 request_id, u64 body_size, Requests::RequestTimingInfo timing_info, Optional<Requests::NetworkError> network_error) override;
@@ -242,6 +244,9 @@ private:
     virtual void did_request_minimize_window() override;
     virtual void did_request_fullscreen_window() override;
     virtual void did_request_exit_fullscreen() override;
+    virtual void did_exit_picture_in_picture() override;
+    virtual void did_change_picture_in_picture_video_size(Gfx::IntSize video_size) override;
+    virtual void did_change_picture_in_picture_player_controls_visibility(bool shown) override;
     virtual void did_request_file(ByteString path, i32 request_id) override;
     virtual void did_request_color_picker(Color current_color) override;
     virtual void did_request_geolocation_position(u64 request_id) override;
@@ -266,8 +271,7 @@ private:
     virtual void request_history_operation(Web::HTML::CrossProcessId operation_id, Web::HistoryOperationParameters parameters) override;
     virtual void revoke_history_operation(Web::HTML::CrossProcessId operation_id) override;
     virtual void beforeunload_check_result(Web::HTML::CrossProcessId operation_id, Web::HTML::CheckIfUnloadingIsCanceledResult result, Web::HTML::UnloadPromptShown unload_prompt_shown) override;
-    virtual void changing_navigable_history_job_ready(Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::ChangingNavigableHistoryStepJobDisposition disposition, Web::HTML::UnloadDisplayedDocument unload_displayed_document) override;
-    virtual void changing_navigable_unload_preparation_complete(Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id) override;
+    virtual void changing_navigable_history_job_ready(Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::ChangingNavigableHistoryStepJobDisposition disposition, bool update_only, Optional<Web::HTML::CrossProcessId> target_document_id) override;
     virtual void descendant_unload_task_complete(Web::HTML::CrossProcessId unload_id, Web::HTML::CrossProcessId navigable_id) override;
     virtual void request_navigable_document_abort(Web::HTML::CrossProcessId navigable_id) override;
     virtual void request_navigable_document_unfullscreen(Web::HTML::CrossProcessId navigable_id) override;
@@ -309,24 +313,27 @@ private:
     virtual void did_receive_download_data(u64 download_id, ByteBuffer data) override;
     virtual void did_finish_download(u64 download_id) override;
     virtual void did_fail_download(u64 download_id, String error) override;
-    virtual void did_finish_loading(Web::HTML::CrossProcessId navigable_id, Optional<Utf16String> navigation_id) override;
+    virtual void did_finish_loading(Web::HTML::CrossProcessId navigable_id, Web::HTML::CrossProcessId document_id) override;
     virtual void did_change_title(Utf16String title) override;
-    virtual void did_request_context_menu(Web::HTML::CrossProcessId local_root_id, Gfx::IntPoint content_position, Web::ContextMenuForInputEventsTarget for_input_events_target, Optional<Utf16String> misspelled_word) override;
-    virtual void did_request_link_context_menu(Web::HTML::CrossProcessId local_root_id, Gfx::IntPoint content_position, Web::HTML::PreparedNavigationDescriptor navigation, ByteString, unsigned) override;
+    virtual void did_request_context_menu(Web::HTML::CrossProcessId local_root_id, Gfx::IntPoint content_position, Web::ContextMenuForInputEventsTarget for_input_events_target, Optional<Utf16String> misspelled_word, Optional<u64> text_fragment_generation_id) override;
+    virtual void did_request_link_context_menu(Web::HTML::CrossProcessId local_root_id, Gfx::IntPoint content_position, Web::HTML::PreparedNavigationDescriptor navigation, ByteString, unsigned, Optional<u64> text_fragment_generation_id) override;
+    virtual void did_generate_text_fragment_url(u64 request_id, Optional<URL::URL> url) override;
     virtual void did_request_image_context_menu(Web::HTML::CrossProcessId local_root_id, Gfx::IntPoint content_position, Web::HTML::PreparedNavigationDescriptor navigation, ByteString, unsigned, Optional<Gfx::ShareableBitmap> bitmap) override;
-    virtual void did_request_media_context_menu(Web::HTML::CrossProcessId local_root_id, Gfx::IntPoint content_position, ByteString, unsigned, Web::MediaContextMenu menu, Web::HTML::PreparedNavigationDescriptor navigation) override;
+    virtual void did_request_media_context_menu(Web::HTML::CrossProcessId local_root_id, Gfx::IntPoint content_position, ByteString, unsigned, Web::MediaContextMenu menu, Optional<Web::HTML::PreparedNavigationDescriptor> navigation) override;
     virtual void did_get_highlighted_source(String html) override;
     virtual void did_get_debugger_environments(u64 request_id, Optional<String> error, Vector<DebuggerEnvironment> environments) override;
     virtual void did_evaluate_javascript_in_debugger_frame(u64 request_id, Optional<String> error, DebuggerEvaluationResult result) override;
     virtual void did_get_debugger_object_properties(u64 request_id, Optional<String> error, DebuggerObjectProperties properties) override;
     virtual void did_get_debugger_source_positions(u64 request_id, Vector<DebuggerSourcePosition> positions) override;
     virtual void did_request_alert(Utf16String message) override;
+    virtual void did_request_before_unload(String source) override;
     virtual void did_request_confirm(Utf16String message) override;
     virtual void did_request_prompt(Utf16String message, Utf16String default_) override;
     virtual void did_change_favicon(Gfx::ShareableBitmap favicon) override;
     virtual void did_request_delete_all_cookies(u64 request_id, URL::URL url) override;
     Messages::WebContentClient::DidRequestNewWebViewResponse did_request_new_web_view(Web::HTML::ActivateTab activate_tab, Web::HTML::WebViewHints hints, Optional<Web::HTML::CrossProcessId> opener_navigable_id, Optional<URL::URL> opener_base_url, Utf16String target_name, Web::HTML::SandboxingFlagSet popup_sandboxing_flag_set);
     void did_close_browsing_context();
+    virtual void did_complete_close_preflight(u64 request_id, bool approved) override;
     virtual void did_request_select_dropdown(Web::HTML::CrossProcessId local_root_id, Gfx::IntPoint content_position, i32 minimum_width, Vector<Web::HTML::SelectItem> items) override;
     virtual void did_request_primary_paste() override;
     virtual void did_update_primary_selection(String text) override;

@@ -129,9 +129,26 @@ pub enum BranchCondition {
     MagicalLength,
     /// The input is the `Repr::Pointer` of an object: is it extensible?
     Extensible,
+    /// The input is the `Repr::Pointer` of an object: is it an array that a
+    /// `[[Set]]` of an element it does not have defines that element on
+    /// without running any code, because it is extensible, does not
+    /// interfere with indexed access, is no proxy target, and its prototype
+    /// chain is the realm's default one without indexed properties (like
+    /// `Op::CheckAppendableArray` checks, whatever its length and storage)?
+    HoleFillableArray,
     /// The input is the `Repr::Pointer` of an object: is it an array
     /// iterator over values, like `%Array.prototype.values%` makes?
     ArrayIterator,
+    /// The input is the `Repr::Pointer` of an object: is it the generator
+    /// object of a generator or of an async function (and no async
+    /// generator)?
+    GeneratorObject,
+    /// The input is the `Repr::Pointer` of an object: is it an array whose
+    /// prototype is the realm's `%Array.prototype%`, and do that and
+    /// `%Object.prototype%` have no indexed properties and nothing that may
+    /// interfere with indexed property access, so that indices it has no
+    /// element at read undefined?
+    PlainArrayPrototypeChain,
     /// Input 0 is an object and input 1 its address: does it have the
     /// shape, like `Op::ShapeSwitch` cases test it? Only the refinements of
     /// those cases have this condition; no branch does.
@@ -187,6 +204,20 @@ pub enum TypeofKind {
     Boolean,
     Bigint,
     Function,
+}
+
+/// Which bytecode a `Suspend` suspends the frame for, which tells the code
+/// resuming it what the returned value is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SuspendKind {
+    /// A generator's `Yield`.
+    Yield,
+    /// A generator's `YieldIteratorResult`, whose value is an iterator
+    /// result already.
+    YieldIteratorResult,
+    /// An `Await` of an async function or async generator, whose value is
+    /// the awaited one.
+    Await,
 }
 
 /// Which function of an accessor property an access calls.
@@ -413,6 +444,17 @@ pub enum Op {
     /// Does what `InitializeFrame` does, unless the frame is initialized
     /// already. See `passes::frame_initialization`.
     EnsureFrameInitialized,
+    /// The suspension of the `Yield`, `YieldIteratorResult` and `Await`
+    /// bytecodes, right before the `Return` of the yielded or awaited value:
+    /// records in the frame where its generator or async function resumes
+    /// (`continuation`, or nowhere once it completes) and what the value is
+    /// (`kind`). The `StoreSlot`s before it put every slot live at the
+    /// continuation in frame memory, from where the runtime resumes the
+    /// frame.
+    Suspend {
+        continuation: Option<u32>,
+        kind: SuspendKind,
+    },
     /// The environment the environment at the `Repr::Pointer` input 0 is in
     /// (its outer environment), as a `Repr::Pointer`. Environments keep
     /// their outer environment.
@@ -742,7 +784,7 @@ pub enum Op {
     CheckShape {
         shapes: Vec<ShapeCheck>,
     },
-    /// Exits unless the `PrototypeChainValidity` cell `validity` is still valid.
+    /// Exits unless the `WatchpointSet` cell `validity` is still valid.
     CheckPrototypeChainValid {
         validity: CellId,
     },
@@ -936,6 +978,13 @@ pub enum Op {
     /// `Repr::Float64`: NaN if either is NaN, and -0 below +0.
     Float64Min,
     Float64Max,
+    /// `Math.<function>` of the `Repr::Float64` inputs (two for Pow, one for
+    /// the others), as a `Repr::Float64`, through the runtime's function of
+    /// doubles for it (see `RuntimeInfo::float64_functions`), which only
+    /// computes.
+    CallFloat64Function {
+        function: Float64Function,
+    },
     /// `input 0 comparison input 1` of two `Repr::Float64` inputs, as a
     /// `Repr::Bool`: false if either is NaN, but for the inequalities.
     /// Equalities are strict and loose alike.
@@ -1013,13 +1062,11 @@ pub enum Op {
     CallArrayPush,
 
     // For-of loops over arrays.
-    /// `RuntimeInfo::create_array_iterator` of the tagged iterable input 0
-    /// and the builtin `next` method input 1: a new array iterator over the
-    /// values of the iterable, or the empty value where it is no array such
-    /// iterators can iterate. It saves the registers the call clobbers and
-    /// restores them afterwards, so it is no call for the register
-    /// allocator.
-    CreateArrayIterator,
+    /// `RuntimeInfo::open_array_iteration` of the tagged iterable input 0:
+    /// the iterable, where `GetIterator` iterates it in fast array mode, or
+    /// the empty value. It saves the registers the call clobbers and restores
+    /// them afterwards, so it is no call for the register allocator.
+    OpenArrayIteration,
     /// The `[[IteratedArrayLike]]` of the array iterator at the
     /// `Repr::Pointer` input 0, as a tagged value: the array, or `undefined`
     /// once the iterator is done.
@@ -1034,6 +1081,13 @@ pub enum Op {
     /// Sets the `[[IteratedArrayLike]]` of the array iterator at the
     /// `Repr::Pointer` input 0 to `undefined`, which makes it done.
     FinishArrayIterator,
+    /// The type of the completion the generator object at the
+    /// `Repr::Pointer` input 0 resumed with, as the `Repr::Int32` that
+    /// `GetCompletionFields` writes.
+    LoadGeneratorCompletionType,
+    /// The value of the completion the generator object at the
+    /// `Repr::Pointer` input 0 resumed with, as a tagged value.
+    LoadGeneratorCompletionValue,
 
     // For-in loops.
     /// The number of keys of the property iterator cache input 0, as a
@@ -1147,6 +1201,39 @@ impl Float64UnaryOp {
     }
 }
 
+/// What `Op::CallFloat64Function` computes: the `Math` function of that
+/// name, of numbers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Float64Function {
+    Exp,
+    Log,
+    Sin,
+    Cos,
+    Tan,
+    Pow,
+}
+
+impl Float64Function {
+    pub fn name(self) -> &'static str {
+        match self {
+            Float64Function::Exp => "Exp",
+            Float64Function::Log => "Log",
+            Float64Function::Sin => "Sin",
+            Float64Function::Cos => "Cos",
+            Float64Function::Tan => "Tan",
+            Float64Function::Pow => "Pow",
+        }
+    }
+
+    /// How many numbers the function takes.
+    pub fn argument_count(self) -> usize {
+        match self {
+            Float64Function::Pow => 2,
+            _ => 1,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NodeProperties {
     /// May need to exit to the interpreter after it returns, resuming after
@@ -1187,6 +1274,12 @@ impl Op {
                 writes: Locations::FRAME,
                 ..P::PURE
             },
+            // NB: It hands the frame's slots to the code that resumes it.
+            Op::Suspend { .. } => P {
+                reads: Locations::FRAME,
+                writes: Locations::FRAME,
+                ..P::PURE
+            },
             Op::Phi => P::PURE,
             Op::InitializeFrame | Op::EnsureFrameInitialized | Op::PublishFrame => P {
                 writes: Locations::FRAME,
@@ -1207,7 +1300,7 @@ impl Op {
                 ..P::PURE
             },
             Op::IsCallable => P::PURE,
-            Op::ToBoolean => P {
+            Op::ToBoolean | Op::CallFloat64Function { .. } => P {
                 is_call: true,
                 ..P::PURE
             },
@@ -1474,13 +1567,16 @@ impl Op {
                 allocates: true,
                 ..P::PURE
             },
-            // NB: The new iterator is no location anything reads before.
-            Op::CreateArrayIterator => P {
+            // NB: The runtime watches the intrinsics anew with new watchpoint sets once the old ones fired.
+            Op::OpenArrayIteration => P {
                 reads: Locations::ALL,
                 allocates: true,
                 ..P::PURE
             },
-            Op::LoadArrayIteratorArray | Op::LoadArrayIteratorIndex => P {
+            Op::LoadArrayIteratorArray
+            | Op::LoadArrayIteratorIndex
+            | Op::LoadGeneratorCompletionType
+            | Op::LoadGeneratorCompletionValue => P {
                 reads: Locations::ITERATORS,
                 ..P::PURE
             },
@@ -1499,6 +1595,7 @@ impl Op {
             Op::Phi => "Phi",
             Op::InitializeFrame => "InitializeFrame",
             Op::EnsureFrameInitialized => "EnsureFrameInitialized",
+            Op::Suspend { .. } => "Suspend",
             Op::PublishFrame => "PublishFrame",
             Op::BoxCell => "BoxCell",
             Op::LoadOuterEnvironment => "LoadOuterEnvironment",
@@ -1591,6 +1688,7 @@ impl Op {
             Op::Float64Binary { .. } => "Float64Binary",
             Op::Float64Min => "Float64Min",
             Op::Float64Max => "Float64Max",
+            Op::CallFloat64Function { .. } => "CallFloat64Function",
             Op::Float64Compare { .. } => "Float64Compare",
             Op::Float64ToInt32 => "Float64ToInt32",
             Op::Float64ToUint8Clamped => "Float64ToUint8Clamped",
@@ -1608,9 +1706,11 @@ impl Op {
             Op::LoadElementsCapacity => "LoadElementsCapacity",
             Op::AppendElement => "AppendElement",
             Op::CallArrayPush => "CallArrayPush",
-            Op::CreateArrayIterator => "CreateArrayIterator",
+            Op::OpenArrayIteration => "OpenArrayIteration",
             Op::LoadArrayIteratorArray => "LoadArrayIteratorArray",
             Op::LoadArrayIteratorIndex => "LoadArrayIteratorIndex",
+            Op::LoadGeneratorCompletionType => "LoadGeneratorCompletionType",
+            Op::LoadGeneratorCompletionValue => "LoadGeneratorCompletionValue",
             Op::StoreArrayIteratorIndex => "StoreArrayIteratorIndex",
             Op::FinishArrayIterator => "FinishArrayIterator",
             Op::SlowPathOutput { .. } => "SlowPathOutput",
@@ -1918,6 +2018,10 @@ pub struct Graph {
     /// Where exits of each executable were taken before, as (executable,
     /// pc, kind), for passes that must not repeat a failed speculation.
     pub exit_sites: Vec<(u32, u32, ExitKind)>,
+    /// The nodes that loop invariant code motion moved out of blocks that not
+    /// every iteration of their loop runs, which exit with
+    /// `ExitKind::Hoisted` instead of their own kind of exit.
+    pub speculatively_hoisted: Vec<NodeId>,
     /// The argument slots of the compiled function that its legacy
     /// `arguments` shows. Empty for functions without legacy `arguments`.
     pub legacy_arguments: core::ops::Range<u32>,

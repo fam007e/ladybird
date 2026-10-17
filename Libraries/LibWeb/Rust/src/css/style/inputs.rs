@@ -1079,6 +1079,7 @@ impl RetainedState {
 
     /// Replace the ordered list of nodes a slot has assigned to it, text nodes included.
     pub fn set_slot_assigned_nodes(&mut self, slot: StyleNodeID, nodes: &[StyleNodeID]) {
+        self.counters.bump(Counter::SlotAssignedNodeListsPublished);
         self.tree.set_assigned_nodes(slot, nodes, &mut self.memory);
     }
 
@@ -2578,6 +2579,25 @@ impl StyleEngine {
         self.host
             .tree_staging_memory
             .resize_required_to(&mut self.retained.memory, bytes);
+    }
+
+    /// Raises `deepest_element` to the depth of the deepest element the tree holds, and keeps `staged_rows` at how many
+    /// relation rows are staged and not settled yet, both of which the document's host reads, rather than counts of
+    /// the engine's own. Nothing is staged yet.
+    pub(crate) fn share_tree_depth(
+        &mut self,
+        deepest_element: std::sync::Arc<std::sync::atomic::AtomicU32>,
+        staged_rows: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    ) {
+        self.retained.tree.share_deepest_element(deepest_element);
+        self.host.tree_staging.share_staged_rows(staged_rows);
+    }
+
+    /// Gives a fork counts of the tree's depth of its own in place of those it shares with the host, holding what they
+    /// hold now.
+    pub(crate) fn detach_tree_depth_for_fork(&mut self) {
+        self.retained.tree.detach_deepest_element_for_fork();
+        self.host.tree_staging.detach_staged_rows_for_fork();
     }
 
     /// Install final staged relation rows at the transaction barrier.

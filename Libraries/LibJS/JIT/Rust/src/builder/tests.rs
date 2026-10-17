@@ -384,22 +384,14 @@ fn instructions_whose_feedback_is_empty_never_ran() {
 
 #[test]
 fn unsupported_instructions_fail_cleanly() {
-    let program = assemble(|label| {
-        vec![
-            Instruction::Yield {
-                continuation_label: Some(label(1)),
-                value: r(5),
-            },
-            Instruction::Return { value: r(5) },
-        ]
-    });
+    let program = assemble(|_| vec![Instruction::Catch { dst: r(5) }, Instruction::Return { value: r(5) }]);
     let snapshot = snapshot_for(&program, test_layout());
     let failure = build_graph(&snapshot).unwrap_err();
     assert!(matches!(
         failure,
         CompileFailure::UnsupportedInstruction {
             pc: 0,
-            opcode: crate::bytecode::OpCode::Yield,
+            opcode: crate::bytecode::OpCode::Catch,
             ..
         }
     ));
@@ -838,6 +830,7 @@ pub(crate) mod property_access {
             key_value: 0,
             prototype_property: None,
             prototype_property_intrinsic: None,
+            prototype_property_inline_executable: None,
             accessor_function: None,
             holds_accessor: false,
         }
@@ -1103,7 +1096,7 @@ pub(crate) mod property_access {
         assert_eq!(text.matches("AssumeValid").count(), 1, "{text}");
         assert_eq!(
             graph.dependencies,
-            vec![crate::code::Dependency::PrototypeChainValid(CellId(0x8000))]
+            vec![crate::code::Dependency::WatchpointSetValid(CellId(0x8000))]
         );
     }
 

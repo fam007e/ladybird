@@ -16,6 +16,8 @@
 #include <LibRequests/Request.h>
 #include <LibRequests/RequestClient.h>
 #include <LibURL/Parser.h>
+#include <LibWeb/Bindings/MainThreadVM.h>
+#include <LibWeb/DOM/Document.h>
 #include <LibWeb/Fetch/Infrastructure/HTTP/Requests.h>
 #include <LibWeb/Fetch/Infrastructure/URL.h>
 #include <LibWeb/Loader/ContentBlocker.h>
@@ -33,6 +35,22 @@ static RefPtr<ResourceLoader>& resource_loader()
 {
     static RefPtr<ResourceLoader>& resource_loader = *new RefPtr<ResourceLoader>;
     return resource_loader;
+}
+
+static Optional<URL::URL>& proxy_autoconfig_url_storage()
+{
+    static Optional<URL::URL>& proxy_autoconfig_url = *new Optional<URL::URL>;
+    return proxy_autoconfig_url;
+}
+
+void ResourceLoader::set_proxy_autoconfig_url(URL::URL url)
+{
+    proxy_autoconfig_url_storage() = move(url);
+}
+
+Optional<URL::URL> const& ResourceLoader::proxy_autoconfig_url()
+{
+    return proxy_autoconfig_url_storage();
 }
 
 void ResourceLoader::initialize(GC::Heap& heap, NonnullRefPtr<Requests::RequestClient> request_client)
@@ -58,10 +76,24 @@ ResourceLoader::ResourceLoader(GC::Heap& heap, NonnullRefPtr<Requests::RequestCl
     : m_heap(heap)
     , m_user_agent(MUST(String::from_utf8(default_user_agent)))
     , m_platform(MUST(String::from_utf8(default_platform)))
-    , m_preferred_languages({ "en-US"_string })
-    , m_navigator_compatibility_mode(default_navigator_compatibility_mode)
+    , m_preferred_languages(default_preferred_languages())
 {
     set_client(move(request_client));
+}
+
+NavigatorCompatibilityMode ResourceLoader::s_navigator_compatibility_mode = default_navigator_compatibility_mode;
+
+void ResourceLoader::set_navigator_compatibility_mode(NavigatorCompatibilityMode mode)
+{
+    s_navigator_compatibility_mode = mode;
+
+    // A script reads two strings to tell engines apart that no navigator attribute covers: the frames of an error's
+    // stack, and the source text of a built-in function. Both follow the engine the navigator claims.
+    auto& vm = Bindings::main_thread_vm();
+    if (mode == NavigatorCompatibilityMode::Chrome)
+        vm.set_source_text_syntaxes(JS::VM::StackFrameSyntax::Indented, JS::VM::NativeFunctionSourceSyntax::SingleLine);
+    else
+        vm.set_source_text_syntaxes(JS::VM::StackFrameSyntax::AtSign, JS::VM::NativeFunctionSourceSyntax::MultiLine);
 }
 
 void ResourceLoader::set_client(NonnullRefPtr<Requests::RequestClient> request_client)
@@ -73,30 +105,42 @@ void ResourceLoader::set_client(NonnullRefPtr<Requests::RequestClient> request_c
     };
 }
 
-void ResourceLoader::prefetch_dns(URL::URL const& url, URL::URL const& source_url)
+void ResourceLoader::prefetch_dns(GC::Ptr<DOM::Document> document, URL::URL const& url, URL::URL const& source_url)
 {
     if (url.scheme().is_one_of("file"sv, "data"sv))
         return;
 
-    if (ContentBlocker::the().is_filtered(url, source_url, ContentBlocker::ResourceType::Other)) {
-        dbgln("ResourceLoader: Refusing to prefetch DNS for '{}': \033[31;1mURL was filtered\033[0m", url);
-        return;
+    if (!document || document->content_blocking_enabled()) {
+        if (ContentBlocker::the().is_filtered(url, source_url, ContentBlocker::ResourceType::Other)) {
+            dbgln("ResourceLoader: Refusing to prefetch DNS for '{}': \033[31;1mURL was filtered\033[0m", url);
+            return;
+        }
     }
+
+    // Speculation would resolve and connect without the proxy that the PAC file would have picked.
+    if (proxy_autoconfig_url().has_value())
+        return;
 
     // FIXME: We could put this request in a queue until the client connection is re-established.
     if (m_request_client)
         m_request_client->ensure_connection(url, RequestServer::CacheLevel::ResolveOnly);
 }
 
-void ResourceLoader::preconnect(URL::URL const& url, URL::URL const& source_url)
+void ResourceLoader::preconnect(GC::Ptr<DOM::Document> document, URL::URL const& url, URL::URL const& source_url)
 {
     if (url.scheme().is_one_of("file"sv, "data"sv))
         return;
 
-    if (ContentBlocker::the().is_filtered(url, source_url, ContentBlocker::ResourceType::Other)) {
-        dbgln("ResourceLoader: Refusing to pre-connect to '{}': \033[31;1mURL was filtered\033[0m", url);
-        return;
+    if (!document || document->content_blocking_enabled()) {
+        if (ContentBlocker::the().is_filtered(url, source_url, ContentBlocker::ResourceType::Other)) {
+            dbgln("ResourceLoader: Refusing to pre-connect to '{}': \033[31;1mURL was filtered\033[0m", url);
+            return;
+        }
     }
+
+    // Speculation would resolve and connect without the proxy that the PAC file would have picked.
+    if (proxy_autoconfig_url().has_value())
+        return;
 
     // FIXME: We could put this request in a queue until the client connection is re-established.
     if (m_request_client)
@@ -186,10 +230,14 @@ static bool should_block_request(LoadRequest const& request)
         return true;
     }
 
-    auto source_url = request.source_url().value_or(url);
-    if (ContentBlocker::the().is_filtered(url, source_url, request.destination(), request.initiator_type(), request.request_mode())) {
-        log_filtered_request(request);
-        return true;
+    if (auto page = request.page(); !page || page->content_blocking_enabled_for_url(request.top_level_creation_url())) {
+        auto source_url = request.source_url().value_or(url);
+        if (ContentBlocker::the().is_filtered(url, source_url, request.destination(), request.initiator_type(), request.request_mode())) {
+            log_filtered_request(request);
+            if (page)
+                page->client().page_did_block_resource();
+            return true;
+        }
     }
 
     return false;
@@ -405,6 +453,15 @@ RefPtr<Requests::Request> ResourceLoader::load(LoadRequest& request, GC::Root<On
         auto not_implemented_error = ByteString::formatted("Protocol not implemented: {}", url.scheme());
         log_failure(request, not_implemented_error);
         on_complete->function()(false, {}, not_implemented_error);
+        return nullptr;
+    }
+
+    // We cannot evaluate PAC files yet, and connecting directly would ignore the proxy that was asked for.
+    if (proxy_autoconfig_url().has_value()) {
+        dbgln("FIXME: Evaluate the PAC file to find the proxy for {}; failing the request", url);
+        auto error = "PAC proxy configurations are not supported"sv;
+        log_failure(request, error);
+        on_complete->function()(false, {}, error);
         return nullptr;
     }
 

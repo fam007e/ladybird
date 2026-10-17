@@ -304,10 +304,28 @@ Optional<Compositing::CanvasId> CompositorConnection::create_canvas_2d_context(G
     if (!can_send_message_to_compositor())
         return {};
 
-    auto response = send_sync<Messages::CompositorWebContentServer::CreateCanvas2dContext>(size, alpha);
-    if (!response->success())
+    // NB: The Compositor refuses the same sizes, so a context it is asked to create always exists afterwards.
+    if (!Gfx::is_valid_canvas_2d_size(size))
         return {};
-    return response->canvas_id();
+
+    // OPTIMIZATION: Creating a context is asynchronous, under an ID from a range reserved up front. A synchronous
+    //               reply would wait for the Compositor to replay every canvas command queued before it.
+    if (m_reserved_canvas_ids_remaining == 0) {
+        auto response = send_sync_but_allow_failure<Messages::CompositorWebContentServer::ReserveCanvasIds>();
+        if (!response) {
+            did_lose_compositor();
+            return {};
+        }
+        m_next_reserved_canvas_id = response->first_canvas_id().value();
+        m_reserved_canvas_ids_remaining = response->count();
+        if (m_reserved_canvas_ids_remaining == 0)
+            return {};
+    }
+    auto canvas_id = Compositing::CanvasId { m_next_reserved_canvas_id++ };
+    --m_reserved_canvas_ids_remaining;
+
+    async_create_canvas_2d_context(canvas_id, size, alpha);
+    return canvas_id;
 }
 
 void CompositorConnection::update_canvas_2d_stream(Compositing::Canvas2DCommandStream& stream)
@@ -412,12 +430,12 @@ void CompositorConnection::invalidate_wheel_event_listener_state(Web::Compositor
     async_invalidate_wheel_event_listener_state(context_id, generation);
 }
 
-Compositing::AsyncScrollEnqueueResult CompositorConnection::async_scroll_by(Web::CompositorContextId context_id, Web::UniqueNodeID document_id, Gfx::FloatPoint position, Gfx::FloatPoint delta, Gfx::IntRect viewport_rect, Web::WheelDeltaPrecision wheel_delta_precision, Web::ScrollGesturePhase scroll_gesture_phase, u32 modifiers, Compositing::AsyncScrollOperationTracking operation_tracking)
+Compositing::AsyncScrollEnqueueResult CompositorConnection::async_scroll_by(Web::CompositorContextId context_id, Web::UniqueNodeID document_id, Gfx::FloatPoint position, Gfx::FloatPoint delta, Gfx::IntRect viewport_rect, Web::WheelDeltaPrecision wheel_delta_precision, Web::ScrollGesturePhase scroll_gesture_phase, u32 modifiers, Compositing::AsyncScrollOperationTracking operation_tracking, Compositing::WheelStepDispatch wheel_step_dispatch, u64 input_event_id)
 {
     if (!can_send_message_to_compositor())
         return {};
 
-    auto response = send_sync_but_allow_failure<Messages::CompositorWebContentServer::AsyncScrollBy>(context_id, document_id, position, delta, viewport_rect, wheel_delta_precision, scroll_gesture_phase, modifiers, operation_tracking);
+    auto response = send_sync_but_allow_failure<Messages::CompositorWebContentServer::AsyncScrollBy>(context_id, document_id, position, delta, viewport_rect, wheel_delta_precision, scroll_gesture_phase, modifiers, operation_tracking, wheel_step_dispatch, input_event_id);
     if (!response) {
         did_lose_compositor();
         return {};
@@ -438,17 +456,59 @@ Compositing::AsyncScrollEnqueueResult CompositorConnection::smooth_scroll_to(Web
     return response->take_result();
 }
 
-Gfx::FloatPoint CompositorConnection::elastic_overscroll_stretch_for_testing(Web::CompositorContextId context_id, Web::AsyncScrollNodeStableID stable_node_id)
+String CompositorConnection::scroll_state_for_testing(Web::CompositorContextId context_id, Web::AsyncScrollNodeStableID stretched_scroller)
 {
     if (!can_send_message_to_compositor())
         return {};
 
-    auto response = send_sync_but_allow_failure<Messages::CompositorWebContentServer::ElasticOverscrollStretchForTesting>(context_id, stable_node_id);
+    auto response = send_sync_but_allow_failure<Messages::CompositorWebContentServer::ScrollStateForTesting>(context_id, stretched_scroller);
     if (!response) {
         did_lose_compositor();
         return {};
     }
-    return response->stretch();
+    return response->take_scroll_state();
+}
+
+void CompositorConnection::synchronize_for_testing()
+{
+    if (!can_send_message_to_compositor())
+        return;
+    if (!send_sync_but_allow_failure<Messages::CompositorWebContentServer::SynchronizeForTesting>())
+        did_lose_compositor();
+}
+
+Optional<Compositing::FirstWheelStepRouteForTesting> CompositorConnection::route_first_wheel_step_for_testing(Web::CompositorContextId context_id, Gfx::FloatPoint position, Gfx::FloatPoint delta_in_css_pixels)
+{
+    if (!can_send_message_to_compositor())
+        return {};
+    auto response = send_sync_but_allow_failure<Messages::CompositorWebContentServer::RouteFirstWheelStepForTesting>(context_id, position, delta_in_css_pixels);
+    if (!response) {
+        did_lose_compositor();
+        return {};
+    }
+    if (!response->decision().has_value())
+        return {};
+    return Compositing::FirstWheelStepRouteForTesting { .route = { *response->decision(), response->scroller() }, .document_id = response->document_id() };
+}
+
+void CompositorConnection::begin_input_trace_for_testing(Web::CompositorContextId context_id)
+{
+    if (!can_send_message_to_compositor())
+        return;
+    if (!send_sync_but_allow_failure<Messages::CompositorWebContentServer::BeginInputTraceForTesting>(context_id))
+        did_lose_compositor();
+}
+
+Vector<Web::InputTraceRecord> CompositorConnection::take_input_trace_for_testing(Web::CompositorContextId context_id)
+{
+    if (!can_send_message_to_compositor())
+        return {};
+    auto response = send_sync_but_allow_failure<Messages::CompositorWebContentServer::TakeInputTraceForTesting>(context_id);
+    if (!response) {
+        did_lose_compositor();
+        return {};
+    }
+    return response->take_records();
 }
 
 void CompositorConnection::cancel_smooth_scroll(Web::CompositorContextId context_id, Web::AsyncScrollNodeStableID stable_node_id)
@@ -539,11 +599,11 @@ void CompositorConnection::merge_async_scroll_updates(Web::CompositorContextId c
     pending.user_scroll_gesture_ended |= updates.user_scroll_gesture_ended;
 }
 
-void CompositorConnection::viewport_size_updated(Web::CompositorContextId context_id, Gfx::IntSize viewport_size, Compositing::WindowResizingInProgress window_resize_in_progress)
+void CompositorConnection::viewport_size_updated(Web::CompositorContextId context_id, Gfx::IntSize viewport_size, double device_pixel_ratio, Compositing::WindowResizingInProgress window_resize_in_progress)
 {
     if (!can_send_message_to_compositor())
         return;
-    async_viewport_size_updated(context_id, viewport_size, window_resize_in_progress);
+    async_viewport_size_updated(context_id, viewport_size, device_pixel_ratio, window_resize_in_progress);
 }
 
 bool CompositorConnection::request_rendering_opportunity(Web::CompositorContextId context_id, double maximum_frames_per_second)

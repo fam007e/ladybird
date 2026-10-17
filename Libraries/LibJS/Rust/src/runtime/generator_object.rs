@@ -26,8 +26,9 @@ use crate::runtime::ecmascript_function_object::EcmascriptFunctionObject;
 use crate::runtime::error::ErrorKind;
 use crate::runtime::error_types::ErrorType;
 use crate::runtime::function_object::FunctionObject;
+use crate::runtime::iterator::{BuiltinIteratorNext, BuiltinIteratorStep};
 use crate::runtime::native_javascript_backed_function::NativeJavaScriptBackedFunction;
-use crate::runtime::object::MayInterfereWithIndexedPropertyAccess;
+use crate::runtime::object::{MayInterfereWithIndexedPropertyAccess, ORDINARY_OBJECT_METHODS, ObjectMethods};
 use crate::runtime::shared_function_instance_data::FunctionKind;
 
 /// Variant<GC::Ref<ECMAScriptFunctionObject>, GC::Ref<NativeJavaScriptBackedFunction>>: the function whose body a
@@ -107,14 +108,19 @@ pub struct GeneratorObject {
     yield_continuation: Cell<u32>,
     generator_state: Cell<GeneratorState>,
     generator_brand: Option<&'static str>,
-    pending_completion_value: Cell<Value>,
+    pub(crate) pending_completion_value: Cell<Value>,
     #[gc(untraced)]
-    pending_completion_type: Cell<CompletionType>,
+    pub(crate) pending_completion_type: Cell<CompletionType>,
     #[gc(untraced)]
     execute: GeneratorExecuteFunction,
 }
 
-define_cell!(GeneratorObject, Object, extends: [Object], finalize: finalize);
+pub static GENERATOR_OBJECT_METHODS: ObjectMethods = ObjectMethods {
+    as_builtin_iterator_if_next_is_not_redefined: GeneratorObject::as_builtin_iterator_if_next_is_not_redefined,
+    ..ORDINARY_OBJECT_METHODS
+};
+
+define_cell!(GeneratorObject, Object, extends: [Object], methods: GENERATOR_OBJECT_METHODS, finalize: finalize);
 
 impl Deref for GeneratorObject {
     type Target = Object;
@@ -206,14 +212,54 @@ impl GeneratorObject {
         Gc::from_ref(self)
     }
 
-    /// [[GeneratorContext]]. It lives out of line until the generator is finalized, so the pointer stays valid for
-    /// as long as the generator does.
+    fn as_builtin_iterator_if_next_is_not_redefined(_: &Object, next_method: Value) -> Option<BuiltinIteratorNext> {
+        if next_method.is_function() {
+            let next_function = next_method.as_function();
+            if let Some(realm) = next_function.realm()
+                && next_function == realm.generator_prototype_next_function()
+            {
+                return Some(GeneratorObject::builtin_next);
+            }
+        }
+        None
+    }
+
+    fn builtin_next(object: &Object, vm: &Vm) -> ThrowCompletionOr<BuiltinIteratorStep> {
+        let generator_object = object
+            .as_gc()
+            .downcast::<GeneratorObject>()
+            .expect("the builtin step of a GeneratorObject steps a GeneratorObject");
+
+        // 27.5.1.2 Generator.prototype.next ( value ), https://tc39.es/ecma262/#sec-generator.prototype.next
+        // 1. Return ? GeneratorResume(this value, value, empty).
+        // NB: IteratorStep calls next without arguments, so value is undefined.
+        let iteration_result = generator_object.resume(vm, Value::UNDEFINED, None)?;
+
+        if iteration_result.done {
+            return Ok(BuiltinIteratorStep::Done);
+        }
+        if iteration_result.value_is_iterator_result {
+            return Ok(BuiltinIteratorStep::IteratorResult(iteration_result.value.as_object()));
+        }
+        Ok(BuiltinIteratorStep::Value(iteration_result.value))
+    }
+
+    /// [[GeneratorContext]]. It lives out of line until the generator completes or is finalized, so the pointer stays
+    /// valid for as long as the generator is not completed.
     fn generator_context(&self) -> NonNull<ExecutionContext> {
         self.execution_context
             .borrow()
             .as_ref()
             .expect("a live generator has its execution context")
             .as_non_null()
+    }
+
+    /// Once a generator enters the completed state it never leaves it and its associated execution context is never
+    /// resumed. Any execution state associated with generator can be discarded at this point.
+    /// NB: Freeing the context right away, rather than when the generator is finalized, lets the next generator reuse
+    ///     its memory while it is still in the cache.
+    fn discard_execution_context(&self) {
+        drop(self.execution_context.replace(None));
     }
 
     pub fn generator_state(&self) -> GeneratorState {
@@ -290,7 +336,7 @@ impl GeneratorObject {
 
         // Clear yield state so that a normal return (no yield) is detected as done.
         {
-            // SAFETY: Only finalizing the generator frees its context, and the generator is alive while it runs.
+            // SAFETY: Only completing or finalizing the generator frees its context, and it is alive and running.
             let execution_context = unsafe { self.generator_context().as_ref() };
             execution_context
                 .yield_continuation
@@ -315,6 +361,7 @@ impl GeneratorObject {
             // Uncaught exceptions disable the generator.
             Err(exception) => {
                 self.generator_state.set(GeneratorState::Completed);
+                self.discard_execution_context();
                 return Err(Throw::new(exception));
             }
             Ok(value) => value,
@@ -333,6 +380,9 @@ impl GeneratorObject {
         } else {
             GeneratorState::SuspendedYield
         });
+        if done {
+            self.discard_execution_context();
+        }
 
         Ok(IterationResult::new_with_value_is_iterator_result(
             value,
@@ -395,7 +445,7 @@ impl GeneratorObject {
             self.generator_state.set(GeneratorState::Completed);
 
             // b. Once a generator enters the completed state it never leaves it and its associated execution context is never resumed. Any execution state associated with generator can be discarded at this point.
-            // We don't currently discard anything.
+            self.discard_execution_context();
 
             // c. Set state to completed.
             state = GeneratorState::Completed;

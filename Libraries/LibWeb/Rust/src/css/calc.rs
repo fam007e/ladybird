@@ -374,7 +374,7 @@ pub(crate) fn serialize_context_free_calculation(
         resolve_numbers_as_integers: false,
         accepted_ranges: crate::css::style_value::RetainedNumericRangeList::empty(),
     };
-    crate::css::serialize::serialize_style_value_to_utf16(&calculated)
+    Some(crate::css::serialize::serialize_style_value_to_utf16(&calculated))
 }
 
 /// The result of evaluating a calculation: the numeric value in canonical
@@ -1157,16 +1157,6 @@ pub unsafe extern "C" fn rust_calc_node_create_clamp(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_calc_node_release(node: *const CalcNode) {
     drop(unsafe { Arc::from_raw(node) });
-}
-
-/// Retains an additional strong reference to a calculation node, so the C++
-/// side can take ownership of a borrowed node.
-///
-/// # Safety
-/// `node` must be a valid calculation node pointer.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_calc_node_retain(node: *const CalcNode) {
-    unsafe { Arc::increment_strong_count(node) };
 }
 
 /// https://drafts.csswg.org/css-values-4/#determine-the-type-of-a-calculation

@@ -44,6 +44,7 @@
 #include <LibWeb/DOM/ShadowRoot.h>
 #include <LibWeb/DOM/ViewportClient.h>
 #include <LibWeb/Export.h>
+#include <LibWeb/Forward.h>
 #include <LibWeb/HTML/DocumentReadyState.h>
 #include <LibWeb/HTML/Focus.h>
 #include <LibWeb/HTML/GlobalEventHandlers.h>
@@ -52,6 +53,7 @@
 #include <LibWeb/HTML/PreloadEntry.h>
 #include <LibWeb/HTML/Scripting/ScriptRegistry.h>
 #include <LibWeb/HTML/SessionHistoryEntry.h>
+#include <LibWeb/HTML/TextDirective.h>
 #include <LibWeb/Infra/SerializedURL.h>
 #include <LibWeb/InvalidateDisplayList.h>
 #include <LibWeb/Layout/LayoutRustFFI.h>
@@ -71,6 +73,7 @@
 #include <LibWebCommon/HTML/CrossOrigin/OpenerPolicy.h>
 #include <LibWebCommon/HTML/CrossProcessId.h>
 #include <LibWebCommon/HTML/SandboxingFlagSet.h>
+#include <LibWebCommon/HTML/UserNavigationInvolvement.h>
 #include <LibWebCommon/HTML/VisibilityState.h>
 
 namespace Web::Compositor {
@@ -147,6 +150,7 @@ enum class InvalidateLayoutTreeReason {
     X(EventHandlerDispatchChromeWidgetEvent, false) \
     X(EventHandlerHandleDragAndDrop, false)         \
     X(EventHandlerHandleKeyDown, false)             \
+    X(EventHandlerHandleMouseCancel, false)         \
     X(EventHandlerHandleMouseDown, false)           \
     X(EventHandlerHandleMouseMove, false)           \
     X(EventHandlerHandleMouseUp, false)             \
@@ -262,6 +266,7 @@ enum class PolicyControlledFeature : u8 {
     Fullscreen,
     Gamepad,
     Microphone,
+    PictureInPicture,
     WindowManagement,
 };
 
@@ -396,8 +401,16 @@ public:
     Optional<URL::URL> encoding_parse_url(Utf16View) const;
     Optional<Utf16String> encoding_parse_and_serialize_url(Utf16View) const;
 
-    CSS::StyleComputer& style_computer() { return *m_style_computer; }
-    CSS::StyleComputer const& style_computer() const { return *m_style_computer; }
+    CSS::StyleComputer& style_computer()
+    {
+        if (!m_style_computer) [[unlikely]]
+            create_style_computer();
+        return *m_style_computer;
+    }
+    CSS::StyleComputer const& style_computer() const { return const_cast<Document&>(*this).style_computer(); }
+    // NB: The style computer is made when something first needs it, so a document that never styles anything, such as
+    //     one DOMParser creates, never makes one.
+    CSS::StyleComputer* style_computer_if_created() { return m_style_computer.ptr(); }
 
     CSS::FontComputer& font_computer() { return *m_font_computer; }
     CSS::FontComputer const& font_computer() const { return *m_font_computer; }
@@ -743,6 +756,10 @@ public:
     };
     void set_focused_area(GC::Ptr<Node>, InvalidateFocusPseudoClasses = InvalidateFocusPseudoClasses::Yes);
 
+    // https://html.spec.whatwg.org/multipage/interaction.html#sequential-focus-navigation-starting-point
+    GC::Ptr<Node> sequential_focus_navigation_starting_point() { return m_sequential_focus_navigation_starting_point; }
+    void move_sequential_focus_navigation_starting_point_to(GC::Ptr<Node> node) { m_sequential_focus_navigation_starting_point = node; }
+
     HTML::FocusTrigger last_focus_trigger() const { return m_last_focus_trigger; }
     void set_last_focus_trigger(HTML::FocusTrigger trigger) { m_last_focus_trigger = trigger; }
 
@@ -759,8 +776,9 @@ public:
     Element const* accessibility_focus_target() const { return m_accessibility_focus_target.ptr(); }
     void set_accessibility_focus_target(GC::Ptr<Element>);
 
-    void try_to_scroll_to_the_fragment();
-    void scroll_to_the_fragment();
+    void try_to_scroll_to_the_fragment(bool allow_text_directive_scroll = false);
+    void schedule_text_fragment_search_after_parser_progress(Badge<HTML::HTMLParser>);
+    void scroll_to_the_fragment(bool allow_text_directive_scroll = false);
     void scroll_to_the_beginning_of_the_document();
 
     bool created_for_appropriate_template_contents() const { return m_created_for_appropriate_template_contents; }
@@ -812,6 +830,21 @@ public:
 
     DOMImplementation* implementation();
 
+    // https://wicg.github.io/scroll-to-text-fragment/#feature-detectability
+    GC::Ref<FragmentDirective> fragment_directive();
+    Optional<Vector<HTML::TextDirective>> const& pending_text_directives() const { return m_pending_text_directives; }
+    void set_pending_text_directives(Optional<Vector<HTML::TextDirective>> directives);
+    void clear_pending_text_directives();
+    ReadonlySpan<GC::Ref<Range>> text_fragment_ranges() const { return m_text_fragment_ranges; }
+    void dismiss_text_fragment_indication();
+    bool pending_text_directive_scroll_allowed() const { return m_pending_text_directive_scroll_allowed; }
+    bool check_if_a_text_directive_can_be_scrolled(Optional<URL::Origin> const&, Optional<HTML::UserNavigationInvolvement>);
+    bool text_directive_user_activation() const { return m_text_directive_user_activation; }
+    void set_text_directive_user_activation(bool value) { m_text_directive_user_activation = value; }
+    bool browsing_context_group_has_multiple_contexts() const;
+    bool browsing_context_group_has_remote_contexts() const { return m_browsing_context_group_has_remote_contexts; }
+    void set_browsing_context_group_has_remote_contexts(bool value) { m_browsing_context_group_has_remote_contexts = value; }
+
     GC::Ptr<HTML::HTMLScriptElement> current_script() const { return m_current_script.ptr(); }
     void set_current_script(Badge<HTML::HTMLScriptElement>, GC::Ptr<HTML::HTMLScriptElement> script) { m_current_script = move(script); }
     static constexpr size_t current_script_offset() { return offsetof(Document, m_current_script); }
@@ -826,8 +859,18 @@ public:
 
     [[nodiscard]] bool has_a_style_sheet_that_is_blocking_scripts() const;
 
-    bool is_fully_active() const;
+    bool is_fully_active() const
+    {
+        // Whether a document is fully active rarely changes, so the answer is kept until invalidate_full_activity().
+        if (m_full_activity_epoch == s_full_activity_epoch) [[likely]]
+            return m_is_fully_active;
+        return update_is_fully_active();
+    }
     bool is_active() const;
+
+    // To call whenever anything that decides if a document is fully active changes: a navigable's parent, its being
+    // destroyed, or its active document, or a document's navigable or unload counter.
+    static void invalidate_full_activity() { ++s_full_activity_epoch; }
 
     [[nodiscard]] HTML::HTMLParser::AllowDeclarativeShadowRoots allow_declarative_shadow_roots() const;
     void set_allow_declarative_shadow_roots(HTML::HTMLParser::AllowDeclarativeShadowRoots allow_declarative_shadow_roots);
@@ -966,6 +1009,12 @@ public:
     // https://html.spec.whatwg.org/multipage/dom.html#is-initial-about:blank
     bool is_initial_about_blank() const { return m_is_initial_about_blank; }
     void set_is_initial_about_blank(bool b) { m_is_initial_about_blank = b; }
+
+    bool iframe_load_in_progress() const { return m_iframe_load_in_progress; }
+    void set_iframe_load_in_progress(bool value) { m_iframe_load_in_progress = value; }
+
+    bool mute_iframe_load() const { return m_mute_iframe_load; }
+    void set_mute_iframe_load(bool value) { m_mute_iframe_load = value; }
 
     HTML::CrossProcessId id() const { return m_id.value(); }
     void set_id(HTML::CrossProcessId);
@@ -1108,12 +1157,13 @@ public:
     void shared_declarative_refresh_steps(Utf16View input, GC::Ptr<HTML::HTMLMetaElement const> meta_element = nullptr);
 
     struct TopOfTheDocument { };
-    using IndicatedPart = Variant<Element*, TopOfTheDocument>;
-    IndicatedPart determine_the_indicated_part() const;
+    using IndicatedPart = Variant<Element*, GC::Ptr<Range>, TopOfTheDocument>;
+    IndicatedPart determine_the_indicated_part();
+    void update_text_fragment_indication_visibility(bool visible);
 
     u32 unload_counter() const { return m_unload_counter; }
 
-    void update_for_history_step_application(NonnullRefPtr<HTML::SessionHistoryEntry>, bool do_not_reactivate, size_t script_history_length, size_t script_history_index, Optional<HTML::NavigationType> navigation_type, Optional<Vector<NonnullRefPtr<HTML::SessionHistoryEntry>>> entries_for_navigation_api = {}, RefPtr<HTML::SessionHistoryEntry> previous_entry_for_activation = {}, bool previous_entry_for_activation_document_is_initial_about_blank = false);
+    void update_for_history_step_application(NonnullRefPtr<HTML::SessionHistoryEntry>, bool do_not_reactivate, size_t script_history_length, size_t script_history_index, Optional<HTML::NavigationType> navigation_type, Optional<Vector<NonnullRefPtr<HTML::SessionHistoryEntry>>> entries_for_navigation_api = {}, RefPtr<HTML::SessionHistoryEntry> previous_entry_for_activation = {}, bool previous_entry_for_activation_document_is_initial_about_blank = false, bool allow_text_directive_scroll = false, Optional<URL::Origin> initiator_origin = {}, Optional<HTML::UserNavigationInvolvement> user_involvement = {});
 
     HashMap<URL::URL, GC::Ptr<HTML::SharedResourceRequest>>& shared_resource_requests();
     HashMap<URL::URL, GC::Ptr<HTML::SharedResourceRequest>> const& shared_resource_requests() const;
@@ -1575,6 +1625,12 @@ public:
     bool is_simple_fullscreen_document() const;
     GC::Ref<GC::HeapVector<GC::Ref<Document>>> collect_documents_to_unfullscreen();
 
+    GC::Ptr<Element> picture_in_picture_element() const { return m_picture_in_picture_element; }
+    void set_picture_in_picture_element(GC::Ptr<Element>);
+    GC::Ptr<Element> retargeted_picture_in_picture_element() const;
+    bool picture_in_picture_enabled() const;
+    GC::Ref<WebIDL::Promise> exit_picture_in_picture();
+
     auto& script_blocking_style_sheet_set() { return m_script_blocking_style_sheet_set; }
     auto const& script_blocking_style_sheet_set() const { return m_script_blocking_style_sheet_set; }
     void remove_from_script_blocking_style_sheet_set(Element&);
@@ -1591,6 +1647,8 @@ public:
 
     CSS::StyleScope const& style_scope() const { return m_style_scope; }
     CSS::StyleScope& style_scope() { return m_style_scope; }
+
+    bool content_blocking_enabled() const;
     Utf16String const& content_blocker_style_sheet();
     void invalidate_content_blocker_style_sheet();
     bool content_blocker_style_sheet_may_need_refresh_for_class_or_id(Utf16FlyString const* id, ReadonlySpan<Utf16FlyString> class_names);
@@ -1624,6 +1682,9 @@ protected:
     void initialize_document();
 
 private:
+    bool update_is_fully_active() const;
+    bool compute_is_fully_active() const;
+
     // Records the document's viewport for the host to publish, or, given `committed`, commits the recording.
     Optional<Painting::DisplayListRecording> start_recording(Layout::BegunRead const&, HTML::PaintConfig, Painting::PaintCommandCacheMode, Optional<Compositor::FlightPresentation>&& committed);
 
@@ -1678,6 +1739,7 @@ private:
     void after_layout_commit(Layout::BegunRead const& read, LayoutTreeChanged);
 
     void run_unloading_cleanup_steps();
+    bool showing_an_unload_prompt_is_unlikely_to_be_annoying_deceptive_or_pointless() const;
 
     void evaluate_media_rules();
 
@@ -1721,6 +1783,8 @@ private:
         Optional<Utf16FlyString> is;
     };
     WebIDL::ExceptionOr<RegistryAndIs> flatten_element_creation_options(ElementCreationOptions const&) const;
+
+    void create_style_computer();
 
     GC::Ref<Page> m_page;
     GC::Ptr<CSS::StyleComputer> m_style_computer;
@@ -1808,6 +1872,9 @@ private:
     // https://html.spec.whatwg.org/multipage/interaction.html#focused-area-of-the-document
     GC::Ptr<Node> m_focused_area;
 
+    // https://html.spec.whatwg.org/multipage/interaction.html#sequential-focus-navigation-starting-point
+    GC::Ptr<Node> m_sequential_focus_navigation_starting_point;
+
     HTML::FocusTrigger m_last_focus_trigger { HTML::FocusTrigger::Other };
 
     GC::Ptr<Element> m_active_element;
@@ -1839,12 +1906,27 @@ private:
     bool m_ready_for_post_load_tasks { false };
 
     GC::Ptr<DOMImplementation> m_implementation;
+    GC::Ptr<FragmentDirective> m_fragment_directive;
+    Optional<Vector<HTML::TextDirective>> m_pending_text_directives;
+    Vector<GC::Ref<Range>> m_text_fragment_ranges;
+    bool m_pending_text_directive_scroll_allowed { false };
+    bool m_text_fragment_parser_progress_search_pending { false };
+
+    // https://wicg.github.io/scroll-to-text-fragment/#restricting-the-text-fragment
+    // Each Document has a text directive user activation, which is a boolean, initially false.
+    bool m_text_directive_user_activation { false };
+    bool m_browsing_context_group_has_remote_contexts { false };
     GC::Ptr<HTML::HTMLScriptElement> m_current_script;
 
     u32 m_ignore_destructive_writes_counter { 0 };
 
     // https://html.spec.whatwg.org/multipage/browsing-the-web.html#unload-counter
     u32 m_unload_counter { 0 };
+
+    // The answer is_fully_active() last gave, and the value of s_full_activity_epoch it's valid for.
+    mutable bool m_is_fully_active { false };
+    mutable u64 m_full_activity_epoch { 0 };
+    static u64 s_full_activity_epoch;
 
     // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#throw-on-dynamic-markup-insertion-counter
     u32 m_throw_on_dynamic_markup_insertion_counter { 0 };
@@ -1929,6 +2011,13 @@ private:
 
     // https://html.spec.whatwg.org/multipage/dom.html#is-initial-about:blank
     bool m_is_initial_about_blank { false };
+
+    // https://html.spec.whatwg.org/multipage/iframe-embed-object.html#iframe-load-in-progress
+    bool m_iframe_load_in_progress { false };
+
+    // https://html.spec.whatwg.org/multipage/iframe-embed-object.html#mute-iframe-load
+    bool m_mute_iframe_load { false };
+
     Optional<HTML::CrossProcessId> m_id;
 
     // https://html.spec.whatwg.org/multipage/dom.html#concept-document-about-base-url
@@ -2283,6 +2372,9 @@ private:
 
     // https://fullscreen.spec.whatwg.org/#list-of-pending-fullscreen-events
     Vector<PendingFullscreenEvent> m_pending_fullscreen_events;
+
+    // https://w3c.github.io/picture-in-picture/#picture-in-picture-element
+    GC::Ptr<Element> m_picture_in_picture_element;
 
     // https://dom.spec.whatwg.org/#document-custom-element-registry
     GC::Ptr<HTML::CustomElementRegistry> m_custom_element_registry;

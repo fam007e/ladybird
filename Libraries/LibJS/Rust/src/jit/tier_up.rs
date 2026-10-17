@@ -25,7 +25,7 @@ use crate::layout::function_object::EcmascriptFunctionObject;
 use crate::layout::value::Value;
 use crate::runtime::ecmascript_function_object::as_ecmascript_function_object;
 use crate::runtime::native_javascript_backed_function::NativeJavaScriptBackedFunction;
-use crate::runtime::shared_function_instance_data::FunctionKind;
+use crate::runtime::realm_watchpoints;
 
 /// `threshold` invocations.
 fn threshold_budget(options: &Options) -> i32 {
@@ -112,9 +112,11 @@ fn function_to_compile(vm: &Vm) -> Option<Gc<EcmascriptFunctionObject>> {
     if vm.debugging_enabled() {
         return None;
     }
-    // NB: Generators and async functions resume in the middle, and top-level code runs once.
+    // NB: Top-level code runs once, like the body of a module with top-level await, which runs as an async function.
+    //     Generators, async functions and async generators resume in their code at the entries of their
+    //     continuations.
     let function = as_ecmascript_function_object(vm.running_execution_context_ref().function.get()?)?;
-    (function.kind() == FunctionKind::Normal).then_some(function)
+    (!function.shared_data().is_module_wrapper()).then_some(function)
 }
 
 /// Whether the running frame runs a builtin written in JavaScript.
@@ -319,7 +321,7 @@ fn install(
     //     queued (from the tier-up check of another executable, like a callee's), or because they exited from the
     //     code before. Those frames keep counting, so that they continue in the code at its on-stack replacement
     //     entry rather than run in the interpreter until they return.
-    executable.install_jit_code(Box::new(code), compile_wait_budget(&vm.jit.options));
+    executable.install_jit_code(vm, Box::new(code), compile_wait_budget(&vm.jit.options));
 }
 
 type SnapshotExecutables = Vec<SnapshotExecutable>;
@@ -380,6 +382,10 @@ fn compile(
     assert_eq!(executable.jit_compile_state(), CompileState::None);
     executable.set_jit_compile_state(CompileState::Queued);
 
+    // NB: The snapshot captures the set only while it is valid, and capturing it may not allocate a new one.
+    let realm = function.realm().expect("an ECMAScript function has a realm");
+    realm_watchpoints::array_iterators_have_no_return(vm, realm);
+
     // NB: Nothing may collect the cells the snapshot captured before something keeps them alive.
     let defer_gc = DeferGc::new(vm);
     let captured = capture_snapshot(vm, executable, function, osr_pc);
@@ -415,7 +421,7 @@ fn compile(
 /// Compiles the executable of `function` right away, from the feedback it has, unless it has code, is being compiled or
 /// is never compiled. Returns whether it has code afterwards. For tests (see `jit::testing`).
 pub fn compile_now(vm: &Vm, function: Gc<EcmascriptFunctionObject>) -> bool {
-    if !vm.jit.options.enabled || vm.debugging_enabled() || function.kind() != FunctionKind::Normal {
+    if !vm.jit.options.enabled || vm.debugging_enabled() {
         return false;
     }
     let executable = function.compiled_executable(vm);

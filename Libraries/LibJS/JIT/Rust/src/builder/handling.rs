@@ -84,9 +84,6 @@ const EXPANDED: Handling = Handling::Expanded(GenericInfo {
     reads_whole_frame: false,
 });
 
-const SUSPENDS: Handling =
-    Handling::Unsupported("suspends a generator or async function; JIT code is only entered at function entry");
-
 /// How the graph builder handles `opcode`.
 pub fn handling(opcode: OpCode) -> Handling {
     use OpCode as O;
@@ -110,7 +107,10 @@ pub fn handling(opcode: OpCode) -> Handling {
         | O::JumpNullish
         | O::JumpUndefined
         | O::Return
-        | O::End => Handling::Native,
+        | O::End
+        | O::Yield
+        | O::YieldIteratorResult
+        | O::Await => Handling::Native,
 
         // Truthiness, built from a truthiness branch and a phi.
         O::Not | O::ToBoolean => Handling::Native,
@@ -123,7 +123,6 @@ pub fn handling(opcode: OpCode) -> Handling {
         | O::GetArgumentCount => Handling::Native,
 
         O::Catch => Handling::Unsupported("starts an exception handler; handler blocks are not built"),
-        O::Await | O::Yield | O::YieldIteratorResult => SUSPENDS,
 
         // Calls.
         O::Call
@@ -135,14 +134,8 @@ pub fn handling(opcode: OpCode) -> Handling {
         // The builtin slow paths call the builtin directly, and any other
         // callee through the generic call machinery, without leaving the
         // caller's frame.
-        O::CallBuiltinMathExp
-        | O::CallBuiltinMathLog
-        | O::CallBuiltinMathPow
-        | O::CallBuiltinMathImul
+        O::CallBuiltinMathImul
         | O::CallBuiltinMathRandom
-        | O::CallBuiltinMathSin
-        | O::CallBuiltinMathCos
-        | O::CallBuiltinMathTan
         | O::CallBuiltinRegExpPrototypeExec
         | O::CallBuiltinRegExpPrototypeReplace
         | O::CallBuiltinRegExpPrototypeSplit
@@ -160,6 +153,14 @@ pub fn handling(opcode: OpCode) -> Handling {
         | O::CallBuiltinMathCeil
         | O::CallBuiltinMathRound
         | O::CallBuiltinMathSqrt => EXPANDED,
+        // Math functions the runtime computes, built as calls of its
+        // functions of doubles for numbers.
+        O::CallBuiltinMathExp
+        | O::CallBuiltinMathLog
+        | O::CallBuiltinMathSin
+        | O::CallBuiltinMathCos
+        | O::CallBuiltinMathTan
+        | O::CallBuiltinMathPow => EXPANDED,
 
         O::CreateArguments | O::CreateRestParams | O::Debugger => GENERIC_READS_WHOLE_FRAME,
 
@@ -290,6 +291,14 @@ pub fn handling(opcode: OpCode) -> Handling {
         // Iteration over arrays.
         O::GetIterator | O::IteratorNextUnpack => EXPANDED,
 
+        // The completion a generator resumed with, which the generator
+        // object holds.
+        O::GetCompletionFields => EXPANDED,
+
+        // Closing an iterator, which does nothing if the cache of the site
+        // has no return method for it.
+        O::IteratorClose => EXPANDED,
+
         // Conversions that change nothing for objects, and for lengths that
         // are int32 values already.
         O::ToObject | O::ToLength => EXPANDED,
@@ -338,7 +347,6 @@ pub fn handling(opcode: OpCode) -> Handling {
         | O::GetLengthWithThis
         | O::GetMethod
         | O::GetObjectPropertyIterator
-        | O::IteratorClose
         | O::IteratorNext
         | O::IteratorToArray
         | O::CacheObjectShape
@@ -354,7 +362,6 @@ pub fn handling(opcode: OpCode) -> Handling {
         | O::DeleteById
         | O::DeleteByValue
         | O::DeleteVariable
-        | O::GetCompletionFields
         | O::SetCompletionType
         | O::GetTemplateObject
         | O::GetPrivateById

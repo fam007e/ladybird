@@ -15,6 +15,7 @@
 #include <AK/NonnullRawPtr.h>
 #include <AK/Optional.h>
 #include <AK/Variant.h>
+#include <LibCompositing/Forward.h>
 #include <LibCompositing/Types.h>
 #include <LibCore/AnonymousBuffer.h>
 #include <LibCore/EventLoop.h>
@@ -39,6 +40,7 @@
 #include <LibWebCommon/HTML/ReplicatedNavigableState.h>
 #include <LibWebCommon/HTML/SessionHistoryEntryDescriptor.h>
 #include <LibWebCommon/HTML/VisibilityState.h>
+#include <LibWebCommon/Loader/NavigatorCompatibilityMode.h>
 #include <LibWebCommon/Page/InputEvent.h>
 #include <LibWebCommon/Page/PageId.h>
 #include <LibWebView/BlobURLStore.h>
@@ -128,24 +130,41 @@ public:
 
     virtual bool supports_system_menu_bar() const { return false; }
     virtual bool supports_vertical_tabs() const { return false; }
+    virtual bool supports_content_blocking_controls() const { return false; }
     virtual bool supports_private_browsing_windows() const { return false; }
     virtual bool supports_client_side_window_decorations() const { return false; }
+    virtual bool supports_picture_in_picture() const;
     // Returns true if the platform sends momentum scroll events after a touchpad flick.
     // If it does not, the compositor makes the fling.
     virtual bool platform_reports_scroll_momentum() const { return true; }
     // Returns true if a touchpad may pull a scroller past the edges of its scroll range, from where it springs back.
     // This needs the platform to say when the fingers lift from the touchpad, or the scroller would stay stretched.
     virtual bool platform_scrolls_elastically() const { return false; }
+    // The languages the user prefers, as the platform lists them (BCP 47 tags, most preferred first).
+    virtual Vector<String> platform_preferred_languages() const { return {}; }
+
+    virtual OwnPtr<PictureInPictureWindow> create_picture_in_picture_window(WebContentPage& requesting_page, CanonicalTraversable&, Gfx::IntSize video_size);
 
     void appearance_changed(Badge<ApplicationSettingsObserver>);
     void tab_settings_changed(Badge<ApplicationSettingsObserver>);
+    void languages_changed(Badge<ApplicationSettingsObserver>);
+
+    // The spoofing choices in effect: what every page and worker reports from its navigator.
+    String user_agent_string() const;
+    Web::NavigatorCompatibilityMode navigator_compatibility_mode() const;
 
     static BookmarkStore& bookmark_store() { return *the().m_bookmark_store; }
     void update_bookmark_action_for_current_web_view();
     void bookmarks_changed(Badge<ApplicationBookmarkStoreObserver>);
     void show_bookmarks_bar_changed(Badge<ApplicationSettingsObserver>);
+
     void background_networking_settings_changed(Badge<ApplicationSettingsObserver>);
+
+    bool content_blocking_enabled() const;
+    bool has_content_blocking_rules() const;
+    void apply_content_blocking_policy(WebContentPage&);
     void content_blocker_settings_changed(Badge<ApplicationSettingsObserver>);
+
     bool content_blocker_list_update_in_progress() const;
     void update_content_blocker_lists(Badge<SettingsUI>);
     void download_content_blocker_list_if_needed(Badge<Application, SettingsUI>, StringView identifier);
@@ -237,8 +256,8 @@ public:
     ErrorOr<IPC::TransportHandle> connect_new_compositor_canvas_client();
     void register_compositor_context(WebContentClient&, Web::CompositorContextId, Optional<Web::PageId> page_id);
     ErrorOr<void> try_register_compositor_context(WebContentClient&, Web::CompositorContextId, Optional<Web::PageId> page_id);
-    void update_compositor_viewport(Web::CompositorContextId, Gfx::IntSize viewport_size, Compositing::WindowResizingInProgress = Compositing::WindowResizingInProgress::No);
-    void update_compositor_paused_debugger_overlay(Web::CompositorContextId, bool visible, double device_pixel_ratio, Optional<String> font_family, Optional<u8> hovered_action);
+    void update_compositor_viewport(Web::CompositorContextId, Gfx::IntSize viewport_size, double device_pixel_ratio, Compositing::WindowResizingInProgress = Compositing::WindowResizingInProgress::No);
+    void update_compositor_ui_overlays(Web::CompositorContextId, Compositing::UIOverlays const&);
     void update_compositor_display_metadata(Web::CompositorContextId, Optional<u64> display_id, double refresh_rate);
     void update_compositor_context_visibility(Web::CompositorContextId, Web::HTML::VisibilityState);
     bool handle_key_event_in_compositor(Web::CompositorContextId, Web::KeyEvent const&);
@@ -428,7 +447,8 @@ private:
     ErrorOr<void> launch_wasm_compiler_server();
 #endif
     ErrorOr<void> launch_devtools_server();
-    ErrorOr<void> load_content_blocker_lists();
+    // Returns whether the combined rules changed.
+    ErrorOr<bool> load_content_blocker_lists();
     void apply_content_blocker_settings();
     void rebuild_content_blocker_list_paths();
     ByteString content_blocker_list_path(StringView identifier) const;
@@ -681,7 +701,6 @@ private:
     RefPtr<Action> m_show_line_box_borders_action;
     RefPtr<Action> m_show_caret_hit_test_debug_overlay_action;
     RefPtr<Action> m_enable_scripting_action;
-    RefPtr<Action> m_enable_content_blocking_action;
     RefPtr<Action> m_block_pop_ups_action;
     StringView m_user_agent_string;
     StringView m_navigator_compatibility_mode;

@@ -15,16 +15,26 @@
 //! Each back edge gets an entry block without predecessors that loads the
 //! slots live into the back edge instruction from the frame and then runs the
 //! instruction itself, or jumps to its block where the instruction starts it
-//! (as the tests at the bottom of loops do). Its edges are forward edges into
-//! the loop and the loop exit, so the values it loaded meet the other paths in
-//! phis.
+//! (as the tests at the bottom of loops do). Where the instruction jumps to the
+//! update step of a for loop, which leads to the loop's header, the entry runs
+//! that step itself instead. Its edges are forward edges into the loop and the
+//! loop exit, so the values it loaded meet the other paths in phis.
+//!
+//! Generators and async functions resume the same way: a suspended frame holds
+//! every value live at the continuation it resumes at (see `build_suspend()`),
+//! so each continuation of a `Yield`, `YieldIteratorResult` or `Await` gets an
+//! entry block that loads them and jumps to the continuation's block, which
+//! compiled code reaches from nowhere else. The runtime enters there like at
+//! an on-stack replacement entry.
 
 use super::AbstractFrame;
 use super::Flow;
 use super::GraphBuilder;
 use crate::CompileFailure;
+use crate::bytecode::Instruction;
 use crate::bytecode::OpCode;
 use crate::bytecode::RESERVED_REGISTER_COUNT;
+use crate::bytecode::cfg::BlockIndex;
 use crate::bytecode::cfg::Loop;
 
 /// Whether instructions with this opcode are loop back edges, which count
@@ -98,6 +108,9 @@ impl GraphBuilder<'_> {
             //     Unconditional back edges jump to their loop's header
             //     directly instead, since entering a block of the loop
             //     other than its header would make the loop irreducible.
+            //     Those of loops whose update step has a block of its own
+            //     (like for loops with a continue) jump to that step, which
+            //     the entry runs itself before it continues at the header.
             let opcode = self.function.instructions[index].instruction.opcode();
             let own_block = self
                 .function
@@ -108,6 +121,9 @@ impl GraphBuilder<'_> {
             if let Some(own_block) = own_block {
                 self.end_with_jump(own_block)?;
                 targets.push(own_block);
+            } else if let Some(update_block) = self.update_block_of_back_edge(index) {
+                self.build_bytecode_block(update_block)?;
+                targets.extend(self.function.cfg.blocks[update_block].successors.iter().copied());
             } else {
                 match self.build_instruction()? {
                     Flow::Ended => {}
@@ -126,18 +142,95 @@ impl GraphBuilder<'_> {
             }
             self.graph.osr_entries.push((pc, block));
             self.record_osr_loop_back_edges(pc);
+            self.note_loops_entered_at(&targets);
+        }
+        Ok(())
+    }
 
-            // NB: The loops the entry leads into other than at their header may
-            //     only be reached from here over their back edges.
-            for target in targets {
-                for current_loop in &self.function.cfg.loops {
-                    if current_loop.blocks.contains(&target) && current_loop.header != target {
-                        self.function.osr_loop_headers[current_loop.header] = true;
-                    }
+    /// Builds an entry block for every continuation of a suspension of a
+    /// generator or async function in the compiled function, after the
+    /// on-stack replacement entries, before any of its bytecode blocks is
+    /// started.
+    pub(super) fn build_resume_entries(&mut self) -> Result<(), CompileFailure> {
+        debug_assert!(!self.function.is_virtual());
+        for index in 0..self.function.instructions.len() {
+            let (Instruction::Yield {
+                continuation_label: Some(continuation),
+                ..
+            }
+            | Instruction::YieldIteratorResult {
+                continuation_label: continuation,
+                ..
+            }
+            | Instruction::Await {
+                continuation_label: continuation,
+                ..
+            }) = self.function.instructions[index].instruction
+            else {
+                continue;
+            };
+            let pc = continuation.0;
+            let target = self.block_for_label(continuation)?;
+            let target_block = &self.function.cfg.blocks[target];
+            if target_block.start_pc != pc {
+                return Err(CompileFailure::InvalidBytecode {
+                    pc,
+                    reason: "continuation that does not start a block",
+                });
+            }
+            // NB: An on-stack replacement entry at a back edge that starts the
+            //     block resumes the frame there just the same.
+            if target_block.rpo_number.is_none() || self.graph.osr_entries.iter().any(|(entry_pc, _)| *entry_pc == pc) {
+                continue;
+            }
+            let block = self.start_new_block(Vec::new());
+            self.frame = AbstractFrame::in_memory(self.function.layout.tracked_slot_count());
+            let start = target_block.instructions.start;
+            self.function.instruction_index = start;
+            self.function.pc = pc;
+            self.function.eager_frame_state = None;
+            let live = self.function.liveness.live_in(start).clone();
+            for slot in live.iter() {
+                if slot >= RESERVED_REGISTER_COUNT as usize {
+                    let operand = self.function.layout.operand_for_tracked_index(slot);
+                    self.read_tracked(slot, operand);
+                }
+            }
+            self.end_with_jump(target)?;
+            self.graph.osr_entries.push((pc, block));
+            self.note_loops_entered_at(&[target]);
+        }
+        Ok(())
+    }
+
+    /// Notes the loops that an entry leads into other than at their header,
+    /// over its edges to `targets`, which may only be reached from there over
+    /// their back edges.
+    fn note_loops_entered_at(&mut self, targets: &[BlockIndex]) {
+        for &target in targets {
+            for current_loop in &self.function.cfg.loops {
+                if current_loop.blocks.contains(&target) && current_loop.header != target {
+                    self.function.osr_loop_headers[current_loop.header] = true;
                 }
             }
         }
-        Ok(())
+    }
+
+    /// The block that the unconditional back edge at instruction `index` jumps
+    /// to, if it is no loop header and leads to one and nowhere else.
+    fn update_block_of_back_edge(&self, index: usize) -> Option<BlockIndex> {
+        let instruction = &self.function.instructions[index].instruction;
+        if instruction.opcode() != OpCode::JumpLoop {
+            return None;
+        }
+        let mut target = None;
+        instruction.for_each_jump_target(|label| target = self.function.cfg.block_for_pc(label.0));
+        let cfg = &self.function.cfg;
+        let block = &cfg.blocks[target?];
+        match block.successors.as_slice() {
+            [successor] if !block.is_loop_header() && cfg.blocks[*successor].is_loop_header() => target,
+            _ => None,
+        }
     }
 
     /// Records the loop back edges in the loop of the back edge at `pc`, which

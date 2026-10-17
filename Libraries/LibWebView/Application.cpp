@@ -58,6 +58,7 @@
 #include <LibWebView/HelperProcess.h>
 #include <LibWebView/HistoryStore.h>
 #include <LibWebView/Menu.h>
+#include <LibWebView/PictureInPictureWindow.h>
 #include <LibWebView/ProcessType.h>
 #include <LibWebView/RequestServerManager.h>
 #include <LibWebView/SessionStore.h>
@@ -118,6 +119,11 @@ struct ApplicationSettingsObserver final : public SettingsObserver {
     virtual void tab_settings_changed() override
     {
         Application::the().tab_settings_changed({});
+    }
+
+    virtual void languages_changed() override
+    {
+        Application::the().languages_changed({});
     }
 
     virtual void browsing_data_settings_changed() override
@@ -313,6 +319,7 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
     Optional<StringView> user_agent_preset;
     Optional<StringView> dns_server_address;
     Optional<StringView> default_time_zone;
+    Optional<StringView> proxy_autoconfig_url;
     Optional<u16> dns_server_port;
     bool use_dns_over_tls = false;
     bool enable_test_mode = false;
@@ -366,6 +373,19 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
     args_parser.add_option(window_width, "Set viewport width in pixels (default: 800) (currently only supported for headless mode)", "window-width", 0, "pixels");
     args_parser.add_option(window_height, "Set viewport height in pixels (default: 600) (currently only supported for headless mode)", "window-height", 0, "pixels");
     args_parser.add_option(certificates, "Path to a certificate file", "certificate", 'C', "certificate");
+    args_parser.add_option(Core::ArgsParser::Option {
+        .argument_mode = Core::ArgsParser::OptionArgumentMode::Required,
+        .help_string = "URL of a PAC file (not supported yet, requests fail)",
+        .long_name = "proxy-autoconfig-url",
+        .value_name = "url",
+        .accept_value = [&](StringView value) {
+            if (!URL::Parser::basic_parse(value).has_value())
+                return false;
+            proxy_autoconfig_url = value;
+            return true;
+        },
+        .hide_mode = Core::ArgsParser::OptionHideMode::CommandLineAndMarkdown,
+    });
     args_parser.add_option(new_window, "Force opening in a new window", "new-window", 'n');
 #if !defined(AK_OS_ANDROID)
     args_parser.add_option(force_new_process, "Force creation of a new browser process", "force-new-process");
@@ -563,7 +583,9 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
         }
     }
 
-    m_settings = make<Settings>(Settings::create(LexicalPath::join(profile().paths().config, "Settings.json"sv).string()));
+    // Test results must not depend on the languages of the machine running the tests.
+    auto platform_languages = enable_test_mode ? Vector<String> {} : platform_preferred_languages();
+    m_settings = make<Settings>(Settings::create(LexicalPath::join(profile().paths().config, "Settings.json"sv).string(), move(platform_languages)));
     m_bookmark_store = make<BookmarkStore>(BookmarkStore::create(LexicalPath::join(profile().paths().config, "Bookmarks.json"sv).string()));
 
     if (!dns_server_port.has_value())
@@ -663,6 +685,7 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
         .paint_viewport_scrollbars = disable_scrollbar_painting ? PaintViewportScrollbars::No : PaintViewportScrollbars::Yes,
         .file_scheme_urls_have_tuple_origins = file_scheme_urls_have_tuple_origins ? FileSchemeUrlsHaveTupleOrigins::Yes : FileSchemeUrlsHaveTupleOrigins::No,
         .default_time_zone = default_time_zone,
+        .proxy_autoconfig_url = proxy_autoconfig_url.map([](auto value) { return value.to_byte_string(); }),
     };
 
     create_platform_options(m_browser_options, m_request_server_options, m_web_content_options);
@@ -742,14 +765,16 @@ void Application::rebuild_content_blocker_list_paths()
     }
 }
 
-ErrorOr<void> Application::load_content_blocker_lists()
+ErrorOr<bool> Application::load_content_blocker_lists()
 {
     StringView custom_filters;
     if (m_web_content_options.is_test_mode == IsTestMode::No)
         custom_filters = m_settings->custom_content_blocker_filters();
     if (m_browser_options.content_blocker_list_paths.is_empty() && custom_filters.is_empty()) {
+        if (m_content_blocker_list_buffer.has_value() && m_content_blocker_list_buffer->size() == 0)
+            return false;
         m_content_blocker_list_buffer = TRY(Core::AnonymousBuffer::create_with_size(0));
-        return {};
+        return true;
     }
 
     Checked<size_t> total_size = 0;
@@ -780,9 +805,11 @@ ErrorOr<void> Application::load_content_blocker_lists()
     bytes[offset++] = '\n';
     VERIFY(offset == bytes.size());
 
-    m_content_blocker_list_buffer = move(blocker_list_buffer);
+    if (m_content_blocker_list_buffer.has_value() && m_content_blocker_list_buffer->bytes() == blocker_list_buffer.bytes())
+        return false;
 
-    return {};
+    m_content_blocker_list_buffer = move(blocker_list_buffer);
+    return true;
 }
 
 void Application::start_content_blocker_list_update(ContentBlockerListUpdateTrigger trigger, Optional<StringView> requested_identifier)
@@ -1100,6 +1127,9 @@ ErrorOr<NonnullRefPtr<WebContentClient>> Application::create_web_content_client(
     client->async_connect_to_wasm_compiler(wasm_compiler_handle);
 #endif
 
+    if (m_content_blocker_list_buffer.has_value())
+        client->async_set_content_blockers(*m_content_blocker_list_buffer);
+
     m_web_content_clients.set(client);
     return client;
 }
@@ -1390,22 +1420,22 @@ ErrorOr<void> Application::try_register_compositor_context(WebContentClient& web
     return {};
 }
 
-void Application::update_compositor_viewport(Web::CompositorContextId context_id, Gfx::IntSize viewport_size, Compositing::WindowResizingInProgress window_resize_in_progress)
+void Application::update_compositor_viewport(Web::CompositorContextId context_id, Gfx::IntSize viewport_size, double device_pixel_ratio, Compositing::WindowResizingInProgress window_resize_in_progress)
 {
     if (!can_send_compositor_process_ipc(m_compositor_client))
         return;
     VERIFY(m_compositor_client);
 
-    m_compositor_client->async_viewport_size_updated(context_id, viewport_size, window_resize_in_progress);
+    m_compositor_client->async_viewport_size_updated(context_id, viewport_size, device_pixel_ratio, window_resize_in_progress);
 }
 
-void Application::update_compositor_paused_debugger_overlay(Web::CompositorContextId context_id, bool visible, double device_pixel_ratio, Optional<String> font_family, Optional<u8> hovered_action)
+void Application::update_compositor_ui_overlays(Web::CompositorContextId context_id, Compositing::UIOverlays const& overlays)
 {
     if (!can_send_compositor_process_ipc(m_compositor_client))
         return;
     VERIFY(m_compositor_client);
 
-    m_compositor_client->async_set_paused_debugger_overlay(context_id, visible, device_pixel_ratio, move(font_family), hovered_action);
+    m_compositor_client->async_set_ui_overlays(context_id, overlays);
 }
 
 void Application::update_compositor_display_metadata(Web::CompositorContextId context_id, Optional<u64> display_id, double refresh_rate)
@@ -2266,6 +2296,21 @@ bool Application::supports_clipboard_type(ClipboardType type) const
     return type == ClipboardType::Text;
 }
 
+bool Application::supports_picture_in_picture() const
+{
+    return browser_options().headless_mode.has_value();
+}
+
+OwnPtr<PictureInPictureWindow> Application::create_picture_in_picture_window(WebContentPage& requesting_page, CanonicalTraversable& traversable, Gfx::IntSize video_size)
+{
+    if (!browser_options().headless_mode.has_value())
+        return {};
+
+    // Every view in a headless browser is a HeadlessWebView.
+    auto& requesting_view = static_cast<HeadlessWebView&>(requesting_page.view());
+    return HeadlessWebView::create_picture_in_picture_window(requesting_view, traversable, video_size);
+}
+
 Utf16String Application::clipboard_text(ClipboardType) const
 {
     for (auto const& representation : m_clipboard.system_clipboard_representations) {
@@ -2395,10 +2440,12 @@ void Application::initialize_actions()
         };
     };
 
-    auto add_spoofed_value = [](auto& menu, auto name, auto value, auto& cached_value, auto request, auto persist) {
-        auto action = Action::create_checkable(name, ActionID::SpoofUserAgent, [value, &cached_value, request, persist]() {
+    auto add_spoofed_value = [](auto& menu, auto name, auto value, auto& cached_value, auto request, auto persist, auto notify_workers) {
+        auto action = Action::create_checkable(name, ActionID::SpoofUserAgent, [value, &cached_value, request, persist, notify_workers]() {
             cached_value = value;
             persist();
+            // Workers take no debug requests; the worker process manager hands the new value to every live worker.
+            notify_workers();
 
             ViewImplementation::for_each_view([&](ViewImplementation& view) {
                 view.debug_request(request, cached_value);
@@ -2668,11 +2715,10 @@ void Application::initialize_actions()
         ? *WebView::user_agents.get(*user_agent_preset)
         : Web::default_user_agent;
 
-    add_spoofed_value(spoof_user_agent_menu, "Disabled"sv, Web::default_user_agent, m_user_agent_string, "spoof-user-agent"sv,
-        [this] { m_settings->set_user_agent_preset({}); });
+    auto notify_workers_of_user_agent = [this] { WorkerProcessManager::the().update_user_agent(user_agent_string()); };
+    add_spoofed_value(spoof_user_agent_menu, "Disabled"sv, Web::default_user_agent, m_user_agent_string, "spoof-user-agent"sv, [this] { m_settings->set_user_agent_preset({}); }, notify_workers_of_user_agent);
     for (auto const& user_agent : WebView::user_agents) {
-        add_spoofed_value(spoof_user_agent_menu, user_agent.key, user_agent.value, m_user_agent_string, "spoof-user-agent"sv,
-            [this, name = user_agent.key] { m_settings->set_user_agent_preset(name); });
+        add_spoofed_value(spoof_user_agent_menu, user_agent.key, user_agent.value, m_user_agent_string, "spoof-user-agent"sv, [this, name = user_agent.key] { m_settings->set_user_agent_preset(name); }, notify_workers_of_user_agent);
     }
 
     auto navigator_compatibility_mode_menu = Menu::create_group("Navigator Compatibility Mode"sv);
@@ -2680,9 +2726,9 @@ void Application::initialize_actions()
             ? m_settings->navigator_compatibility_mode()
             : Web::default_navigator_compatibility_mode);
 
+    auto notify_workers_of_navigator_compatibility_mode = [this] { WorkerProcessManager::the().update_navigator_compatibility_mode(navigator_compatibility_mode()); };
     auto add_navigator_compatibility_mode = [&](StringView name, Web::NavigatorCompatibilityMode mode) {
-        add_spoofed_value(navigator_compatibility_mode_menu, name, navigator_compatibility_mode_to_string(mode), m_navigator_compatibility_mode, "navigator-compatibility-mode"sv,
-            [this, mode] { m_settings->set_navigator_compatibility_mode(mode); });
+        add_spoofed_value(navigator_compatibility_mode_menu, name, navigator_compatibility_mode_to_string(mode), m_navigator_compatibility_mode, "navigator-compatibility-mode"sv, [this, mode] { m_settings->set_navigator_compatibility_mode(mode); }, notify_workers_of_navigator_compatibility_mode);
     };
     add_navigator_compatibility_mode("Chrome"sv, Web::NavigatorCompatibilityMode::Chrome);
     add_navigator_compatibility_mode("Gecko"sv, Web::NavigatorCompatibilityMode::Gecko);
@@ -2695,24 +2741,6 @@ void Application::initialize_actions()
     m_enable_scripting_action = Action::create_checkable("Enable Scripting"sv, ActionID::EnableScripting, check(m_enable_scripting_action, "scripting"sv));
     m_enable_scripting_action->set_checked(m_browser_options.disable_scripting == WebView::DisableScripting::No);
     m_debug_menu->add_action(*m_enable_scripting_action);
-
-    m_enable_content_blocking_action = Action::create_checkable("Enable Content Blocking"sv, ActionID::EnableContentBlocking, [this, toggle_views = check(m_enable_content_blocking_action, "content-blocking"sv)] {
-        if (m_web_content_options.is_test_mode == IsTestMode::Yes) {
-            toggle_views();
-            return;
-        }
-        m_settings->set_content_blocker_enabled(m_enable_content_blocking_action->checked());
-        if (m_enable_content_blocking_action->checked()) {
-            for (auto const& list : m_settings->content_blocker_lists()) {
-                if (list.enabled)
-                    download_content_blocker_list_if_needed({}, list.identifier);
-            }
-        }
-    });
-    // NB: Test mode supplies its own filter lists independently of profile preferences.
-    m_enable_content_blocking_action->set_checked(m_browser_options.enable_content_blocker == WebView::EnableContentBlocker::Yes
-        && (m_web_content_options.is_test_mode == IsTestMode::Yes || m_settings->content_blocker_enabled()));
-    m_debug_menu->add_action(*m_enable_content_blocking_action);
 
     m_block_pop_ups_action = Action::create_checkable("Block Pop-ups"sv, ActionID::BlockPopUps, check(m_block_pop_ups_action, "block-pop-ups"sv));
     m_block_pop_ups_action->set_checked(m_browser_options.allow_popups == AllowPopups::No);
@@ -2733,15 +2761,29 @@ void Application::apply_view_options(Badge<ViewImplementation>, ViewImplementati
     view.set_preferred_contrast(m_contrast);
     view.set_preferred_motion(m_motion);
 
+    apply_content_blocking_policy(page);
+
     page.async_debug_request("set-line-box-borders"sv, m_show_line_box_borders_action->checked() ? "on"sv : "off"sv);
     page.async_debug_request("set-caret-hit-test-debug-overlay"sv, m_show_caret_hit_test_debug_overlay_action->checked() ? "on"sv : "off"sv);
     page.async_debug_request("scripting"sv, m_enable_scripting_action->checked() ? "on"sv : "off"sv);
-    page.async_debug_request("content-blocking"sv, m_enable_content_blocking_action->checked() ? "on"sv : "off"sv);
-    if (m_content_blocker_list_buffer.has_value())
-        page.client().async_set_content_blockers(*m_content_blocker_list_buffer);
     page.async_debug_request("block-pop-ups"sv, m_block_pop_ups_action->checked() ? "on"sv : "off"sv);
     page.async_debug_request("spoof-user-agent"sv, m_user_agent_string);
     page.async_debug_request("navigator-compatibility-mode"sv, m_navigator_compatibility_mode);
+}
+
+void Application::languages_changed(Badge<ApplicationSettingsObserver>)
+{
+    WorkerProcessManager::the().update_preferred_languages(m_settings->languages());
+}
+
+String Application::user_agent_string() const
+{
+    return MUST(String::from_utf8(m_user_agent_string));
+}
+
+Web::NavigatorCompatibilityMode Application::navigator_compatibility_mode() const
+{
+    return navigator_compatibility_mode_from_string(m_navigator_compatibility_mode).value_or(Web::default_navigator_compatibility_mode);
 }
 
 void Application::update_vertical_tabs_action()
@@ -2776,31 +2818,54 @@ void Application::background_networking_settings_changed(Badge<ApplicationSettin
     start_content_blocker_list_update(ContentBlockerListUpdateTrigger::Automatic);
 }
 
+bool Application::content_blocking_enabled() const
+{
+    // Test mode supplies its own filter lists independently of profile preferences.
+    return m_browser_options.enable_content_blocker == EnableContentBlocker::Yes
+        && (m_web_content_options.is_test_mode == IsTestMode::Yes || m_settings->content_blocker_enabled());
+}
+
+bool Application::has_content_blocking_rules() const
+{
+    return m_content_blocker_list_buffer.has_value() && m_content_blocker_list_buffer->size() > 0;
+}
+
+void Application::apply_content_blocking_policy(WebContentPage& page)
+{
+    auto disabled_sites = m_web_content_options.is_test_mode == IsTestMode::Yes ? Vector<String> {} : m_settings->content_blocker_disabled_sites().values();
+    page.async_set_content_blocking_policy(content_blocking_enabled(), disabled_sites);
+}
+
 void Application::content_blocker_settings_changed(Badge<ApplicationSettingsObserver>)
 {
-    if (m_web_content_options.is_test_mode == IsTestMode::Yes)
-        return;
-    auto enabled = m_browser_options.enable_content_blocker == EnableContentBlocker::Yes && m_settings->content_blocker_enabled();
-    m_enable_content_blocking_action->set_checked(enabled);
-    ViewImplementation::for_each_view([enabled](ViewImplementation& view) {
-        view.debug_request("content-blocking"sv, enabled ? "on"sv : "off"sv);
-        return IterationDecision::Continue;
-    });
     apply_content_blocker_settings();
 }
 
 void Application::apply_content_blocker_settings()
 {
-    if (m_web_content_options.is_test_mode == IsTestMode::Yes)
-        return;
-    rebuild_content_blocker_list_paths();
-    if (auto result = load_content_blocker_lists(); result.is_error()) {
-        warnln("Unable to apply content blocker settings: {}", result.error());
-        return;
+    bool rules_changed = false;
+    if (m_web_content_options.is_test_mode == IsTestMode::No) {
+        rebuild_content_blocker_list_paths();
+        if (auto result = load_content_blocker_lists(); result.is_error())
+            warnln("Unable to apply content blocker settings: {}", result.error());
+        else
+            rules_changed = result.release_value();
     }
 
+    auto enabled = content_blocking_enabled();
+    auto disabled_sites = m_web_content_options.is_test_mode == IsTestMode::Yes ? Vector<String> {} : m_settings->content_blocker_disabled_sites().values();
+
     WebContentClient::for_each_client([&](WebContentClient& client) {
-        client.async_set_content_blockers(*m_content_blocker_list_buffer);
+        client.for_each_page([&](WebContentPage& page) {
+            client.async_set_content_blocking_policy(page.id(), enabled, disabled_sites);
+            return IterationDecision::Continue;
+        });
+        if (rules_changed)
+            client.async_set_content_blockers(*m_content_blocker_list_buffer);
+        return IterationDecision::Continue;
+    });
+    ViewImplementation::for_each_view([](ViewImplementation& view) {
+        view.notify_content_blocking_changed();
         return IterationDecision::Continue;
     });
 }
@@ -3048,7 +3113,8 @@ Vector<DevTools::TabDescription> Application::tab_list() const
     Vector<DevTools::TabDescription> tabs;
 
     ViewImplementation::for_each_view([&](ViewImplementation& view) {
-        tabs.empend(view.view_id(), view.title().to_utf8(), view.url().to_string());
+        if (!view.owner_view_id().has_value())
+            tabs.empend(view.view_id(), view.title().to_utf8(), view.url().to_string());
         return IterationDecision::Continue;
     });
 

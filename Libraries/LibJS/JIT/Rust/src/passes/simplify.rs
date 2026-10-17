@@ -276,7 +276,10 @@ fn constant_condition(graph: &Graph, condition: BranchCondition, input: NodeId, 
         | BranchCondition::IndexInBounds
         | BranchCondition::MagicalLength
         | BranchCondition::Extensible
+        | BranchCondition::HoleFillableArray
         | BranchCondition::ArrayIterator
+        | BranchCondition::GeneratorObject
+        | BranchCondition::PlainArrayPrototypeChain
         | BranchCondition::Shape(_) => None,
     }
 }
@@ -294,7 +297,22 @@ fn constant_number(graph: &Graph, node: NodeId) -> Option<f64> {
 }
 
 pub fn run(graph: &mut Graph) {
-    let dissolvable = dissolvable_checks(graph);
+    simplify(graph, true);
+}
+
+/// Simplification after check elimination, which keeps every int32 check of
+/// a double: check elimination may have relied on what one established, like
+/// the int32 that an unboxing in a branch it decided takes.
+pub fn run_after_check_elimination(graph: &mut Graph) {
+    simplify(graph, false);
+}
+
+fn simplify(graph: &mut Graph, dissolve_checks: bool) {
+    let dissolvable = if dissolve_checks {
+        dissolvable_checks(graph)
+    } else {
+        BitSet::new(0)
+    };
     let dissolved_double = |graph: &Graph, value: NodeId| {
         // NB: Nodes the pass adds are no checks.
         (value.index() < dissolvable.capacity() && dissolvable.contains(value.index()))
@@ -343,7 +361,7 @@ pub fn run(graph: &mut Graph) {
             let converted = (graph.node(node).op == Op::CheckNumber)
                 .then(|| graph.node(graph.unrefined(inputs[0])))
                 .filter(|unrefined| unrefined.op == Op::BoxInt32)
-                .map(|unrefined| unrefined.inputs[0]);
+                .map(|unrefined| replacements.resolve(unrefined.inputs[0]));
             // NB: ToInt32 of double arithmetic of int32 values is wrapping
             //     int32 arithmetic.
             let wrapping = (graph.node(node).op == Op::Float64ToInt32)
@@ -411,6 +429,13 @@ pub fn run(graph: &mut Graph) {
                     let boolean = if bits != 0 { value::TRUE } else { value::FALSE };
                     constants.get(graph, boolean)
                 }),
+                // NB: Boxing the double of an int32 boxes the int32.
+                Op::CheckInt32
+                    if let Some(double) = boxed(Op::BoxFloat64, inputs[0])
+                        && graph.node(double).op == Op::Int32ToFloat64 =>
+                {
+                    Some(graph.node(double).inputs[0])
+                }
                 Op::CheckInt32 => constant_bits(graph, 0)
                     .filter(|bits| graph.node(inputs[0]).repr == Some(Repr::Tagged) && value::as_int32(*bits).is_some())
                     .map(|bits| constants.get_typed(graph, bits & u64::from(u32::MAX), Repr::Int32)),
@@ -490,6 +515,9 @@ pub fn run(graph: &mut Graph) {
             });
             let folded = folded.or_else(|| {
                 let integer = converted?;
+                if let Some(double) = dissolved_double(graph, integer) {
+                    return Some(double);
+                }
                 let pc = graph.node(node).pc;
                 let conversion = graph.add_node(Node::new(Op::Int32ToFloat64, vec![integer], Some(Repr::Float64), pc));
                 graph.blocks[block.index()].body.insert(index - 1, conversion);
@@ -594,13 +622,29 @@ pub fn run(graph: &mut Graph) {
     replacements.apply(graph);
     edit::remove_nodes(graph, &removed);
     // NB: Folds can give a check users that need the int32, like the
-    //     unboxing of a boxing of it, which keep the check. The other users
-    //     of the checks that go took the doubles above, and frame states
-    //     take them now.
-    let still_dissolvable = dissolvable_checks(graph);
+    //     unboxing of a boxing of it, and the loop never visits the nodes
+    //     that folds add before the node they replace. A check that any node
+    //     still uses stays, and frame states take the doubles of the others.
+    if dissolvable.is_empty() {
+        if changed_control_flow {
+            edit::clean_up_control_flow(graph);
+        }
+        return;
+    }
+    let mut dissolvable = dissolvable;
+    dissolvable.subtract(&removed);
+    for block in &graph.blocks {
+        for node in block.nodes() {
+            for input in &graph.node(node).inputs {
+                if input.index() < dissolvable.capacity() {
+                    dissolvable.remove(input.index());
+                }
+            }
+        }
+    }
     let mut replacements = Replacements::new(graph);
     let mut removed = BitSet::new(graph.nodes.len());
-    for check in dissolvable.iter().filter(|check| still_dissolvable.contains(*check)) {
+    for check in dissolvable.iter() {
         let check = NodeId::from_index(check);
         let double = checked_double(graph, check).expect("dissolvable checks check doubles");
         replacements.replace(check, double);

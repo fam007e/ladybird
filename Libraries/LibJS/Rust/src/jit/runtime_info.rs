@@ -15,8 +15,8 @@ use libjs_abi::value as nan_box;
 use libjs_jit::bytecode::OpCode;
 use libjs_jit::codegen::slow_path_symbol;
 use libjs_jit::snapshot::{
-    CellId, DynamicCallLayout, HelperCallAddresses, IntrinsicHelpers, RuntimeInfo, RuntimeLayout, RuntimeOffsets,
-    TypeofStrings,
+    CellId, DynamicCallLayout, Float64FunctionAddresses, HelperCallAddresses, IntrinsicHelpers, RuntimeInfo,
+    RuntimeLayout, RuntimeOffsets, TypeofStrings,
 };
 
 use super::allocation::{AllocationInfos, FUNCTION_ENVIRONMENT_FREE_LIST_COUNT};
@@ -54,7 +54,7 @@ use crate::layout::property_lookup_cache::{
     PropertyLookupCacheEntryType,
 };
 use crate::layout::realm::Realm;
-use crate::layout::shape::{PrototypeChainValidity, Shape};
+use crate::layout::shape::{Shape, WatchpointSet};
 use crate::layout::value::Value;
 use crate::layout::vm::VmHead;
 use crate::runtime::array::{ARRAY_IS_PROXY_TARGET_OFFSET, ARRAY_LENGTH_WRITABLE_OFFSET};
@@ -62,6 +62,7 @@ use crate::runtime::array_iterator::ArrayIterator;
 use crate::runtime::function_environment::{
     FUNCTION_ENVIRONMENT_FUNCTION_OBJECT_OFFSET, FUNCTION_ENVIRONMENT_THIS_VALUE_OFFSET,
 };
+use crate::runtime::generator_object::GeneratorObject;
 use crate::runtime::module_environment::ModuleEnvironment;
 use crate::runtime::object::{ObjectMethods, PropertyKind};
 
@@ -122,7 +123,7 @@ fn runtime_offsets() -> RuntimeOffsets {
         object_shape: offset(offset_of!(Object, shape)),
         object_named_properties: offset(offset_of!(Object, named_properties)),
         shape_dictionary_generation: offset(offset_of!(Shape, dictionary_generation)),
-        prototype_chain_validity_valid: offset(offset_of!(PrototypeChainValidity, valid)),
+        prototype_chain_validity_valid: offset(offset_of!(WatchpointSet, valid)),
         accessor_getter: offset(offset_of!(Accessor, getter)),
         accessor_setter: offset(offset_of!(Accessor, setter)),
         execution_context_function: offset(offset_of!(ExecutionContext, function)),
@@ -220,6 +221,12 @@ fn runtime_layout() -> RuntimeLayout {
         builtin_math_ceil: Builtin::MathCeil as u8,
         builtin_math_round: Builtin::MathRound as u8,
         builtin_math_sqrt: Builtin::MathSqrt as u8,
+        builtin_math_exp: Builtin::MathExp as u8,
+        builtin_math_log: Builtin::MathLog as u8,
+        builtin_math_sin: Builtin::MathSin as u8,
+        builtin_math_cos: Builtin::MathCos as u8,
+        builtin_math_tan: Builtin::MathTan as u8,
+        builtin_math_pow: Builtin::MathPow as u8,
         // NB: Filled in by runtime_info().
         typeof_strings: TypeofStrings::default(),
         fly_string_cache: 0,
@@ -234,6 +241,9 @@ fn runtime_layout() -> RuntimeLayout {
         array_iterator_index: offset(offset_of!(ArrayIterator, index)),
         array_iterator_kind: offset(offset_of!(ArrayIterator, iteration_kind)),
         array_iterator_kind_value: PropertyKind::Value as u8,
+        generator_object_class: core::ptr::from_ref(GeneratorObject::CLASS) as u64,
+        generator_object_pending_completion_value: offset(offset_of!(GeneratorObject, pending_completion_value)),
+        generator_object_pending_completion_type: offset(offset_of!(GeneratorObject, pending_completion_type)),
         declarative_environment_binding_values_size: offset(offset_of!(DeclarativeEnvironment, binding_values.size)),
         declarative_environment_binding_values_capacity: offset(offset_of!(
             DeclarativeEnvironment,
@@ -343,6 +353,11 @@ fn runtime_layout() -> RuntimeLayout {
         keyed_lookup_cache_name: 0,
     }
 }
+
+const _: () = assert!(
+    libjs_jit::bytecode::NO_YIELD_CONTINUATION
+        == crate::layout::execution_context::ExecutionContext::NO_YIELD_CONTINUATION
+);
 
 // NB: The compiler has its own copy of the bits of the interpreter's feedback.
 const _: () = {
@@ -454,13 +469,15 @@ pub fn runtime_info(vm: &Vm, realm: Gc<Realm>, allocation: AllocationInfos) -> R
         },
         array_push: super::calls::libjs_jit_array_push as *const () as u64,
         slice_arguments: super::calls::libjs_jit_slice_arguments as *const () as u64,
-        create_array_iterator: super::intrinsics::libjs_jit_create_array_iterator as *const () as u64,
+        open_array_iteration: super::intrinsics::libjs_jit_open_array_iteration as *const () as u64,
         // NB: Filled in by capture_snapshot(), which lists it as an embedded cell.
         array_iterator_next: None,
+        array_iterator_return_watchpoint_set: None,
         jit_exit: super::entry_exit::libjs_jit_exit as *const () as u64,
         to_boolean: addresses.to_boolean,
         primitive_to_string: super::calls::libjs_jit_primitive_to_string as *const () as u64,
         helper_calls: HelperCallAddresses(super::helper_calls::address),
+        float64_functions: Float64FunctionAddresses(super::calls::float64_function_address),
         to_object: super::calls::libjs_jit_to_object as *const () as u64,
         array_create: super::calls::libjs_jit_array_create as *const () as u64,
         intrinsic_helpers: IntrinsicHelpers {

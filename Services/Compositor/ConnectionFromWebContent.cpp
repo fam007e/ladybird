@@ -242,12 +242,28 @@ void ConnectionFromWebContent::update_scroll_state(Web::CompositorContextId cont
     m_compositor_state->update_scroll_state(context_id, move(scroll_state_snapshot), move(keyboard_scroll_state));
 }
 
-Messages::CompositorWebContentServer::CreateCanvas2dContextResponse ConnectionFromWebContent::create_canvas_2d_context(Gfx::IntSize size, bool alpha)
+Messages::CompositorWebContentServer::ReserveCanvasIdsResponse ConnectionFromWebContent::reserve_canvas_ids()
 {
-    auto canvas_id = m_canvas_host.create_2d_context(size, alpha);
-    if (!canvas_id.has_value())
-        return { false, Compositing::CanvasId { 0 } };
-    return { true, *canvas_id };
+    static constexpr u64 reserved_canvas_id_count = 1 << 20;
+    if (!m_reserved_canvas_ids.is_used_up()) {
+        did_misbehave("WebContent reserved canvas IDs before using up its range");
+        return { Compositing::CanvasId { 0 }, 0 };
+    }
+    auto first_canvas_id = m_compositor_state->canvas_surface_registry().reserve_canvas_ids(reserved_canvas_id_count);
+    m_reserved_canvas_ids = { first_canvas_id.value(), first_canvas_id.value() + reserved_canvas_id_count };
+    return { first_canvas_id, reserved_canvas_id_count };
+}
+
+void ConnectionFromWebContent::create_canvas_2d_context(Compositing::CanvasId canvas_id, Gfx::IntSize size, bool alpha)
+{
+    // NB: WebContent names its contexts with the IDs of its range in order, so each ID names one context only.
+    if (m_reserved_canvas_ids.is_used_up() || canvas_id.value() != m_reserved_canvas_ids.next) {
+        did_misbehave("WebContent named a 2D canvas context with an ID other than the next one it reserved");
+        return;
+    }
+    ++m_reserved_canvas_ids.next;
+    // NB: A context that cannot be created is not a protocol violation: commands recorded for it are dropped.
+    (void)m_canvas_host.create_2d_context(canvas_id, size, alpha);
 }
 
 void ConnectionFromWebContent::update_canvas_2d_stream(Vector<Compositing::Canvas2DCommandStreamSegment> segments, Vector<Compositing::DisplayListFontResource> fonts)
@@ -407,11 +423,11 @@ void ConnectionFromWebContent::invalidate_wheel_event_listener_state(Web::Compos
     m_compositor_state->invalidate_wheel_event_listener_state(context_id, generation);
 }
 
-Messages::CompositorWebContentServer::AsyncScrollByResponse ConnectionFromWebContent::async_scroll_by(Web::CompositorContextId context_id, Web::UniqueNodeID document_id, Gfx::FloatPoint position, Gfx::FloatPoint delta, Gfx::IntRect viewport_rect, Web::WheelDeltaPrecision wheel_delta_precision, Web::ScrollGesturePhase scroll_gesture_phase, u32 modifiers, Compositing::AsyncScrollOperationTracking operation_tracking)
+Messages::CompositorWebContentServer::AsyncScrollByResponse ConnectionFromWebContent::async_scroll_by(Web::CompositorContextId context_id, Web::UniqueNodeID document_id, Gfx::FloatPoint position, Gfx::FloatPoint delta, Gfx::IntRect viewport_rect, Web::WheelDeltaPrecision wheel_delta_precision, Web::ScrollGesturePhase scroll_gesture_phase, u32 modifiers, Compositing::AsyncScrollOperationTracking operation_tracking, Compositing::WheelStepDispatch wheel_step_dispatch, u64 input_event_id)
 {
     if (!context_is_owned_by_this_connection(context_id))
         return Compositing::AsyncScrollEnqueueResult {};
-    auto result = m_compositor_state->async_scroll_by(context_id, document_id, position, delta, viewport_rect, wheel_delta_precision, scroll_gesture_phase, modifiers, operation_tracking);
+    auto result = m_compositor_state->async_scroll_by(context_id, document_id, position, delta, viewport_rect, wheel_delta_precision, scroll_gesture_phase, modifiers, operation_tracking, wheel_step_dispatch, input_event_id);
     if (result.accepted)
         async_request_rendering_update();
     return result;
@@ -427,11 +443,35 @@ Messages::CompositorWebContentServer::SmoothScrollToResponse ConnectionFromWebCo
     return result;
 }
 
-Messages::CompositorWebContentServer::ElasticOverscrollStretchForTestingResponse ConnectionFromWebContent::elastic_overscroll_stretch_for_testing(Web::CompositorContextId context_id, Web::AsyncScrollNodeStableID stable_node_id)
+Messages::CompositorWebContentServer::ScrollStateForTestingResponse ConnectionFromWebContent::scroll_state_for_testing(Web::CompositorContextId context_id, Web::AsyncScrollNodeStableID stretched_scroller)
 {
     if (!context_is_owned_by_this_connection(context_id))
-        return Gfx::FloatPoint {};
-    return m_compositor_state->elastic_overscroll_stretch_for_testing(context_id, stable_node_id);
+        return String {};
+    return m_compositor_state->scroll_state_for_testing(context_id, stretched_scroller);
+}
+
+Messages::CompositorWebContentServer::RouteFirstWheelStepForTestingResponse ConnectionFromWebContent::route_first_wheel_step_for_testing(Web::CompositorContextId context_id, Gfx::FloatPoint position, Gfx::FloatPoint delta_in_css_pixels)
+{
+    if (!context_is_owned_by_this_connection(context_id))
+        return { {}, {}, {} };
+    auto result = m_compositor_state->route_first_wheel_step_for_testing(context_id, position, delta_in_css_pixels);
+    if (!result.has_value())
+        return { {}, {}, {} };
+    return { result->route.decision, result->route.scroller, result->document_id };
+}
+
+void ConnectionFromWebContent::begin_input_trace_for_testing(Web::CompositorContextId context_id)
+{
+    if (!context_is_owned_by_this_connection(context_id))
+        return;
+    m_compositor_state->begin_input_trace_for_testing(context_id);
+}
+
+Messages::CompositorWebContentServer::TakeInputTraceForTestingResponse ConnectionFromWebContent::take_input_trace_for_testing(Web::CompositorContextId context_id)
+{
+    if (!context_is_owned_by_this_connection(context_id))
+        return Vector<Web::InputTraceRecord> {};
+    return m_compositor_state->take_input_trace_for_testing(context_id);
 }
 
 void ConnectionFromWebContent::cancel_smooth_scroll(Web::CompositorContextId context_id, Web::AsyncScrollNodeStableID stable_node_id)
@@ -448,11 +488,15 @@ Messages::CompositorWebContentServer::TakePendingAsyncScrollUpdatesResponse Conn
     return m_compositor_state->take_pending_async_scroll_updates(context_id);
 }
 
-void ConnectionFromWebContent::viewport_size_updated(Web::CompositorContextId context_id, Gfx::IntSize viewport_size, Compositing::WindowResizingInProgress window_resize_in_progress)
+void ConnectionFromWebContent::viewport_size_updated(Web::CompositorContextId context_id, Gfx::IntSize viewport_size, double device_pixel_ratio, Compositing::WindowResizingInProgress window_resize_in_progress)
 {
     if (!context_is_owned_by_this_connection(context_id))
         return;
-    m_compositor_state->viewport_size_updated(context_id, viewport_size, window_resize_in_progress);
+    if (!isfinite(device_pixel_ratio) || device_pixel_ratio <= 0) {
+        did_misbehave("WebContent sent an invalid device pixel ratio");
+        return;
+    }
+    m_compositor_state->viewport_size_updated(context_id, viewport_size, device_pixel_ratio, window_resize_in_progress);
 }
 
 void ConnectionFromWebContent::present_frame(Web::CompositorContextId context_id, Gfx::IntRect viewport_rect)

@@ -84,6 +84,7 @@
 #include <LibWebCommon/Page/ContextMenuForInputEventsTarget.h>
 #include <LibWebCommon/Page/EventResult.h>
 #include <LibWebCommon/Page/InputEvent.h>
+#include <LibWebCommon/Page/InputTrace.h>
 #include <LibWebCommon/Page/MediaContextMenu.h>
 #include <LibWebCommon/Page/NavigationTarget.h>
 #include <LibWebCommon/Page/PageId.h>
@@ -168,6 +169,8 @@ public:
 
     HTML::HistoryExecutor& history_executor();
 
+    PictureInPicture::PictureInPictureController& picture_in_picture_controller() const { return *m_picture_in_picture_controller; }
+
     GC::Ptr<HTML::Navigable> focused_navigable() const;
     GC::Ptr<HTML::LocalNavigable> hosted_focused_navigable() const;
     void set_focused_navigable(HTML::Navigable&);
@@ -190,14 +193,16 @@ public:
     EventResult handle_mousedown(HTML::LocalNavigable& root, DevicePixelPoint, DevicePixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers, int click_count, Optional<Web::ScrollbarDraggedByCompositor> const&, Optional<RemoteInputEventTarget>* remote_target);
     EventResult handle_mousemove(HTML::LocalNavigable& root, DevicePixelPoint, DevicePixelPoint screen_position, unsigned buttons, unsigned modifiers, Optional<RemoteInputEventTarget>* remote_target);
     EventResult handle_mouseleave(HTML::LocalNavigable& root);
+    EventResult handle_mousecancel(HTML::LocalNavigable& root);
     EventResult handle_mousewheel(HTML::LocalNavigable& root, DevicePixelPoint, DevicePixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers, double wheel_delta_x, double wheel_delta_y, Web::WheelDeltaPrecision, Web::ScrollGesturePhase, bool async_scroll_performed_default_action, Optional<AsyncScrollOperation>* async_scroll_operation, Optional<RemoteInputEventTarget>* remote_target);
     EventResult handle_drag_and_drop_event(HTML::LocalNavigable& root, DragEvent::Type, DevicePixelPoint, DevicePixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers, Vector<HTML::SelectedFile> files);
     EventResult handle_pinch_event(HTML::LocalNavigable& root, DevicePixelPoint point, unsigned modifiers, double scale);
 
     EventResult handle_mouseup(DevicePixelPoint, DevicePixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers);
-    EventResult handle_mousedown(DevicePixelPoint, DevicePixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers, int click_count, Optional<Web::ScrollbarDraggedByCompositor> const& = {});
+    EventResult handle_mousedown(DevicePixelPoint, DevicePixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers, int click_count);
     EventResult handle_mousemove(DevicePixelPoint, DevicePixelPoint screen_position, unsigned buttons, unsigned modifiers);
     EventResult handle_mouseleave();
+    EventResult handle_mousecancel();
     void set_mouse_event_tracking_navigable(Badge<EventHandler>, HTML::LocalNavigable&);
 #if defined(AK_OS_MACOS)
     bool select_word_for_dictionary_lookup(DevicePixelPoint);
@@ -273,6 +278,9 @@ public:
 
     void did_request_alert(Utf16String const& message);
     void alert_closed();
+
+    bool did_request_before_unload(String const& source, HTML::EventLoop&);
+    void before_unload_closed(bool accepted);
 
     bool did_request_confirm(Utf16String const& message);
     void confirm_closed(bool accepted);
@@ -367,6 +375,7 @@ public:
         };
         Kind kind { Kind::Page };
         GC::Ref<DOM::Node> target;
+        Optional<Web::MediaContextMenu> media {};
     };
     void record_context_menu_request(Badge<EventHandler>, ContextMenuRequest);
     void clear_context_menu_request() { m_context_menu_request.clear(); }
@@ -380,22 +389,29 @@ public:
     void did_complete_spelling_menu_action_for_testing(String menu);
     Optional<ContextMenuRequest> take_context_menu_request();
 
+    // The routing decisions this process makes for input events, which a test can trace.
+    InputTraceRecorder& input_trace() { return m_input_trace; }
+
     using MediaContextMenu = Web::MediaContextMenu;
-    void did_request_media_context_menu(UniqueNodeID media_id, HTML::CrossProcessId local_root_id, CSSPixelPoint, ByteString const& target, unsigned modifiers, MediaContextMenu const&, HTML::PreparedNavigationDescriptor);
+    void did_request_media_context_menu(UniqueNodeID media_id, HTML::CrossProcessId local_root_id, CSSPixelPoint, ByteString const& target, unsigned modifiers, MediaContextMenu const&, Optional<HTML::PreparedNavigationDescriptor>);
     void toggle_media_play_state();
     void toggle_media_mute_state();
     void toggle_media_loop_state();
     void toggle_media_fullscreen_state();
+    void toggle_media_picture_in_picture_state();
     void toggle_media_controls_state();
+    void set_picture_in_picture_window_controls_in_use(bool);
 
     HTML::MuteState page_mute_state() const { return m_mute_state; }
     void set_page_mute_state(HTML::MuteState);
 
     Optional<Utf16String> const& user_style() const { return m_user_style_sheet_source; }
     void set_user_style(Utf16String source);
-    void set_content_blocking_enabled(bool);
     void invalidate_user_style();
     void invalidate_style_for_preference_change();
+
+    bool content_blocking_enabled_for_url(Optional<URL::URL> const&) const;
+    void set_content_blocking_policy(bool enabled, ReadonlySpan<String> disabled_sites);
 
     bool pdf_viewer_supported() const { return m_pdf_viewer_supported; }
 
@@ -482,6 +498,7 @@ private:
     HTML::VisibilityState m_system_visibility_state { HTML::VisibilityState::Hidden };
 
     GC::Ref<HTML::HistoryExecutor> m_history_executor;
+    GC::Ref<PictureInPicture::PictureInPictureController> m_picture_in_picture_controller;
 
     struct ScreenshotTask {
         Optional<UniqueNodeID> node_id;
@@ -517,6 +534,7 @@ private:
     PendingDialog m_pending_dialog { PendingDialog::None };
     Optional<Utf16String> m_pending_dialog_text;
     Optional<Empty> m_pending_alert_response;
+    Optional<bool> m_pending_before_unload_response;
     Optional<bool> m_pending_confirm_response;
     Optional<Optional<Utf16String>> m_pending_prompt_response;
     GC::Ptr<GC::Function<void()>> m_on_pending_dialog_closed;
@@ -557,12 +575,16 @@ private:
     Web::HTML::MuteState m_mute_state { Web::HTML::MuteState::Unmuted };
 
     Optional<ContextMenuRequest> m_context_menu_request;
+    InputTraceRecorder m_input_trace;
     Optional<Editing::ContextMenuMisspelling> m_context_menu_misspelling;
     HashTable<Utf16String> m_accepted_spelling_words;
     GC::Ptr<GC::Function<void(String)>> m_on_spelling_menu_action_for_testing;
     size_t m_active_screen_wake_lock_count { 0 };
 
     Optional<Utf16String> m_user_style_sheet_source;
+
+    bool m_content_blocking_enabled { true };
+    HashTable<String> m_content_blocking_disabled_sites;
 
     // https://html.spec.whatwg.org/multipage/system-state.html#pdf-viewer-supported
     // Each user agent has a PDF viewer supported boolean, whose value is implementation-defined (and might vary
@@ -653,6 +675,9 @@ public:
     virtual void send_bad_ipc_message_for_testing([[maybe_unused]] StringView kind, [[maybe_unused]] URL::URL const& active_document_url) { }
     virtual Gfx::Palette palette() const = 0;
     virtual DevicePixelRect screen_rect() const = 0;
+    // The part of the screen that windows may occupy: the screen less the areas the system keeps for itself, such as
+    // a menu bar or a dock. A client that doesn't know it reports the whole screen.
+    virtual DevicePixelRect available_screen_rect() const { return screen_rect(); }
     virtual double zoom_level() const = 0;
     virtual double device_pixel_ratio() const = 0;
     virtual double device_pixels_per_css_pixel() const = 0;
@@ -686,6 +711,7 @@ public:
     virtual void inject_rendering_opportunity([[maybe_unused]] double frame_time) { }
     virtual void page_did_change_title(Utf16String const&) { }
     virtual void page_did_update_editing_history_state(bool, bool) { }
+    virtual void page_did_set_text_fragment_indication_visibility(bool) { }
     virtual void page_did_request_refresh() { }
     virtual void page_did_request_resize_window(Gfx::IntSize, u64) { }
     virtual void page_did_request_reposition_window(Gfx::IntPoint, u64) { }
@@ -694,9 +720,11 @@ public:
     virtual void page_did_request_minimize_window() { }
     virtual void page_did_request_fullscreen_window() { }
     virtual void page_did_request_exit_fullscreen() { }
-    virtual void page_did_create_new_document(Web::DOM::Document&) { }
+    virtual void page_did_exit_picture_in_picture() { }
+    virtual void page_did_change_picture_in_picture_video_size(Gfx::IntSize) { }
+    virtual void page_did_change_picture_in_picture_player_controls_visibility(bool) { }
     virtual void page_did_change_active_document_in_top_level_browsing_context(Web::DOM::Document&) { }
-    virtual void page_did_finish_loading(HTML::CrossProcessId, Optional<Utf16String> const&) { }
+    virtual void page_did_finish_loading(HTML::CrossProcessId, HTML::CrossProcessId) { }
     virtual Optional<u64> page_did_start_download(HTML::CrossProcessId navigable_id, Optional<Utf16String> const& navigation_id, URL::URL const&, ByteString const& suggested_filename, Optional<u64> total_size, int request_server_client_id, u64 request_server_request_id, ByteBuffer initial_data)
     {
         (void)navigable_id;
@@ -724,10 +752,10 @@ public:
     // The node an assistive technology should treat as focused: the focused element, or the document element once
     // nothing in the document is focused.
     virtual void page_did_change_accessibility_focus(Web::UniqueNodeID) { }
-    virtual void page_did_request_context_menu([[maybe_unused]] HTML::CrossProcessId local_root_id, CSSPixelPoint, ContextMenuForInputEventsTarget, [[maybe_unused]] Optional<Utf16String> misspelled_word) { }
-    virtual void page_did_request_link_context_menu([[maybe_unused]] HTML::CrossProcessId local_root_id, CSSPixelPoint, HTML::PreparedNavigationDescriptor, [[maybe_unused]] ByteString const& target, [[maybe_unused]] unsigned modifiers) { }
+    virtual void page_did_request_context_menu([[maybe_unused]] HTML::CrossProcessId local_root_id, CSSPixelPoint, ContextMenuForInputEventsTarget, [[maybe_unused]] Optional<Utf16String> misspelled_word, [[maybe_unused]] GC::Ptr<DOM::Range> selected_text_range) { }
+    virtual void page_did_request_link_context_menu([[maybe_unused]] HTML::CrossProcessId local_root_id, CSSPixelPoint, HTML::PreparedNavigationDescriptor, [[maybe_unused]] ByteString const& target, [[maybe_unused]] unsigned modifiers, [[maybe_unused]] GC::Ptr<DOM::Range> selected_text_range) { }
     virtual void page_did_request_image_context_menu([[maybe_unused]] HTML::CrossProcessId local_root_id, CSSPixelPoint, HTML::PreparedNavigationDescriptor, [[maybe_unused]] ByteString const& target, [[maybe_unused]] unsigned modifiers, Optional<Gfx::Bitmap const*>) { }
-    virtual void page_did_request_media_context_menu([[maybe_unused]] HTML::CrossProcessId local_root_id, CSSPixelPoint, [[maybe_unused]] ByteString const& target, [[maybe_unused]] unsigned modifiers, Page::MediaContextMenu const&, HTML::PreparedNavigationDescriptor) { }
+    virtual void page_did_request_media_context_menu([[maybe_unused]] HTML::CrossProcessId local_root_id, CSSPixelPoint, [[maybe_unused]] ByteString const& target, [[maybe_unused]] unsigned modifiers, Page::MediaContextMenu const&, Optional<HTML::PreparedNavigationDescriptor>) { }
     virtual void page_did_click_link(HTML::PreparedNavigationDescriptor, [[maybe_unused]] ByteString const& target, [[maybe_unused]] unsigned modifiers) { }
     virtual void page_did_middle_click_link(HTML::PreparedNavigationDescriptor, [[maybe_unused]] ByteString const& target, [[maybe_unused]] unsigned modifiers) { }
     virtual void page_did_request_external_url([[maybe_unused]] URL::URL const& url, [[maybe_unused]] URL::Origin const& initiator_origin, [[maybe_unused]] bool has_transient_activation) { }
@@ -739,6 +767,7 @@ public:
     virtual void page_did_unhover_link() { }
     virtual void page_did_change_favicon(Gfx::Bitmap const&) { }
     virtual void page_did_request_alert(Utf16String const&) { }
+    virtual void page_did_request_before_unload(String const&) { }
     virtual void page_did_request_confirm(Utf16String const&) { }
     virtual void page_did_request_prompt(Utf16String const&, Utf16String const&) { }
     virtual void page_did_request_set_prompt_text(Utf16String const&) { }
@@ -857,6 +886,7 @@ public:
     virtual Gamepad::ReceivedRumbleEffects virtual_gamepad_received_rumble_effects([[maybe_unused]] Gamepad::GamepadHandle handle) { return {}; }
     virtual void pump_gamepad_events() { }
 
+    virtual void page_did_block_resource() { }
     virtual void page_did_start_network_request([[maybe_unused]] u64 request_id, [[maybe_unused]] URL::URL const& url, [[maybe_unused]] ByteString const& method, [[maybe_unused]] Vector<HTTP::Header> const& request_headers, [[maybe_unused]] ReadonlyBytes request_body, [[maybe_unused]] Optional<String> initiator_type, [[maybe_unused]] String const& referrer_policy, [[maybe_unused]] bool is_navigation_request, [[maybe_unused]] Fetch::Infrastructure::Request::Priority priority) { }
     virtual void page_did_receive_network_response_headers([[maybe_unused]] u64 request_id, [[maybe_unused]] u32 status_code, [[maybe_unused]] Optional<String> reason_phrase, [[maybe_unused]] Vector<HTTP::Header> const& response_headers, [[maybe_unused]] Requests::CacheState cache_state) { }
     virtual void page_did_receive_network_response_body([[maybe_unused]] u64 request_id, [[maybe_unused]] ReadonlyBytes data) { }

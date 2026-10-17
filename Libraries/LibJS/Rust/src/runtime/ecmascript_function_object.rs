@@ -238,11 +238,11 @@ impl EcmascriptFunctionObject {
 
         // NOTE: The constructor gave us a premade shape with "length" and "name" (and "prototype" for generator kinds) at
         //       these offsets, with the attributes the spec requires, so we only have to store the values.
-        self.put_direct(
+        self.initialize_direct(
             realm.normal_function_length_offset(),
             Value::from_i32(self.function_length()),
         );
-        self.put_direct(realm.normal_function_name_offset(), Value::from_string(name_string));
+        self.initialize_direct(realm.normal_function_name_offset(), Value::from_string(name_string));
 
         match self.kind() {
             FunctionKind::Normal => {
@@ -252,7 +252,7 @@ impl EcmascriptFunctionObject {
             }
             FunctionKind::Generator => {
                 // prototype is "g1.prototype" in figure-2 (https://tc39.es/ecma262/img/figure-2.png)
-                self.put_direct(
+                self.initialize_direct(
                     realm.generator_function_prototype_property_offset(),
                     Value::from_object(Object::create_prototype(
                         vm,
@@ -266,7 +266,7 @@ impl EcmascriptFunctionObject {
                 // AsyncFunction instances do not have a prototype property as they are not constructible.
             }
             FunctionKind::AsyncGenerator => {
-                self.put_direct(
+                self.initialize_direct(
                     realm.generator_function_prototype_property_offset(),
                     Value::from_object(Object::create_prototype(
                         vm,
@@ -636,15 +636,24 @@ impl EcmascriptFunctionObject {
         let executable = self
             .bytecode_executable()
             .expect("a function is compiled before it is called");
-        let result = vm
-            .run_executable(NonNull::from(context), executable, 0)
-            .map_err(Throw::new)?;
+        let result = vm.run_executable(NonNull::from(context), executable, 0);
 
         // NOTE: Running the bytecode should eventually return a completion.
         // Until it does, we assume "return" and include the undefined fallback from the call site.
         if self.kind() == FunctionKind::Normal {
-            return Ok(result);
+            return result.map_err(Throw::new);
         }
+
+        if self.kind() == FunctionKind::Async {
+            return Ok(Value::from_object(AsyncFunctionDriverWrapper::start(
+                vm,
+                context.realm.get().expect("a function runs in a realm"),
+                GeneratingFunction::Ecmascript(self.as_ecmascript_function_gc()),
+                context,
+                result,
+            )));
+        }
+        result.map_err(Throw::new)?;
 
         let realm = context.realm.get().expect("a function runs in a realm");
         if self.kind() == FunctionKind::AsyncGenerator {
@@ -656,24 +665,13 @@ impl EcmascriptFunctionObject {
             )));
         }
 
-        let generator_object = GeneratorObject::create(
+        debug_assert!(self.kind() == FunctionKind::Generator);
+        Ok(Value::from_object(GeneratorObject::create(
             vm,
             realm,
             GeneratingFunction::Ecmascript(self.as_ecmascript_function_gc()),
             context.copy(),
-        );
-
-        // NOTE: Async functions are entirely transformed to generator functions, and wrapped in a custom driver that returns a promise.
-        if self.kind() == FunctionKind::Async {
-            return Ok(Value::from_object(AsyncFunctionDriverWrapper::create(
-                vm,
-                realm,
-                generator_object,
-            )));
-        }
-
-        debug_assert!(self.kind() == FunctionKind::Generator);
-        Ok(Value::from_object(generator_object))
+        )))
     }
 
     pub fn set_name(&self, vm: &Vm, name: &Utf16FlyString) {
@@ -1076,7 +1074,7 @@ impl EcmascriptFunctionObject {
             let metadata = object.shape().lookup(property_key);
             if metadata.is_none() {
                 let prototype = Object::create_with_premade_shape(vm, realm.normal_function_prototype_shape());
-                prototype.put_direct(
+                prototype.initialize_direct(
                     realm.normal_function_prototype_constructor_offset(),
                     Value::from_object(function.as_function_object_gc()),
                 );

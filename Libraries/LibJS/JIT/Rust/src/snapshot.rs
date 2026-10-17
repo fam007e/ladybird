@@ -13,6 +13,7 @@
 
 use std::sync::Arc;
 
+use crate::ir::Float64Function;
 use crate::ir::Locations;
 
 use crate::bytecode::EnvironmentCoordinate;
@@ -338,6 +339,14 @@ impl CallFeedbackSnapshot {
         Some((self.target?, self.target_intrinsic?))
     }
 
+    /// The site's single callee, if it is the builtin function `builtin`.
+    pub fn monomorphic_builtin(&self, builtin: u8) -> Option<CellId> {
+        if self.flags & call_feedback_flags::POLYMORPHIC != 0 || self.target_builtin != Some(builtin) {
+            return None;
+        }
+        self.target
+    }
+
     /// The site's single callee if it is `Function.prototype.call`, whose
     /// calls JIT code makes by calling the `this` value directly.
     pub fn function_prototype_call_target(&self) -> Option<CellId> {
@@ -399,6 +408,9 @@ pub struct CallFeedbackSnapshot {
     pub forwarded: Option<ForwardedCallSnapshot>,
     /// Which intrinsic `target` is, if it is one the compiler knows.
     pub target_intrinsic: Option<Intrinsic>,
+    /// The `Builtin` id of `target` (see `RuntimeLayout::builtin_math_abs`), if
+    /// it is a builtin function.
+    pub target_builtin: Option<u8>,
     /// `target`, if JIT code can inline its constructs.
     pub construct: Option<ConstructTarget>,
 }
@@ -644,6 +656,10 @@ pub struct PropertyCacheEntrySnapshot {
     /// Which intrinsic `prototype_property` is, if it is one the compiler
     /// knows.
     pub prototype_property_intrinsic: Option<Intrinsic>,
+    /// The executable of `prototype_property` as an inlining candidate, if
+    /// it is a function JIT code may inline: code that calls the property's
+    /// value as a constant can inline the call without feedback for it.
+    pub prototype_property_inline_executable: Option<u32>,
     /// The function of the accessor the access calls: for `GetPropertyInPrototypeChain` entries, the getter of the
     /// accessor `prototype` held in the property when the snapshot was
     /// taken, for `ChangePropertyInPrototypeChain` entries its setter, and
@@ -729,6 +745,10 @@ pub enum Intrinsic {
     StringPrototypeTrimEnd,
     /// `RegExp.prototype.exec`.
     RegExpPrototypeExec,
+    /// `Map.prototype.get`.
+    MapPrototypeGet,
+    /// `Map.prototype.has`.
+    MapPrototypeHas,
 }
 
 /// A `this` value or argument of a builtin whose runtime helper JIT code
@@ -804,6 +824,17 @@ impl Default for HelperCallAddresses {
     }
 }
 
+/// `u64 (Float64Function)`: the address of the runtime's `double
+/// (double...)` function that computes a `Float64Function`, or 0.
+#[derive(Debug, Clone, Copy)]
+pub struct Float64FunctionAddresses(pub fn(Float64Function) -> u64);
+
+impl Default for Float64FunctionAddresses {
+    fn default() -> Self {
+        Self(|_| 0)
+    }
+}
+
 impl Intrinsic {
     /// How JIT code calls the builtin through its runtime helper, if it
     /// does.
@@ -845,6 +876,15 @@ impl Intrinsic {
                 result: HelperResult::Value,
                 reads: Locations::NAMED,
                 writes: Locations::NAMED_SLOTS,
+            }),
+            // NB: The helpers decline for receivers that are no Map, which
+            //     the slow path throws for.
+            Intrinsic::MapPrototypeGet | Intrinsic::MapPrototypeHas => Some(HelperCall {
+                receiver: HelperOperand::Value,
+                arguments: &[HelperOperand::Value],
+                result: HelperResult::Value,
+                reads: Locations::COLLECTIONS,
+                writes: Locations::NONE,
             }),
             _ => None,
         }
@@ -915,6 +955,9 @@ pub struct RuntimeInfo {
     /// The runtime helpers of the intrinsics JIT code calls through them
     /// (see `Intrinsic::helper_call()`).
     pub helper_calls: HelperCallAddresses,
+    /// The runtime's functions of doubles that `Op::CallFloat64Function`
+    /// calls.
+    pub float64_functions: Float64FunctionAddresses,
     /// `u64 libjs_jit_to_object(VM*, u64 primitive, u64 function)`: ToObject
     /// of a primitive other than undefined and null, as the builtin
     /// `function` makes it, or the empty value if that function is of
@@ -978,16 +1021,20 @@ pub struct RuntimeInfo {
     /// `Array.prototype.slice.call(arguments, start)` with the arguments
     /// object of `frame`, which the code never created, as an array value.
     pub slice_arguments: u64,
-    /// `u64 libjs_jit_create_array_iterator(VM*, u64 iterable, u64 next)`:
-    /// `GetIterator` of an array whose iterator method is
-    /// `%Array.prototype.values%`, if the iterators it makes have the method
-    /// `next`, as a new array iterator over its values; the empty value,
-    /// having done nothing, otherwise.
-    pub create_array_iterator: u64,
+    /// `u64 libjs_jit_open_array_iteration(VM*, u64 iterable)`:
+    /// `GetIterator` in fast array mode: the iterable, if it is an array whose
+    /// iterator method is `%Array.prototype.values%` and whose iterators have
+    /// the builtin `next` method; the empty value otherwise.
+    pub open_array_iteration: u64,
     /// The builtin `%ArrayIteratorPrototype%.next` of the realm of the
     /// compiled code, if `%ArrayIteratorPrototype%` holds it. Code that
     /// embeds it must list it in `CompiledCode::embedded_cells`.
     pub array_iterator_next: Option<CellId>,
+    /// The watchpoint set of the realm of the compiled code that stays valid
+    /// while its array iterators have no `return` method, if it was valid.
+    /// Code that depends on it must list it in
+    /// `CompiledCode::embedded_cells`.
+    pub array_iterator_return_watchpoint_set: Option<CellId>,
     /// The realm of the compiled code.
     pub realm: CellId,
     /// `%Array.prototype%` and `%Object.prototype%` of the realm of the
@@ -1352,7 +1399,7 @@ pub struct RuntimeOffsets {
     pub object_named_properties: u32,
     /// `Shape::dictionary_generation` (u32).
     pub shape_dictionary_generation: u32,
-    /// `PrototypeChainValidity::valid` (bool).
+    /// `WatchpointSet::valid` (bool).
     pub prototype_chain_validity_valid: u32,
     /// `Accessor::getter` and `Accessor::setter` (cell pointers, null if
     /// none).
@@ -1596,13 +1643,20 @@ pub struct RuntimeLayout {
     /// `Builtin` values.
     pub builtin_string_prototype_char_code_at: u8,
     pub builtin_string_prototype_char_at: u8,
-    /// `JS::Builtin::MathAbs`, `MathFloor`, `MathCeil`, `MathRound` and
-    /// `MathSqrt`.
+    /// `JS::Builtin::MathAbs`, `MathFloor`, `MathCeil`, `MathRound`,
+    /// `MathSqrt`, `MathExp`, `MathLog`, `MathSin`, `MathCos`, `MathTan` and
+    /// `MathPow`.
     pub builtin_math_abs: u8,
     pub builtin_math_floor: u8,
     pub builtin_math_ceil: u8,
     pub builtin_math_round: u8,
     pub builtin_math_sqrt: u8,
+    pub builtin_math_exp: u8,
+    pub builtin_math_log: u8,
+    pub builtin_math_sin: u8,
+    pub builtin_math_cos: u8,
+    pub builtin_math_tan: u8,
+    pub builtin_math_pow: u8,
     /// The strings `typeof` results in, as values, or all 0 for code
     /// without them.
     pub typeof_strings: TypeofStrings,
@@ -1635,6 +1689,14 @@ pub struct RuntimeLayout {
     pub array_iterator_kind: u32,
     /// The `[[ArrayLikeIterationKind]]` of iterators over values.
     pub array_iterator_kind_value: u8,
+    /// The class (pointer) of `GeneratorObject`s, which starts their cells.
+    pub generator_object_class: u64,
+    /// `GeneratorObject::pending_completion_value` (value): the value of
+    /// the completion a generator resumes with.
+    pub generator_object_pending_completion_value: u32,
+    /// `GeneratorObject::pending_completion_type` (u32): the type of that
+    /// completion, as `GetCompletionFields` writes it.
+    pub generator_object_pending_completion_type: u32,
     /// `DeclarativeEnvironment::binding_values.size` (u64).
     pub declarative_environment_binding_values_size: u32,
     /// The capacity (u64) of `DeclarativeEnvironment::binding_values`.

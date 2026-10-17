@@ -76,9 +76,10 @@ public:
     void set_palette_impl(Gfx::PaletteImpl&);
     void set_viewport(Web::DevicePixelSize const&, double device_pixel_ratio);
     void set_hosted_root_viewport(Web::HTML::CrossProcessId, Web::DevicePixelSize const&, Web::DevicePixelRect const& viewport_intersection, double device_pixel_ratio);
-    void set_screen_rects(Vector<Web::DevicePixelRect> const& rects, size_t main_screen_index)
+    void set_screen_rects(Vector<Web::DevicePixelRect> const& rects, Vector<Web::DevicePixelRect> const& available_rects, size_t main_screen_index)
     {
         m_all_screen_rects = rects;
+        m_all_available_screen_rects = available_rects;
         m_main_screen_index = main_screen_index;
     }
     void set_zoom_level(double zoom_level);
@@ -104,6 +105,7 @@ public:
     void set_geolocation_emulated_position(WebView::GeolocationPositionData const&, Optional<u16> error_code);
     void geolocation_position_response(u64 request_id, WebView::GeolocationPositionData const&, Optional<u16> error_code);
     void permission_request_completed(u64 request_id, bool granted);
+    Optional<URL::URL> generate_text_fragment_url(u64 generation_id);
 
     void alert_closed();
     void confirm_closed(bool accepted);
@@ -213,6 +215,12 @@ private:
     virtual void send_bad_ipc_message_for_testing(StringView kind, URL::URL const& active_document_url) override;
     virtual Gfx::Palette palette() const override;
     virtual Web::DevicePixelRect screen_rect() const override { return m_all_screen_rects[m_main_screen_index]; }
+    virtual Web::DevicePixelRect available_screen_rect() const override
+    {
+        if (m_main_screen_index < m_all_available_screen_rects.size())
+            return m_all_available_screen_rects[m_main_screen_index];
+        return screen_rect();
+    }
     virtual size_t screen_count() const override { return m_all_screen_rects.size(); }
     virtual Web::CSS::PreferredColorScheme preferred_color_scheme() const override { return m_preferred_color_scheme; }
     virtual Web::CSS::PreferredContrast preferred_contrast() const override { return m_preferred_contrast; }
@@ -226,6 +234,7 @@ private:
     virtual void inject_rendering_opportunity(double frame_time) override;
     virtual void page_did_change_title(Utf16String const&) override;
     virtual void page_did_update_editing_history_state(bool can_undo, bool can_redo) override;
+    virtual void page_did_set_text_fragment_indication_visibility(bool) override;
     virtual void page_did_request_refresh() override;
     virtual void page_did_request_resize_window(Gfx::IntSize, u64 completion_id) override;
     virtual void page_did_request_reposition_window(Gfx::IntPoint, u64 completion_id) override;
@@ -234,6 +243,9 @@ private:
     virtual void page_did_request_minimize_window() override;
     virtual void page_did_request_fullscreen_window() override;
     virtual void page_did_request_exit_fullscreen() override;
+    virtual void page_did_exit_picture_in_picture() override;
+    virtual void page_did_change_picture_in_picture_video_size(Gfx::IntSize) override;
+    virtual void page_did_change_picture_in_picture_player_controls_visibility(bool shown) override;
     virtual void page_did_request_tooltip_override(Web::CSSPixelPoint, ByteString const&) override;
     virtual void page_did_stop_tooltip_override() override;
     virtual void page_did_enter_tooltip_area(ByteString const&) override;
@@ -243,14 +255,13 @@ private:
     virtual void page_did_click_link(Web::HTML::PreparedNavigationDescriptor, ByteString const& target, unsigned modifiers) override;
     virtual void page_did_middle_click_link(Web::HTML::PreparedNavigationDescriptor, ByteString const& target, unsigned modifiers) override;
     virtual void page_did_request_external_url(URL::URL const&, URL::Origin const& initiator_origin, bool has_transient_activation) override;
-    virtual void page_did_request_context_menu(Web::HTML::CrossProcessId local_root_id, Web::CSSPixelPoint, Web::ContextMenuForInputEventsTarget, Optional<Utf16String> misspelled_word) override;
+    virtual void page_did_request_context_menu(Web::HTML::CrossProcessId local_root_id, Web::CSSPixelPoint, Web::ContextMenuForInputEventsTarget, Optional<Utf16String> misspelled_word, GC::Ptr<Web::DOM::Range> selected_text_range) override;
     virtual void page_did_request_spelling_menu_action_for_testing(Web::SpellingMenuActionForTesting, u32 guess_index) override;
-    virtual void page_did_request_link_context_menu(Web::HTML::CrossProcessId local_root_id, Web::CSSPixelPoint, Web::HTML::PreparedNavigationDescriptor, ByteString const& target, unsigned modifiers) override;
+    virtual void page_did_request_link_context_menu(Web::HTML::CrossProcessId local_root_id, Web::CSSPixelPoint, Web::HTML::PreparedNavigationDescriptor, ByteString const& target, unsigned modifiers, GC::Ptr<Web::DOM::Range> selected_text_range) override;
     virtual void page_did_request_image_context_menu(Web::HTML::CrossProcessId local_root_id, Web::CSSPixelPoint, Web::HTML::PreparedNavigationDescriptor, ByteString const& target, unsigned modifiers, Optional<Gfx::Bitmap const*>) override;
-    virtual void page_did_request_media_context_menu(Web::HTML::CrossProcessId local_root_id, Web::CSSPixelPoint, ByteString const& target, unsigned modifiers, Web::Page::MediaContextMenu const&, Web::HTML::PreparedNavigationDescriptor) override;
-    virtual void page_did_create_new_document(Web::DOM::Document&) override;
+    virtual void page_did_request_media_context_menu(Web::HTML::CrossProcessId local_root_id, Web::CSSPixelPoint, ByteString const& target, unsigned modifiers, Web::Page::MediaContextMenu const&, Optional<Web::HTML::PreparedNavigationDescriptor>) override;
     virtual void page_did_change_active_document_in_top_level_browsing_context(Web::DOM::Document&) override;
-    virtual void page_did_finish_loading(Web::HTML::CrossProcessId, Optional<Utf16String> const&) override;
+    virtual void page_did_finish_loading(Web::HTML::CrossProcessId, Web::HTML::CrossProcessId) override;
     virtual Optional<u64> page_did_start_download(Web::HTML::CrossProcessId navigable_id, Optional<Utf16String> const& navigation_id, URL::URL const&, ByteString const& suggested_filename, Optional<u64> total_size, int request_server_client_id, u64 request_server_request_id, ByteBuffer initial_data) override;
     virtual Optional<u64> page_did_start_download(URL::URL const&, ByteString const& suggested_filename, Optional<u64> total_size) override;
     virtual void page_did_receive_download_data(u64 download_id, ByteBuffer data) override;
@@ -263,6 +274,7 @@ private:
     virtual void page_did_change_accessibility_focus(Web::UniqueNodeID) override;
 
     virtual void page_did_request_alert(Utf16String const&) override;
+    virtual void page_did_request_before_unload(String const&) override;
     virtual void page_did_request_confirm(Utf16String const&) override;
     virtual void page_did_request_prompt(Utf16String const&, Utf16String const&) override;
     virtual void page_did_request_set_prompt_text(Utf16String const&) override;
@@ -367,6 +379,7 @@ private:
     virtual void page_did_change_accessibility_tree() override;
     virtual void page_did_take_screenshot(Gfx::ShareableBitmap const& screenshot) override;
     virtual void received_message_from_web_ui(Utf16String const& name, JS::Value data) override;
+    virtual void page_did_block_resource() override;
     virtual void page_did_start_network_request(u64 request_id, URL::URL const&, ByteString const&, Vector<HTTP::Header> const&, ReadonlyBytes, Optional<String>, String const& referrer_policy, bool is_navigation_request, Web::Fetch::Infrastructure::Request::Priority) override;
     virtual void page_did_receive_network_response_headers(u64 request_id, u32 status_code, Optional<String>, Vector<HTTP::Header> const&, Requests::CacheState) override;
     virtual void page_did_receive_network_response_body(u64 request_id, ReadonlyBytes) override;
@@ -377,11 +390,13 @@ private:
     void setup_palette();
     ConnectionFromClient& client() const;
     void send_dom_mutation(Web::DOM::Node const& target, WebView::Mutation mutation);
+    Optional<u64> prepare_text_fragment_generation(GC::Ptr<Web::DOM::Range>);
 
     PageHost& m_owner;
     GC::Ref<Web::Page> m_page;
     RefPtr<Gfx::PaletteImpl> m_palette_impl;
     Vector<Web::DevicePixelRect> m_all_screen_rects { Web::DevicePixelRect {} };
+    Vector<Web::DevicePixelRect> m_all_available_screen_rects { Web::DevicePixelRect {} };
     size_t m_main_screen_index { 0 };
     Web::DevicePixelSize m_viewport_size;
     double m_device_pixel_ratio { 1.0 };
@@ -391,12 +406,15 @@ private:
     double m_maximum_frames_per_second { 60.0 };
     Web::PageId m_id { 0 };
     u64 m_next_delete_all_cookies_request_id { 1 };
+    u64 m_next_text_fragment_generation_id { 1 };
+    HashMap<u64, GC::Ref<Web::DOM::Range>> m_pending_text_fragment_generation_ranges;
     HashMap<u64, GC::Ref<Web::WebIDL::Promise>> m_pending_delete_all_cookies_promises;
     HashMap<Web::HTML::CrossProcessId, GC::Ref<GC::Function<void(Web::HTML::CheckIfUnloadingIsCanceledResult)>>> m_pending_unload_checks;
     HashMap<u64, GC::Ref<Web::Fetch::Infrastructure::FetchController>> m_download_controllers;
     HashMap<u64, GC::Ref<Web::Streams::ReadableStreamDefaultReader>> m_download_readers;
     HashTable<u64> m_canceled_downloads;
     bool m_has_focus { true };
+    bool m_is_closed { false };
 
     Web::CSS::PreferredColorScheme m_preferred_color_scheme { Web::CSS::PreferredColorScheme::Auto };
     Web::CSS::PreferredContrast m_preferred_contrast { Web::CSS::PreferredContrast::NoPreference };

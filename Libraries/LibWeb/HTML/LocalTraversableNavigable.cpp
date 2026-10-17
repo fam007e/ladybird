@@ -12,6 +12,7 @@
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/Geolocation/GeolocationCoordinates.h>
 #include <LibWeb/HTML/BrowsingContext.h>
+#include <LibWeb/HTML/CheckUnloadingCanceledState.h>
 #include <LibWeb/HTML/DocumentState.h>
 #include <LibWeb/HTML/History.h>
 #include <LibWeb/HTML/HistoryExecutor.h>
@@ -114,6 +115,18 @@ GC::Ref<LocalTraversableNavigable> LocalTraversableNavigable::create_a_new_top_l
     // NB: The UI process holds the user agent's top-level traversable set.
 
     // 12. Return traversable.
+    return traversable;
+}
+
+// Creates a new top-level traversable in the page that the UI process created for it, adopting the identity the UI
+// process assigned to it.
+GC::Ref<LocalTraversableNavigable> LocalTraversableNavigable::create_for_new_web_view(PageClient::NewWebViewResult&& new_web_view, GC::Ptr<BrowsingContext> opener)
+{
+    auto traversable = create_a_new_top_level_traversable(*new_web_view.page, opener, new_web_view.initial_history_entry.release_value(), new_web_view.initial_document_id.release_value());
+    traversable->active_document()->relevant_settings_object().id = new_web_view.initial_environment_id.release_value();
+    traversable->active_browsing_context()->set_browsing_context_group_id(new_web_view.browsing_context_group_id);
+    new_web_view.page->set_top_level_traversable(traversable);
+    traversable->set_window_handle(Utf16String::from_ascii_without_validation(new_web_view.window_handle.bytes()));
     return traversable;
 }
 
@@ -330,6 +343,12 @@ void LocalTraversableNavigable::destroy_top_level_traversable()
     //        However, without this, we can keep stale destroyed navigables around.
     set_has_been_destroyed();
     remove_from_all_local_navigables();
+}
+
+void LocalTraversableNavigable::visit_edges(Visitor& visitor)
+{
+    Base::visit_edges(visitor);
+    visitor.visit(m_active_beforeunload_check);
 }
 
 }

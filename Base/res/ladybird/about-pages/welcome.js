@@ -50,16 +50,27 @@ function initialize() {
 
         const row = document.createElement("label");
         row.className = "filter-list";
+        row.title = list.url;
+
         const checkbox = document.createElement("input");
         checkbox.type = "checkbox";
         checkbox.dataset.identifier = list.identifier;
         checkbox.checked = list.enabled;
+        checkbox.addEventListener("change", () => {
+            ladybird.sendMessage("setContentBlockerListEnabled", {
+                identifier: list.identifier,
+                enabled: checkbox.checked,
+            });
+        });
+
         const name = document.createElement("span");
         name.textContent = list.name;
+
         const description = document.createElement("p");
         description.id = `description-${list.identifier}`;
         description.textContent = filterListDescriptions[list.identifier];
         checkbox.setAttribute("aria-describedby", description.id);
+
         row.append(checkbox, name, description);
         contentBlockerLists.append(row);
     }
@@ -67,11 +78,6 @@ function initialize() {
     setupOptions.disabled = false;
     startBrowsing.disabled = false;
 }
-
-enableContentBlocking.addEventListener("change", updateBlockingOptions);
-searchEngine.addEventListener("change", () => {
-    updateSearchSuggestionsControl(searchEngine, searchSuggestions, searchSuggestionsDescription);
-});
 
 for (const input of document.querySelectorAll('input[name="tab-mode"]')) {
     input.addEventListener("change", () => {
@@ -83,6 +89,30 @@ for (const input of document.querySelectorAll('input[name="tab-mode"]')) {
     });
 }
 
+function saveSearchEngineSettings() {
+    if (!initialized) return;
+
+    ladybird.sendMessage("setSearchEngineSettings", {
+        engine: searchEngine.value || null,
+        suggestions: searchSuggestions.checked,
+    });
+}
+
+searchEngine.addEventListener("change", () => {
+    updateSearchSuggestionsControl(searchEngine, searchSuggestions, searchSuggestionsDescription);
+    saveSearchEngineSettings();
+});
+
+searchSuggestions.addEventListener("change", saveSearchEngineSettings);
+
+enableContentBlocking.addEventListener("change", () => {
+    if (!initialized) return;
+
+    updateBlockingOptions();
+    ladybird.sendMessage("setContentBlockerEnabled", enableContentBlocking.checked);
+    ladybird.sendMessage("setFilterListUpdatesEnabled", enableContentBlocking.checked);
+});
+
 form.addEventListener("submit", event => {
     event.preventDefault();
     if (!initialized || startBrowsing.disabled) return;
@@ -90,15 +120,7 @@ form.addEventListener("submit", event => {
     setupOptions.disabled = true;
     startBrowsing.disabled = true;
     saveStatus.textContent = "";
-    ladybird.sendMessage("completeFirstRun", {
-        verticalTabsEnabled: document.querySelector('input[name="tab-mode"]:checked').value === "vertical",
-        searchEngine: { engine: searchEngine.value || null, suggestions: searchSuggestions.checked },
-        contentBlockerEnabled: enableContentBlocking.checked,
-        contentBlockerLists: [...contentBlockerLists.querySelectorAll("input")].map(checkbox => ({
-            identifier: checkbox.dataset.identifier,
-            enabled: checkbox.checked,
-        })),
-    });
+    ladybird.sendMessage("completeFirstRun");
 });
 
 document.addEventListener("WebUILoaded", () => {

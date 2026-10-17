@@ -291,6 +291,7 @@ set(SOURCES
     DOM/Event.cpp
     DOM/EventDispatcher.cpp
     DOM/EventTarget.cpp
+    DOM/FragmentDirective.cpp
     DOM/HTMLCollection.cpp
     DOM/IDLEventListener.cpp
     DOM/LiveNodeList.cpp
@@ -451,6 +452,7 @@ set(SOURCES
     HTML/CanvasGradient.cpp
     HTML/CanvasPattern.cpp
     HTML/CanvasRenderingContext2D.cpp
+    HTML/CheckUnloadingCanceledState.cpp
     HTML/CloseEvent.cpp
     HTML/CloseWatcher.cpp
     HTML/CloseWatcherManager.cpp
@@ -672,6 +674,8 @@ set(SOURCES
     HTML/SupportedImageTypes.cpp
     HTML/SyntaxHighlighter/SyntaxHighlighter.cpp
     HTML/TagNames.cpp
+    HTML/TextDirective.cpp
+    HTML/TextDirectiveGenerator.cpp
     HTML/TextMetrics.cpp
     HTML/TextTrack.cpp
     HTML/TextTrackCue.cpp
@@ -739,6 +743,7 @@ set(SOURCES
     Layout/Node.cpp
     Layout/NodeArena.cpp
     Layout/RenderDocument.cpp
+    Layout/SearchableText.cpp
     Layout/TextNode.cpp
     Layout/TreeBuilder.cpp
     Layout/UpdateLayout.cpp
@@ -807,6 +812,9 @@ set(SOURCES
     PermissionsAPI/Permissions.cpp
     PermissionsAPI/PermissionStore.cpp
     PermissionsAPI/PermissionStatus.cpp
+    PictureInPicture/PictureInPictureController.cpp
+    PictureInPicture/PictureInPictureEvent.cpp
+    PictureInPicture/PictureInPictureWindow.cpp
     Platform/EventLoopPlugin.cpp
     Platform/FontPlugin.cpp
     Platform/ImageCodecPlugin.cpp
@@ -1102,6 +1110,7 @@ generate_css_implementation()
 
 generate_html_implementation()
 
+generate_picture_in_picture_implementation()
 
 set(GENERATED_SOURCES
     ARIA/AriaRoles.cpp
@@ -1124,6 +1133,7 @@ set(GENERATED_SOURCES
     SVG/SVGStyleSheetSource.cpp
     HTML/MediaControlsDOM.cpp
     HTML/Parser/NamedCharacterReferences.cpp
+    PictureInPicture/PictureInPicturePlayerDOM.cpp
 )
 
 ladybird_lib(LibWeb web EXPLICIT_SYMBOL_EXPORT)

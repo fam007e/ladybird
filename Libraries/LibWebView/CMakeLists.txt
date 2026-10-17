@@ -44,6 +44,8 @@ set(SOURCES
     NavigationLoader.cpp
     Omnibox.cpp
     OmniboxEngagement.cpp
+    PictureInPictureManager.cpp
+    PictureInPictureWindow.cpp
     Process.cpp
     ProcessManager.cpp
     TabPerformanceStats.cpp
@@ -92,8 +94,6 @@ endif()
 
 set(GENERATED_SOURCES ${CURRENT_LIB_GENERATED})
 
-compile_ipc(../../Services/AudioServer/AudioServerControl.ipc ../../Services/AudioServer/AudioServerControlEndpoint.h)
-compile_ipc(../../Services/AudioServer/AudioServerControlClient.ipc ../../Services/AudioServer/AudioServerControlClientEndpoint.h)
 compile_ipc(UIProcessServer.ipc UIProcessServerEndpoint.h)
 compile_ipc(UIProcessClient.ipc UIProcessClientEndpoint.h)
 

@@ -9,7 +9,6 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <AK/HashMap.h>
 #include <AK/Platform.h>
 #include <AK/StdLibExtras.h>
 #include <AK/TypeCasts.h>
@@ -26,7 +25,6 @@
 #if defined(AK_OS_MACOS)
 #    include <UI/Qt/MacWindow.h>
 #endif
-#include <UI/Qt/Settings.h>
 #include <UI/Qt/TabBar.h>
 #include <UI/Qt/WebContentView.h>
 #include <UI/Qt/WindowControlButton.h>
@@ -64,37 +62,6 @@ static constexpr int WINDOW_RESIZE_CORNER_WIDTH = WINDOW_RESIZE_BORDER_WIDTH * 2
 static constexpr int NATIVE_WINDOW_CONTROL_X_OFFSET = 6;
 static constexpr int NATIVE_WINDOW_CONTROL_Y_OFFSET = 6;
 #endif
-
-static bool should_use_screen_signal_for_dpi_changes()
-{
-    return QGuiApplication::platformName() != "wayland";
-}
-
-#if !defined(AK_OS_MACOS)
-static Optional<u64> display_id_for_screen(QScreen* screen)
-{
-    if (!screen)
-        return {};
-
-    // Qt does not expose a portable physical display identifier. Away from macOS the compositor only needs a
-    // stable per-process grouping key for Qt-backed windows.
-    static u64 next_display_id = 1;
-    static HashMap<QScreen*, u64> display_ids;
-    return display_ids.ensure(screen, [] {
-        return next_display_id++;
-    });
-}
-#endif
-
-static Optional<u64> display_id_for_window([[maybe_unused]] QWidget& window, [[maybe_unused]] QScreen* screen)
-{
-#if defined(AK_OS_MACOS)
-    // The compositor drives a CVDisplayLink per display, which needs the CGDirectDisplayID of the window's screen.
-    return appkit_display_id_for_window(window);
-#else
-    return display_id_for_screen(screen);
-#endif
-}
 
 static int visible_browser_window_count()
 {
@@ -247,19 +214,17 @@ BrowserWindow::BrowserWindow(Vector<URL::URL> const& initial_urls, IsPopupWindow
 
     update_tabs_display();
 
-    // Listen for DPI changes
-    m_device_pixel_ratio = devicePixelRatio();
-    m_current_screen = screen();
-    m_display_id = display_id_for_window(*this, m_current_screen);
-    if (m_current_screen)
-        m_refresh_rate = m_current_screen->refreshRate();
-
-    if (should_use_screen_signal_for_dpi_changes()) {
-        setAttribute(Qt::WA_NativeWindow);
-        setAttribute(Qt::WA_DontCreateNativeAncestors);
-    }
-    connect_screen_signals(m_current_screen);
-    connect_window_screen_changed_signal();
+    m_screen_observer = new WindowScreenObserver(*this);
+    m_screen_observer->on_device_pixel_ratio_change = [this] {
+        for_each_tab([this](auto& tab) {
+            tab.view().set_device_pixel_ratio(m_screen_observer->device_pixel_ratio());
+        });
+    };
+    m_screen_observer->on_display_metadata_change = [this] {
+        for_each_tab([this](auto& tab) {
+            tab.view().set_display_metadata(m_screen_observer->display_id(), m_screen_observer->refresh_rate());
+        });
+    };
 
     initialize_application_actions();
     initialize_application_menu();
@@ -511,6 +476,7 @@ void BrowserWindow::duplicate_tab(Tab& source_tab)
 
 Tab& BrowserWindow::create_new_tab(Web::HTML::ActivateTab activate_tab, Optional<WebView::CanonicalTraversable&> traversable)
 {
+    cancel_window_close_preflight();
     if (!traversable.has_value())
         return create_new_tab(activate_tab, TabLocation::end());
 
@@ -546,6 +512,8 @@ bool BrowserWindow::has_chrome_in_titlebar()
 
 Tab& BrowserWindow::create_new_tab(Web::HTML::ActivateTab activate_tab, TabLocation location)
 {
+    cancel_window_close_preflight();
+
     auto* tab = new Tab(this);
 
     if (m_current_tab == nullptr) {
@@ -643,6 +611,8 @@ void BrowserWindow::uninitialize_tab(Tab* tab)
 
 void BrowserWindow::adopt_tab(Tab& tab, int index)
 {
+    cancel_window_close_preflight();
+
     index = clamp(index, 0, m_tabs_container->count());
 
     tab.set_window(*this);
@@ -671,8 +641,8 @@ void BrowserWindow::adopt_tab(Tab& tab, int index)
         }
     }
 
-    tab.view().set_device_pixel_ratio(m_device_pixel_ratio);
-    tab.view().set_display_metadata(m_display_id, m_refresh_rate);
+    tab.view().set_device_pixel_ratio(m_screen_observer->device_pixel_ratio());
+    tab.view().set_display_metadata(m_screen_observer->display_id(), m_screen_observer->refresh_rate());
 
     m_tabs_container->set_current_tab(&tab);
 }
@@ -692,6 +662,8 @@ void BrowserWindow::move_tab_to_window(int index, BrowserWindow& target_window, 
 
     if (is_private() != target_window.is_private())
         return;
+
+    cancel_window_close_preflight();
 
     auto* tab = m_tabs_container->tab(index);
     tab->view().prepare_for_window_move();
@@ -772,6 +744,8 @@ bool BrowserWindow::activate_tab_with_url(URL::URL const& url)
 
 bool BrowserWindow::definitely_close_tab(int index)
 {
+    cancel_window_close_preflight();
+
     if (m_tabs_container->count() == 1 && Application::the().file_downloader().has_active_downloads() && visible_browser_window_count() <= 1) {
         if (!Application::the().confirm_stop_active_downloads(this))
             return false;
@@ -847,91 +821,6 @@ void BrowserWindow::request_to_close_current_tab()
 int BrowserWindow::tab_index(Tab* tab)
 {
     return m_tabs_container->index_of(tab);
-}
-
-void BrowserWindow::device_pixel_ratio_changed(qreal dpi)
-{
-    m_device_pixel_ratio = dpi;
-    for_each_tab([this](auto& tab) {
-        tab.view().set_device_pixel_ratio(m_device_pixel_ratio);
-    });
-}
-
-bool BrowserWindow::connect_window_screen_changed_signal()
-{
-    auto* window = windowHandle();
-    if (!window)
-        return false;
-    if (m_window_screen_changed_signal_window == window)
-        return true;
-
-    disconnect_window_screen_changed_signal();
-
-    m_window_screen_changed_signal_window = window;
-    QObject::connect(window, &QWindow::screenChanged, this, [this](QScreen* screen) {
-        screen_changed(screen);
-    });
-    screen_changed(window->screen());
-    return true;
-}
-
-void BrowserWindow::disconnect_window_screen_changed_signal()
-{
-    if (!m_window_screen_changed_signal_window)
-        return;
-
-    QObject::disconnect(m_window_screen_changed_signal_window, &QWindow::screenChanged, this, nullptr);
-    m_window_screen_changed_signal_window = nullptr;
-}
-
-void BrowserWindow::connect_screen_signals(QScreen* screen)
-{
-    if (!screen)
-        return;
-
-    if (should_use_screen_signal_for_dpi_changes())
-        QObject::connect(screen, &QScreen::logicalDotsPerInchChanged, this, &BrowserWindow::device_pixel_ratio_changed);
-    QObject::connect(screen, &QScreen::refreshRateChanged, this, &BrowserWindow::refresh_rate_changed);
-}
-
-void BrowserWindow::disconnect_screen_signals(QScreen* screen)
-{
-    if (!screen)
-        return;
-
-    QObject::disconnect(screen, &QScreen::logicalDotsPerInchChanged, this, &BrowserWindow::device_pixel_ratio_changed);
-    QObject::disconnect(screen, &QScreen::refreshRateChanged, this, &BrowserWindow::refresh_rate_changed);
-}
-
-void BrowserWindow::screen_changed(QScreen* screen)
-{
-    if (m_current_screen != screen) {
-        disconnect_screen_signals(m_current_screen);
-        m_current_screen = screen;
-        connect_screen_signals(m_current_screen);
-    }
-
-    if (m_device_pixel_ratio != devicePixelRatio())
-        device_pixel_ratio_changed(devicePixelRatio());
-
-    auto display_id = display_id_for_window(*this, m_current_screen);
-    auto refresh_rate = m_current_screen ? m_current_screen->refreshRate() : m_refresh_rate;
-    if (m_display_id != display_id || m_refresh_rate != refresh_rate)
-        display_metadata_changed(display_id, refresh_rate);
-}
-
-void BrowserWindow::refresh_rate_changed(qreal refresh_rate)
-{
-    display_metadata_changed(m_display_id, refresh_rate);
-}
-
-void BrowserWindow::display_metadata_changed(Optional<u64> display_id, qreal refresh_rate)
-{
-    m_display_id = display_id;
-    m_refresh_rate = refresh_rate;
-    for_each_tab([this](auto& tab) {
-        tab.view().set_display_metadata(m_display_id, m_refresh_rate);
-    });
 }
 
 void BrowserWindow::update_window_title(QString const& title)
@@ -1227,37 +1116,19 @@ void BrowserWindow::exit_fullscreen()
     });
 }
 
-void BrowserWindow::showEvent(QShowEvent* event)
-{
-    QMainWindow::showEvent(event);
-    // The native window exists by now and knows the screen it settled on.
-    screen_changed(screen());
-}
-
 bool BrowserWindow::event(QEvent* event)
 {
-    if (event->type() == QEvent::DevicePixelRatioChange) {
-        if (m_device_pixel_ratio != devicePixelRatio())
-            device_pixel_ratio_changed(devicePixelRatio());
-    }
-    if (event->type() == QEvent::WinIdChange)
-        connect_window_screen_changed_signal();
+#if defined(AK_OS_MACOS)
     if (event->type() == QEvent::PlatformSurface) {
         auto* platform_surface_event = static_cast<QPlatformSurfaceEvent*>(event);
         if (platform_surface_event->surfaceEventType() == QPlatformSurfaceEvent::SurfaceCreated) {
-            connect_window_screen_changed_signal();
-#if defined(AK_OS_MACOS)
             QTimer::singleShot(0, this, [this] {
                 hide_appkit_window_title(*this);
                 offset_appkit_window_controls(*this, NATIVE_WINDOW_CONTROL_X_OFFSET, NATIVE_WINDOW_CONTROL_Y_OFFSET);
             });
-#endif
-        } else if (platform_surface_event->surfaceEventType() == QPlatformSurfaceEvent::SurfaceAboutToBeDestroyed) {
-            disconnect_window_screen_changed_signal();
         }
     }
-    if (event->type() == QEvent::ScreenChangeInternal)
-        screen_changed(screen());
+#endif
 
     if (event->type() == QEvent::WindowActivate) {
         Application::the().set_active_window(*this);
@@ -1599,24 +1470,44 @@ void BrowserWindow::wheelEvent(QWheelEvent* event)
 
 void BrowserWindow::closeEvent(QCloseEvent* event)
 {
-    if (Application::the().file_downloader().has_active_downloads()) {
-        if (visible_browser_window_count() <= 1) {
-            if (!Application::the().confirm_stop_active_downloads(this)) {
-                event->ignore();
-                return;
+    if (!m_window_close_approved) {
+        if (m_window_close_coordinator.is_running()) {
+            event->ignore();
+            return;
+        }
+
+        if (Application::the().file_downloader().has_active_downloads()) {
+            if (visible_browser_window_count() <= 1) {
+                if (!Application::the().confirm_stop_active_downloads(this)) {
+                    event->ignore();
+                    return;
+                }
             }
         }
+
+        begin_window_close_preflight();
+        event->ignore();
+        return;
     }
+
+    Vector<Function<void()>> close_requests;
+    for_each_tab([&](auto& tab) {
+        close_requests.append(tab.prepare_for_window_close());
+    });
+    for (auto& close_request : close_requests)
+        close_request();
 
     clear_resize_cursor();
 
-    auto active_tab_index = static_cast<i64>(max(m_tabs_container->current_index(), 0));
+    auto active_tab_index = m_window_close_active_tab_index.value_or(static_cast<i64>(max(m_tabs_container->current_index(), 0)));
 
     if (m_is_private == WebView::IsPrivate::No) {
         if (m_is_popup_window == IsPopupWindow::No) {
-            Settings::the()->set_last_position(pos());
-            Settings::the()->set_last_size(size());
-            Settings::the()->set_is_maximized(isMaximized());
+            WebView::Application::settings().set_window_settings({
+                .position = Gfx::IntPoint { pos().x(), pos().y() },
+                .size = Gfx::IntSize { width(), height() },
+                .maximized = isMaximized(),
+            });
         }
     }
 
@@ -1634,6 +1525,162 @@ void BrowserWindow::closeEvent(QCloseEvent* event)
             dbgln("Unable to record the closing window in the session store: {}", result.error());
         Application::the().update_reopen_recently_closed_actions();
     }
+}
+
+void BrowserWindow::request_close_preflight_for_quit(Function<void(bool approved)> on_complete)
+{
+    if (m_window_close_approved) {
+        on_complete(true);
+        return;
+    }
+
+    // A close the user already started on this window gives way to the quit's check, which asks every page again.
+    if (m_window_close_coordinator.is_running())
+        cancel_window_close_preflight();
+
+    begin_window_close_preflight(AK::move(on_complete));
+}
+
+void BrowserWindow::raise_for_quit_prompt()
+{
+    // Only a quit's check carries a completion; a close the user started on this window is already in front.
+    if (!m_window_close_coordinator.is_running() || !m_window_close_preflight_on_complete)
+        return;
+
+    // A page's beforeunload prompt shows inside this window, which may sit behind other windows or in the Dock while a
+    // quit asks it, so the window comes to the front first, where the user can see the prompt.
+    if (isMinimized())
+        setWindowState(windowState() & ~Qt::WindowMinimized);
+    raise();
+    activateWindow();
+}
+
+void BrowserWindow::begin_window_close_preflight(Function<void(bool approved)> on_complete)
+{
+    m_window_close_active_tab_index = static_cast<i64>(max(m_tabs_container->current_index(), 0));
+    m_window_close_original_active_tab = m_current_tab;
+    m_window_close_current_preflight_tab = nullptr;
+    m_window_close_approved_tabs.clear();
+
+    Vector<QPointer<Tab>> tabs;
+    if (m_current_tab)
+        tabs.append(m_current_tab);
+    for_each_tab([&](auto& tab) {
+        if (&tab != m_current_tab)
+            tabs.append(&tab);
+    });
+
+    Vector<WindowCloseCoordinator::Preflight> preflights;
+    preflights.ensure_capacity(tabs.size());
+    for (auto tab : tabs) {
+        preflights.append([this, tab](Function<void(bool)> on_complete) mutable {
+            if (!tab) {
+                on_complete(true);
+                return;
+            }
+
+            auto index = tab_index(tab);
+            if (index < 0) {
+                on_complete(true);
+                return;
+            }
+
+            activate_tab(index);
+            m_window_close_current_preflight_tab = tab;
+            auto weak_this = QPointer<BrowserWindow>(this);
+            tab->request_window_close_preflight([weak_this, tab, on_complete = AK::move(on_complete)](bool approved) mutable {
+                if (!weak_this) {
+                    on_complete(approved);
+                    return;
+                }
+                if (weak_this->m_window_close_current_preflight_tab == tab)
+                    weak_this->m_window_close_current_preflight_tab = nullptr;
+                if (approved && tab && !weak_this->m_window_close_approved_tabs.contains([&](auto const& approved_tab) { return approved_tab == tab; }))
+                    weak_this->m_window_close_approved_tabs.append(tab);
+                on_complete(approved);
+            });
+        });
+    }
+
+    // With a completion, approval only marks the window as approved (so that a later close() goes straight through),
+    // and the caller decides when to close it.
+    m_window_close_preflight_on_complete = AK::move(on_complete);
+
+    auto weak_this = QPointer<BrowserWindow>(this);
+    m_window_close_coordinator.start(
+        AK::move(preflights),
+        [weak_this] {
+            if (!weak_this)
+                return;
+            weak_this->m_window_close_approved = true;
+            if (auto on_complete = AK::move(weak_this->m_window_close_preflight_on_complete)) {
+                // The window stays open until the caller closes it, so it goes back to the tab it showed before the
+                // check, which the session store then keeps as its active tab.
+                if (auto* original_tab = weak_this->m_window_close_original_active_tab.data()) {
+                    auto index = weak_this->tab_index(original_tab);
+                    if (index >= 0)
+                        weak_this->activate_tab(index);
+                }
+                on_complete(true);
+                return;
+            }
+            QTimer::singleShot(0, weak_this, [weak_this] {
+                if (weak_this && weak_this->m_window_close_approved)
+                    weak_this->close();
+            });
+        },
+        [weak_this] {
+            if (!weak_this)
+                return;
+            if (auto* original_tab = weak_this->m_window_close_original_active_tab.data()) {
+                auto index = weak_this->tab_index(original_tab);
+                if (index >= 0)
+                    weak_this->activate_tab(index);
+            }
+            weak_this->m_window_close_active_tab_index.clear();
+            weak_this->m_window_close_original_active_tab = nullptr;
+            weak_this->m_window_close_current_preflight_tab = nullptr;
+            weak_this->m_window_close_approved_tabs.clear();
+            weak_this->for_each_tab([](auto& tab) {
+                tab.cancel_window_close_preflight();
+            });
+            if (auto on_complete = AK::move(weak_this->m_window_close_preflight_on_complete))
+                on_complete(false);
+        });
+}
+
+void BrowserWindow::cancel_window_close_preflight()
+{
+    if (m_window_close_coordinator.is_running()) {
+        m_window_close_coordinator.cancel();
+        return;
+    }
+
+    if (!m_window_close_approved)
+        return;
+
+    if (auto* original_tab = m_window_close_original_active_tab.data()) {
+        auto index = tab_index(original_tab);
+        if (index >= 0)
+            activate_tab(index);
+    }
+    m_window_close_approved = false;
+    m_window_close_active_tab_index.clear();
+    m_window_close_original_active_tab = nullptr;
+    m_window_close_current_preflight_tab = nullptr;
+    m_window_close_approved_tabs.clear();
+    for_each_tab([](auto& tab) {
+        tab.cancel_window_close_preflight();
+    });
+}
+
+void BrowserWindow::on_tab_load_start(Tab& tab)
+{
+    if (!m_window_close_coordinator.is_running() && !m_window_close_approved)
+        return;
+
+    if (m_window_close_current_preflight_tab == &tab || m_window_close_approved_tabs.contains([&](auto const& approved_tab) { return approved_tab == &tab; }))
+        cancel_window_close_preflight();
 }
 
 }
