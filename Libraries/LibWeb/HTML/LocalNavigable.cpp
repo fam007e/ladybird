@@ -1257,14 +1257,21 @@ void LocalNavigable::run_ui_descendant_unload_task(ChildNavigableDestruction chi
                 // The browsing context's WindowProxy outlives the document, since scripts hold it for the navigable.
                 if (auto browsing_context = active_document->browsing_context())
                     navigable->m_window_proxy_after_unload = browsing_context->window_proxy();
-                auto replicated_state = navigable->replicated_state();
+                // NB: The navigable can be destroyed after this task was queued, which can leave its parent without the
+                //     active document its replicated state reads. A destroyed navigable has nothing to stop hosting.
+                Optional<ReplicatedNavigableState> replicated_state;
+                if (stop_hosting_after_unload == StopHostingAfterUnload::Yes && !navigable->has_been_destroyed())
+                    replicated_state = navigable->replicated_state();
                 active_document->unload();
 
                 // Another page hosts the navigable's next document, or destroys the navigable. A RemoteNavigable takes
                 // the navigable's place in the same task, so no task here sees the navigable without an active
                 // document.
-                if (stop_hosting_after_unload == StopHostingAfterUnload::Yes)
-                    navigable->page().stop_hosting(*navigable, move(replicated_state));
+                // NB: An unload handler can remove the navigable's container, which destroys the navigable. Nothing is
+                //     left to stop hosting then: the container's removal tells the UI process the navigable is gone, and
+                //     scripts holding the WindowProxy see the window of a removed iframe.
+                if (replicated_state.has_value() && !navigable->has_been_destroyed())
+                    navigable->page().stop_hosting(*navigable, replicated_state.release_value());
             }
             on_complete->function()();
         }));
@@ -1542,7 +1549,8 @@ void LocalNavigable::report_opener_browsing_context()
 // A container in another process reads what it asks of its content navigable from the replicated state.
 void LocalNavigable::report_state_to_remote_container()
 {
-    if (is_local_root() && parent())
+    // A navigable destroyed while its navigation was in flight has no document left to report the state of.
+    if (is_local_root() && parent() && m_active_document)
         report_hosted_state();
 }
 
@@ -2367,6 +2375,16 @@ static void perform_navigation_params_fetch(JS::Realm& realm, GC::Ref<Navigation
                     return;
                 }
             }
+        }
+
+        // AD-HOC: The navigable can be destroyed while the response is on its way, e.g. a popup closed right after it
+        //         was opened, with nothing to navigate left.
+        if (state_holder->navigable->has_been_destroyed() || !state_holder->navigable->active_document()) {
+            state_holder->fetch_controller->abort(realm, {});
+            auto result = realm.heap().allocate<InternalNavigationResult>();
+            result->navigation_params = LocalNavigable::NullOrError {};
+            top_level_completion_steps->function()(*result);
+            return;
         }
 
         // 8. If request's body is null, then set entry's document state's resource to null.
@@ -3369,10 +3387,8 @@ void LocalNavigable::adopt_navigation_started_in_ui_process(Utf16String navigati
     //     then stop intersection-observing a lazy loading element container and set container's lazy load resumption steps to null.
     if (container && container->is_html_iframe_element()) {
         auto& iframe_element = static_cast<HTMLIFrameElement&>(*container);
-        if (iframe_element.will_lazy_load_element()) {
-            iframe_element.document().stop_intersection_observing_a_lazy_loading_element(iframe_element);
-            iframe_element.set_lazy_load_resumption_steps(nullptr);
-        }
+        if (iframe_element.will_lazy_load_element())
+            iframe_element.stop_lazy_loading();
     }
 
     // 15. If navigable's parent is non-null, then set navigable's is delaying load events to true.
@@ -3506,10 +3522,8 @@ void LocalNavigable::begin_navigation(PreparedNavigation navigation)
     //     then stop intersection-observing a lazy loading element container and set container's lazy load resumption steps to null.
     if (container && container->is_html_iframe_element()) {
         auto& iframe_element = static_cast<HTMLIFrameElement&>(*container);
-        if (iframe_element.will_lazy_load_element()) {
-            iframe_element.document().stop_intersection_observing_a_lazy_loading_element(iframe_element);
-            iframe_element.set_lazy_load_resumption_steps(nullptr);
-        }
+        if (iframe_element.will_lazy_load_element())
+            iframe_element.stop_lazy_loading();
     }
 
     // 12. If historyHandling is "auto", then:

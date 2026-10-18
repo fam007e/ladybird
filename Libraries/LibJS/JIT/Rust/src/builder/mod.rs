@@ -610,6 +610,7 @@ impl<'a> GraphBuilder<'a> {
         if self.build_osr_entries {
             self.build_osr_entries()?;
             self.build_resume_entries()?;
+            self.build_catch_entries()?;
         }
         self.build_function()?;
 
@@ -1385,7 +1386,7 @@ impl<'a> GraphBuilder<'a> {
             Instruction::Enter => {
                 // NB: Inlined frames are set up by the caller.
                 if !self.function.is_virtual() {
-                    self.emit(Op::InitializeFrame, Vec::new(), None);
+                    self.emit(Op::InitializeFrame { clobbers_floats: false }, Vec::new(), None);
                     let this_value = self.emit(
                         Op::LoadSlot {
                             slot: THIS_VALUE_REGISTER,

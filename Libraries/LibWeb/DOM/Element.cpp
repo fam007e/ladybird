@@ -2449,6 +2449,26 @@ void Element::apply_display_none_change(Layout::BegunRead const& read, DisplayNo
         clear_computed_styles_from_display_none_descendants(read);
 }
 
+bool Element::has_referenceable_svg_descendant() const
+{
+    bool found = false;
+    // NB: The traversal only reads the subtree.
+    const_cast<Element&>(*this).for_each_shadow_including_descendant([&found](auto const& node) {
+        auto const* element = as_if<Element>(node);
+        if (!element)
+            return TraversalDecision::Continue;
+        // NB: A resource keeps its style, and so do the elements it inherits from, so an unstyled subtree holds none.
+        if (!element->has_style())
+            return TraversalDecision::SkipChildrenAndContinue;
+        if (auto const* svg_element = as_if<SVG::SVGElement>(*element); svg_element && svg_element->is_referenceable_in_display_none_subtree()) {
+            found = true;
+            return TraversalDecision::Break;
+        }
+        return TraversalDecision::Continue;
+    });
+    return found;
+}
+
 void Element::clear_computed_styles_from_display_none_descendants(Layout::BegunRead const& read)
 {
     for_each_shadow_including_descendant([&read](auto& node) {
@@ -2474,7 +2494,7 @@ void Element::clear_computed_styles_from_display_none_descendants(Layout::BegunR
         //     Restore their styles in this style update, so painting never needs to materialize
         //     styles for referenced resources. The engine still holds their records and settles
         //     the reaction from them.
-        if (element->is_svg_element())
+        if (auto const* svg_element = as_if<SVG::SVGElement>(*element); svg_element && svg_element->is_referenceable_in_display_none_subtree())
             element->document().style_computer().style_engine().record_derived_element_style_input_change(element->style_node_id(), CSS::StyleEngine::PublishedStyle | CSS::StyleEngine::RecomputeStyle);
 
         element->for_each_synthetic_pseudo_element([&](CSS::PseudoElement, SyntheticPseudoElement& pseudo_element) {

@@ -475,23 +475,54 @@ static Web::UIEvents::KeyModifier get_modifiers_from_qt_key_event(QKeyEvent cons
     return modifiers;
 }
 
-static QPointF wheel_delta_from_angle_delta(QPoint angle_delta)
-{
-    static constexpr double wheel_delta_units_per_step = static_cast<double>(QWheelEvent::DefaultDeltasPerStep);
-    double delta_x = -static_cast<double>(angle_delta.x()) / wheel_delta_units_per_step;
-    double delta_y = static_cast<double>(angle_delta.y()) / wheel_delta_units_per_step;
-
-    static constexpr double scroll_step_size = 40;
-    auto step_x = delta_x * static_cast<double>(QApplication::wheelScrollLines());
-    auto step_y = delta_y * static_cast<double>(QApplication::wheelScrollLines());
-
-    return { step_x * scroll_step_size, step_y * scroll_step_size };
-}
+static constexpr double wheel_scroll_line_size = 40;
+static constexpr double wheel_tick_120ths_per_tick = 120;
 
 struct WheelDelta {
     QPointF delta;
+    QPointF tick_120ths;
     Web::WheelDeltaPrecision precision { Web::WheelDeltaPrecision::Discrete };
 };
+
+static WheelDelta precise_wheel_delta(QPointF pixel_delta)
+{
+    auto precise_tick_120ths = [](double pixel_step) {
+        return Web::wheel_tick_120ths_from_pixel_delta(pixel_step, Web::WheelDeltaPrecision::Precise);
+    };
+    return { pixel_delta, { precise_tick_120ths(pixel_delta.x()), precise_tick_120ths(pixel_delta.y()) }, Web::WheelDeltaPrecision::Precise };
+}
+
+// Qt counts a wheel's angle delta in 120ths of a notch, as wheel input counts its ticks.
+static_assert(static_cast<double>(QWheelEvent::DefaultDeltasPerStep) == wheel_tick_120ths_per_tick);
+
+static WheelDelta wheel_delta_from_angle_delta(QPoint angle_delta)
+{
+    QPointF notch_120ths { -static_cast<double>(angle_delta.x()), static_cast<double>(angle_delta.y()) };
+    auto pixels_per_notch = static_cast<double>(QApplication::wheelScrollLines()) * wheel_scroll_line_size;
+    return { notch_120ths * (pixels_per_notch / wheel_tick_120ths_per_tick), notch_120ths, Web::WheelDeltaPrecision::Discrete };
+}
+
+#if defined(AK_OS_MACOS)
+// NB: Qt reports every macOS mouse-wheel event as exactly one notch of angle delta, which drops the scroll
+//     acceleration that macOS applies to fast wheel spins. The accelerated line count survives in the pixel delta,
+//     which Qt computes by multiplying it with an estimated line height.
+// INTEROP: Blink and WebKit count each accelerated line of a macOS mouse wheel as one wheel tick.
+static constexpr double qt_macos_mouse_wheel_pixel_delta_per_line = 20;
+
+static WheelDelta mouse_wheel_delta_with_macos_scroll_acceleration(QPoint angle_delta, QPoint qt_pixel_delta)
+{
+    auto notch = wheel_delta_from_angle_delta(angle_delta);
+    // A slow click is accelerated to only a tenth of a line, so a click scrolls at least one line.
+    auto accelerated_line_count = [](double notch_step, int qt_pixel_step) -> double {
+        if (notch_step == 0)
+            return 0;
+        auto line_count = max(AK::abs(qt_pixel_step) / qt_macos_mouse_wheel_pixel_delta_per_line, 1.0);
+        return notch_step < 0 ? -line_count : line_count;
+    };
+    QPointF line_counts { accelerated_line_count(notch.tick_120ths.x(), qt_pixel_delta.x()), accelerated_line_count(notch.tick_120ths.y(), qt_pixel_delta.y()) };
+    return { line_counts * wheel_scroll_line_size, line_counts * wheel_tick_120ths_per_tick, Web::WheelDeltaPrecision::Discrete };
+}
+#endif
 
 static bool is_running_on_wayland()
 {
@@ -531,19 +562,24 @@ static WheelDelta wheel_delta_from_qt_event(QWheelEvent const& wheel_event)
 {
     // NB: A slow touchpad movement can have a pixel delta of zero. It is still precise input, not a wheel step.
     if (is_running_on_wayland() && wheel_event_scrolls_continuously(wheel_event))
-        return { wayland_touchpad_delta(wheel_event), Web::WheelDeltaPrecision::Precise };
+        return precise_wheel_delta(wayland_touchpad_delta(wheel_event));
 
     auto pixel_delta = -wheel_event.pixelDelta();
     // NB: macOS can report a tiny pixel delta for mouse-wheel ticks. Use it only for continuous scrolling so physical
     //     wheels continue through the line-step conversion below.
     if (!pixel_delta.isNull() && wheel_event_scrolls_continuously(wheel_event))
-        return { pixel_delta, Web::WheelDeltaPrecision::Precise };
+        return precise_wheel_delta(pixel_delta);
 
     auto angle_delta = -wheel_event.angleDelta();
-    if (!angle_delta.isNull())
-        return { wheel_delta_from_angle_delta(angle_delta), Web::WheelDeltaPrecision::Discrete };
+    if (!angle_delta.isNull()) {
+#if defined(AK_OS_MACOS)
+        return mouse_wheel_delta_with_macos_scroll_acceleration(angle_delta, wheel_event.pixelDelta());
+#else
+        return wheel_delta_from_angle_delta(angle_delta);
+#endif
+    }
 
-    return { pixel_delta, Web::WheelDeltaPrecision::Precise };
+    return precise_wheel_delta(pixel_delta);
 }
 
 static Web::ScrollGesturePhase scroll_gesture_phase_from_qt_event(QWheelEvent const& wheel_event)
@@ -2033,6 +2069,8 @@ void WebContentView::enqueue_native_event(Web::MouseEvent::Type type, QSinglePoi
 
     double wheel_delta_x = 0;
     double wheel_delta_y = 0;
+    double wheel_tick_120ths_x = 0;
+    double wheel_tick_120ths_y = 0;
     auto wheel_delta_precision = Web::WheelDeltaPrecision::Discrete;
     auto scroll_gesture_phase = Web::ScrollGesturePhase::None;
 
@@ -2041,11 +2079,13 @@ void WebContentView::enqueue_native_event(Web::MouseEvent::Type type, QSinglePoi
         auto wheel_delta = wheel_delta_from_qt_event(wheel_event);
         wheel_delta_x = wheel_delta.delta.x();
         wheel_delta_y = wheel_delta.delta.y();
+        wheel_tick_120ths_x = wheel_delta.tick_120ths.x();
+        wheel_tick_120ths_y = wheel_delta.tick_120ths.y();
         wheel_delta_precision = wheel_delta.precision;
         scroll_gesture_phase = scroll_gesture_phase_from_qt_event(wheel_event);
     }
 
-    enqueue_input_event(Web::MouseEvent { type, position, screen_position.to_type<Web::DevicePixels>(), button, buttons, modifiers, wheel_delta_x, wheel_delta_y, wheel_delta_precision, scroll_gesture_phase, m_click_count, nullptr });
+    enqueue_input_event(Web::MouseEvent { type, position, screen_position.to_type<Web::DevicePixels>(), button, buttons, modifiers, wheel_delta_x, wheel_delta_y, wheel_tick_120ths_x, wheel_tick_120ths_y, wheel_delta_precision, scroll_gesture_phase, m_click_count, nullptr });
 }
 
 struct DragData : Web::BrowserInputData {

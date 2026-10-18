@@ -161,6 +161,9 @@ pub enum BranchCondition {
     TaggedEquals { equal: bool },
     /// The input is a tagged value: is it an int32?
     Int32Value,
+    /// The input is a tagged value: is it an int32 or a boolean, whose low
+    /// 32 bits are its ToInt32 either way?
+    Int32OrBoolean,
     /// The input is a tagged value: is it a double, a number that is no
     /// int32?
     Double,
@@ -434,7 +437,12 @@ pub enum Op {
     Phi,
     /// The `Enter` bytecode: fills the registers and locals with the empty
     /// value, copies the constants into the frame and marks it initialized.
-    InitializeFrame,
+    /// If `clobbers_floats`, the node it initializes the frame for clobbers
+    /// the floating point registers anyway, so it stores through one of
+    /// them, two slots at a time.
+    InitializeFrame {
+        clobbers_floats: bool,
+    },
     /// Makes the frame the running execution context, where other code (the
     /// garbage collector, stack walks, runtime functions) sees it. Direct
     /// calls of compiled functions leave their frame unpublished until it
@@ -443,7 +451,9 @@ pub enum Op {
     PublishFrame,
     /// Does what `InitializeFrame` does, unless the frame is initialized
     /// already. See `passes::frame_initialization`.
-    EnsureFrameInitialized,
+    EnsureFrameInitialized {
+        clobbers_floats: bool,
+    },
     /// The suspension of the `Yield`, `YieldIteratorResult` and `Await`
     /// bytecodes, right before the `Return` of the yielded or awaited value:
     /// records in the frame where its generator or async function resumes
@@ -941,7 +951,8 @@ pub enum Op {
     },
     // Numbers and strings.
     /// The `Repr::Int32` of the tagged input 0, which must be an int32: a
-    /// branch on `BranchCondition::Int32Value` decides that first.
+    /// branch on `BranchCondition::Int32Value` decides that first. Of a
+    /// boolean (see `BranchCondition::Int32OrBoolean`), it is 0 or 1.
     UnboxInt32,
     /// The absolute value of the `Repr::Int32` input 0, which must not be
     /// `i32::MIN`, as a `Repr::Int32`.
@@ -1281,7 +1292,7 @@ impl Op {
                 ..P::PURE
             },
             Op::Phi => P::PURE,
-            Op::InitializeFrame | Op::EnsureFrameInitialized | Op::PublishFrame => P {
+            Op::InitializeFrame { .. } | Op::EnsureFrameInitialized { .. } | Op::PublishFrame => P {
                 writes: Locations::FRAME,
                 ..P::PURE
             },
@@ -1593,8 +1604,8 @@ impl Op {
             Op::LoadSlot { .. } => "LoadSlot",
             Op::StoreSlot { .. } => "StoreSlot",
             Op::Phi => "Phi",
-            Op::InitializeFrame => "InitializeFrame",
-            Op::EnsureFrameInitialized => "EnsureFrameInitialized",
+            Op::InitializeFrame { .. } => "InitializeFrame",
+            Op::EnsureFrameInitialized { .. } => "EnsureFrameInitialized",
             Op::Suspend { .. } => "Suspend",
             Op::PublishFrame => "PublishFrame",
             Op::BoxCell => "BoxCell",
@@ -2001,8 +2012,10 @@ pub struct Graph {
     /// them, take at once. Compiled code checks at entry that they fit.
     pub materialized_frame_bytes: u64,
     /// On-stack replacement entries: blocks without predecessors where code
-    /// already running in the interpreter enters compiled code, with the pc of
-    /// the loop back edge each one starts at. The frame holds every value.
+    /// already running in the interpreter enters compiled code, with the pc
+    /// each one starts at: a loop back edge, the continuation of a generator,
+    /// or the instruction after the `Catch` of an exception handler. The frame
+    /// holds every value.
     pub osr_entries: Vec<(u32, BlockId)>,
     /// The pcs of the loop back edges in the loops of the on-stack
     /// replacement entries (including those of the entries), from where a
@@ -2012,6 +2025,10 @@ pub struct Graph {
     /// on-stack replacement entries, from where a frame running in the
     /// interpreter may reach an entry on a later iteration.
     pub osr_outer_loop_back_edges: Vec<u32>,
+    /// The pcs of the `Catch` of the exception handlers that got no catch
+    /// entry because they never caught an exception before the compile (see
+    /// `builder::osr`). A compile after they caught gives them one.
+    pub uncaught_handlers: Vec<u32>,
     /// The register-saving `CallSlowPath` nodes that may run before the
     /// frame is initialized, and so initialize it first if it is not.
     pub slow_paths_initializing_frame: Vec<NodeId>,

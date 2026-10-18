@@ -77,9 +77,9 @@ private:
     }
 };
 
-static QColor location_focus_glow_color(QPalette const& palette, int alpha)
+static QColor location_focus_glow_color(int alpha)
 {
-    auto color = ChromeStyle::chrome_accent(palette);
+    auto color = ChromeStyle::chrome_accent();
     color.setAlpha(alpha);
     return color;
 }
@@ -406,7 +406,7 @@ void LocationEdit::update_focus_glow(int alpha)
 {
     m_focus_glow_alpha = alpha;
     if (m_focus_glow_effect)
-        m_focus_glow_effect->setColor(location_focus_glow_color(palette(), alpha));
+        m_focus_glow_effect->setColor(location_focus_glow_color(alpha));
 }
 
 void LocationEdit::animate_focus_glow(int target_alpha)
@@ -556,7 +556,8 @@ void LocationEdit::update_chrome_style()
         return;
 
     m_is_updating_chrome_style = true;
-    setStyleSheet(ChromeStyle::location_edit_style_sheet(palette()));
+    // Match the popup's palette without feeding our styled background into the next style update.
+    setStyleSheet(ChromeStyle::location_edit_style_sheet(QApplication::palette()));
     m_is_updating_chrome_style = false;
     update_zoom_indicator();
 }

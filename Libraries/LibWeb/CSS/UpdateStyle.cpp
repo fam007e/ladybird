@@ -386,8 +386,12 @@ static void move_custom_property_environment_below(StyleReactionApplication& app
 void StyleEngineFFI::web_css_republish_moved_environment(StyleReactionApplication* application, u32 style_node, u64 style_record, u64 replaced, void const* new_inheritable_data)
 {
     auto& style_engine = application->document->style_computer().style_engine();
-    auto element = application->document->style_computer().element_for_style_node(style_node);
-    VERIFY(element);
+    auto element = application->document->style_computer().element_for_lane_style_node(style_node);
+    // A task running beside a flown transaction can remove the element, whose style node the engine's tree still holds
+    // until the tree delta applies, and another element can have taken the style node's slot by then. Nothing is left
+    // to republish then.
+    if (!element)
+        return;
     RefPtr new_inheritable = static_cast<CustomPropertyData const*>(new_inheritable_data);
     for (auto kind = 0; kind < to_underlying(PseudoElement::KnownPseudoElementCount); ++kind) {
         auto pseudo_element = static_cast<PseudoElement>(kind);
@@ -412,8 +416,10 @@ void StyleEngineFFI::web_css_rebuild_custom_property_environment(StyleReactionAp
 {
     auto const& read = application->read;
     auto& document = *application->document;
-    auto element = document.style_computer().element_for_style_node(style_node);
-    VERIFY(element);
+    auto element = document.style_computer().element_for_lane_style_node(style_node);
+    // As above, the element can be gone, and its descendants with it.
+    if (!element)
+        return;
     auto existing_base = custom_property_environment_base(*element, element->custom_property_data({}));
     VERIFY(existing_base && existing_base->declared_count() > 0);
     if (existing_base->parent().ptr() == new_parent_inheritable_data)
@@ -516,8 +522,17 @@ static RequiredInvalidationAfterStyleChange install_engine_computed_records(Layo
         auto changed_inherited_groups = StyleEngineFFI::style_engine_changed_style_groups(&old_record, &new_record, 0, ComputedValues::inherited_style_group_count);
         invalidation.set_inherited_style_groups_changed(static_cast<u8>(changed_inherited_groups & RequiredInvalidationAfterStyleChange::all_inherited_style_groups));
     }
-    if (old_computed_values)
+    if (old_computed_values) {
         element.apply_display_none_change(read, DOM::Element::DisplayNoneState::of(*old_computed_values));
+        // NB: The descendants of an element that stays display:none have no boxes, so their styles only serve a CSSOM
+        //     read or the subtree's reveal, both of which materialize them again. Where what they inherit moves, clear
+        //     them as entering display:none does rather than computing them all again. The SVG elements visible
+        //     content can reference keep their styles, and take what they inherit from styled ancestors.
+        if (old_computed_values->display().is_none() && element.computed_style()->display().is_none()
+            && invalidation.inherited_style_groups_changed() != 0 && !did_change_custom_properties
+            && !element.has_referenceable_svg_descendant())
+            element.clear_computed_styles_from_display_none_descendants(read);
+    }
     // The pseudo-elements of a record the host composes inherit the composition, so the engine settles them only now.
     if (reaction.composed_by_the_host)
         invalidation |= element.refresh_pseudo_element_styles_over_composition(read, old_computed_values ? &*old_computed_values : nullptr, did_change_custom_properties);

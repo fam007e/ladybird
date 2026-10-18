@@ -87,6 +87,11 @@ impl CompileState {
 pub struct SnapshotExecutable {
     pub executable: Gc<Executable>,
     pub function: Option<InlinedFunction>,
+    /// How many sites where JIT code exited the executable had recorded when the code was compiled, which the code
+    /// knew of (see `Executable::add_jit_exit_site()`). The sites are only ever appended to.
+    pub known_exit_sites: usize,
+    /// For the compiled executable, how many sites in inlined builtins it had recorded then.
+    pub known_builtin_exit_sites: usize,
 }
 
 /// The function object of an inlined executable, which its materialized frames run.
@@ -118,7 +123,7 @@ pub struct JitCode {
     /// keep their addresses for as long as the code may run.
     embedded_cells: Vec<Gc<CellHeader>>,
     snapshot_executables: Vec<SnapshotExecutable>,
-    /// Where a frame running in the interpreter at the loop back edge `pc` can continue in this code.
+    /// Where a frame running in the interpreter at `pc` can continue in this code (see `osr_entry()`).
     osr_entries: Vec<(u32, JitEntry)>,
     /// The loop back edges from where a frame running in the interpreter reaches one of the `osr_entries` without
     /// leaving the loop it is in.
@@ -126,6 +131,9 @@ pub struct JitCode {
     /// The loop back edges in the loops around those of the `osr_entries`, from where a frame running in the
     /// interpreter may reach one of them on a later iteration.
     osr_outer_loop_back_edges: Vec<u32>,
+    /// The pcs of the `Catch` of the exception handlers that have no catch entry only because they never caught an
+    /// exception before the compile.
+    uncaught_handlers: Vec<u32>,
     /// Identifies the code among all code the VM installed, for the dependencies it registers (see
     /// `super::dependencies`).
     id: u64,
@@ -165,6 +173,7 @@ impl JitCode {
             osr_entries,
             osr_loop_back_edges,
             osr_outer_loop_back_edges: Vec::new(),
+            uncaught_handlers: Vec::new(),
             id: 0,
             invalidation_patches: Vec::new(),
             invalidated: Cell::new(false),
@@ -182,6 +191,17 @@ impl JitCode {
     pub fn with_osr_outer_loop_back_edges(mut self, osr_outer_loop_back_edges: Vec<u32>) -> Self {
         self.osr_outer_loop_back_edges = osr_outer_loop_back_edges;
         self
+    }
+
+    pub fn with_uncaught_handlers(mut self, uncaught_handlers: Vec<u32>) -> Self {
+        self.uncaught_handlers = uncaught_handlers;
+        self
+    }
+
+    /// Whether the handler whose `Catch` is at `pc` has no catch entry only because it never caught an exception
+    /// before the compile, so that a compile now would give it one.
+    pub fn compiled_before_handler_caught(&self, pc: u32) -> bool {
+        self.uncaught_handlers.contains(&pc)
     }
 
     pub fn id(&self) -> u64 {
@@ -207,7 +227,8 @@ impl JitCode {
     }
 
     /// The entry at `pc` for a frame whose memory holds every value live there: an on-stack replacement entry at a
-    /// loop back edge, or the resume entry at a continuation of a generator's suspension.
+    /// loop back edge, the resume entry at a continuation of a generator's suspension, or the catch entry after the
+    /// `Catch` of an exception handler.
     pub fn osr_entry(&self, pc: u32) -> Option<JitEntry> {
         self.osr_entries
             .iter()
@@ -278,6 +299,11 @@ pub struct ExecutableJitState {
     builtin_exit_sites: RefCell<Vec<(u64, u32, ExitKind)>>,
     /// How often the executable's code was discarded.
     discard_count: Cell<u32>,
+    /// How often in a row the executable's code was discarded without its exits having been at a site the code did not
+    /// know of, so that a recompile would learn nothing from them.
+    fruitless_discard_count: Cell<u32>,
+    /// Whether exits of the executable's code recorded a site it did not know of since its code was last discarded.
+    learned_exit_site: Cell<bool>,
     /// Whether the executable is refused once its discarded code is detached, because it was refused while frames
     /// still ran that code (see `refuse_jit_compile_once_detached()`).
     refused_once_detached: Cell<bool>,
@@ -305,8 +331,16 @@ pub const EXIT_COUNT_BEFORE_DISCARD: u32 = 10;
 /// costs more than code that exits as often elsewhere.
 pub const EXIT_COUNT_BEFORE_DISCARD_FROM_LOOP: u32 = 5;
 
-/// An executable whose code was discarded this often is not compiled again.
-pub const MAX_DISCARD_COUNT: u32 = 8;
+/// An executable whose code was discarded this often in a row without its exits teaching it anything is not compiled
+/// again. Discards after exits at sites the code did not know of make progress: each site is recorded once, and
+/// recompiles no longer speculate there, so code that keeps reaching new paths (like a dispatcher whose program moves
+/// on to new phases) keeps being compiled.
+pub const MAX_FRUITLESS_DISCARD_COUNT: u32 = 8;
+
+/// An executable whose code was discarded this often, whatever its exits taught it, is not compiled again either: each
+/// recompile compiles the whole executable, so code that keeps reaching new sites would otherwise cost compile time
+/// without bound.
+pub const MAX_DISCARD_COUNT: u32 = 64;
 
 impl Executable {
     pub fn jit_compile_state(&self) -> CompileState {
@@ -382,26 +416,46 @@ impl Executable {
         self.jit_state().exit_sites.borrow().clone()
     }
 
-    pub fn add_jit_exit_site(&self, site: (u32, ExitKind)) {
+    pub fn jit_exit_site_count(&self) -> usize {
+        self.jit_state().exit_sites.borrow().len()
+    }
+
+    /// Records a site where JIT code exited, and returns its index among the sites.
+    pub fn add_jit_exit_site(&self, site: (u32, ExitKind)) -> usize {
         let mut sites = self.jit_state().exit_sites.borrow_mut();
-        if !sites.contains(&site) {
-            sites.push(site);
+        if let Some(index) = sites.iter().position(|recorded| *recorded == site) {
+            return index;
         }
+        sites.push(site);
+        sites.len() - 1
     }
 
     pub fn jit_builtin_exit_sites(&self) -> Vec<(u64, u32, ExitKind)> {
         self.jit_state().builtin_exit_sites.borrow().clone()
     }
 
-    pub fn add_jit_builtin_exit_site(&self, site: (u64, u32, ExitKind)) {
+    pub fn jit_builtin_exit_site_count(&self) -> usize {
+        self.jit_state().builtin_exit_sites.borrow().len()
+    }
+
+    /// Records a site where JIT code exited in an inlined builtin, and returns its index among those sites.
+    pub fn add_jit_builtin_exit_site(&self, site: (u64, u32, ExitKind)) -> usize {
         let mut sites = self.jit_state().builtin_exit_sites.borrow_mut();
-        if !sites.contains(&site) {
-            sites.push(site);
+        if let Some(index) = sites.iter().position(|recorded| *recorded == site) {
+            return index;
         }
+        sites.push(site);
+        sites.len() - 1
     }
 
     pub fn jit_discard_count(&self) -> u32 {
         self.jit_state().discard_count.get()
+    }
+
+    /// Notes that an exit of the executable's installed code was at a site the code did not know of, which a
+    /// recompile learns from (see `MAX_FRUITLESS_DISCARD_COUNT`).
+    pub fn note_learned_jit_exit_site(&self) {
+        self.jit_state().learned_exit_site.set(true);
     }
 
     /// Makes new frames of the executable run in its JIT code. Frames of it that run in the interpreter count down
@@ -481,7 +535,17 @@ impl Executable {
                 super::describe_executable(self)
             );
         }
-        if discard_count >= MAX_DISCARD_COUNT || state.refused_once_detached.get() {
+        if state.learned_exit_site.replace(false) {
+            state.fruitless_discard_count.set(0);
+        } else {
+            state
+                .fruitless_discard_count
+                .set(state.fruitless_discard_count.get() + 1);
+        }
+        if discard_count >= MAX_DISCARD_COUNT
+            || state.fruitless_discard_count.get() >= MAX_FRUITLESS_DISCARD_COUNT
+            || state.refused_once_detached.get()
+        {
             super::tier_up::refuse_jit_compile(vm, self);
             return;
         }

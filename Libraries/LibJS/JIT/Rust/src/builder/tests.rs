@@ -384,7 +384,15 @@ fn instructions_whose_feedback_is_empty_never_ran() {
 
 #[test]
 fn unsupported_instructions_fail_cleanly() {
-    let program = assemble(|_| vec![Instruction::Catch { dst: r(5) }, Instruction::Return { value: r(5) }]);
+    let program = assemble(|_| {
+        vec![
+            Instruction::Catch {
+                value_feedback: 0,
+                dst: r(5),
+            },
+            Instruction::Return { value: r(5) },
+        ]
+    });
     let snapshot = snapshot_for(&program, test_layout());
     let failure = build_graph(&snapshot).unwrap_err();
     assert!(matches!(
@@ -2430,6 +2438,48 @@ mod arguments {
         let aliased = |snapshot: &mut Snapshot| snapshot.executables[0].mapped_arguments_alias_parameters = true;
         assert!(build(&reads_length(true), aliased).contains("ArgumentCount"));
     }
+}
+
+fn dump_bitwise_or(feedback: u8) -> String {
+    let program = assemble(|_| {
+        vec![
+            Instruction::BitwiseOr {
+                dst: r(5),
+                lhs: a(0),
+                rhs: r(6),
+                arith_feedback: 0,
+            },
+            Instruction::Return { value: r(5) },
+        ]
+    });
+    let mut snapshot = snapshot_for(&program, test_layout());
+    snapshot.executables[0].feedback.arith = vec![feedback];
+    dump(&optimized_graph(&snapshot), &test_layout())
+}
+
+#[test]
+fn bitwise_operands_that_were_booleans_are_read_as_int32s() {
+    use crate::snapshot::arith_feedback::{BOOLEAN, INT32, OTHER, STRING};
+    let text = dump_bitwise_or(INT32 | BOOLEAN);
+    assert_eq!(text.matches("BranchInt32OrBoolean").count(), 2, "{text}");
+    assert!(text.contains("Int32BitwiseOr"), "{text}");
+    // Operands of other kinds never came, so they exit rather than run the slow path.
+    assert!(
+        text.contains("Exit SlowPath") && !text.contains("CallSlowPath"),
+        "{text}"
+    );
+    // Other kinds that came, like undefined or strings, take the slow path.
+    for other in [OTHER, STRING] {
+        let text = dump_bitwise_or(INT32 | BOOLEAN | other);
+        assert_eq!(text.matches("CallSlowPath BitwiseOr").count(), 1, "{text}");
+    }
+    // Other operands, like undefined, are no booleans.
+    let text = dump_bitwise_or(INT32 | OTHER);
+    assert!(!text.contains("BranchInt32OrBoolean"), "{text}");
+    // Without booleans, int32 speculation checks the operands instead.
+    let text = dump_bitwise_or(INT32);
+    assert!(!text.contains("BranchInt32OrBoolean"), "{text}");
+    assert_eq!(text.matches("CheckInt32").count(), 2, "{text}");
 }
 
 #[test]
